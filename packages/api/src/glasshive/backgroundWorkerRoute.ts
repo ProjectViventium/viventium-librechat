@@ -8,6 +8,7 @@ const bounded = (value: unknown, max = 160): string =>
 const fields = {
   workerProfile: 'worker_profile',
   workerModel: 'worker_model',
+  workerAccess: 'worker_access',
   workerReasoningEffort: 'worker_reasoning_effort',
   fallbackWorkerProfile: 'fallback_worker_profile',
   fallbackWorkerModel: 'fallback_worker_model',
@@ -23,6 +24,7 @@ export function configuredBackgroundWorkerRoute(agent: unknown): Record<string, 
       const value = bounded(settings[snake]);
       if (
         !value ||
+        (camel === 'workerAccess' && !['ask', 'full'].includes(value)) ||
         (camel.endsWith('Profile') &&
           !(MAIN_DELEGATION_PROFILES as readonly string[]).includes(value))
       )
@@ -37,7 +39,9 @@ export function backgroundWorkerResources(route: unknown): Record<string, string
   return Object.fromEntries(
     Object.entries(fields).flatMap(([camel, snake]) => {
       const value = bounded(values[camel]);
-      return value ? [[snake, value]] : [];
+      return value && (camel !== 'workerAccess' || ['ask', 'full'].includes(value))
+        ? [[snake, value]]
+        : [];
     }),
   );
 }
@@ -51,6 +55,9 @@ export function resolveBackgroundWorkerRoute(args: RecordValue, resources: Recor
     bounded(args.effort) ||
     (usesPreferredProfile ? bounded(resources.worker_reasoning_effort) : '');
   const authority: Record<string, string> = {};
+  // Native access comes only from owner-saved background settings, never model arguments.
+  if (['ask', 'full'].includes(String(resources.worker_access)))
+    authority.worker_access = String(resources.worker_access);
   if (usesPreferredProfile && bounded(resources.worker_model))
     authority.worker_model = bounded(resources.worker_model);
   if (effort) authority.worker_reasoning_effort = effort;

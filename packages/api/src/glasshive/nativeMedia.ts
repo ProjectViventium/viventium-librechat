@@ -21,6 +21,7 @@ import type {
 
 export const GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES = 24;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES = MAX_IMAGE_BYTES;
 export const GLASSHIVE_NATIVE_MEDIA_MAX_BYTES = 32 * 1024 * 1024;
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
 const observationSchema = z.object({
@@ -628,10 +629,8 @@ export async function buildGlassHiveNativeMediaContent(
   for (const insight of insights) {
     if (insight.runInput) {
       // Both accepted callback kinds carry bound input; media authority stays terminal-only below.
-      if (
-        insight.authority?.kind !== 'durable_terminal_callback' &&
-        insight.authority?.kind !== 'durable_work_callback'
-      ) {
+      if (insight.authority?.kind !== 'durable_terminal_callback' &&
+          insight.authority?.kind !== 'durable_work_callback') {
         throw mediaError('mission_input_authority_invalid');
       }
       const runInput = normalizeGlassHiveRunInput(insight.runInput, insight.authority.runId || '');

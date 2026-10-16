@@ -16,6 +16,8 @@ interface AuthorizationRecord extends ValueRecord {
   ownerId: string;
   originRef: string;
   allowedServers: string[];
+  eagerServers?: string[];
+  deferredServers?: string[];
   allowedHostTools: string[];
   hostToolResources: ValueRecord;
   contentReadScope: boolean;
@@ -95,6 +97,8 @@ interface CreateAuthorizationInput {
   user?: UserRecord;
   originRef?: unknown;
   allowedServers?: unknown;
+  eagerServers?: unknown;
+  deferredServers?: unknown;
   allowedHostTools?: unknown;
   hostToolResources?: unknown;
   contentReadScope?: boolean;
@@ -271,6 +275,42 @@ function scopeFingerprint(value: unknown): string {
   return crypto.createHash('sha256').update(stableJson(value)).digest('base64url');
 }
 
+/* VIVENTIUM START: Preserve an explicit discovery partition without changing legacy scopes. */
+function serverDiscoveryPartition(
+  allowedServers: string[],
+  eagerServers: unknown,
+  deferredServers: unknown,
+): { eagerServers?: string[]; deferredServers?: string[] } {
+  if (eagerServers === undefined && deferredServers === undefined) return {};
+  const invalid = () => new CapabilityAuthorizationError(
+    'capability_discovery_partition_invalid',
+    'The mission capability discovery scope is invalid.',
+    { status: 400, needsInput: false },
+  );
+  if (!Array.isArray(eagerServers) || !Array.isArray(deferredServers) ||
+      ![...eagerServers, ...deferredServers].every((value) => typeof value === 'string')) {
+    throw invalid();
+  }
+  const eager = normalizedStrings(eagerServers);
+  const deferred = normalizedStrings(deferredServers);
+  const eagerSet = new Set(eager);
+  if (deferred.some((server) => eagerSet.has(server)) ||
+      stableJson(normalizedStrings([...eager, ...deferred])) !== stableJson(allowedServers)) {
+    throw invalid();
+  }
+  return { eagerServers: eager, deferredServers: deferred };
+}
+
+function matchesAuthorizationEnvelope(record: AuthorizationRecord, envelope: ValueRecord): boolean {
+  // A rollout must not migrate an already prepared origin to a different signed discovery scope.
+  if (record.eagerServers === undefined && record.deferredServers === undefined) {
+    const { eagerServers: _eager, deferredServers: _deferred, ...legacyEnvelope } = envelope;
+    return record.scopeFingerprint === scopeFingerprint(legacyEnvelope);
+  }
+  return record.scopeFingerprint === scopeFingerprint(envelope);
+}
+/* VIVENTIUM END */
+
 function admissionSecret(): string {
   const value = String(process.env.VIVENTIUM_GLASSHIVE_ADMISSION_SECRET || '').trim();
   if (!value || value.includes('${')) {
@@ -404,6 +444,8 @@ export async function createCapabilityAuthorization({
   user,
   originRef,
   allowedServers = [],
+  eagerServers,
+  deferredServers,
   allowedHostTools = [],
   hostToolResources = {},
   contentReadScope = false,
@@ -422,6 +464,7 @@ export async function createCapabilityAuthorization({
     );
   }
   const servers = normalizedStrings(allowedServers);
+  const discovery = serverDiscoveryPartition(servers, eagerServers, deferredServers);
   const hostTools = normalizedStrings(allowedHostTools);
   const resources = scopedHostToolResources(hostToolResources, hostTools);
   const safeContext = {
@@ -441,6 +484,7 @@ export async function createCapabilityAuthorization({
     ownerId,
     originRef: normalizedOriginRef,
     allowedServers: servers,
+    ...discovery,
     allowedHostTools: hostTools,
     hostToolResources: resources,
     contentReadScope: contentReadScope === true,
@@ -460,7 +504,7 @@ export async function createCapabilityAuthorization({
     originRef: normalizedOriginRef,
   });
   if (existing) {
-    if (existing.scopeFingerprint !== fingerprint) {
+    if (!matchesAuthorizationEnvelope(existing, envelope)) {
       throw new CapabilityAuthorizationError(
         'capability_authorization_conflict',
         'The mission origin already has a different capability authorization.',
@@ -495,7 +539,7 @@ export async function createCapabilityAuthorization({
       ownerId,
       originRef: normalizedOriginRef,
     });
-    if (!raced || raced.scopeFingerprint !== fingerprint) {
+    if (!raced || !matchesAuthorizationEnvelope(raced, envelope)) {
       throw new CapabilityAuthorizationError(
         'capability_authorization_conflict',
         'The mission origin already has a different capability authorization.',
@@ -875,9 +919,13 @@ export async function admitCapabilityAuthorization({
     );
   }
   const user = await revalidateAuthorization(record);
+  const discovery = serverDiscoveryPartition(
+    record.allowedServers, record.eagerServers, record.deferredServers,
+  );
   const minted = mintBrokerGrant({
     user,
     allowedServers: record.allowedServers,
+    ...discovery,
     allowedHostTools: record.allowedHostTools,
     hostToolResources: record.hostToolResources,
     allowDynamicPolicyServers: false,
@@ -964,6 +1012,7 @@ export async function admitCapabilityAuthorization({
       grantId,
       expiresAt: minted.payload.exp,
       allowedServers: record.allowedServers,
+      ...discovery,
       allowedHostTools: record.allowedHostTools,
       scopes: minted.payload.scopes,
     },
@@ -1094,34 +1143,19 @@ function authorizationDateMs(value: unknown): number {
 
 /** Read a historical descriptor candidate; the native action digest alone owns receipt recovery. */
 export async function readCapabilityReauthorizationReceiptCandidate({
-  ownerId,
-  workRef,
+  ownerId, workRef,
 }: ReauthorizeInput = {}) {
   const normalizedOwner = String(ownerId || '').trim();
   const normalizedWork = String(workRef || '').trim();
-  if (!normalizedOwner || normalizedOwner.length > 192 || !SIMPLE_REF.test(normalizedWork))
-    return null;
+  if (!normalizedOwner || normalizedOwner.length > 192 || !SIMPLE_REF.test(normalizedWork)) return null;
   const record = await authorizationCollection().findOne({
-    ownerId: normalizedOwner,
-    workRef: normalizedWork,
-    status: 'active',
+    ownerId: normalizedOwner, workRef: normalizedWork, status: 'active',
   });
   const maximumMs = authorizationDateMs(record?.maxExpiresAt);
-  if (
-    !record ||
-    !Number.isFinite(maximumMs) ||
-    !Number.isInteger(record.reauthorizationCount) ||
-    Number(record.reauthorizationCount) < 1 ||
-    !record.authorizationRef ||
-    !record.scopeFingerprint
-  )
-    return null;
-  return {
-    version: 1,
-    authorizationRef: record.authorizationRef,
-    maxExpiresAt: new Date(maximumMs).toISOString(),
-    scopeFingerprint: record.scopeFingerprint,
-  };
+  if (!record || !Number.isFinite(maximumMs) || !Number.isInteger(record.reauthorizationCount) ||
+      Number(record.reauthorizationCount) < 1 || !record.authorizationRef || !record.scopeFingerprint) return null;
+  return { version: 1, authorizationRef: record.authorizationRef,
+    maxExpiresAt: new Date(maximumMs).toISOString(), scopeFingerprint: record.scopeFingerprint };
 }
 
 /**

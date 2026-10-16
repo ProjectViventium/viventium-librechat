@@ -1649,6 +1649,7 @@ router.post('/claim', async (req, res) => {
       gatewayAgentName: claimed.gatewayAgentName,
       ownerParticipantIdentity: claimed.ownerParticipantIdentity,
       requestedVoiceRoute: claimed.requestedVoiceRoute,
+      preparationTimeoutS: Number(claimed.contextPreparation?.timeoutSeconds || 0),
       ...(Array.isArray(claimed.contextualKeyterms) && claimed.contextualKeyterms.length
         ? { contextualKeyterms: claimed.contextualKeyterms }
         : {}),
@@ -1786,48 +1787,23 @@ function boundedVoiceTraceId(value) {
 function exactVoiceGatewayTraceBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body) || body.version !== 1) return null;
   const keys = Object.keys(body);
-  if (
-    keys.length !==
-    VOICE_GATEWAY_TRACE_KEYS.size +
-      (body.startedAtMs === undefined ? 0 : 1) +
-      (body.workerDelivery === undefined ? 0 : 1)
-  )
-    return null;
-  if (
-    keys.some(
-      (key) =>
-        !['startedAtMs', 'workerDelivery'].includes(key) && !VOICE_GATEWAY_TRACE_KEYS.has(key),
-    )
-  )
-    return null;
+  if (keys.length !== VOICE_GATEWAY_TRACE_KEYS.size + (body.startedAtMs === undefined ? 0 : 1) +
+      (body.workerDelivery === undefined ? 0 : 1)) return null;
+  if (keys.some((key) => !['startedAtMs', 'workerDelivery'].includes(key) &&
+      !VOICE_GATEWAY_TRACE_KEYS.has(key))) return null;
   if (body.workerDelivery !== undefined) {
     const proof = body.workerDelivery;
-    if (
-      !proof ||
-      typeof proof !== 'object' ||
-      Array.isArray(proof) ||
-      Object.keys(proof).length !== 3 ||
-      Object.keys(proof).some(
-        (key) => !['deliveryId', 'claimId', 'dispatchPermit'].includes(key),
-      ) ||
-      !boundedVoiceTraceId(proof.deliveryId) ||
-      !boundedVoiceTraceId(proof.claimId) ||
-      !proof.dispatchPermit ||
-      typeof proof.dispatchPermit !== 'object' ||
-      Array.isArray(proof.dispatchPermit)
-    )
-      return null;
+    if (!proof || typeof proof !== 'object' || Array.isArray(proof) ||
+        Object.keys(proof).length !== 3 ||
+        Object.keys(proof).some((key) => !['deliveryId', 'claimId', 'dispatchPermit'].includes(key)) ||
+        !boundedVoiceTraceId(proof.deliveryId) || !boundedVoiceTraceId(proof.claimId) ||
+        !proof.dispatchPermit || typeof proof.dispatchPermit !== 'object' ||
+        Array.isArray(proof.dispatchPermit)) return null;
   }
-  if (
-    body.stage === 'audio.started' &&
-    (!Number.isSafeInteger(body.startedAtMs) || body.startedAtMs <= 0)
-  )
-    return null;
-  if (
-    body.startedAtMs !== undefined &&
-    (!Number.isSafeInteger(body.startedAtMs) || body.startedAtMs <= 0)
-  )
-    return null;
+  if (body.stage === 'audio.started' &&
+      (!Number.isSafeInteger(body.startedAtMs) || body.startedAtMs <= 0)) return null;
+  if (body.startedAtMs !== undefined &&
+      (!Number.isSafeInteger(body.startedAtMs) || body.startedAtMs <= 0)) return null;
   const normalized = {
     version: 1,
     callSessionId: boundedVoiceTraceId(body.callSessionId),
@@ -1854,55 +1830,23 @@ function exactVoiceGatewayTraceBody(body) {
 /* === VIVENTIUM START === Reuse an already validated Worker delivery settlement for playout status. === */
 async function projectGlassHiveVoiceTaskPresentation(req, delivery, stage) {
   const input = req.body?.taskPresentation;
-  if (
-    !input ||
-    !['audio.completed', 'audio.interrupted', 'audio.failed', 'audio.superseded'].includes(stage) ||
-    input.stage !== stage ||
-    !boundedVoiceTraceId(input.taskId) ||
-    !boundedVoiceTraceId(input.streamId) ||
-    !Number.isSafeInteger(input.startedAtMs) ||
-    input.startedAtMs <= 0
-  )
-    return;
+  if (!input || !['audio.completed', 'audio.interrupted', 'audio.failed', 'audio.superseded'].includes(stage) ||
+      input.stage !== stage || !boundedVoiceTraceId(input.taskId) || !boundedVoiceTraceId(input.streamId) ||
+      !Number.isSafeInteger(input.startedAtMs) || input.startedAtMs <= 0) return;
   const userId = req.user?.id;
   const callSessionId = req.viventiumCallSession?.callSessionId;
   const ref = delivery?.workerCompletionPresentation?.presentationRef || delivery?.deliveryId;
-  if (
-    !userId ||
-    !callSessionId ||
-    delivery?.userId !== userId ||
-    delivery.voiceCallSessionId !== callSessionId ||
-    !ref ||
-    ref !== input.presentationRef ||
-    (stage === 'audio.completed'
-      ? delivery.status !== 'sent'
-      : delivery.status !== 'delivery_unknown')
-  )
-    return;
+  if (!userId || !callSessionId || delivery?.userId !== userId ||
+      delivery.voiceCallSessionId !== callSessionId || !ref || ref !== input.presentationRef ||
+      (stage === 'audio.completed' ? delivery.status !== 'sent' : delivery.status !== 'delivery_unknown')) return;
   try {
-    const task = await hydrateVoiceTaskByStreamId(input.streamId, {
-      userId,
-      callSessionId,
-      requireDurable: true,
-    });
-    if (
-      !task ||
-      task.taskId !== input.taskId ||
-      task.conversationId !== delivery.conversationId ||
-      task.owner?.kind !== 'glasshive_delivery' ||
-      task.owner.id !== delivery.deliveryId ||
-      snapshotEvent(task.taskId)?.resultMessageId !== delivery.callbackMessageId
-    )
-      return;
-    recordVoiceTaskDeliveryPresentation(task.taskId, {
-      userId,
-      callSessionId,
-      streamId: input.streamId,
+    const task = await hydrateVoiceTaskByStreamId(input.streamId, {userId, callSessionId, requireDurable: true});
+    if (!task || task.taskId !== input.taskId || task.conversationId !== delivery.conversationId ||
+        task.owner?.kind !== 'glasshive_delivery' || task.owner.id !== delivery.deliveryId ||
+        snapshotEvent(task.taskId)?.resultMessageId !== delivery.callbackMessageId) return;
+    recordVoiceTaskDeliveryPresentation(task.taskId, {userId, callSessionId, streamId: input.streamId,
       deliveryId: delivery.deliveryId,
-      presentationRef: ref,
-      stage,
-      startedAtMs: input.startedAtMs,
-    });
+      presentationRef: ref, stage, startedAtMs: input.startedAtMs});
   } catch (error) {
     logger.warn('[VIVENTIUM][voice] worker_presentation_projection_failed', {
       code: String(error?.code || 'projection_unavailable').slice(0, 120),
@@ -2025,7 +1969,7 @@ router.post('/trace/stages', voiceTerminalStateAuth, async (req, res) => {
     });
   }
   if (req.viventiumCallSession?.status === 'ended' && input.stage !== 'audio.interrupted') {
-    return res.status(410).json({ code: 'call_ended', retryable: false });
+    return res.status(410).json({code: 'call_ended', retryable: false});
   }
   const callSessionId = req.viventiumCallSession?.callSessionId;
   const userId = req.user?.id;
@@ -2050,36 +1994,27 @@ router.post('/trace/stages', voiceTerminalStateAuth, async (req, res) => {
     // Speech ends after the generation job can be cleaned up. Its canonical turn binding
     // stays with the existing durable Voice task; client input cannot author this binding.
     const retainedBinding = getVoiceTaskTraceBinding(input.taskId);
-    const workerPresentation =
-      input.workerDelivery &&
-      task?.owner?.kind === 'glasshive_delivery' &&
+    const workerPresentation = input.workerDelivery && task?.owner?.kind === 'glasshive_delivery' &&
       task.owner.id === input.workerDelivery.deliveryId &&
       task.streamId === `glasshive-delivery:${input.workerDelivery.deliveryId}`
-        ? await resolveGlassHiveVoicePresentation({
-            ...input.workerDelivery,
-            presentationRef: input.presentationRef,
-            turnId: input.turnId,
-            userId,
-            voiceCallSessionId: callSessionId,
-            conversationId: task.conversationId,
-          })
-        : null;
-    const exactGeneration = input.workerDelivery
-      ? Boolean(workerPresentation)
-      : job
-        ? Boolean(
-            metadata?.userId === userId &&
-            metadata?.viventiumCallSessionId === callSessionId &&
-            metadata?.viventiumVoiceTaskId === input.taskId &&
-            interactionContext?.surface === 'voice' &&
-            interactionContext?.logical_turn_id === input.turnId,
-          )
-        : Boolean(
-            retainedBinding?.userId === userId &&
-            retainedBinding?.callSessionId === callSessionId &&
-            retainedBinding?.streamId === input.streamId &&
-            retainedBinding?.logicalTurnId === input.turnId,
-          );
+      ? await resolveGlassHiveVoicePresentation({
+          ...input.workerDelivery, presentationRef: input.presentationRef, turnId: input.turnId,
+          userId, voiceCallSessionId: callSessionId, conversationId: task.conversationId,
+        }) : null;
+    const exactGeneration = input.workerDelivery ? Boolean(workerPresentation) : job
+      ? Boolean(
+          metadata?.userId === userId &&
+          metadata?.viventiumCallSessionId === callSessionId &&
+          metadata?.viventiumVoiceTaskId === input.taskId &&
+          interactionContext?.surface === 'voice' &&
+          interactionContext?.logical_turn_id === input.turnId,
+        )
+      : Boolean(
+          retainedBinding?.userId === userId &&
+          retainedBinding?.callSessionId === callSessionId &&
+          retainedBinding?.streamId === input.streamId &&
+          retainedBinding?.logicalTurnId === input.turnId,
+        );
     const exactAuthority = Boolean(
       task &&
       task.taskId === input.taskId &&
@@ -2116,28 +2051,19 @@ router.post('/trace/stages', voiceTerminalStateAuth, async (req, res) => {
         retryable: false,
       });
     }
-    const presentationInput = {
-      userId,
-      callSessionId,
-      streamId: input.streamId,
-      presentationRef: input.presentationRef,
-      stage: input.stage,
-      startedAtMs: req.body.startedAtMs,
-    };
+    const presentationInput = {userId, callSessionId, streamId: input.streamId,
+      presentationRef: input.presentationRef, stage: input.stage, startedAtMs: req.body.startedAtMs};
     if (input.workerDelivery && input.stage !== 'audio.started') {
-      return res.status(400).json({ code: 'voice_trace_invalid', retryable: false });
+      return res.status(400).json({code: 'voice_trace_invalid', retryable: false});
     }
     if (input.stage === 'audio.started') {
       if (input.workerDelivery) {
-        if (
-          task.turnId !== workerPresentation.voiceRequestId ||
-          snapshotEvent(task.taskId)?.resultMessageId !== workerPresentation.callbackMessageId
-        ) {
-          return res.status(403).json({ code: 'voice_trace_not_authorized', retryable: false });
+        if (task.turnId !== workerPresentation.voiceRequestId ||
+            snapshotEvent(task.taskId)?.resultMessageId !== workerPresentation.callbackMessageId) {
+          return res.status(403).json({code: 'voice_trace_not_authorized', retryable: false});
         }
         recordVoiceTaskDeliveryPresentation(input.taskId, {
-          ...presentationInput,
-          deliveryId: workerPresentation.deliveryId,
+          ...presentationInput, deliveryId: workerPresentation.deliveryId,
         });
       } else recordVoiceTaskPresentation(input.taskId, presentationInput);
       return res.json({ version: 1, accepted: true, stage: input.stage });
@@ -2782,7 +2708,7 @@ router.post(
   async (req, _res, next) => {
     req.viventiumVoiceIngressReceivedAtMs = Date.now();
     const session = req.viventiumCallSession;
-    const callMode = canonicalVoiceSessionMode(session);
+    let callMode = canonicalVoiceSessionMode(session);
     const incoming = req.body ?? {};
     const text = typeof incoming.text === 'string' ? incoming.text : '';
     const speakInsights = incoming.speakInsights === true;
@@ -2849,6 +2775,29 @@ router.post(
         segments: speakerPersistence.effectiveSegments,
       });
     }
+    /* VIVENTIUM: media/ingress stay live while the same Main's opt-in context turn settles. */
+    if (callMode !== 'listen_only' && session.contextPreparation) {
+      const waitingRequest = new AbortController();
+      const onWaitingClose = () => {
+        if (!_res.writableEnded && !_res.finished) waitingRequest.abort();
+      };
+      _res.once('close', onWaitingClose);
+      if (_res.destroyed || req.aborted) waitingRequest.abort();
+      try {
+        const prepared = await require('~/server/services/viventium/CallPreparationService').wait(session, waitingRequest.signal);
+        if (waitingRequest.signal.aborted) return;
+        Object.assign(session, prepared);
+        callMode = canonicalVoiceSessionMode(session);
+      } catch (error) {
+        if (waitingRequest.signal.aborted) return;
+        return _res.status(error.status || 409).json({ code: error.code || 'call_context_failed',
+          message: error.message || 'Context gathering did not finish.',
+          retryable: error.code === 'call_context_busy' });
+      } finally {
+        _res.removeListener('close', onWaitingClose);
+      }
+    }
+
     const latestEffectiveSegments = new Map();
     for (const segment of speakerPersistence.effectiveSegments || []) {
       if (!segment?.segmentId) {
@@ -3625,26 +3574,21 @@ router.get('/tasks/:taskId', voiceSessionCapabilityAuth, async (req, res) => {
   const event = snapshotEvent(task.taskId);
   const binding = getVoiceTaskOwnerBinding(task.taskId);
   const taskUserId =
-    binding?.taskId === task.taskId &&
-    binding.callSessionId === task.callSessionId &&
+    binding?.taskId === task.taskId && binding.callSessionId === task.callSessionId &&
     binding.conversationId === task.conversationId
       ? binding.userId
       : undefined;
   try {
-    const resultFilenames = await resolveVoiceTaskResultFilenames(
-      {
-        userId: req.user?.id,
-        callSessionId: req.viventiumCallSession?.callSessionId,
-        task: { ...task, userId: taskUserId },
-        event,
-      },
-      {
-        conversationExists: async (filter) =>
-          Boolean(await Conversation.findOne(filter).select('_id').lean()),
-        getResultMessage: (filter) => Message.findOne(filter).select('files attachments').lean(),
-        getResultFiles: (filter) => File.find(filter).select('file_id filename').lean(),
-      },
-    );
+    const resultFilenames = await resolveVoiceTaskResultFilenames({
+      userId: req.user?.id,
+      callSessionId: req.viventiumCallSession?.callSessionId,
+      task: { ...task, userId: taskUserId },
+      event,
+    }, {
+      conversationExists: async (filter) => Boolean(await Conversation.findOne(filter).select('_id').lean()),
+      getResultMessage: (filter) => Message.findOne(filter).select('files attachments').lean(),
+      getResultFiles: (filter) => File.find(filter).select('file_id filename').lean(),
+    });
     return res.json({ version: 1, event, resultFilenames });
   } catch {
     return res.status(503).json({ error: 'Task result files are temporarily unavailable.' });
@@ -3678,12 +3622,8 @@ router.post('/tasks/:taskId/cancel', voiceSessionCapabilityAuth, async (req, res
     });
   }
   if (cancellation?.presentationStopRequested) {
-    return res.json({
-      version: 1,
-      outcome: 'playout_stop_requested',
-      task: cancellation.task,
-      event: cancellation.event,
-    });
+    return res.json({ version: 1, outcome: 'playout_stop_requested',
+      task: cancellation.task, event: cancellation.event });
   }
   if (cancellation?.alreadyCompleted) {
     return res.status(409).json({
@@ -3759,33 +3699,15 @@ router.post('/tasks/:taskId/cancel', voiceSessionCapabilityAuth, async (req, res
   });
 });
 
-router.post(
-  '/tasks/:taskId/native-input/speech-offer',
-  voiceSessionCapabilityAuth,
-  async (req, res) => {
-    const task = await hydrateVoiceTask(req.params.taskId, {
-      userId: req.user?.id,
-      callSessionId: req.viventiumCallSession?.callSessionId,
-    });
-    if (!taskOwnedBySession(task, req)) return res.status(404).json({ error: 'Task not found' });
-    try {
-      const offer = await claimVoiceNativeInputSpeechOffer(task.taskId, {
-        userId: req.user.id,
-        callSessionId: req.viventiumCallSession.callSessionId,
-        streamId: req.body?.streamId,
-        prompt: req.body?.prompt,
-        nativeInputRequest: req.body?.nativeInputRequest,
-      });
-      if (!offer) return res.status(409).json({ error: 'native_input_speech_not_admitted' });
-      return res.json(offer);
-    } catch (error) {
-      logger.warn('[VIVENTIUM][VoiceTask] native_input_speech_offer_unavailable', {
-        code: error?.code || 'unknown',
-      });
-      return res.status(503).json({ error: 'native_input_speech_unavailable' });
-    }
-  },
-);
+router.post('/tasks/:taskId/native-input/speech-offer', voiceSessionCapabilityAuth, async (req,res)=>{
+  const task=await hydrateVoiceTask(req.params.taskId,{userId:req.user?.id,callSessionId:req.viventiumCallSession?.callSessionId});
+  if(!taskOwnedBySession(task,req)) return res.status(404).json({error:'Task not found'});
+  try {
+    const offer=await claimVoiceNativeInputSpeechOffer(task.taskId,{userId:req.user.id,callSessionId:req.viventiumCallSession.callSessionId,streamId:req.body?.streamId,prompt:req.body?.prompt,nativeInputRequest:req.body?.nativeInputRequest});
+    if(!offer) return res.status(409).json({error:'native_input_speech_not_admitted'});
+    return res.json(offer);
+  } catch(error) {logger.warn('[VIVENTIUM][VoiceTask] native_input_speech_offer_unavailable',{code:error?.code||'unknown'});return res.status(503).json({error:'native_input_speech_unavailable'});}
+});
 
 router.post('/tasks/:taskId/input', voiceSessionCapabilityAuth, async (req, res) => {
   const task = await hydrateVoiceTask(req.params.taskId, {
@@ -3799,20 +3721,13 @@ router.post('/tasks/:taskId/input', voiceSessionCapabilityAuth, async (req, res)
     return res.status(400).json({ error: 'input is required' });
   }
   const binding = createVoiceWorkAuthorityBinding({
-    session: req.viventiumCallSession,
-    segments: [],
-    typedInput: { kind: 'participant_text' },
+    session: req.viventiumCallSession, segments: [], typedInput: { kind: 'participant_text' },
   });
   const result = await submitVoiceTaskInput(task.taskId, req.body.input, {
     userId: req.user?.id,
-    ...(binding
-      ? {
-          voiceAuthorityContext: {
-            callSessionId: req.viventiumCallSession.callSessionId,
-            binding,
-          },
-        }
-      : {}),
+    ...(binding ? { voiceAuthorityContext: {
+      callSessionId: req.viventiumCallSession.callSessionId, binding,
+    } } : {}),
   });
   if (!result.ok) {
     const status = result.code === 'owner_input_failed' ? 503 : 409;
@@ -4046,10 +3961,7 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
       enqueueOutput(async () => {
         const suppressed = await outputIsSuppressed();
         if (voiceTask && !suppressed) {
-          failVoiceTask(
-            voiceTask.taskId,
-            errorClass ? { code: errorClass, message: error } : error,
-          );
+          failVoiceTask(voiceTask.taskId, errorClass ? { code: errorClass, message: error } : error);
         }
         if (!res.writableEnded) {
           if (!suppressed) {
@@ -4239,12 +4151,9 @@ router.get('/cortex/:messageId', voiceAuth, async (req, res) => {
     return res.status(400).json({ error: 'messageId is required' });
   }
 
-  const expectedFollowUpId =
-    typeof req.query?.followupMessageId === 'string' ? req.query.followupMessageId.trim() : '';
-  if (
-    req.query?.followupMessageId !== undefined &&
-    (!expectedFollowUpId || expectedFollowUpId.length > 160)
-  ) {
+  const expectedFollowUpId = typeof req.query?.followupMessageId === 'string'
+    ? req.query.followupMessageId.trim() : '';
+  if (req.query?.followupMessageId !== undefined && (!expectedFollowUpId || expectedFollowUpId.length > 160)) {
     return res.status(400).json({ error: 'Invalid follow-up reference' });
   }
   try {
@@ -4261,8 +4170,7 @@ router.get('/cortex/:messageId', voiceAuth, async (req, res) => {
 
     /* === VIVENTIUM START === Seal the canonical source before the worker receives its text. === */
     // A delayed publication wake must not accept a different child as its own result.
-    if (expectedFollowUpId && result.followUp?.messageId !== expectedFollowUpId)
-      result.followUp = null;
+    if (expectedFollowUpId && result.followUp?.messageId !== expectedFollowUpId) result.followUp = null;
     if (result.followUp && result.presentationRequired === true) {
       const context = result.presentationContext;
       const task = await hydrateVoiceTask(context?.taskId, {
@@ -4296,16 +4204,10 @@ router.get('/cortex/:messageId', voiceAuth, async (req, res) => {
         leaseMs: Number(session.expiresAtMs) - Date.now(),
       });
       if (!deliverable) result.followUp = null;
-      else
-        result.followUp = {
-          ...result.followUp,
-          presentationContext: {
-            callSessionId: session.callSessionId,
-            taskId: task.taskId,
-            streamId: binding.streamId,
-            turnId: context.turnId,
-          },
-        };
+      else result.followUp = { ...result.followUp, presentationContext: {
+        callSessionId: session.callSessionId, taskId: task.taskId,
+        streamId: binding.streamId, turnId: context.turnId,
+      } };
     }
     /* === VIVENTIUM END === */
 
@@ -4412,33 +4314,20 @@ router.post('/glasshive/deliveries/claim', voiceAuth, async (req, res) => {
     ) {
       return res.status(409).json({ error: 'delivery_scope_mismatch' });
     }
-    const settled = deliveries.length
-      ? null
-      : await getSettledGlassHiveVoiceCallbackDelivery({
-          callbackId: expectedCallbackId,
-          userId: expectedUserId,
-          voiceCallSessionId: expectedCallSessionId,
-        });
-    if (
-      settled &&
-      (!['sent', 'suppressed'].includes(settled.status) ||
-        settled.callbackId !== expectedCallbackRef ||
-        settled.userId !== expectedUserId ||
-        settled.voiceCallSessionId !== expectedCallSessionId ||
-        !String(settled.deliveryId || '').trim())
-    ) {
+    const settled = deliveries.length ? null : await getSettledGlassHiveVoiceCallbackDelivery({
+      callbackId: expectedCallbackId, userId: expectedUserId,
+      voiceCallSessionId: expectedCallSessionId,
+    });
+    if (settled && (!['sent', 'suppressed'].includes(settled.status) || settled.callbackId !== expectedCallbackRef ||
+        settled.userId !== expectedUserId || settled.voiceCallSessionId !== expectedCallSessionId ||
+        !String(settled.deliveryId || '').trim())) {
       return res.status(409).json({ error: 'delivery_scope_mismatch' });
     }
-    return res.json({
-      ...(settled ? { settled } : {}),
-      deliveries: deliveries.map((delivery) => ({
-        ...delivery,
-        presentationTask: registerVoiceTaskDeliveryPresentation(delivery, {
-          userId: expectedUserId,
-          callSessionId: expectedCallSessionId,
-        }),
-      })),
-    });
+    return res.json({ ...(settled ? { settled } : {}), deliveries: deliveries.map((delivery) => ({...delivery,
+      presentationTask: registerVoiceTaskDeliveryPresentation(delivery, {
+        userId: expectedUserId, callSessionId: expectedCallSessionId,
+      }),
+    })) });
   } catch (err) {
     logger.error('[VIVENTIUM][voice/glasshive-delivery] Claim failed:', err);
     return res.status(500).json({ error: 'Failed to claim GlassHive delivery' });
@@ -4551,86 +4440,74 @@ router.post(
   },
 );
 
-router.post(
-  '/glasshive/deliveries/:deliveryId/status',
-  voiceTerminalStateAuth,
-  async (req, res) => {
-    const deliveryId = String(req.params?.deliveryId || '').trim();
-    const claimId = String(req.body?.claimId || '').trim();
-    const status = String(req.body?.status || '').trim();
-    if (req.viventiumCallSession?.status === 'ended' && status !== 'delivery_unknown') {
-      return res.status(410).json({ code: 'call_ended', retryable: false });
+router.post('/glasshive/deliveries/:deliveryId/status', voiceTerminalStateAuth, async (req, res) => {
+  const deliveryId = String(req.params?.deliveryId || '').trim();
+  const claimId = String(req.body?.claimId || '').trim();
+  const status = String(req.body?.status || '').trim();
+  if (req.viventiumCallSession?.status === 'ended' && status !== 'delivery_unknown') {
+    return res.status(410).json({code: 'call_ended', retryable: false});
+  }
+  if (!deliveryId || !claimId) {
+    return res.status(400).json({ error: 'deliveryId and claimId are required' });
+  }
+  if (status === 'delivery_unknown' && !req.body?.dispatchPermit) {
+    return res.status(400).json({ error: 'dispatchPermit is required for delivery_unknown' });
+  }
+  try {
+    let delivery = null;
+    if (status === 'sent') {
+      delivery = await markGlassHiveCallbackDeliverySent({
+        deliveryId,
+        claimId,
+        dispatchPermit: req.body?.dispatchPermit || null,
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else if (status === 'failed') {
+      delivery = await markGlassHiveCallbackDeliveryFailed({
+        deliveryId,
+        claimId,
+        dispatchPermit: req.body?.dispatchPermit || null,
+        error: req.body?.error || '',
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else if (status === 'suppressed') {
+      delivery = await markGlassHiveCallbackDeliverySuppressed({
+        deliveryId,
+        claimId,
+        reason: req.body?.reason || '',
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else if (status === 'delivery_unknown') {
+      delivery = await markGlassHiveCallbackDeliveryUnknown({
+        deliveryId,
+        claimId,
+        dispatchPermit: req.body.dispatchPermit,
+        ...(req.viventiumCallSession?.status === 'ended' ? {requireIssuedPermit: true} : {}),
+        reason: req.body?.reason || 'voice_speech_outcome_unknown',
+        userId: req.user?.id || '',
+        voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
+      });
+    } else {
+      return res.status(400).json({ error: 'Unsupported delivery status' });
     }
-    if (!deliveryId || !claimId) {
-      return res.status(400).json({ error: 'deliveryId and claimId are required' });
+    if (!delivery) {
+      return res.status(409).json({ error: 'delivery_not_claimed' });
     }
-    if (status === 'delivery_unknown' && !req.body?.dispatchPermit) {
-      return res.status(400).json({ error: 'dispatchPermit is required for delivery_unknown' });
+    if (status === 'sent') {
+      await projectGlassHiveVoiceTaskPresentation(req, delivery, 'audio.completed');
+    } else if (status === 'delivery_unknown' &&
+        ['audio.interrupted', 'audio.failed', 'audio.superseded'].includes(req.body?.taskPresentation?.stage)) {
+      await projectGlassHiveVoiceTaskPresentation(req, delivery, req.body?.taskPresentation?.stage);
     }
-    try {
-      let delivery = null;
-      if (status === 'sent') {
-        delivery = await markGlassHiveCallbackDeliverySent({
-          deliveryId,
-          claimId,
-          dispatchPermit: req.body?.dispatchPermit || null,
-          userId: req.user?.id || '',
-          voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
-        });
-      } else if (status === 'failed') {
-        delivery = await markGlassHiveCallbackDeliveryFailed({
-          deliveryId,
-          claimId,
-          dispatchPermit: req.body?.dispatchPermit || null,
-          error: req.body?.error || '',
-          userId: req.user?.id || '',
-          voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
-        });
-      } else if (status === 'suppressed') {
-        delivery = await markGlassHiveCallbackDeliverySuppressed({
-          deliveryId,
-          claimId,
-          reason: req.body?.reason || '',
-          userId: req.user?.id || '',
-          voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
-        });
-      } else if (status === 'delivery_unknown') {
-        delivery = await markGlassHiveCallbackDeliveryUnknown({
-          deliveryId,
-          claimId,
-          dispatchPermit: req.body.dispatchPermit,
-          ...(req.viventiumCallSession?.status === 'ended' ? { requireIssuedPermit: true } : {}),
-          reason: req.body?.reason || 'voice_speech_outcome_unknown',
-          userId: req.user?.id || '',
-          voiceCallSessionId: req.viventiumCallSession?.callSessionId || '',
-        });
-      } else {
-        return res.status(400).json({ error: 'Unsupported delivery status' });
-      }
-      if (!delivery) {
-        return res.status(409).json({ error: 'delivery_not_claimed' });
-      }
-      if (status === 'sent') {
-        await projectGlassHiveVoiceTaskPresentation(req, delivery, 'audio.completed');
-      } else if (
-        status === 'delivery_unknown' &&
-        ['audio.interrupted', 'audio.failed', 'audio.superseded'].includes(
-          req.body?.taskPresentation?.stage,
-        )
-      ) {
-        await projectGlassHiveVoiceTaskPresentation(
-          req,
-          delivery,
-          req.body?.taskPresentation?.stage,
-        );
-      }
-      return res.json({ delivery });
-    } catch (err) {
-      logger.error('[VIVENTIUM][voice/glasshive-delivery] Status update failed:', err);
-      return res.status(500).json({ error: 'Failed to update GlassHive delivery' });
-    }
-  },
-);
+    return res.json({ delivery });
+  } catch (err) {
+    logger.error('[VIVENTIUM][voice/glasshive-delivery] Status update failed:', err);
+    return res.status(500).json({ error: 'Failed to update GlassHive delivery' });
+  }
+});
 
 module.exports = router;
 

@@ -2102,10 +2102,8 @@ describe('GenerationJobManager logical turns', () => {
         expect(terminals[0]).toMatchObject(
           lateReceipt
             ? {
-                responseMessage: {
-                  messageId: 'answer-old',
-                  text: 'Background work started. Open Active Work to view or steer it.',
-                },
+                final: true, superseded: true,
+                durableEffectReceipt: { effect_ref: 'effect-old' },
               }
             : { final: true, superseded: true },
         );
@@ -2749,7 +2747,7 @@ describe('GenerationJobManager logical turns', () => {
     await manager.destroy();
   });
 
-  test('a durable receipt that lands during supersession still presents immediately once', async () => {
+  test('a durable receipt that lands during supersession still closes its obsolete stream once', async () => {
     const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
     const manager = new GenerationJobManagerClass({
       jobStore: store,
@@ -2815,16 +2813,14 @@ describe('GenerationJobManager logical turns', () => {
     expect(terminals).toEqual([
       expect.objectContaining({
         final: true,
-        responseMessage: expect.objectContaining({
-          messageId: 'response-race-a',
-          text: 'Background work started. Open Active Work to view or steer it.',
-        }),
+        superseded: true,
+        durableEffectReceipt: { effect_ref: 'ghr_race_a' },
       }),
     ]);
     await manager.destroy();
   });
 
-  test('response_only supersession delivers one final receipt after exact durable work proof', async () => {
+  test('response_only supersession closes with one internal receipt after exact durable work proof', async () => {
     const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
     const manager = new GenerationJobManagerClass({
       jobStore: store,
@@ -2869,11 +2865,8 @@ describe('GenerationJobManager logical turns', () => {
     expect(terminals).toEqual([
       expect.objectContaining({
         final: true,
-        conversation: { conversationId: 'conversation-1' },
-        responseMessage: expect.objectContaining({
-          messageId: 'response-a',
-          text: 'Background work started. Open Active Work to view or steer it.',
-        }),
+        superseded: true,
+        durableEffectReceipt: { effect_ref: 'ghr_background_a' },
       }),
     ]);
     await manager.emitChunk('telegram-work-a', {
@@ -2893,11 +2886,13 @@ describe('GenerationJobManager logical turns', () => {
     expect(terminals).toEqual([
       expect.objectContaining({
         final: true,
-        responseMessage: expect.objectContaining({
-          messageId: 'response-a',
-          text: 'Background work started. Open Active Work to view or steer it.',
-        }),
+        superseded: true,
+        durableEffectReceipt: { effect_ref: 'ghr_background_a' },
       }),
+    ]);
+    expect(terminals[0]).not.toHaveProperty('responseMessage');
+    expect((await store.getJob('telegram-work-a'))?.durableEffectReceipts).toEqual([
+      expect.objectContaining({ effect_ref: 'ghr_background_a', source_event_id: 'event-a' }),
     ]);
     await expect(store.isCurrentLogicalTurn('telegram-direct-b')).resolves.toBe(true);
     await expect(store.isCurrentLogicalTurn('telegram-work-a')).resolves.toBe(false);
@@ -2914,7 +2909,7 @@ describe('GenerationJobManager logical turns', () => {
     await manager.destroy();
   });
 
-  test('response_only supersession presents a settled existing-work action and closes once', async () => {
+  test('response_only supersession retains an existing-work action internally and closes once', async () => {
     const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
     const manager = new GenerationJobManagerClass({
       jobStore: store,
@@ -2952,16 +2947,19 @@ describe('GenerationJobManager logical turns', () => {
         responseMessageId: 'response-action-a',
         effectKind: 'durable_work_action_accepted',
         effectRef: `work_action_${'a'.repeat(64)}`,
+        confirmationPending: true,
       }),
     ).resolves.toBe(true);
+
+    expect((await store.getJob('telegram-action-a'))?.durableEffectReceipt).toMatchObject({
+      confirmation_pending: true, effect_kind: 'durable_work_action_accepted',
+    });
 
     expect(terminals).toEqual([
       expect.objectContaining({
         final: true,
-        responseMessage: expect.objectContaining({
-          messageId: 'response-action-a',
-          text: 'Background work updated. Open Active Work to view or steer it.',
-        }),
+        superseded: true,
+        durableEffectReceipt: { effect_ref: `work_action_${'a'.repeat(64)}` },
       }),
     ]);
     await manager.emitDone('telegram-action-a', {
@@ -2971,6 +2969,51 @@ describe('GenerationJobManager logical turns', () => {
     expect(terminals).toHaveLength(1);
     await manager.destroy();
   });
+
+  test.each(['telegram', 'voice'] as const)(
+    'resume closes a legacy superseded receipt without conversational output on %s',
+    async (surface) => {
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+      const manager = new GenerationJobManagerClass({
+        jobStore: store,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      await manager.initialize();
+      const claim = await store.claimLogicalTurn('legacy-stream', 'owner', {
+        ...telegramContext('conversation', 'source'), surface,
+      });
+      const context = claim.interactionContext;
+      await store.createJob('legacy-stream', 'owner', 'conversation', {
+        interactionContext: context,
+        adapterCapabilities: { segment_stability: 'provisional', supersede_scope: 'response_only' },
+        deliveryPolicy: externalDelivery,
+      });
+      const receipt = {
+        effect_kind: 'durable_work_accepted' as const, effect_ref: 'work-existing',
+        source_event_id: 'source', response_message_id: 'answer-old', committed_at: 1,
+      };
+      await store.updateJob('legacy-stream', {
+        status: 'superseded', responseMessageId: 'answer-old',
+        durableEffectReceipt: receipt, durableEffectReceipts: [receipt],
+        finalEvent: JSON.stringify({ final: true, responseMessage: {
+          messageId: 'answer-old', text: 'Legacy generated operation receipt.',
+        } }),
+      });
+      try {
+        const expected = { final: true, superseded: true, logical_turn_id: context.logical_turn_id, revision: 1,
+          durableEffectReceipt: { effect_ref: 'work-existing' } };
+        expect((await manager.getResumeState('legacy-stream'))?.finalEvent).toEqual(expected);
+        const terminals: unknown[] = [];
+        await manager.subscribe('legacy-stream', () => {}, (event) => terminals.push(event));
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(terminals).toEqual([expected]);
+        expect((await store.getJob('legacy-stream'))?.durableEffectReceipts).toEqual([receipt]);
+      } finally {
+        await manager.destroy();
+      }
+    },
+  );
 
   test('records an idempotent delivery acknowledgement from server-held turn ownership', async () => {
     const manager = new GenerationJobManagerClass({

@@ -1,7 +1,7 @@
 import { ChevronLeft } from 'lucide-react';
 import { useCallback, useMemo } from 'react';
 import { useToastContext } from '@librechat/client';
-import { useGetAgentByIdQuery, useRevertAgentVersionMutation } from '~/data-provider';
+import { useGetExpandedAgentByIdQuery, useRevertAgentVersionMutation } from '~/data-provider';
 import type { AgentWithVersions, VersionContext } from './types';
 import { isActiveVersion } from './isActiveVersion';
 import { useAgentPanelContext } from '~/Providers';
@@ -16,7 +16,16 @@ export default function VersionPanel() {
 
   const selectedAgentId = agent_id ?? '';
 
-  const { data: agent, isLoading, error, refetch } = useGetAgentByIdQuery(selectedAgentId);
+  /* === VIVENTIUM START === Version history requires the existing EDIT/expanded details. === */
+  const {
+    data: agent,
+    isLoading,
+    error,
+    refetch,
+  } = useGetExpandedAgentByIdQuery(selectedAgentId, {
+    enabled: !!selectedAgentId,
+  });
+  /* === VIVENTIUM END === */
 
   const revertAgentVersion = useRevertAgentVersionMutation({
     onSuccess: () => {

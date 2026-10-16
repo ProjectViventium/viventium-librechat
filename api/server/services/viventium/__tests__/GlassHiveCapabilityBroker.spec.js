@@ -127,40 +127,22 @@ jest.mock('~/server/services/Tools/mcp', () => ({
 
 jest.mock('@librechat/api', () => ({
   assertCurrentGlassHiveSourceAuthor: (...args) => mockAssertCurrentGlassHiveSourceAuthor(...args),
-  GenerationJobManager: {
-    getJobStore: jest.fn(),
-    markDurableEffectReceipt: (...args) => mockMarkDurableEffectReceipt(...args),
-  },
-  isManagedSourceMutation: (...args) =>
-    jest.requireActual('@librechat/api').isManagedSourceMutation(...args),
+  GenerationJobManager: { getJobStore: jest.fn(), markDurableEffectReceipt: (...args) => mockMarkDurableEffectReceipt(...args) },
+  isManagedSourceMutation: (...args) => jest.requireActual('@librechat/api').isManagedSourceMutation(...args),
   executeManagedSourceMutation: async (options) => {
     const api = jest.requireActual('@librechat/api');
     if (!api.isManagedSourceMutation(options.requestBody)) return (await options.dispatch()).result;
     return api.executeSourceMutation({
-      input: {
-        streamId: options.requestBody.viventiumStreamId,
-        userId: options.userId,
+      input: { streamId: options.requestBody.viventiumStreamId, userId: options.userId,
         sourceEventId: options.requestBody.viventiumSourceEventId,
-        adapterId: options.adapterId,
-        routeId: options.routeId,
-        operation: options.operation,
-        effectKind: options.effectKind,
-        effectOrdinal: 0,
-        effectOccurrenceRef: options.occurrenceId,
+        adapterId: options.adapterId, routeId: options.routeId, operation: options.operation,
+        effectKind: options.effectKind, effectOrdinal: 0, effectOccurrenceRef: options.occurrenceId,
         providerIdempotencyKey: options.providerIdempotencyKey,
-        providerIdempotencyMode: options.providerIdempotencyMode,
-        canonicalArgs: options.canonicalArgs,
-      },
-      service: options.service,
-      dispatch: options.dispatch,
-      recordReceipt: options.recordReceipt,
+        providerIdempotencyMode: options.providerIdempotencyMode, canonicalArgs: options.canonicalArgs },
+      service: options.service, dispatch: options.dispatch, recordReceipt: options.recordReceipt,
       assertAuthor: async () => {
-        try {
-          await mockAssertCurrentGlassHiveSourceAuthor(options);
-        } catch (error) {
-          await options.rejectDispatch?.(error);
-          throw error;
-        }
+        try { await mockAssertCurrentGlassHiveSourceAuthor(options); }
+        catch (error) { await options.rejectDispatch?.(error); throw error; }
       },
     });
   },
@@ -196,21 +178,18 @@ jest.mock('../GlassHiveConversationOrchestration', () => {
   const mutationTools = new Set([delegationTool, 'active_work_action']);
   const canonical = (toolName, args = {}) => {
     if (toolName === delegationTool) {
-      return jest
-        .requireActual('@librechat/api')
+      return jest.requireActual('@librechat/api')
         .canonicalConversationOrchestrationArguments(toolName, args);
     }
     if (toolName === 'active_work_action') {
-      return jest
-        .requireActual('@librechat/api')
+      return jest.requireActual('@librechat/api')
         .canonicalConversationOrchestrationArguments(toolName, args);
     }
     return args;
   };
   return {
     ACTIVE_WORK_ACTION_DESCRIPTION: 'Control one existing durable mission.',
-    ACTIVE_WORK_ACTION_JSON_SCHEMA:
-      jest.requireActual('@librechat/api').ACTIVE_WORK_ACTION_JSON_SCHEMA,
+    ACTIVE_WORK_ACTION_JSON_SCHEMA: jest.requireActual('@librechat/api').ACTIVE_WORK_ACTION_JSON_SCHEMA,
     ACTIVE_WORK_LIST_DESCRIPTION: 'List existing durable missions.',
     ACTIVE_WORK_LIST_JSON_SCHEMA: { type: 'object', properties: {}, additionalProperties: false },
     DELEGATION_TOOL_NAME: delegationTool,
@@ -257,8 +236,7 @@ jest.mock('~/app/clients/tools/util/viventiumSearchTool', () => ({
 }));
 
 jest.mock('../GlassHiveAccountService', () => ({
-  buildTrustedActionIdempotencyKey: (...args) =>
-    jest.requireActual('@librechat/api').buildTrustedActionIdempotencyKey(...args),
+  buildTrustedActionIdempotencyKey: (...args) => jest.requireActual('@librechat/api').buildTrustedActionIdempotencyKey(...args),
   getActiveWorkPage: (...args) => mockGetActiveWorkPage(...args),
   getActiveWorkHistoryPage: (...args) => mockGetActiveWorkHistoryPage(...args),
   invalidateActiveWorkSnapshot: (...args) => mockInvalidateActiveWorkSnapshot(...args),
@@ -291,19 +269,12 @@ describe('GlassHive capability broker', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetMessages.mockReset().mockResolvedValue([]);
-    mockPrepareDurableEffect
-      .mockReset()
-      .mockResolvedValue({ decision: 'dispatch', effectKey: 'effect', claimToken: 'claim' });
+    mockPrepareDurableEffect.mockReset().mockResolvedValue({ decision: 'dispatch', effectKey: 'effect', claimToken: 'claim' });
     mockCommitDurableEffect.mockReset().mockImplementation(async (input) => ({
-      ownerId: 'user-1',
-      sourceEventId: 'source-1',
-      responseMessageId: 'msg-1',
-      effectKind: 'durable_work_accepted',
-      providerReceiptRef: input.providerReceiptRef,
+      ownerId: 'user-1', sourceEventId: 'source-1', responseMessageId: 'msg-1',
+      effectKind: 'durable_work_accepted', providerReceiptRef: input.providerReceiptRef,
     }));
-    mockSettleDurableEffectFailure
-      .mockReset()
-      .mockResolvedValue({ status: 'provider_outcome_unknown' });
+    mockSettleDurableEffectFailure.mockReset().mockResolvedValue({ status: 'provider_outcome_unknown' });
     mockMarkDurableEffectReceipt.mockReset().mockResolvedValue({ status: 'recorded' });
     mockAssertCurrentGlassHiveSourceAuthor.mockReset().mockResolvedValue(undefined);
     mockGetLogStores.mockImplementation(() => {
@@ -343,12 +314,13 @@ describe('GlassHive capability broker', () => {
     });
     mockMarkGlassHiveLaunchDispatchReady.mockResolvedValue({ launchState: 'dispatch_ready' });
     mockMarkGlassHiveLaunchPreDispatchFailed.mockResolvedValue({ launchState: 'not_dispatched' });
-    mockCreateCapabilityAuthorization.mockResolvedValue({
+    mockCreateCapabilityAuthorization.mockImplementation(async (input) => ({
+      ...(Array.isArray(input.eagerServers) ? { eagerServers: input.eagerServers, deferredServers: input.deferredServers } : {}),
       authorizationRef: 'gha-synthetic-authorization',
       originRef: 'ghi-synthetic',
       scopeFingerprint: 'synthetic-scope-fingerprint',
       maxExpiresAt: new Date('2026-09-03T00:00:00.000Z'),
-    });
+    }));
   });
 
   afterAll(() => {
@@ -606,6 +578,7 @@ describe('GlassHive capability broker', () => {
         'active_work_action',
       ],
       workerProfile: 'codex-cli',
+      workerAccess: 'full',
       fallbackWorkerProfile: 'claude-code',
     });
     const grant = await hydrateBrokerGrantResources(
@@ -628,173 +601,120 @@ describe('GlassHive capability broker', () => {
         file_selection: { version: 1 },
         request_body: { conversationId: 'conv-1', messageId: 'msg-1' },
         worker_profile: 'codex-cli',
+        worker_access: 'full',
         fallback_worker_profile: 'claude-code',
         mission_host_tools: [],
       },
     });
     expect(bundle.glasshive_capability_broker.allowed_host_tools).toEqual(grant.allowed_host_tools);
+    for (const brief of [bundle.agents_md, bundle.claude_md, bundle.codex_md]) {
+      expect(brief).toContain('This list is the scope of this invocation only');
+      expect(brief).toContain('Absence means the host did not resolve or authorize them for this invocation');
+      expect(brief).not.toContain('same resolved host capabilities available to the main Agent');
+    }
   });
 
+
+
   test('joins a created broker grant to its signed current scope with hashes only', async () => {
-    const {
-      buildConversationProviderBootstrapBundle,
-    } = require('../GlassHiveCapabilityBootstrapService');
+    const { buildConversationProviderBootstrapBundle } = require('../GlassHiveCapabilityBootstrapService');
     const { verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { logger } = require('@librechat/data-schemas');
-    const requestBody = {
-      conversationId: 'conversation-synthetic-private',
+    const requestBody = { conversationId: 'conversation-synthetic-private',
       messageId: 'message-synthetic-private',
       text: 'Private synthetic request content.',
-      privateMetadata: {
-        url: 'https://private.example.test/record',
-        token: 'private-token-marker',
-      },
-      viventiumGlassHiveTurnContextB64: 'private-context-marker',
-    };
+      privateMetadata: { url: 'https://private.example.test/record', token: 'private-token-marker' },
+      viventiumGlassHiveTurnContextB64: 'private-context-marker' };
     const bundle = await buildConversationProviderBootstrapBundle({
-      user: { id: 'user-1' },
-      requestBody,
+      user: { id: 'user-1' }, requestBody,
       allowedConversationOrchestrationTools: ['active_work_action'],
-      workerModel: 'synthetic-private-model',
-    });
+      workerModel: 'synthetic-private-model' });
     const grant = verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN);
-    const events = logger.info.mock.calls
-      .map(([line]) => JSON.parse(line))
-      .filter((event) => event.event === 'glasshive_broker_grant_created');
-    const hash = (value) => require('crypto').createHash('sha256').update(value).digest('hex');
-    expect(events).toEqual([
-      {
-        event: 'glasshive_broker_grant_created',
-        grant_id_sha256: hash(grant.grant_id),
-        message_id_sha256: hash(grant.message_id),
-        conversation_id_sha256: hash(grant.conversation_id),
-      },
-    ]);
+    const events = logger.info.mock.calls.map(([line]) => JSON.parse(line))
+      .filter(event => event.event === 'glasshive_broker_grant_created');
+    const hash = value => require('crypto').createHash('sha256').update(value).digest('hex');
+    expect(events).toEqual([{ event: 'glasshive_broker_grant_created',
+      grant_id_sha256: hash(grant.grant_id),
+      message_id_sha256: hash(grant.message_id),
+      conversation_id_sha256: hash(grant.conversation_id) }]);
     const serialized = JSON.stringify(events);
-    for (const value of [
-      grant.grant_id,
-      requestBody.messageId,
-      requestBody.conversationId,
-      requestBody.text,
-      requestBody.privateMetadata.url,
-      requestBody.privateMetadata.token,
-      requestBody.viventiumGlassHiveTurnContextB64,
-      'synthetic-private-model',
-      bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN,
-    ])
-      expect(serialized).not.toContain(value);
+    for (const value of [grant.grant_id, requestBody.messageId, requestBody.conversationId,
+      requestBody.text, requestBody.privateMetadata.url, requestBody.privateMetadata.token,
+      requestBody.viventiumGlassHiveTurnContextB64, 'synthetic-private-model',
+      bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN]) expect(serialized).not.toContain(value);
     expect(Object.keys(events[0]).sort()).toEqual(
-      ['event', 'grant_id_sha256', 'message_id_sha256', 'conversation_id_sha256'].sort(),
-    );
+      ['event', 'grant_id_sha256', 'message_id_sha256', 'conversation_id_sha256'].sort());
   });
 
   test('records only the present signed scope on an explicit first-message turn', async () => {
-    const {
-      buildConversationProviderBootstrapBundle,
-    } = require('../GlassHiveCapabilityBootstrapService');
+    const { buildConversationProviderBootstrapBundle } = require('../GlassHiveCapabilityBootstrapService');
     const { verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { logger } = require('@librechat/data-schemas');
     const bundle = await buildConversationProviderBootstrapBundle({
       user: { id: 'user-1' },
       requestBody: { messageId: 'message-synthetic-first', turnId: 'turn-synthetic-first' },
-      allowedConversationOrchestrationTools: ['active_work_action'],
-    });
+      allowedConversationOrchestrationTools: ['active_work_action'] });
     const grant = verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN);
     const event = JSON.parse(logger.info.mock.calls[0][0]);
     expect(event.conversation_id_sha256).toBeNull();
-    expect(event.message_id_sha256).toBe(
-      require('crypto').createHash('sha256').update(grant.message_id).digest('hex'),
-    );
+    expect(event.message_id_sha256).toBe(require('crypto').createHash('sha256')
+      .update(grant.message_id).digest('hex'));
     expect(JSON.stringify(event)).not.toContain('turn-synthetic-first');
   });
 
   test('keeps a valid broker grant when diagnostic logging throws', async () => {
-    const {
-      buildConversationProviderBootstrapBundle,
-    } = require('../GlassHiveCapabilityBootstrapService');
-    const {
-      verifyBrokerGrant,
-      hydrateBrokerGrantResources,
-    } = require('../GlassHiveCapabilityBrokerAuth');
+    const { buildConversationProviderBootstrapBundle } = require('../GlassHiveCapabilityBootstrapService');
+    const { verifyBrokerGrant, hydrateBrokerGrantResources } = require('../GlassHiveCapabilityBrokerAuth');
     const { logger } = require('@librechat/data-schemas');
-    logger.info.mockImplementationOnce(() => {
-      throw new Error('synthetic diagnostic failure');
-    });
+    logger.info.mockImplementationOnce(() => { throw new Error('synthetic diagnostic failure'); });
     const body = { conversationId: 'conv-1', messageId: 'msg-1', text: 'Exact retained request.' };
     const bundle = await buildConversationProviderBootstrapBundle({
-      user: { id: 'user-1' },
-      requestBody: body,
-      allowedConversationOrchestrationTools: ['active_work_action'],
-    });
+      user: { id: 'user-1' }, requestBody: body,
+      allowedConversationOrchestrationTools: ['active_work_action'] });
     expect(bundle.glasshive_capability_status?.reason).not.toBe('grant_unavailable');
-    const grant = await hydrateBrokerGrantResources(
-      verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN),
-    );
+    const grant = await hydrateBrokerGrantResources(verifyBrokerGrant(
+      bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN));
     expect(grant.host_tool_resources.active_work_action.request_body).toEqual(body);
     expect(grant.allowed_host_tools).toEqual(['active_work_action']);
     expect(logger.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining('Provider bundle grant unavailable'),
-      expect.anything(),
-    );
+      expect.stringContaining('Provider bundle grant unavailable'), expect.anything());
   });
 
   test('retains a long admitted request once so Main does not lose its two action capabilities', async () => {
-    const {
-      buildConversationProviderBootstrapBundle,
-    } = require('../GlassHiveCapabilityBootstrapService');
-    const {
-      hydrateBrokerGrantResources,
-      verifyBrokerGrant,
-    } = require('../GlassHiveCapabilityBrokerAuth');
+    const { buildConversationProviderBootstrapBundle } = require('../GlassHiveCapabilityBootstrapService');
+    const { hydrateBrokerGrantResources, verifyBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
     const delegationTool = 'worker_delegate_once_mcp_glasshive-workers-projects';
     const requestBody = {
-      conversationId: 'conv-1',
-      parentMessageId: 'parent-1',
-      messageId: 'msg-1',
-      viventiumGlassHiveTurnContextB64: Buffer.from(
-        JSON.stringify({
-          history: [{ role: 'user', content: 'Synthetic retained context. '.repeat(10500) }],
-          memory: 'Exact synthetic memory.',
-          feelings: { state: 'retained' },
-        }),
-      ).toString('base64'),
+      conversationId: 'conv-1', parentMessageId: 'parent-1', messageId: 'msg-1',
+      viventiumGlassHiveTurnContextB64: Buffer.from(JSON.stringify({
+        history: [{ role: 'user', content: 'Synthetic retained context. '.repeat(10500) }],
+        memory: 'Exact synthetic memory.', feelings: { state: 'retained' },
+      })).toString('base64'),
       files: [{ file_id: 'current-upload', filename: 'input.txt' }],
       privateMetadata: { sourceRevision: 7, sourceEventId: 'source-current' },
     };
     expect(Buffer.byteLength(JSON.stringify(requestBody)) * 2).toBeGreaterThan(512 * 1024);
     const bundle = await buildConversationProviderBootstrapBundle({
-      user: { id: 'user-1', role: 'USER' },
-      requestBody,
+      user: { id: 'user-1', role: 'USER' }, requestBody,
       allowedConversationOrchestrationTools: [delegationTool, 'active_work_action'],
-      workerProfile: 'codex-cli',
-      workerMemory: 'Exact independent worker memory.',
+      workerProfile: 'codex-cli', workerMemory: 'Exact independent worker memory.',
     });
     expect(bundle.glasshive_capability_status?.reason).not.toBe('grant_unavailable');
-    const grant = await hydrateBrokerGrantResources(
-      verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN, {
-        expectedUserId: 'user-1',
-        expectedTenantId: 'tenant-a',
-        requireTurnScope: true,
-      }),
-    );
+    const grant = await hydrateBrokerGrantResources(verifyBrokerGrant(
+      bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN,
+      { expectedUserId: 'user-1', expectedTenantId: 'tenant-a', requireTurnScope: true },
+    ));
     const actionBody = grant.host_tool_resources.active_work_action.request_body;
     expect(actionBody).toEqual(requestBody);
     expect(grant.host_tool_resources[delegationTool].request_body).toBe(actionBody);
-    expect(grant.host_tool_resources[delegationTool].worker_memory).toBe(
-      'Exact independent worker memory.',
-    );
+    expect(grant.host_tool_resources[delegationTool].worker_memory).toBe('Exact independent worker memory.');
     mockGetMCPServersRegistry.mockReturnValue({});
     mockExecuteGlassHiveWorkAction.mockResolvedValue({ status: 'accepted' });
-    await handleToolCall({
-      grant,
-      toolName: 'active_work_action',
-      args: { workRef: 'work-1', action: 'resume' },
-      invocationId: 'resume-occurrence-1',
-    });
+    await handleToolCall({ grant, toolName: 'active_work_action',
+      args: { workRef: 'work-1', action: 'resume' }, invocationId: 'resume-occurrence-1' });
     expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledWith(
-      expect.objectContaining({ requestBody: actionBody }),
-    );
+      expect.objectContaining({ requestBody: actionBody }));
     expect(JSON.stringify(bundle)).not.toContain(requestBody.viventiumGlassHiveTurnContextB64);
   });
 
@@ -802,139 +722,73 @@ describe('GlassHive capability broker', () => {
     ['active_work_action'],
     ['worker_delegate_once_mcp_glasshive-workers-projects'],
     ['active_work_action', 'worker_delegate_once_mcp_glasshive-workers-projects'],
-  ])(
-    'hydrates the same signed conversation body for each allowed action subset %j',
-    async (...tools) => {
-      const {
-        mintBrokerGrant,
-        hydrateBrokerGrantResources,
-        verifyBrokerGrant,
-        BROKER_AUTHORITY_KINDS,
-      } = require('../GlassHiveCapabilityBrokerAuth');
-      const body = {
-        conversationId: 'conv-1',
-        messageId: 'msg-1',
-        source: { exact: 'Synthetic original goal', revision: 3 },
-        history: [{ text: 'Prior input' }],
-      };
-      const minted = mintBrokerGrant({
-        user: { id: 'user-1' },
-        authorityKind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-        requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
-        allowedHostTools: tools,
-        conversationRequestBody: body,
-        hostToolResources: Object.fromEntries(
-          tools.map((name) => [
-            name,
-            { version: 1, request_body_ref: 'conversation_request_body' },
-          ]),
-        ),
-      });
-      expect(minted.resourceRecord.resources.conversation_request_body).toEqual(body);
-      expect(
-        Object.values(minted.resourceRecord.resources).filter((x) => x?.request_body),
-      ).toHaveLength(0);
-      const hydrated = await hydrateBrokerGrantResources(verifyBrokerGrant(minted.token));
-      for (const name of tools)
-        expect(hydrated.host_tool_resources[name].request_body).toEqual(body);
-      if (tools.length === 2)
-        expect(hydrated.host_tool_resources[tools[0]].request_body).toBe(
-          hydrated.host_tool_resources[tools[1]].request_body,
-        );
-    },
-  );
+  ])('hydrates the same signed conversation body for each allowed action subset %j', async (...tools) => {
+    const { mintBrokerGrant, hydrateBrokerGrantResources, verifyBrokerGrant,
+      BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
+    const body = { conversationId: 'conv-1', messageId: 'msg-1',
+      source: { exact: 'Synthetic original goal', revision: 3 }, history: [{ text: 'Prior input' }] };
+    const minted = mintBrokerGrant({ user: { id: 'user-1' },
+      authorityKind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+      allowedHostTools: tools, conversationRequestBody: body,
+      hostToolResources: Object.fromEntries(tools.map(name =>
+        [name, { version: 1, request_body_ref: 'conversation_request_body' }])),
+    });
+    expect(minted.resourceRecord.resources.conversation_request_body).toEqual(body);
+    expect(Object.values(minted.resourceRecord.resources).filter(x => x?.request_body)).toHaveLength(0);
+    const hydrated = await hydrateBrokerGrantResources(verifyBrokerGrant(minted.token));
+    for (const name of tools) expect(hydrated.host_tool_resources[name].request_body).toEqual(body);
+    if (tools.length === 2) expect(hydrated.host_tool_resources[tools[0]].request_body)
+      .toBe(hydrated.host_tool_resources[tools[1]].request_body);
+  });
 
   test.each([
     ['missing body', undefined, { version: 1, request_body_ref: 'conversation_request_body' }],
-    [
-      'unknown reference',
-      { exact: 'retained' },
-      { version: 1, request_body_ref: 'foreign_request' },
-    ],
-    [
-      'ambiguous inline body',
-      { exact: 'retained' },
-      {
-        version: 1,
-        request_body_ref: 'conversation_request_body',
-        request_body: { different: true },
-      },
-    ],
-  ])(
-    'fails closed for %s at signed conversation resource hydration',
-    async (_name, body, descriptor) => {
-      const {
-        mintBrokerGrant,
-        hydrateBrokerGrantResources,
-        verifyBrokerGrant,
-        BROKER_AUTHORITY_KINDS,
-      } = require('../GlassHiveCapabilityBrokerAuth');
-      const minted = mintBrokerGrant({
-        user: { id: 'user-1' },
-        authorityKind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-        requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
-        allowedHostTools: ['active_work_action'],
-        conversationRequestBody: body,
-        hostToolResources: { active_work_action: descriptor },
-      });
-      await expect(hydrateBrokerGrantResources(verifyBrokerGrant(minted.token))).rejects.toThrow(
-        /conversation resource scope is unavailable/,
-      );
-    },
-  );
-
-  test('isolates consumer changes from the retained signed shared body', async () => {
-    const {
-      mintBrokerGrant,
-      hydrateBrokerGrantResources,
-      verifyBrokerGrant,
-      BROKER_AUTHORITY_KINDS,
-    } = require('../GlassHiveCapabilityBrokerAuth');
-    const minted = mintBrokerGrant({
-      user: { id: 'user-1' },
+    ['unknown reference', { exact: 'retained' }, { version: 1, request_body_ref: 'foreign_request' }],
+    ['ambiguous inline body', { exact: 'retained' },
+      { version: 1, request_body_ref: 'conversation_request_body', request_body: { different: true } }],
+  ])('fails closed for %s at signed conversation resource hydration', async (_name, body, descriptor) => {
+    const { mintBrokerGrant, hydrateBrokerGrantResources, verifyBrokerGrant,
+      BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
+    const minted = mintBrokerGrant({ user: { id: 'user-1' },
       authorityKind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
       requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
-      allowedHostTools: ['active_work_action'],
-      conversationRequestBody: { source: { exact: 'retained' } },
-      hostToolResources: {
-        active_work_action: { version: 1, request_body_ref: 'conversation_request_body' },
-      },
+      allowedHostTools: ['active_work_action'], conversationRequestBody: body,
+      hostToolResources: { active_work_action: descriptor },
     });
+    await expect(hydrateBrokerGrantResources(verifyBrokerGrant(minted.token)))
+      .rejects.toThrow(/conversation resource scope is unavailable/);
+  });
+
+  test('isolates consumer changes from the retained signed shared body', async () => {
+    const { mintBrokerGrant, hydrateBrokerGrantResources, verifyBrokerGrant,
+      BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
+    const minted = mintBrokerGrant({ user: { id: 'user-1' },
+      authorityKind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+      requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
+      allowedHostTools: ['active_work_action'], conversationRequestBody: { source: { exact: 'retained' } },
+      hostToolResources: { active_work_action: { version: 1, request_body_ref: 'conversation_request_body' } } });
     const grant = verifyBrokerGrant(minted.token);
     const first = await hydrateBrokerGrantResources(grant);
     first.host_tool_resources.active_work_action.request_body.source.exact = 'consumer-only';
     const second = await hydrateBrokerGrantResources(grant);
-    expect(second.host_tool_resources.active_work_action.request_body.source.exact).toBe(
-      'retained',
-    );
+    expect(second.host_tool_resources.active_work_action.request_body.source.exact).toBe('retained');
     expect(minted.resourceRecord.resources.conversation_request_body.source.exact).toBe('retained');
   });
 
   test('rejects a mission-worker shared conversation resource and a changed signed body', async () => {
-    const {
-      mintBrokerGrant,
-      hydrateBrokerGrantResources,
-      verifyBrokerGrant,
-      BROKER_AUTHORITY_KINDS,
-    } = require('../GlassHiveCapabilityBrokerAuth');
-    const input = {
-      user: { id: 'user-1' },
+    const { mintBrokerGrant, hydrateBrokerGrantResources, verifyBrokerGrant,
+      BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
+    const input = { user: { id: 'user-1' },
       requestContext: { conversation_id: 'conv-1', message_id: 'msg-1' },
-      allowedHostTools: ['active_work_action'],
-      conversationRequestBody: { exact: 'retained' },
-      hostToolResources: {
-        active_work_action: { version: 1, request_body_ref: 'conversation_request_body' },
-      },
-    };
+      allowedHostTools: ['active_work_action'], conversationRequestBody: { exact: 'retained' },
+      hostToolResources: { active_work_action: { version: 1, request_body_ref: 'conversation_request_body' } } };
     expect(() => mintBrokerGrant(input)).toThrow(/conversation resource scope is invalid/);
-    const minted = mintBrokerGrant({
-      ...input,
-      authorityKind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-    });
+    const minted = mintBrokerGrant({ ...input,
+      authorityKind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR });
     minted.resourceRecord.resources.conversation_request_body.exact = 'changed';
-    await expect(hydrateBrokerGrantResources(verifyBrokerGrant(minted.token))).rejects.toThrow(
-      /resource scope is unavailable/,
-    );
+    await expect(hydrateBrokerGrantResources(verifyBrokerGrant(minted.token)))
+      .rejects.toThrow(/resource scope is unavailable/);
   });
 
   test('keeps large authorized evidence without duplicating raw tool resources in launch envelopes', async () => {
@@ -1098,160 +952,68 @@ describe('GlassHive capability broker', () => {
     const { BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
     mockGetMCPServersRegistry.mockReturnValue({});
-    mockExecuteGlassHiveWorkAction.mockResolvedValue({ status: 'accepted' });
-    const grant = {
-      grant_id: 'ghcb_question_1',
-      user_id: 'user-1',
-      user_role: 'USER',
-      conversation_id: 'conv-1',
-      message_id: 'msg-1',
-      turn_id: 'turn-1',
-      authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-      allowed_servers: [],
-      eager_servers: [],
-      deferred_servers: [],
-      allowed_host_tools: ['active_work_action'],
-      host_tool_resources: { active_work_action: { version: 1 } },
-    };
-    const nativeInput = JSON.parse(
-      '{"version":1,"requestId":"question-1","requestFingerprint":"' +
-        'a'.repeat(64) +
-        '","action":"accept","content":{"answers":{"__proto__":["Blue"]}}}',
-    );
-    await expect(
-      handleToolCall({
-        grant,
-        toolName: 'active_work_action',
-        args: { workRef: 'work-1', action: 'resume', nativeInput },
-      }),
-    ).resolves.toMatchObject({ status: 'ok' });
-    expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledWith(
-      expect.objectContaining({ ownerId: 'user-1', nativeInput }),
-    );
+    mockExecuteGlassHiveWorkAction.mockResolvedValue({status:'accepted'});
+    const grant={grant_id:'ghcb_question_1',user_id:'user-1',user_role:'USER',
+      conversation_id:'conv-1',message_id:'msg-1',turn_id:'turn-1',
+      authority_kind:BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+      allowed_servers:[],eager_servers:[],deferred_servers:[],allowed_host_tools:['active_work_action'],
+      host_tool_resources:{active_work_action:{version:1}}};
+    const nativeInput=JSON.parse('{"version":1,"requestId":"question-1","requestFingerprint":"'+ 'a'.repeat(64)+'","action":"accept","content":{"answers":{"__proto__":["Blue"]}}}');
+    await expect(handleToolCall({grant,toolName:'active_work_action',args:{workRef:'work-1',action:'resume',nativeInput}})).resolves.toMatchObject({status:'ok'});
+    expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledWith(expect.objectContaining({ownerId:'user-1',nativeInput}));
     expect(mockExecuteGlassHiveWorkAction.mock.calls[0][0]).not.toHaveProperty('ownerInputControl');
-    expect(
-      Object.hasOwn(
-        mockExecuteGlassHiveWorkAction.mock.calls[0][0].nativeInput.content.answers,
-        '__proto__',
-      ),
-    ).toBe(true);
+    expect(Object.hasOwn(mockExecuteGlassHiveWorkAction.mock.calls[0][0].nativeInput.content.answers,'__proto__')).toBe(true);
   });
+
 
   test('native Queen rejects conflicting instructions with a safe actionable constraint', async () => {
     const { BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
     mockGetMCPServersRegistry.mockReturnValue({});
-    const grant = {
-      grant_id: 'ghcb_native_constraint',
-      user_id: 'user-1',
-      user_role: 'USER',
-      conversation_id: 'conv-1',
-      message_id: 'msg-1',
-      turn_id: 'turn-1',
+    const grant = { grant_id: 'ghcb_native_constraint', user_id: 'user-1', user_role: 'USER',
+      conversation_id: 'conv-1', message_id: 'msg-1', turn_id: 'turn-1',
       authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-      allowed_servers: [],
-      eager_servers: [],
-      deferred_servers: [],
-      allowed_host_tools: ['active_work_action'],
-      host_tool_resources: { active_work_action: { version: 1 } },
-    };
-    const nativeInput = {
-      version: 1,
-      requestId: 'question-1',
-      requestFingerprint: 'a'.repeat(64),
-      action: 'accept',
-      content: { answers: { 'private-marker@example.test': ['Blue circle'] } },
-    };
-    const result = await handleToolCall({
-      grant,
-      toolName: 'active_work_action',
-      args: {
-        workRef: 'work-1',
-        action: 'resume',
-        nativeInput,
-        instruction: 'private-marker@example.test',
-      },
-    });
-    expect(result).toEqual({
-      status: 'blocked',
-      reason: 'invalid_arguments',
-      tool: 'active_work_action',
-      retryable: false,
-      needsInput: false,
-      argumentError: {
-        code: 'native_input_arguments_conflict',
-        message: 'nativeInput requires action resume without instruction.',
-      },
-    });
+      allowed_servers: [], eager_servers: [], deferred_servers: [],
+      allowed_host_tools: ['active_work_action'], host_tool_resources: { active_work_action: { version: 1 } } };
+    const nativeInput = { version: 1, requestId: 'question-1', requestFingerprint: 'a'.repeat(64),
+      action: 'accept', content: { answers: { 'private-marker@example.test': ['Blue circle'] } } };
+    const result = await handleToolCall({ grant, toolName: 'active_work_action', args: {
+      workRef: 'work-1', action: 'resume', nativeInput, instruction: 'private-marker@example.test',
+    } });
+    expect(result).toEqual({ status: 'blocked', reason: 'invalid_arguments', tool: 'active_work_action',
+      retryable: false, needsInput: false, argumentError: { code: 'native_input_arguments_conflict',
+        message: 'nativeInput requires action resume without instruction.' } });
     expect(JSON.stringify(result)).not.toContain('private-marker');
     expect(mockExecuteGlassHiveWorkAction).not.toHaveBeenCalled();
-    const malformed = await handleToolCall({
-      grant,
-      toolName: 'active_work_action',
-      args: {
-        workRef: 'work-1',
-        action: 'resume',
-        nativeInput: { ...nativeInput, requestFingerprint: 'private-marker@example.test' },
-      },
-    });
-    expect(malformed).toEqual({
-      status: 'blocked',
-      reason: 'invalid_arguments',
-      tool: 'active_work_action',
-      retryable: false,
-      needsInput: false,
-    });
+    const malformed = await handleToolCall({ grant, toolName: 'active_work_action', args: {
+      workRef: 'work-1', action: 'resume', nativeInput: { ...nativeInput, requestFingerprint: 'private-marker@example.test' },
+    } });
+    expect(malformed).toEqual({ status: 'blocked', reason: 'invalid_arguments', tool: 'active_work_action',
+      retryable: false, needsInput: false });
     expect(JSON.stringify(malformed)).not.toContain('private-marker');
   });
 
-  test('native Queen permission carries the server source body without caller authority', async () => {
+  test('native Queen permission carries the server source body without caller authority',async()=>{
     const { BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
     mockGetMCPServersRegistry.mockReturnValue({});
-    mockExecuteGlassHiveWorkAction.mockResolvedValue({ status: 'accepted' });
-    const grant = {
-      grant_id: 'ghcb_permission',
-      user_id: 'user-1',
-      user_role: 'USER',
-      conversation_id: 'conv-1',
-      message_id: 'msg-1',
-      turn_id: 'turn-1',
-      authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-      allowed_servers: [],
-      eager_servers: [],
-      deferred_servers: [],
-      allowed_host_tools: ['active_work_action'],
-      host_tool_resources: {
-        active_work_action: {
-          version: 1,
-          request_body: { conversationId: 'conv-1', messageId: 'msg-1' },
-        },
-      },
-    };
-    const nativeInput = {
-      version: 1,
-      requestId: 'permission-1',
-      requestFingerprint: 'a'.repeat(64),
-      action: 'accept',
-      content: { optionId: 'offered-choice' },
-    };
-    await handleToolCall({
-      grant,
-      toolName: 'active_work_action',
-      args: { workRef: 'work-1', action: 'resume', nativeInput },
-    });
-    expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledWith(
-      expect.objectContaining({
-        nativeInput,
-        requestBody: expect.objectContaining({ conversationId: 'conv-1', messageId: 'msg-1' }),
-      }),
-    );
+    mockExecuteGlassHiveWorkAction.mockResolvedValue({status:'accepted'});
+    const grant={grant_id:'ghcb_permission',user_id:'user-1',user_role:'USER',
+      conversation_id:'conv-1',message_id:'msg-1',turn_id:'turn-1',
+      authority_kind:BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+      allowed_servers:[],eager_servers:[],deferred_servers:[],allowed_host_tools:['active_work_action'],
+      host_tool_resources:{active_work_action:{version:1,request_body:{conversationId:'conv-1',messageId:'msg-1'}}}};
+    const nativeInput={version:1,requestId:'permission-1',requestFingerprint:'a'.repeat(64),action:'accept',content:{optionId:'offered-choice'}};
+    await handleToolCall({grant,toolName:'active_work_action',args:{workRef:'work-1',action:'resume',nativeInput}});
+    expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledWith(expect.objectContaining({nativeInput,
+      requestBody:expect.objectContaining({conversationId:'conv-1',messageId:'msg-1'})}));
     expect(mockExecuteGlassHiveWorkAction.mock.calls[0][0]).not.toHaveProperty('ownerInputControl');
     expect(mockExecuteGlassHiveWorkAction.mock.calls[0][0]).not.toHaveProperty('nativeHumanInput');
   });
 
   test.each([
     [{ status: 503, retryable: false }, false],
+    [{ status: 503, retryable: false, code: 'work_action_outcome_unconfirmed' }, false],
     [{ status: 429 }, true],
     [{ status: 408 }, true],
     [{ status: 429, failureRetryable: false }, false],
@@ -1287,7 +1049,7 @@ describe('GlassHive capability broker', () => {
       });
       expect(result).toMatchObject({
         status: 'blocked',
-        reason: 'work_action_rejected',
+        reason: failure.code || 'work_action_rejected',
         retryable,
       });
       expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledTimes(1);
@@ -1350,98 +1112,45 @@ describe('GlassHive capability broker', () => {
     },
   );
 
+
   describe('native advertised historical selection', () => {
     const toolName = 'worker_delegate_once_mcp_glasshive-workers-projects';
     const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-    const original = {
-      file_id: '11111111-1111-4111-8111-111111111111',
-      filename: 'original.csv',
-      type: 'text/csv',
-      bytes: 117,
-      source: 'local',
-    };
-    const pdf = {
-      file_id: 'native_' + 'a'.repeat(64),
-      filename: 'prior.pdf',
-      type: 'application/pdf',
-      bytes: 3154,
-      source: 'local',
-    };
+    const original = { file_id: '11111111-1111-4111-8111-111111111111',
+      filename: 'original.csv', type: 'text/csv', bytes: 117, source: 'local' };
+    const pdf = { file_id: 'native_' + 'a'.repeat(64), filename: 'prior.pdf',
+      type: 'application/pdf', bytes: 3154, source: 'local' };
     function fixture({ current = [], advertised = true } = {}) {
       const { BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
-      mockGetMessages.mockResolvedValue([
-        { messageId: parentMessageId, files: [original, pdf].map(({ file_id }) => ({ file_id })) },
-      ]);
-      mockGetFiles.mockImplementation(async (filter) =>
-        [original, pdf].filter((file) => filter.file_id.$in.includes(file.file_id)),
-      );
-      const callTool = jest.fn().mockResolvedValue({
-        structuredContent: {
-          status: 'accepted',
-          work_ref: 'work-native-1',
-        },
-      });
+      mockGetMessages.mockResolvedValue([{ messageId: parentMessageId,
+        files: [original, pdf].map(({ file_id }) => ({ file_id })) }]);
+      mockGetFiles.mockImplementation(async (filter) => [original, pdf]
+        .filter((file) => filter.file_id.$in.includes(file.file_id)));
+      const callTool = jest.fn().mockResolvedValue({ structuredContent: {
+        status: 'accepted', work_ref: 'work-native-1' } });
       mockGetMCPManager.mockReturnValue({ callTool });
-      mockGetMCPServersRegistry.mockReturnValue({
-        getAllServerConfigs: jest.fn().mockResolvedValue({}),
-      });
+      mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
       mockReconcileGlassHiveLaunchResult.mockResolvedValue({ workRef: 'work-native-1' });
-      const grant = {
-        grant_id: 'ghcb_file_choices',
-        user_id: 'user-1',
-        user_role: 'USER',
-        conversation_id: conversationId,
-        message_id: 'current-message',
-        turn_id: 'turn-files',
+      const grant = { grant_id: 'ghcb_file_choices', user_id: 'user-1', user_role: 'USER',
+        conversation_id: conversationId, message_id: 'current-message', turn_id: 'turn-files',
         authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-        allowed_servers: [],
-        eager_servers: [],
-        deferred_servers: [],
-        allowed_host_tools: [toolName],
-        host_tool_resources: {
-          [toolName]: {
-            version: 1,
-            ...(advertised ? { file_selection: { version: 1 } } : {}),
-            request_body: {
-              conversationId,
-              parentMessageId,
-              messageId: 'current-message',
-              files: current,
-            },
-            mission_host_tools: [],
-          },
-        },
-      };
-      return {
-        grant,
-        callTool,
-        args: {
-          title: 'Read original',
-          instruction: 'Read the original.',
-          resourceClass: 'standard',
-        },
-      };
+        allowed_servers: [], eager_servers: [], deferred_servers: [], allowed_host_tools: [toolName],
+        host_tool_resources: { [toolName]: { version: 1,
+          ...(advertised ? { file_selection: { version: 1 } } : {}),
+          request_body: { conversationId, parentMessageId, messageId: 'current-message', files: current },
+          mission_host_tools: [] } } };
+      return { grant, callTool, args: { title: 'Read original', instruction: 'Read the original.',
+        resourceClass: 'standard' } };
     }
     test('enumerates UUID and native identities and rejects omitted choice before effects', async () => {
-      const {
-        buildCapabilityCatalog,
-        toolDefinitionsForMcp,
-        handleToolCall,
-      } = require('../GlassHiveCapabilityBrokerService');
+      const { buildCapabilityCatalog, toolDefinitionsForMcp, handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       const { grant, callTool, args } = fixture();
-      const definition = toolDefinitionsForMcp(await buildCapabilityCatalog({ grant })).find(
-        (t) => t.name === toolName,
-      );
+      const definition = toolDefinitionsForMcp(await buildCapabilityCatalog({ grant })).find((t) => t.name === toolName);
       expect(definition.inputSchema.required).toContain('fileIds');
-      expect(definition.inputSchema.properties.fileIds.items.enum).toEqual([
-        original.file_id,
-        pdf.file_id,
-      ]);
+      expect(definition.inputSchema.properties.fileIds.items.enum).toEqual([original.file_id, pdf.file_id]);
       await expect(handleToolCall({ grant, toolName, args })).resolves.toMatchObject({
-        status: 'blocked',
-        reason: 'file_selection_required',
-      });
+        status: 'blocked', reason: 'file_selection_required' });
       expect(callTool).not.toHaveBeenCalled();
       expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
     });
@@ -1449,57 +1158,40 @@ describe('GlassHive capability broker', () => {
       const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       const { grant, callTool, args } = fixture();
       await expect(handleToolCall({ grant, toolName, args })).resolves.toMatchObject({
-        status: 'blocked',
-        reason: 'file_selection_required',
-      });
+        status: 'blocked', reason: 'file_selection_required' });
       expect(callTool).not.toHaveBeenCalled();
       expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
     });
     test.each([{ fileIds: [] }, { fileIds: ['11111111-1111-4111-8111-111111111111'] }])(
-      'explicit choice $fileIds adds exactly that history subset',
-      async ({ fileIds }) => {
+      'explicit choice $fileIds adds exactly that history subset', async ({ fileIds }) => {
         const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
         const { grant, callTool, args } = fixture();
-        await expect(
-          handleToolCall({ grant, toolName, args: { ...args, fileIds } }),
-        ).resolves.toMatchObject({ status: 'ok' });
+        await expect(handleToolCall({ grant, toolName, args: { ...args, fileIds } }))
+          .resolves.toMatchObject({ status: 'ok' });
         const files = callTool.mock.calls[0][0].toolArguments.uploaded_files || [];
         expect(files.map((file) => file.file_id)).toEqual(fileIds);
-      },
-    );
+      });
     test('unknown advertised choice rejects before effects', async () => {
       const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       const { grant, callTool, args } = fixture();
-      await expect(
-        handleToolCall({ grant, toolName, args: { ...args, fileIds: ['foreign-id'] } }),
-      ).resolves.toMatchObject({ reason: 'delegation_file_selection_unauthorized' });
+      await expect(handleToolCall({ grant, toolName, args: { ...args, fileIds: ['foreign-id'] } }))
+        .resolves.toMatchObject({ reason: 'delegation_file_selection_unauthorized' });
       expect(callTool).not.toHaveBeenCalled();
       expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
     });
     test('current-only ancestry does not require selection or duplicate files', async () => {
-      const {
-        buildCapabilityCatalog,
-        toolDefinitionsForMcp,
-        handleToolCall,
-      } = require('../GlassHiveCapabilityBrokerService');
+      const { buildCapabilityCatalog, toolDefinitionsForMcp, handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       const { grant, callTool, args } = fixture({ current: [original, pdf] });
-      const definition = toolDefinitionsForMcp(await buildCapabilityCatalog({ grant })).find(
-        (t) => t.name === toolName,
-      );
+      const definition = toolDefinitionsForMcp(await buildCapabilityCatalog({ grant })).find((t) => t.name === toolName);
       expect(definition.inputSchema.required).not.toContain('fileIds');
-      await expect(handleToolCall({ grant, toolName, args })).resolves.toMatchObject({
-        status: 'ok',
-      });
-      expect(
-        callTool.mock.calls[0][0].toolArguments.uploaded_files.map((file) => file.file_id),
-      ).toEqual([original.file_id, pdf.file_id]);
+      await expect(handleToolCall({ grant, toolName, args })).resolves.toMatchObject({ status: 'ok' });
+      expect(callTool.mock.calls[0][0].toolArguments.uploaded_files.map((file) => file.file_id))
+        .toEqual([original.file_id, pdf.file_id]);
     });
     test('legacy native grants with no advertised contract preserve omission', async () => {
       const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       const { grant, callTool, args } = fixture({ advertised: false });
-      await expect(handleToolCall({ grant, toolName, args })).resolves.toMatchObject({
-        status: 'ok',
-      });
+      await expect(handleToolCall({ grant, toolName, args })).resolves.toMatchObject({ status: 'ok' });
       expect(callTool.mock.calls[0][0].toolArguments.uploaded_files).toBeUndefined();
     });
     test('unrelated host calls do not read attachment history even when that history is unavailable', async () => {
@@ -1507,46 +1199,25 @@ describe('GlassHive capability broker', () => {
       const { grant } = fixture();
       grant.allowed_host_tools.push('active_work_list');
       mockGetMessages.mockRejectedValue(new Error('history unavailable'));
-      mockGetGlassHiveWorkResult.mockResolvedValue({
-        runId: 'run-stored',
-        outputText: 'Stored output',
-      });
-      await expect(
-        handleToolCall({
-          grant,
-          toolName: 'active_work_list',
-          args: { scope: 'result', runId: 'run-stored' },
-        }),
-      ).resolves.toMatchObject({
-        status: 'ok',
-        result: { runId: 'run-stored', outputText: 'Stored output' },
-      });
+      mockGetGlassHiveWorkResult.mockResolvedValue({ runId: 'run-stored', outputText: 'Stored output' });
+      await expect(handleToolCall({ grant, toolName: 'active_work_list',
+        args: { scope: 'result', runId: 'run-stored' } })).resolves.toMatchObject({
+        status: 'ok', result: { runId: 'run-stored', outputText: 'Stored output' } });
       expect(mockGetMessages).not.toHaveBeenCalled();
       expect(mockGetFiles).not.toHaveBeenCalled();
     });
     test.each(['capability_invoke', 'capability_describe', 'unknown-native-tool'])(
-      'specific nondelegation %s does not read attachment history',
-      async (requestedTool) => {
+      'specific nondelegation %s does not read attachment history', async (requestedTool) => {
         const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
         const { grant } = fixture();
         mockGetMessages.mockRejectedValue(new Error('history unavailable'));
-        await expect(
-          handleToolCall({
-            grant,
-            toolName: requestedTool,
-            args: { server: 'not-granted', tool: 'unknown-tool' },
-          }),
-        ).resolves.toMatchObject({ status: 'not_found' });
+        await expect(handleToolCall({ grant, toolName: requestedTool,
+          args: { server: 'not-granted', tool: 'unknown-tool' } })).resolves.toMatchObject({ status: 'not_found' });
         expect(mockGetMessages).not.toHaveBeenCalled();
         expect(mockGetFiles).not.toHaveBeenCalled();
-      },
-    );
+      });
     test('catalog history failure omits only delegation and retains other granted tools', async () => {
-      const {
-        buildCapabilityCatalog,
-        toolDefinitionsForMcp,
-        handleToolCall,
-      } = require('../GlassHiveCapabilityBrokerService');
+      const { buildCapabilityCatalog, toolDefinitionsForMcp, handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       const { grant } = fixture();
       grant.allowed_host_tools.push('active_work_list');
       mockGetMessages.mockRejectedValue(new Error('history unavailable'));
@@ -1555,28 +1226,18 @@ describe('GlassHive capability broker', () => {
       expect(names).toContain('active_work_list');
       expect(names).not.toContain(toolName);
       expect(catalog.omissions).toContainEqual({
-        reason: 'delegation_file_choices_unavailable',
-        tool: toolName,
-      });
-      await expect(handleToolCall({ grant, toolName: 'capabilities_list' })).resolves.toMatchObject(
-        {
-          hostTools: [{ name: 'active_work_list' }],
-          omissions: [{ reason: 'delegation_file_choices_unavailable', tool: toolName }],
-        },
-      );
+        reason: 'delegation_file_choices_unavailable', tool: toolName });
+      await expect(handleToolCall({ grant, toolName: 'capabilities_list' })).resolves.toMatchObject({
+        hostTools: [{ name: 'active_work_list' }],
+        omissions: [{ reason: 'delegation_file_choices_unavailable', tool: toolName }] });
     });
     test('delegation history failure returns a typed rejection before registration or transport', async () => {
       const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       const { grant, callTool, args } = fixture();
       mockGetMessages.mockRejectedValue(new Error('history unavailable'));
-      await expect(
-        handleToolCall({ grant, toolName, args: { ...args, fileIds: [] } }),
-      ).resolves.toMatchObject({
-        status: 'blocked',
-        reason: 'delegation_file_choices_unavailable',
-        retryable: true,
-        needsInput: false,
-      });
+      await expect(handleToolCall({ grant, toolName, args: { ...args, fileIds: [] } }))
+        .resolves.toMatchObject({ status: 'blocked', reason: 'delegation_file_choices_unavailable',
+          retryable: true, needsInput: false });
       expect(callTool).not.toHaveBeenCalled();
       expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
     });
@@ -1586,266 +1247,155 @@ describe('GlassHive capability broker', () => {
     const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
     const file_id = '11111111-1111-4111-8111-111111111111';
-    const original = {
-      file_id,
-      filename: 'original.csv',
-      source: 'local',
-      type: 'text/csv',
-      bytes: 117,
-    };
+    const original = { file_id, filename: 'original.csv', source: 'local', type: 'text/csv', bytes: 117 };
     mockGetMessages.mockResolvedValue([{ messageId: parentMessageId, files: [{ file_id }] }]);
     mockGetFiles.mockResolvedValue([original]);
     const callTool = jest.fn().mockResolvedValue({
       structuredContent: { status: 'accepted', work_ref: 'work-native-1' },
     });
     mockGetMCPManager.mockReturnValue({ callTool });
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
     mockReconcileGlassHiveLaunchResult.mockResolvedValue({ workRef: 'work-native-1' });
     const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-    const requestBody = {
-      conversationId,
-      parentMessageId,
-      messageId: 'current-message',
-      viventiumTriggeringSourceSegments: [
-        { source_event_id: 'current-source', text: 'Use my prior original file.' },
-      ],
-    };
-    await expect(
-      executeMainDelegation({
-        user: { id: 'user-1' },
-        requestBody,
-        args: {
-          title: 'Read original',
-          instruction: 'Use the original attachment.',
-          resourceClass: 'standard',
-          fileIds: [file_id],
-        },
-        invocationId: 'historical-file-call',
-      }),
-    ).resolves.toMatchObject({ status: 'ok', workRef: 'work-native-1' });
+    const requestBody = { conversationId, parentMessageId, messageId: 'current-message',
+      viventiumTriggeringSourceSegments: [{ source_event_id: 'current-source', text: 'Use my prior original file.' }] };
+    await expect(executeMainDelegation({ user: { id: 'user-1' }, requestBody,
+      args: { title: 'Read original', instruction: 'Use the original attachment.',
+        resourceClass: 'standard', fileIds: [file_id] }, invocationId: 'historical-file-call',
+    })).resolves.toMatchObject({ status: 'ok', workRef: 'work-native-1' });
     expect(callTool.mock.calls[0][0].toolArguments.uploaded_files).toEqual([
       { ...original, media_group_index: 0 },
     ]);
     expect(callTool.mock.calls[0][0].requestBody).toEqual(requestBody);
-    expect(mockGetFiles).toHaveBeenCalledWith(
-      { user: 'user-1', file_id: { $in: [file_id] } },
-      null,
-      'file_id filename type bytes source context text messageId',
-    );
+    expect(mockGetFiles).toHaveBeenCalledWith({ user: 'user-1', file_id: { $in: [file_id] } }, null,
+      'file_id filename type bytes source context text messageId');
   });
 
   test('launches with one explicitly selected older original after more than 64 recent branch files', async () => {
-    const ids = Array.from(
-      { length: 65 },
-      (_, index) => 'native_' + index.toString(16).padStart(64, '0'),
-    );
+    const ids = Array.from({ length: 65 }, (_, index) => 'native_' + index.toString(16).padStart(64, '0'));
     const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-    const original = {
-      file_id: ids[64],
-      filename: 'original.csv',
-      source: 'local',
-      type: 'text/csv',
-      bytes: 117,
-    };
-    mockGetMessages.mockResolvedValue([
-      { messageId: parentMessageId, attachments: ids.map((file_id) => ({ file_id })) },
-    ]);
-    mockGetFiles.mockImplementation(async (filter) =>
-      filter.file_id.$in.includes(original.file_id) ? [original] : [],
-    );
-    const callTool = jest
-      .fn()
-      .mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-native-1' } });
+    const original = { file_id: ids[64], filename: 'original.csv', source: 'local', type: 'text/csv', bytes: 117 };
+    mockGetMessages.mockResolvedValue([{ messageId: parentMessageId, attachments: ids.map((file_id) => ({ file_id })) }]);
+    mockGetFiles.mockImplementation(async (filter) => filter.file_id.$in.includes(original.file_id) ? [original] : []);
+    const callTool = jest.fn().mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-native-1' } });
     mockGetMCPManager.mockReturnValue({ callTool });
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
     mockReconcileGlassHiveLaunchResult.mockResolvedValue({ workRef: 'work-native-1' });
     const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-    await expect(
-      executeMainDelegation({
-        user: { id: 'user-1' },
-        requestBody: {
-          conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-          parentMessageId,
-          messageId: 'current-message',
-        },
-        args: {
-          title: 'Read older original',
-          instruction: 'Read the original attachment.',
-          resourceClass: 'standard',
-          fileIds: [original.file_id],
-        },
-        invocationId: 'older-file-call',
-      }),
-    ).resolves.toMatchObject({ status: 'ok', workRef: 'work-native-1' });
-    expect(
-      callTool.mock.calls[0][0].toolArguments.uploaded_files.map((file) => file.file_id),
-    ).toEqual([original.file_id]);
-    expect(mockGetFiles).toHaveBeenCalledWith(
-      { user: 'user-1', file_id: { $in: [original.file_id] } },
-      null,
-      'file_id filename type bytes source context text messageId',
-    );
+    await expect(executeMainDelegation({ user: { id: 'user-1' },
+      requestBody: { conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', parentMessageId,
+        messageId: 'current-message' },
+      args: { title: 'Read older original', instruction: 'Read the original attachment.',
+        resourceClass: 'standard', fileIds: [original.file_id] }, invocationId: 'older-file-call',
+    })).resolves.toMatchObject({ status: 'ok', workRef: 'work-native-1' });
+    expect(callTool.mock.calls[0][0].toolArguments.uploaded_files.map((file) => file.file_id))
+      .toEqual([original.file_id]);
+    expect(mockGetFiles).toHaveBeenCalledWith({ user: 'user-1', file_id: { $in: [original.file_id] } }, null,
+      'file_id filename type bytes source context text messageId');
   });
 
   test.each(['missing', 'deleted', 'foreign', 'off-branch'])(
-    'rejects selected %s file authority before any work registration or native dispatch',
-    async (kind) => {
+    'rejects selected %s file authority before any work registration or native dispatch', async (kind) => {
       const file_id = '11111111-1111-4111-8111-111111111111';
       const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-      mockGetMessages.mockResolvedValue([
-        {
-          messageId: kind === 'off-branch' ? 'other-branch' : parentMessageId,
-          files: [{ file_id }],
-        },
-      ]);
+      mockGetMessages.mockResolvedValue([{ messageId: kind === 'off-branch' ? 'other-branch' : parentMessageId,
+        files: [{ file_id }] }]);
       mockGetFiles.mockResolvedValue([]);
       const callTool = jest.fn();
       mockGetMCPManager.mockReturnValue({ callTool });
       const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-      await expect(
-        executeMainDelegation({
-          user: { id: 'user-1' },
-          requestBody: {
-            conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-            parentMessageId,
-            messageId: 'current-message',
-          },
-          args: {
-            title: 'Read original',
-            instruction: 'Read it.',
-            resourceClass: 'standard',
-            fileIds: [file_id],
-          },
-          invocationId: 'unauthorized-file-call',
-        }),
-      ).resolves.toMatchObject({
-        status: 'blocked',
-        reason: 'delegation_file_selection_unauthorized',
-      });
+      await expect(executeMainDelegation({ user: { id: 'user-1' },
+        requestBody: { conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', parentMessageId,
+          messageId: 'current-message' },
+        args: { title: 'Read original', instruction: 'Read it.', resourceClass: 'standard', fileIds: [file_id] },
+        invocationId: 'unauthorized-file-call',
+      })).resolves.toMatchObject({ status: 'blocked', reason: 'delegation_file_selection_unauthorized' });
       expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
       expect(callTool).not.toHaveBeenCalled();
     },
   );
 
+  test.each([false, true])('mission_worker cannot import model-authored native full authority (connected=%s)', async (connected) => {
+    mockGetMCPServersRegistry.mockReturnValue({getAllServerConfigs: jest.fn().mockResolvedValue(
+      connected ? {'ms-365': {source: 'config', viventiumGlassHive: {version: 1,
+        permitsAutonomousWorker: true, hostAllowed: true, sandboxAllowed: true,
+        defaultToolAccess: 'content_read', contentReadPolicy: 'require_broker_grant'}}} : {})});
+    const {maybeInjectGlassHiveCapabilityBroker} = require('../GlassHiveCapabilityBootstrapService');
+    const result = await maybeInjectGlassHiveCapabilityBroker({serverName: 'glasshive-workers-projects',
+      toolName: 'worker_delegate_once', toolArguments: {instruction: 'Synthetic ordinary worker task.',
+        execution_mode: 'host', bootstrap_bundle_json: {access_mode: 'full',
+          viventium_launch_authority: {version: 1, kind: 'conversation_orchestrator',
+            execution_mode: 'host', worker_access: 'full'}}},
+      config: {configurable: {user: {id: 'user-1', role: 'USER'},
+        requestBody: {conversationId: 'conv-1', messageId: 'msg-1'},
+        glasshive_launch_authority_kind: 'mission_worker'}}});
+    expect(result.bootstrap_bundle_json.viventium_launch_authority).toBeUndefined();
+  });
+
+  test.each([undefined, 'ask', 'full'])('carries only owner background native access %s through normal Main delegation transport', async (workerAccess) => {
+    const callTool = jest.fn().mockResolvedValue({structuredContent: {status: 'accepted', work_ref: 'work-native-1'}});
+    mockGetMCPManager.mockReturnValue({callTool});
+    mockGetMCPServersRegistry.mockReturnValue({getAllServerConfigs: jest.fn().mockResolvedValue({})});
+    mockReconcileGlassHiveLaunchResult.mockResolvedValue({workRef: 'work-native-1'});
+    const {executeMainDelegation} = require('../GlassHiveCapabilityBrokerService');
+    const result = await executeMainDelegation({user: {id: 'user-1'},
+      requestBody: {conversationId: 'conversation-1', messageId: 'message-1'}, workerAccess,
+      args: {title: 'Synthetic task', instruction: 'Complete the synthetic local task.',
+        resourceClass: 'standard', worker_access: 'full', access_mode: 'full'},
+      invocationId: 'native-access-configured'});
+    expect(result).toMatchObject({status: 'ok', workRef: 'work-native-1'});
+    const authority = callTool.mock.calls[0][0].toolArguments.bootstrap_bundle_json.viventium_launch_authority;
+    expect(authority.worker_access).toBe(workerAccess);
+    expect(callTool.mock.calls[0][0].toolArguments.access_mode).toBeUndefined();
+  });
+
   test('keeps current rapid-source uploads separate when explicit historical file selection is added', async () => {
-    const first = {
-      file_id: '11111111-1111-4111-8111-111111111111',
-      filename: 'first.csv',
-      source_event_id: 'source-1',
-      source_index: 0,
-    };
-    const second = {
-      file_id: '22222222-2222-4222-8222-222222222222',
-      filename: 'second.csv',
-      source_event_id: 'source-2',
-      source_index: 0,
-    };
-    const prior = {
-      file_id: '33333333-3333-4333-8333-333333333333',
-      filename: 'prior.csv',
-      source: 'local',
-      type: 'text/csv',
-      bytes: 117,
-    };
+    const first = { file_id: '11111111-1111-4111-8111-111111111111', filename: 'first.csv', source_event_id: 'source-1', source_index: 0 };
+    const second = { file_id: '22222222-2222-4222-8222-222222222222', filename: 'second.csv', source_event_id: 'source-2', source_index: 0 };
+    const prior = { file_id: '33333333-3333-4333-8333-333333333333', filename: 'prior.csv', source: 'local', type: 'text/csv', bytes: 117 };
     const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-    mockGetMessages.mockResolvedValue([
-      { messageId: parentMessageId, files: [{ file_id: prior.file_id }] },
-    ]);
+    mockGetMessages.mockResolvedValue([{ messageId: parentMessageId, files: [{ file_id: prior.file_id }] }]);
     mockGetFiles.mockResolvedValue([prior]);
-    const callTool = jest
-      .fn()
-      .mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-native-1' } });
+    const callTool = jest.fn().mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-native-1' } });
     mockGetMCPManager.mockReturnValue({ callTool });
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
     mockReconcileGlassHiveLaunchResult.mockResolvedValue({ workRef: 'work-native-1' });
     const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-    await executeMainDelegation({
-      user: { id: 'user-1' },
-      requestBody: {
-        conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-        parentMessageId,
-        messageId: 'current-message',
-        viventiumSourceEventId: 'source-1',
-        files: [first, second],
+    await executeMainDelegation({ user: { id: 'user-1' },
+      requestBody: { conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', parentMessageId,
+        messageId: 'current-message', viventiumSourceEventId: 'source-1', files: [first, second],
         viventiumTriggeringSourceSegments: [
           { source_event_id: 'source-1', source_index: 0, text: 'First objective.' },
           { source_event_id: 'source-2', source_index: 0, text: 'Second objective.' },
-        ],
-      },
-      args: {
-        title: 'Second objective',
-        instruction: 'Use second and prior files.',
-        resourceClass: 'standard',
-        sourceOrdinals: [2],
-        fileIds: [prior.file_id],
-      },
-      invocationId: 'rapid-historical-file-call',
+        ] },
+      args: { title: 'Second objective', instruction: 'Use second and prior files.', resourceClass: 'standard',
+        sourceOrdinals: [2], fileIds: [prior.file_id] }, invocationId: 'rapid-historical-file-call',
     });
     const launch = callTool.mock.calls[0][0];
-    expect(launch.toolArguments.uploaded_files.map((file) => file.file_id)).toEqual([
-      second.file_id,
-      prior.file_id,
-    ]);
+    expect(launch.toolArguments.uploaded_files.map((file) => file.file_id)).toEqual([second.file_id, prior.file_id]);
     expect(launch.requestBody.files.map((file) => file.file_id)).toEqual([second.file_id]);
-    expect(
-      launch.requestBody.viventiumTriggeringSourceSegments.map((source) => source.text),
-    ).toEqual(['Second objective.']);
+    expect(launch.requestBody.viventiumTriggeringSourceSegments.map((source) => source.text)).toEqual(['Second objective.']);
   });
 
   test('blocks a fileId that bypasses rapid-source selection even if the file appears in selected history', async () => {
-    const first = {
-      file_id: '11111111-1111-4111-8111-111111111111',
-      filename: 'first.csv',
-      source_event_id: 'source-1',
-      source_index: 0,
-    };
-    const second = {
-      file_id: '22222222-2222-4222-8222-222222222222',
-      filename: 'second.csv',
-      source_event_id: 'source-2',
-      source_index: 0,
-    };
+    const first = { file_id: '11111111-1111-4111-8111-111111111111', filename: 'first.csv', source_event_id: 'source-1', source_index: 0 };
+    const second = { file_id: '22222222-2222-4222-8222-222222222222', filename: 'second.csv', source_event_id: 'source-2', source_index: 0 };
     const parentMessageId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
-    mockGetMessages.mockResolvedValue([
-      { messageId: parentMessageId, files: [{ file_id: first.file_id }] },
-    ]);
+    mockGetMessages.mockResolvedValue([{ messageId: parentMessageId, files: [{ file_id: first.file_id }] }]);
     mockGetFiles.mockResolvedValue([first]);
     const callTool = jest.fn();
     mockGetMCPManager.mockReturnValue({ callTool });
     const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-    await expect(
-      executeMainDelegation({
-        user: { id: 'user-1' },
-        requestBody: {
-          conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-          parentMessageId,
-          messageId: 'current-message',
-          viventiumSourceEventId: 'source-1',
-          files: [first, second],
-          viventiumTriggeringSourceSegments: [
-            { source_event_id: 'source-1', source_index: 0, text: 'First objective.' },
-            { source_event_id: 'source-2', source_index: 0, text: 'Second objective.' },
-          ],
-        },
-        args: {
-          title: 'Second objective',
-          instruction: 'Read first file.',
-          resourceClass: 'standard',
-          sourceOrdinals: [2],
-          fileIds: [first.file_id],
-        },
-        invocationId: 'sibling-file-call',
-      }),
-    ).resolves.toMatchObject({
-      status: 'blocked',
-      reason: 'delegation_file_selection_unauthorized',
-    });
+    await expect(executeMainDelegation({ user: { id: 'user-1' },
+      requestBody: { conversationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', parentMessageId,
+        messageId: 'current-message', viventiumSourceEventId: 'source-1', files: [first, second],
+        viventiumTriggeringSourceSegments: [
+          { source_event_id: 'source-1', source_index: 0, text: 'First objective.' },
+          { source_event_id: 'source-2', source_index: 0, text: 'Second objective.' },
+        ] },
+      args: { title: 'Second objective', instruction: 'Read first file.', resourceClass: 'standard',
+        sourceOrdinals: [2], fileIds: [first.file_id] }, invocationId: 'sibling-file-call',
+    })).resolves.toMatchObject({ status: 'blocked', reason: 'delegation_file_selection_unauthorized' });
     expect(mockGetMessages).not.toHaveBeenCalled();
     expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
     expect(callTool).not.toHaveBeenCalled();
@@ -2857,6 +2407,48 @@ describe('GlassHive capability broker', () => {
     expect(result.glasshive_capability_broker.allowed_servers).not.toContain('future-reviewed');
   });
 
+  test.each(['missing_auth', 'unreadable_credential'])('keeps a mission catalog dormant and rechecks cached credentials: %s', async (credentialStatus) => {
+    const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    const policy = { source: 'config', requiresOAuth: true, viventiumGlassHive: {
+      version: 1, permitsAutonomousWorker: true, hostAllowed: true,
+      defaultToolAccess: 'content_read', contentReadPolicy: 'require_broker_grant',
+    } };
+    const getServerConfig = jest.fn().mockResolvedValue(policy);
+    mockGetMCPServersRegistry.mockReturnValue({ getServerConfig });
+    mockReinitMCPServer.mockResolvedValue({ success: true, oauthRequired: false,
+      tools: [{ name: 'read_item', inputSchema: { type: 'object' } }] });
+    const callTool = jest.fn().mockResolvedValue({ value: 'synthetic' });
+    mockGetMCPManager.mockReturnValue({ callTool });
+    const grant = mintBrokerGrant({ user: { id: 'user-1', role: 'USER' },
+      allowedServers: ['selected', 'unrelated'], eagerServers: [],
+      deferredServers: ['selected', 'unrelated'], allowDynamicPolicyServers: false,
+      requestContext: SYNTHETIC_TURN_SCOPE, scopes: { content_read: true },
+    }).payload;
+    expect(await handleToolCall({ grant, toolName: 'capabilities_list' }))
+      .toMatchObject({ servers: [], deferredServers: ['selected', 'unrelated'] });
+    expect(mockReinitMCPServer).not.toHaveBeenCalled();
+    await handleToolCall({ grant, toolName: 'capability_describe', args: { server: 'selected' } });
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    await expect(handleToolCall({ grant, toolName: 'capability_invoke',
+      args: { server: 'selected', tool: 'read_item', arguments: {} },
+    })).resolves.toEqual({ value: 'synthetic' });
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).not.toHaveBeenCalledWith(expect.objectContaining({ serverName: 'unrelated' }));
+    mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: credentialStatus });
+    await expect(handleToolCall({ grant, toolName: 'capability_invoke',
+      args: { server: 'selected', tool: 'read_item', arguments: {} },
+    })).resolves.toMatchObject({ status: 'blocked', reason: credentialStatus });
+    expect(callTool).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    getServerConfig.mockResolvedValue(null);
+    await expect(handleToolCall({ grant, toolName: 'capability_invoke',
+      args: { server: 'selected', tool: 'read_item', arguments: {} },
+    })).resolves.toMatchObject({ status: 'not_found' });
+    expect(callTool).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+  });
+
   test('keeps deferred MS365 dormant until an explicit describe or invoke', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
@@ -2920,7 +2512,7 @@ describe('GlassHive capability broker', () => {
         args: { server: 'ms-365', tool: 'ms-365_search', arguments: { query: 'synthetic' } },
       }),
     ).resolves.toEqual({ ok: true });
-    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    expect(mockReinitMCPServer).not.toHaveBeenCalled();
     expect(callTool).toHaveBeenCalledWith(
       expect.objectContaining({ serverName: 'ms-365', toolName: 'ms-365_search' }),
     );
@@ -3230,57 +2822,36 @@ describe('GlassHive capability broker', () => {
   );
 
   const managedAuthorBody = {
-    conversationId: 'conv-1',
-    messageId: 'msg-1',
-    viventiumStreamId: 'stream-1',
-    viventiumLogicalTurnId: 'turn-1',
-    viventiumLogicalTurnRevision: '1',
-    viventiumAuthoringSourceEventId: 'source-1',
-    viventiumAuthoringSourceRevision: 1,
+    conversationId: 'conv-1', messageId: 'msg-1', viventiumStreamId: 'stream-1',
+    viventiumLogicalTurnId: 'turn-1', viventiumLogicalTurnRevision: '1',
+    viventiumAuthoringSourceEventId: 'source-1', viventiumAuthoringSourceRevision: 1,
   };
-  const supersededAuthorError = () =>
-    Object.assign(new Error('source_authority_superseded'), {
-      code: 'source_authority_superseded',
-      retryable: false,
-    });
+  const supersededAuthorError = () => Object.assign(new Error('source_authority_superseded'), {
+    code: 'source_authority_superseded', retryable: false,
+  });
 
   test('source authority rejects a stale broker author before a launch is reserved', async () => {
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
-    const {
-      maybeInjectGlassHiveCapabilityBroker,
-    } = require('../GlassHiveCapabilityBootstrapService');
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
+    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
     mockAssertCurrentGlassHiveSourceAuthor.mockRejectedValueOnce(supersededAuthorError());
-    await expect(
-      maybeInjectGlassHiveCapabilityBroker({
-        serverName: 'glasshive-workers-projects',
-        toolName: 'worker_delegate_once',
-        toolArguments: { instruction: 'Independent synthetic research.' },
-        config: { configurable: { user: { id: 'user-1' }, requestBody: managedAuthorBody } },
-      }),
-    ).rejects.toMatchObject({ code: 'source_authority_superseded' });
+    await expect(maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects', toolName: 'worker_delegate_once',
+      toolArguments: { instruction: 'Independent synthetic research.' },
+      config: { configurable: { user: { id: 'user-1' }, requestBody: managedAuthorBody } },
+    })).rejects.toMatchObject({ code: 'source_authority_superseded' });
     expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
   });
 
   test('source authority closes a launch if supersession wins during preparation', async () => {
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
-    const {
-      maybeInjectGlassHiveCapabilityBroker,
-    } = require('../GlassHiveCapabilityBootstrapService');
-    mockAssertCurrentGlassHiveSourceAuthor
-      .mockResolvedValueOnce(undefined)
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
+    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    mockAssertCurrentGlassHiveSourceAuthor.mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(supersededAuthorError());
-    await expect(
-      maybeInjectGlassHiveCapabilityBroker({
-        serverName: 'glasshive-workers-projects',
-        toolName: 'worker_delegate_once',
-        toolArguments: { instruction: 'Independent synthetic research.' },
-        config: { configurable: { user: { id: 'user-1' }, requestBody: managedAuthorBody } },
-      }),
-    ).rejects.toMatchObject({ code: 'source_authority_superseded' });
+    await expect(maybeInjectGlassHiveCapabilityBroker({
+      serverName: 'glasshive-workers-projects', toolName: 'worker_delegate_once',
+      toolArguments: { instruction: 'Independent synthetic research.' },
+      config: { configurable: { user: { id: 'user-1' }, requestBody: managedAuthorBody } },
+    })).rejects.toMatchObject({ code: 'source_authority_superseded' });
     expect(mockRegisterGlassHiveLaunchContext).toHaveBeenCalledTimes(1);
     expect(mockMarkGlassHiveLaunchPreDispatchFailed).toHaveBeenCalledWith(
       expect.objectContaining({ originRef: 'ghi-synthetic' }),
@@ -3291,32 +2862,20 @@ describe('GlassHive capability broker', () => {
 
   test('source authority closes a dispatch-ready launch revoked before its MCP call', async () => {
     const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
-    const callTool = jest
-      .fn()
-      .mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-1' } });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
+    const callTool = jest.fn().mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-1' } });
     mockGetMCPManager.mockReturnValue({ callTool });
-    mockAssertCurrentGlassHiveSourceAuthor
-      .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(supersededAuthorError());
+    mockAssertCurrentGlassHiveSourceAuthor.mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined).mockRejectedValueOnce(supersededAuthorError());
     const result = await executeMainDelegation({
-      user: { id: 'user-1', role: 'USER' },
-      requestBody: managedAuthorBody,
-      args: {
-        title: 'Synthetic research',
-        instruction: 'Independent synthetic research.',
-        resourceClass: 'standard',
-      },
+      user: { id: 'user-1', role: 'USER' }, requestBody: managedAuthorBody,
+      args: { title: 'Synthetic research', instruction: 'Independent synthetic research.', resourceClass: 'standard' },
       invocationId: 'call-synthetic',
     });
     expect(result).toMatchObject({ status: 'blocked', reason: 'source_authority_superseded' });
     expect(mockMarkGlassHiveLaunchDispatchReady).toHaveBeenCalledTimes(1);
     expect(mockMarkGlassHiveLaunchDispatchRejected).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({ code: 'source_authority_superseded' }),
+      expect.any(Object), expect.objectContaining({ code: 'source_authority_superseded' }),
     );
     expect(callTool).not.toHaveBeenCalled();
     expect(mockMarkGlassHiveLaunchDispatchUnknown).not.toHaveBeenCalled();
@@ -3324,32 +2883,23 @@ describe('GlassHive capability broker', () => {
 
   test('closes a rejected dispatch-ready CAS before any Worker provider call', async () => {
     const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
     const callTool = jest.fn();
     mockGetMCPManager.mockReturnValue({ callTool });
     const error = Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
-      code: 'glasshive_launch_dispatch_fenced',
-      retryable: false,
+      code: 'glasshive_launch_dispatch_fenced', retryable: false,
     });
     mockMarkGlassHiveLaunchDispatchReady.mockRejectedValueOnce(error);
 
     const result = await executeMainDelegation({
-      user: { id: 'user-1', role: 'USER' },
-      requestBody: managedAuthorBody,
-      args: {
-        title: 'Synthetic research',
-        instruction: 'Independent synthetic research.',
-        resourceClass: 'standard',
-      },
+      user: { id: 'user-1', role: 'USER' }, requestBody: managedAuthorBody,
+      args: { title: 'Synthetic research', instruction: 'Independent synthetic research.', resourceClass: 'standard' },
       invocationId: 'call-synthetic',
     });
 
     expect(result).toMatchObject({ status: 'blocked', reason: error.code, retryable: false });
     expect(mockMarkGlassHiveLaunchPreDispatchFailed).toHaveBeenCalledWith(
-      expect.objectContaining({ originRef: 'ghi-synthetic' }),
-      error,
+      expect.objectContaining({ originRef: 'ghi-synthetic' }), error,
     );
     expect(callTool).not.toHaveBeenCalled();
     expect(mockMarkGlassHiveLaunchDispatchUnknown).not.toHaveBeenCalled();
@@ -3358,21 +2908,15 @@ describe('GlassHive capability broker', () => {
   test('source authority refuses a late native work action without mutating the existing work', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
     const grant = mintBrokerGrant({
-      user: { id: 'user-1', role: 'USER' },
-      requestContext: SYNTHETIC_TURN_SCOPE,
-      authorityKind: 'conversation_orchestrator',
-      allowedHostTools: ['active_work_action'],
+      user: { id: 'user-1', role: 'USER' }, requestContext: SYNTHETIC_TURN_SCOPE,
+      authorityKind: 'conversation_orchestrator', allowedHostTools: ['active_work_action'],
       hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
     }).payload;
     mockAssertCurrentGlassHiveSourceAuthor.mockRejectedValueOnce(supersededAuthorError());
     const result = await handleToolCall({
-      grant,
-      toolName: 'active_work_action',
-      args: { action: 'stop', workRef: 'work-1' },
+      grant, toolName: 'active_work_action', args: { action: 'stop', workRef: 'work-1' },
     });
     expect(result).toMatchObject({ status: 'blocked', reason: 'source_authority_superseded' });
     expect(mockExecuteGlassHiveWorkAction).not.toHaveBeenCalled();
@@ -3381,38 +2925,27 @@ describe('GlassHive capability broker', () => {
   test('source authority refuses a late managed connected write before provider dispatch', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getServerConfig: jest.fn().mockResolvedValue({
-        source: 'config',
-        viventiumGlassHive: {
-          version: 1,
-          permitsAutonomousWorker: true,
-          hostAllowed: true,
-          defaultToolAccess: 'none',
-          writePolicy: 'allow',
-          toolPolicies: { schedule_create: { access: 'write' } },
-        },
-      }),
-    });
-    mockReinitMCPServer.mockResolvedValue({
-      success: true,
-      oauthRequired: false,
+    mockGetMCPServersRegistry.mockReturnValue({ getServerConfig: jest.fn().mockResolvedValue({
+      source: 'config', viventiumGlassHive: {
+        version: 1, permitsAutonomousWorker: true, hostAllowed: true,
+        defaultToolAccess: 'none', writePolicy: 'allow',
+        toolPolicies: { schedule_create: { access: 'write' } },
+      },
+    }) });
+    mockReinitMCPServer.mockResolvedValue({ success: true, oauthRequired: false,
       tools: [{ name: 'schedule_create', inputSchema: { type: 'object' } }],
     });
     const callTool = jest.fn().mockResolvedValue({ success: true });
     mockGetMCPManager.mockReturnValue({ callTool });
     const grant = mintBrokerGrant({
-      user: { id: 'user-1', role: 'USER' },
-      requestContext: SYNTHETIC_TURN_SCOPE,
-      authorityKind: 'conversation_orchestrator',
-      allowedServers: ['scheduling-cortex'],
+      user: { id: 'user-1', role: 'USER' }, requestContext: SYNTHETIC_TURN_SCOPE,
+      authorityKind: 'conversation_orchestrator', allowedServers: ['scheduling-cortex'],
       allowedHostTools: ['active_work_action'],
       hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
     }).payload;
     mockAssertCurrentGlassHiveSourceAuthor.mockRejectedValueOnce(supersededAuthorError());
     const result = await handleToolCall({
-      grant,
-      toolName: 'gh_scheduling_cortex_tool_schedule_create',
+      grant, toolName: 'gh_scheduling_cortex_tool_schedule_create',
       args: { prompt: 'Synthetic reminder', invocation_id: 'write-1' },
     });
     expect(result).toMatchObject({ status: 'blocked', reason: 'source_authority_superseded' });
@@ -3421,125 +2954,72 @@ describe('GlassHive capability broker', () => {
 
   test('managed Worker acceptance reserves before dispatch and saves the exact result', async () => {
     const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
-    const callTool = jest
-      .fn()
-      .mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-1' } });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
+    const callTool = jest.fn().mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-1' } });
     mockGetMCPManager.mockReturnValue({ callTool });
     mockReconcileGlassHiveLaunchResult.mockResolvedValueOnce({ workRef: 'work-1' });
     const result = await executeMainDelegation({
-      user: { id: 'user-1', role: 'USER' },
-      requestBody: managedAuthorBody,
-      args: {
-        title: 'Synthetic research',
-        instruction: 'Independent synthetic research.',
-        resourceClass: 'standard',
-      },
+      user: { id: 'user-1', role: 'USER' }, requestBody: managedAuthorBody,
+      args: { title: 'Synthetic research', instruction: 'Independent synthetic research.', resourceClass: 'standard' },
       invocationId: 'call-synthetic',
     });
     expect(result).toMatchObject({ status: 'ok', workRef: 'work-1' });
-    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({
-        adapterId: 'glasshive.worker_delegate.v1',
-        providerIdempotencyKey: 'a'.repeat(64),
-      }),
-    );
-    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
-      callTool.mock.invocationCallOrder[0],
-    );
-    expect(mockCommitDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({ providerReceiptRef: 'work-1', replayResult: result }),
-    );
-    expect(mockMarkDurableEffectReceipt).toHaveBeenCalledWith(
-      expect.objectContaining({ streamId: 'stream-1', effectRef: 'work-1' }),
-    );
+    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(expect.objectContaining({
+      adapterId: 'glasshive.worker_delegate.v1', providerIdempotencyKey: 'a'.repeat(64),
+    }));
+    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(callTool.mock.invocationCallOrder[0]);
+    expect(mockCommitDurableEffect).toHaveBeenCalledWith(expect.objectContaining({ providerReceiptRef: 'work-1', replayResult: result }));
+    expect(mockMarkDurableEffectReceipt).toHaveBeenCalledWith(expect.objectContaining({ streamId: 'stream-1', effectRef: 'work-1' }));
   });
 
-  test('managed work action reserves and commits one authoritative operation result', async () => {
+  test.each([false, true])('managed work action preserves confirmed pending=%s receipt', async (pending) => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getAllServerConfigs: jest.fn().mockResolvedValue({}),
-    });
-    mockExecuteGlassHiveWorkAction.mockResolvedValueOnce({ state: 'paused', workRef: 'work-1' });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
+    const receipt = { state: pending ? 'running' : 'paused', workRef: 'work-1',
+      status: pending ? 'pending' : 'accepted', confirmationPending: pending };
+    mockExecuteGlassHiveWorkAction.mockResolvedValueOnce(receipt);
+    mockCommitDurableEffect.mockImplementationOnce(async(input)=>({ownerId:'user-1',sourceEventId:'source-1',
+      responseMessageId:'msg-1',effectKind:'durable_work_action_accepted',providerReceiptRef:input.providerReceiptRef,replayResult:input.replayResult}));
     const grant = mintBrokerGrant({
-      user: { id: 'user-1', role: 'USER' },
-      requestContext: SYNTHETIC_TURN_SCOPE,
-      authorityKind: 'conversation_orchestrator',
-      allowedHostTools: ['active_work_action'],
+      user: { id: 'user-1', role: 'USER' }, requestContext: SYNTHETIC_TURN_SCOPE,
+      authorityKind: 'conversation_orchestrator', allowedHostTools: ['active_work_action'],
       hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
     }).payload;
-    const result = await handleToolCall({
-      grant,
-      toolName: 'active_work_action',
-      args: { action: 'pause', workRef: 'work-1', invocation_id: 'action-1' },
-    });
-    expect(result).toMatchObject({ status: 'ok', result: { state: 'paused' } });
-    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({ adapterId: 'glasshive.work_action.v1', operation: 'pause' }),
-    );
-    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
-      mockExecuteGlassHiveWorkAction.mock.invocationCallOrder[0],
-    );
-    expect(mockCommitDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({ replayResult: result }),
-    );
+    const result = await handleToolCall({ grant, toolName: 'active_work_action',
+      args: { action: 'pause', workRef: 'work-1', invocation_id: 'action-1' } });
+    expect(result).toMatchObject({ status: 'ok', result: receipt });
+    expect(mockMarkDurableEffectReceipt).toHaveBeenCalledWith(expect.objectContaining(pending?{confirmationPending:true}:{}));
+    if(!pending)expect(mockMarkDurableEffectReceipt.mock.calls[0][0]).not.toHaveProperty('confirmationPending');
+    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(expect.objectContaining({ adapterId: 'glasshive.work_action.v1', operation: 'pause' }));
+    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(mockExecuteGlassHiveWorkAction.mock.invocationCallOrder[0]);
+    expect(mockCommitDurableEffect).toHaveBeenCalledWith(expect.objectContaining({ replayResult: result }));
   });
 
   test('managed connected writes persist an exact returned outcome without claiming provider idempotency', async () => {
     const { mintBrokerGrant } = require('../GlassHiveCapabilityBrokerAuth');
     const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
-    mockGetMCPServersRegistry.mockReturnValue({
-      getServerConfig: jest.fn().mockResolvedValue({
-        source: 'config',
-        viventiumGlassHive: {
-          version: 1,
-          permitsAutonomousWorker: true,
-          hostAllowed: true,
-          defaultToolAccess: 'none',
-          writePolicy: 'allow',
-          toolPolicies: { schedule_create: { access: 'write' } },
-        },
-      }),
-    });
-    mockReinitMCPServer.mockResolvedValue({
-      success: true,
-      oauthRequired: false,
-      tools: [{ name: 'schedule_create', inputSchema: { type: 'object' } }],
-    });
+    mockGetMCPServersRegistry.mockReturnValue({ getServerConfig: jest.fn().mockResolvedValue({
+      source: 'config', viventiumGlassHive: { version: 1, permitsAutonomousWorker: true,
+        hostAllowed: true, defaultToolAccess: 'none', writePolicy: 'allow',
+        toolPolicies: { schedule_create: { access: 'write' } } },
+    }) });
+    mockReinitMCPServer.mockResolvedValue({ success: true, oauthRequired: false,
+      tools: [{ name: 'schedule_create', inputSchema: { type: 'object' } }] });
     const returned = { success: true, result: { scheduleId: 'synthetic-schedule' } };
-    const callTool = jest.fn().mockResolvedValue(returned);
-    mockGetMCPManager.mockReturnValue({ callTool });
-    const grant = mintBrokerGrant({
-      user: { id: 'user-1', role: 'USER' },
-      requestContext: SYNTHETIC_TURN_SCOPE,
-      authorityKind: 'conversation_orchestrator',
-      allowedServers: ['scheduling-cortex'],
-      allowedHostTools: ['active_work_action'],
+    const callTool = jest.fn().mockResolvedValue(returned); mockGetMCPManager.mockReturnValue({ callTool });
+    const grant = mintBrokerGrant({ user: { id: 'user-1', role: 'USER' },
+      requestContext: SYNTHETIC_TURN_SCOPE, authorityKind: 'conversation_orchestrator',
+      allowedServers: ['scheduling-cortex'], allowedHostTools: ['active_work_action'],
       hostToolResources: { active_work_action: { version: 1, request_body: managedAuthorBody } },
     }).payload;
-    expect(
-      await handleToolCall({
-        grant,
-        toolName: 'gh_scheduling_cortex_tool_schedule_create',
-        args: { prompt: 'Synthetic reminder', invocation_id: 'write-1' },
-      }),
-    ).toEqual(returned);
-    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({
-        adapterId: 'mcp.provider_mutation.v1',
-        providerIdempotencyMode: 'none',
-        effectKind: 'provider_mutation_returned',
-      }),
-    );
-    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(
-      callTool.mock.invocationCallOrder[0],
-    );
-    expect(mockCommitDurableEffect).toHaveBeenCalledWith(
-      expect.objectContaining({ replayResult: returned }),
-    );
+    expect(await handleToolCall({ grant, toolName: 'gh_scheduling_cortex_tool_schedule_create',
+      args: { prompt: 'Synthetic reminder', invocation_id: 'write-1' } })).toEqual(returned);
+    expect(mockPrepareDurableEffect).toHaveBeenCalledWith(expect.objectContaining({
+      adapterId: 'mcp.provider_mutation.v1', providerIdempotencyMode: 'none', effectKind: 'provider_mutation_returned',
+    }));
+    expect(mockPrepareDurableEffect.mock.invocationCallOrder[0]).toBeLessThan(callTool.mock.invocationCallOrder[0]);
+    expect(mockCommitDurableEffect).toHaveBeenCalledWith(expect.objectContaining({ replayResult: returned }));
   });
 
   test('does not register launch intent after its authoring signal is superseded', async () => {
@@ -3623,6 +3103,12 @@ describe('GlassHive capability broker', () => {
       'ms-365',
     ]);
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.scopes.content_read).toBe(true);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.eager_servers).toEqual([]);
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.deferred_servers).toEqual(['ms-365']);
+    for (const content of [result.context, result.bootstrap_bundle_json.agents_md,
+      result.bootstrap_bundle_json.codex_md, result.bootstrap_bundle_json.claude_md]) {
+      expect(content).toContain('Deferred capability servers (discover only when the task needs them): ms-365');
+    }
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.status).toBe(
       'pending_admission',
     );
@@ -3665,6 +3151,8 @@ describe('GlassHive capability broker', () => {
       expect.objectContaining({
         originRef: 'ghi-synthetic',
         allowedServers: ['ms-365'],
+        eagerServers: [],
+        deferredServers: ['ms-365'],
         contentReadScope: true,
         requestContext: expect.objectContaining({
           conversation_id: 'conv-1',
@@ -3705,6 +3193,12 @@ describe('GlassHive capability broker', () => {
     });
 
     expect(result.instruction).toContain('Authorized host tools for this run: file_search');
+    for (const brief of [result.instruction, result.bootstrap_bundle_json.agents_md,
+      result.bootstrap_bundle_json.claude_md, result.bootstrap_bundle_json.codex_md]) {
+      expect(brief).toContain('This list is the scope of this invocation only');
+      expect(brief).toContain('does not describe other agents’ or workers’ capabilities or results');
+      expect(brief).not.toContain('same resolved host capabilities available to the main Agent');
+    }
     expect(result.instruction).toContain(
       'Host-tool resources are virtual service evidence, not workspace paths',
     );
@@ -3715,9 +3209,7 @@ describe('GlassHive capability broker', () => {
     expect(result.bootstrap_bundle_json.glasshive_capability_broker.allowed_host_tools).toEqual([
       'file_search',
     ]);
-    expect(result.bootstrap_bundle_json.glasshive_capability_broker.status).toBe(
-      'pending_admission',
-    );
+    expect(result.bootstrap_bundle_json.glasshive_capability_broker.status).toBe('pending_admission');
     expect(result.bootstrap_bundle_json.env?.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toBeUndefined();
     expect(result.bootstrap_bundle_json.claude_settings_local?.permissions?.allow).toEqual([
       'mcp__glasshive-user-capabilities__file_search',
@@ -4988,9 +4480,7 @@ describe('Claude exact granted host read permissions', () => {
   test.each(['Bootstrap', 'Broker'])('supports the existing %s-first import order', (first) => {
     jest.isolateModules(() => {
       require(`../GlassHiveCapability${first}Service`);
-      const {
-        mergeBrokerBundle: initializedMerge,
-      } = require('../GlassHiveCapabilityBootstrapService');
+      const { mergeBrokerBundle: initializedMerge } = require('../GlassHiveCapabilityBootstrapService');
       const bundle = initializedMerge({
         existingBundle: {},
         brokerUrl: 'http://localhost:9000/broker',

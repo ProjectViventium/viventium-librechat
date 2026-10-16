@@ -29,6 +29,35 @@ const {
   runGlassHiveTerminalCallbackTransaction,
 } = require('./GlassHiveTerminalCallbackTransaction');
 
+/* === VIVENTIUM START === Passive, content-free admission and HTTP timing. === */
+const { createHash } = require('crypto');
+const { logger } = require('@librechat/data-schemas');
+const { voiceLatencyNow, logVoiceLatencyNumericStage } = require('./voiceLatencyTiming');
+
+function observeNativeResponsePhase(req, stage, operation) {
+  if (req?.viventiumVoiceLogLatency !== true) return operation();
+  const startedAt = voiceLatencyNow();
+  let outcome = 'failed';
+  const record = () => {
+    try {
+      const requestHash = createHash('sha256').update(String(req.viventiumVoiceRequestId || 'unknown')).digest('hex');
+      logVoiceLatencyNumericStage(logger, req, 'native_response', `${stage}_${outcome}`, startedAt, requestHash);
+    } catch {
+      // Passive diagnostics must preserve the exact admission or transport outcome.
+    }
+  };
+  try {
+    return Promise.resolve(operation()).then((result) => {
+      outcome = 'completed';
+      return result;
+    }).finally(record);
+  } catch (error) {
+    record();
+    throw error;
+  }
+}
+/* === VIVENTIUM END === */
+
 const runNativeResponseTransaction = (operation) =>
   runGlassHiveTerminalCallbackTransaction(operation, { retry: 'native' });
 
@@ -43,22 +72,12 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
     sanitizeVoiceSurfaceTextForDisplay,
   } = require('./voiceArtifactText');
   message = projectNativeToolEvidence(identity, response, message, candidate);
-  const projectMedia = (value) =>
-    renderGlassHiveNativeMediaAttachmentLinks(value, message.attachments, {
-      ownerId: identity.userId,
-      messageId: identity.responseMessageId,
-    });
-  message = {
-    ...message,
-    text: typeof message.text === 'string' ? projectMedia(message.text) : message.text,
-    content: Array.isArray(message.content)
-      ? message.content.map((part) =>
-          part?.type === 'text' && typeof part.text === 'string'
-            ? { ...part, text: projectMedia(part.text) }
-            : part,
-        )
-      : message.content,
-  };
+  const projectMedia = (value) => renderGlassHiveNativeMediaAttachmentLinks(value,
+    message.attachments, { ownerId: identity.userId, messageId: identity.responseMessageId });
+  message = { ...message, text: typeof message.text === 'string' ? projectMedia(message.text) : message.text,
+    content: Array.isArray(message.content) ? message.content.map((part) =>
+      part?.type === 'text' && typeof part.text === 'string' ? { ...part, text: projectMedia(part.text) } : part)
+      : message.content };
   const context = identity.deliveryContext;
   const req = {
     _viventiumDeliveryDispositionRequired:
@@ -83,14 +102,17 @@ function projectNativeMessage(identity, response, message, purpose, candidate) {
       ...value,
       content: value.content.map((part) => {
         if (part?.type !== 'text' || typeof part.text !== 'string') return part;
-        const ranges = inspectProviderDeliveryRanges(response, part.text, (source) => {
-          const projected = projectMedia(source);
-          if (purpose !== 'transmit' && context?.surface === 'voice')
-            return sanitizeVoiceSurfaceTextForDisplay(projected);
-          return context?.surface === 'web'
-            ? sanitizeVoiceAssistantMessageForPersistence(req, { text: projected }).text
-            : projected;
-        });
+        const ranges = inspectProviderDeliveryRanges(
+          response,
+          part.text,
+          (source) => {
+            const projected = projectMedia(source);
+            if (purpose !== 'transmit' && context?.surface === 'voice')
+              return sanitizeVoiceSurfaceTextForDisplay(projected);
+            return context?.surface === 'web'
+              ? sanitizeVoiceAssistantMessageForPersistence(req, { text: projected }).text : projected;
+          },
+        );
         return ranges === null ? part : { ...part, deliveryDispositionRanges: ranges };
       }),
     };
@@ -166,11 +188,7 @@ function getService() {
     db,
     projectMessage: projectNativeMessage,
     prepareAttachments: async (identity, response, candidate) => {
-      if (
-        response.glasshive?.output_files == null &&
-        !collectGlassHiveNativeMediaReferences(candidate.text).length
-      )
-        return [];
+      if (response.glasshive?.output_files == null && !collectGlassHiveNativeMediaReferences(candidate.text).length) return [];
       const user = await db.findUser({ _id: identity.userId });
       if (!user) throw new Error('native_response_owner_unavailable');
       const config = await require('~/server/services/Config').getAppConfig({ role: user.role });
@@ -293,9 +311,7 @@ function createNativeResponseRelease(req, route, deps = {}) {
     GenerationJobManager.renewNativeDispatchLease(context.streamId, context.jobCreatedAt);
 
   return {
-    get responseTimeoutMs() {
-      return lastReportedResponseTimeoutMs;
-    },
+    get responseTimeoutMs() { return lastReportedResponseTimeoutMs; },
     async beforeDispatch(context) {
       for (let attempt = 0; ; attempt += 1) {
         const targets = await currentTargets(context);
@@ -400,7 +416,9 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
     };
   }
   return createNativeResponseFetch(
-    baseFetch,
+    (input, init) => observeNativeResponsePhase(
+      req, 'provider_response_headers', () => baseFetch(input, init),
+    ),
     async () => {
       /* === VIVENTIUM START === Each Main attempt owns its current admission proof. */
       delete req._viventiumNativeResponseUnaccepted;
@@ -449,7 +467,9 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
         source: source.proof,
       };
     },
-    (identity) => getService().admit(identity),
+    (identity) => observeNativeResponsePhase(
+      req, 'host_native_admission', () => getService().admit(identity),
+    ),
     (identity) => {
       req._viventiumNativeResponseIdentity = identity;
     },
@@ -471,67 +491,48 @@ async function readCurrentMainBackgroundInputs(req, primaryAgentId) {
   if (!identity) return [];
   const source = req._viventiumNativeResponseSource;
   const context = require('./interactionContext').getTrustedInteractionContext(req);
-  const invalid = () =>
-    Object.assign(new Error('Current Main background source is unavailable'), {
-      code: 'main_background_source_unavailable',
-    });
+  const invalid = () => Object.assign(new Error('Current Main background source is unavailable'), {
+    code: 'main_background_source_unavailable',
+  });
   if (
-    !source ||
-    !context ||
-    identity.userId !== req.user?.id ||
-    identity.agentId !== primaryAgentId ||
-    identity.streamId !== req._resumableStreamId ||
+    !source || !context || identity.userId !== req.user?.id ||
+    identity.agentId !== primaryAgentId || identity.streamId !== req._resumableStreamId ||
     identity.conversationId !== source.conversationId ||
     identity.responseMessageId !== source.responseMessageId ||
     identity.source.messageId !== source.proof?.messageId ||
-    identity.source.id !== source.proof?.id ||
-    identity.source.digest !== source.proof?.digest ||
+    identity.source.id !== source.proof?.id || identity.source.digest !== source.proof?.digest ||
     context.conversation_id !== identity.conversationId ||
-    context.logical_turn_id !== identity.logicalTurnId ||
-    context.revision !== identity.revision ||
+    context.logical_turn_id !== identity.logicalTurnId || context.revision !== identity.revision ||
     context.source_order_scope !== identity.sourceOrderScope ||
     interactionPresentationSequence(context) !== identity.sourceSequence
-  )
-    throw invalid();
+  ) throw invalid();
   const store = GenerationJobManager.getJobStore();
   const assertCurrent = async () => {
     if (!(await store.isCurrentLogicalTurn(identity.streamId))) throw supersededDispatchError();
     if (identity.sourceOrderScope && identity.sourceSequence != null) {
       const observed = await GenerationJobManager.observeSourceOrder({
-        source_order_scope: identity.sourceOrderScope,
-        source_sequence: identity.sourceSequence,
+        source_order_scope: identity.sourceOrderScope, source_sequence: identity.sourceSequence,
       });
       if (observed.stale || observed.latest_source_sequence !== identity.sourceSequence)
         throw supersededDispatchError();
     }
     const job = await store.getJob(identity.streamId);
-    if (
-      !nativeJobMatches(job, identity) ||
-      job.status !== 'running' ||
-      job.generationCompleted ||
-      job.nativeResponseCancelled ||
-      (job.nativeResponse &&
-        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity))
-    )
+    if (!nativeJobMatches(job, identity) || job.status !== 'running' || job.generationCompleted ||
+        job.nativeResponseCancelled ||
+        (job.nativeResponse && nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)))
       throw supersededDispatchError();
   };
   await assertCurrent();
   const db = require('~/models');
   const row = await db.getNativeResponse(identity.userId, identity.responseMessageId);
   if (
-    !row ||
-    String(row.user) !== identity.userId ||
-    row.deletedAt ||
+    !row || String(row.user) !== identity.userId || row.deletedAt ||
     (row.error === true && row.nativeResponse?.status !== 'unsupported') ||
-    row.isCreatedByUser !== false ||
-    row.conversationId !== identity.conversationId ||
-    row.messageId !== identity.responseMessageId ||
-    row.parentMessageId !== identity.source.messageId ||
-    !row.nativeResponse ||
-    nativeIdentityJson(row.nativeResponse) !== nativeIdentityJson(identity) ||
+    row.isCreatedByUser !== false || row.conversationId !== identity.conversationId ||
+    row.messageId !== identity.responseMessageId || row.parentMessageId !== identity.source.messageId ||
+    !row.nativeResponse || nativeIdentityJson(row.nativeResponse) !== nativeIdentityJson(identity) ||
     !['pending', 'unsupported'].includes(row.nativeResponse.status)
-  )
-    throw invalid();
+  ) throw invalid();
   const inputs = require('@librechat/data-schemas').normalizeMainBackgroundInputs(
     row.metadata?.viventium?.backgroundInputs,
   );
@@ -562,14 +563,11 @@ async function markNativeResponseReplayStored(identity, mode) {
     // Canonical replay is committed. Wake the existing durable mission lane, including recovery.
     try {
       require('./GlassHiveMissionAdjudicationService').wakeGlassHiveMissionAdjudications({
-        ownerId: identity.userId,
-        conversationId: identity.conversationId,
+        ownerId: identity.userId, conversationId: identity.conversationId,
       });
     } catch {
       // The committed Main stays committed; existing durable reconciliation owns recovery.
-      require('@librechat/data-schemas').logger.warn(
-        '[NativeResponse] Mission wake remains pending',
-      );
+      require('@librechat/data-schemas').logger.warn('[NativeResponse] Mission wake remains pending');
     }
   }
   return settled;
@@ -653,10 +651,7 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
       }
       if (stopped && mode !== 'augmentation') {
         return sanitizeMessageForTransmit(
-          preserveMainContextUpdate(
-            sanitizeMessageForPersistence(row, { purpose: 'document' }),
-            row,
-          ),
+          preserveMainContextUpdate(sanitizeMessageForPersistence(row, { purpose: 'document' }), row),
         );
       }
       const message = preserveMainContextUpdate(
@@ -681,10 +676,7 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
           : await db.settleNativeResponse(identity, 'cancelled', message);
       return saved?.messageId
         ? sanitizeMessageForTransmit(
-            preserveMainContextUpdate(
-              sanitizeMessageForPersistence(saved, { purpose: 'document' }),
-              saved,
-            ),
+            preserveMainContextUpdate(sanitizeMessageForPersistence(saved, { purpose: 'document' }), saved),
           )
         : null;
     },
@@ -697,45 +689,28 @@ async function installNativeResponseRecovery() {
   GenerationJobManager.setNativeResponseRecovery(recoverNativeResponse);
   GenerationJobManager.setNativeResponseCancellation(persistNativeResponseCancellation);
   GenerationJobManager.setNativeSourceRecovery(async (current, previous) => {
-    const route = previous.nativeResponse
-      ? await resolveNativeResponseRoute(previous.nativeResponse)
-      : null;
-    const release = createNativeResponseRelease(
-      { user: { id: current.userId } },
-      {},
-      {
-        baseURL: route?.baseURL,
-        apiKey: route?.headers.Authorization.slice('Bearer '.length),
-      },
-    );
+    const route = previous.nativeResponse ? await resolveNativeResponseRoute(previous.nativeResponse) : null;
+    const release = createNativeResponseRelease({ user: { id: current.userId } }, {}, {
+      baseURL: route?.baseURL,
+      apiKey: route?.headers.Authorization.slice('Bearer '.length),
+    });
     return prepareNativeSourceRecovery(current, previous, {
-      isUnboundCancelled: (job) =>
-        GenerationJobManager.getJobStore().isNativeResponseUnboundCancelled(job),
+      isUnboundCancelled: (job) => GenerationJobManager.getJobStore().isNativeResponseUnboundCancelled(job),
       beforeCapture: async (job) => {
         const callId = job.viventiumCallSessionId || job.voiceCallSessionId;
         if (job.interactionContext?.surface === 'voice' && callId) {
           const call = await require('./CallSessionService').getCallSession(callId);
           if (!call || call.userId !== job.userId || call.conversationId !== job.conversationId) {
-            throw releaseUnconfirmedError(
-              'native_source_delivery_unavailable',
-              'The owning call could not be confirmed',
-            );
+            throw releaseUnconfirmedError('native_source_delivery_unavailable', 'The owning call could not be confirmed');
           }
           if (['ended', 'failed'].includes(call.status)) {
-            throw releaseUnconfirmedError(
-              'native_source_delivery_terminal',
-              'The owning call has ended or failed',
-            );
+            throw releaseUnconfirmedError('native_source_delivery_terminal', 'The owning call has ended or failed');
           }
         }
         await release.beforeDispatch({
-          streamId: job.streamId,
-          jobCreatedAt: job.createdAt,
-          userId: job.userId,
+          streamId: job.streamId, jobCreatedAt: job.createdAt, userId: job.userId,
         });
-        return release.responseTimeoutMs > 0
-          ? job.createdAt + release.responseTimeoutMs
-          : undefined;
+        return release.responseTimeoutMs > 0 ? job.createdAt + release.responseTimeoutMs : undefined;
       },
       getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
       readFacts: require('./InteractionDurableEffectService').getSourceRecoverySnapshot,
@@ -771,13 +746,7 @@ async function recoverNativeResponses() {
  * input courier. A native enqueue is not consumption; the mission ledger still owns synthesis.
  */
 async function offerMissionEvidenceToCurrentMain({
-  ownerId,
-  conversationId,
-  currentLeafMessageId,
-  messages,
-  mainAgentId,
-  insights,
-  onPending,
+  ownerId, conversationId, currentLeafMessageId, messages, mainAgentId, insights, onPending,
 }) {
   if (!ownerId || !conversationId || !currentLeafMessageId || !mainAgentId) return false;
   const byId = new Map((messages || []).map((message) => [message.messageId, message]));
@@ -792,40 +761,22 @@ async function offerMissionEvidenceToCurrentMain({
     const row = await require('~/models').getNativeResponse(ownerId, message.messageId);
     const identity = row?.nativeResponse;
     if (!identity || identity.agentId !== mainAgentId) continue;
-    if (
-      row.deletedAt ||
-      row.isCreatedByUser !== false ||
-      String(row.user) !== ownerId ||
-      row.conversationId !== conversationId ||
-      row.messageId !== message.messageId ||
-      row.messageId !== identity.responseMessageId ||
-      row.parentMessageId !== identity.source?.messageId ||
-      identity.userId !== ownerId ||
-      identity.conversationId !== conversationId
-    )
-      return false;
-    if (
-      !['pending', 'prepared', 'completed'].includes(identity.status) ||
-      identity.finalReplayStoredAt > 0
-    )
+    if (row.deletedAt || row.isCreatedByUser !== false || String(row.user) !== ownerId ||
+        row.conversationId !== conversationId || row.messageId !== message.messageId ||
+        row.messageId !== identity.responseMessageId || row.parentMessageId !== identity.source?.messageId ||
+        identity.userId !== ownerId || identity.conversationId !== conversationId) return false;
+    if (!['pending', 'prepared', 'completed'].includes(identity.status) || identity.finalReplayStoredAt > 0)
       return false;
     const store = GenerationJobManager.getJobStore();
     const current = async () => {
       const job = await store.getJob(identity.streamId);
-      if (
-        !nativeJobMatches(job, identity) ||
-        job.status !== 'running' ||
-        job.generationCompleted ||
-        job.nativeResponseCancelled ||
-        !job.nativeResponse ||
-        nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity) ||
-        !(await store.isCurrentLogicalTurn(identity.streamId))
-      )
-        return false;
+      if (!nativeJobMatches(job, identity) || job.status !== 'running' || job.generationCompleted ||
+          job.nativeResponseCancelled || !job.nativeResponse ||
+          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity) ||
+          !(await store.isCurrentLogicalTurn(identity.streamId))) return false;
       if (identity.sourceOrderScope && identity.sourceSequence != null) {
         const order = await GenerationJobManager.observeSourceOrder({
-          source_order_scope: identity.sourceOrderScope,
-          source_sequence: identity.sourceSequence,
+          source_order_scope: identity.sourceOrderScope, source_sequence: identity.sourceSequence,
         });
         if (order.stale || order.latest_source_sequence !== identity.sourceSequence) return false;
       }
@@ -834,51 +785,27 @@ async function offerMissionEvidenceToCurrentMain({
     if (!(await current())) return false;
     if (!(await require('~/models').nativeResponseSourceMatches(identity)))
       throw new Error('mission_current_main_source_unavailable');
-    await module.exports.deliverCompletedCortexBatchToRunningMain(
-      {
-        ownerId,
-        conversationId,
-        parentMessageId: identity.responseMessageId,
-        streamId: identity.streamId,
-        insights,
-        context: JSON.stringify(
-          insights?.some((insight) => insight.authority?.kind === 'durable_work_callback')
-            ? { accepted_work_evidence: insights }
-            : { terminal_evidence: insights },
-        ),
-      },
-      current,
-    );
+    await module.exports.deliverCompletedCortexBatchToRunningMain({
+      ownerId, conversationId, parentMessageId: identity.responseMessageId,
+      streamId: identity.streamId, insights,
+      context: JSON.stringify(insights?.some((insight) => insight.authority?.kind === 'durable_work_callback')
+        ? { accepted_work_evidence: insights } : { terminal_evidence: insights }),
+    }, current);
     // Completion can win during the native offer. Only the exact still-running author defers.
-    const refreshed = await require('~/models').getNativeResponse(
-      ownerId,
-      identity.responseMessageId,
-    );
-    if (
-      !refreshed?.nativeResponse ||
-      nativeIdentityJson(refreshed.nativeResponse) !== nativeIdentityJson(identity)
-    )
-      return false;
-    if (
-      ['failed', 'cancelled'].includes(refreshed.nativeResponse.status) ||
-      refreshed.nativeResponse.finalReplayStoredAt > 0
-    )
-      return false;
+    const refreshed = await require('~/models').getNativeResponse(ownerId, identity.responseMessageId);
+    if (!refreshed?.nativeResponse ||
+        nativeIdentityJson(refreshed.nativeResponse) !== nativeIdentityJson(identity)) return false;
+    if (['failed', 'cancelled'].includes(refreshed.nativeResponse.status) ||
+        refreshed.nativeResponse.finalReplayStoredAt > 0) return false;
     if (!(await current())) return false;
     // The replay wake may run while this mission claim is still processing. Capture a single
     // exact readiness recheck for after claim release; it does not poll or wait for Main.
     onPending?.(async () => {
-      const latest = await require('~/models').getNativeResponse(
-        ownerId,
-        identity.responseMessageId,
-      );
-      return (
-        !latest?.nativeResponse ||
+      const latest = await require('~/models').getNativeResponse(ownerId, identity.responseMessageId);
+      return !latest?.nativeResponse ||
         nativeIdentityJson(latest.nativeResponse) !== nativeIdentityJson(identity) ||
         !['pending', 'prepared', 'completed'].includes(latest.nativeResponse.status) ||
-        latest.nativeResponse.finalReplayStoredAt > 0 ||
-        !(await current())
-      );
+        latest.nativeResponse.finalReplayStoredAt > 0 || !(await current());
     });
     return true;
   }
@@ -911,16 +838,10 @@ module.exports = {
         (await require('~/models').getNativeResponse(ownerId, messageId))?.nativeResponse || null,
       resolveRoute: resolveNativeResponseRoute,
       isEligible,
-      isCurrentLogicalTurn: (streamId) =>
-        GenerationJobManager.getJobStore().isCurrentLogicalTurn(streamId),
+      isCurrentLogicalTurn: (streamId) => GenerationJobManager.getJobStore().isCurrentLogicalTurn(streamId),
       observeSourceOrder: (context) => GenerationJobManager.observeSourceOrder(context),
-      prepareInput: (identity, input, mode) =>
-        require('~/models').prepareNativeMainBackgroundInput(
-          identity,
-          input,
-          runNativeResponseTransaction,
-          mode,
-        ),
+      prepareInput: (identity, input, mode) => require('~/models').prepareNativeMainBackgroundInput(
+        identity, input, runNativeResponseTransaction, mode),
       recordInputReceipt: (identity, receipt) =>
         require('~/models').recordNativeMainBackgroundInputReceipt(identity, receipt),
     }),

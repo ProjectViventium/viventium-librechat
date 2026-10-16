@@ -11,6 +11,7 @@
  * === VIVENTIUM END === */
 
 const { ContentTypes } = require('librechat-data-provider');
+const { validateDeliveryDisposition } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { memoryReceiptFromAttachments } = require('./memoryReceipt');
 const { getMessages } = require('~/models');
@@ -181,6 +182,13 @@ function resolveDeferredFallbackCanonicalTextState({
     };
   }
 
+  const disposition = validateDeliveryDisposition(message?.metadata?.viventium?.deliveryDisposition);
+  if (!canonicalText && message?.unfinished === false && message?.error !== true &&
+      message?.aborted !== true && message?.superseded !== true &&
+      message?.isCreatedByUser !== true && disposition?.audio === 'skip') {
+    return { canonicalText: null, canonicalTextSource: '', canonicalTextFallbackReason: '' };
+  }
+
   const runtimeHoldText = hasRuntimeHoldText(message?.content);
   const configuredHoldText = isConfiguredHoldCanonicalText(canonicalText, configuredHoldTexts);
   const needsFallback =
@@ -289,14 +297,10 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
     messageId: lastFollowUp.messageId,
     text,
     ...(lastFollowUp?.metadata?.viventium?.deliveryDisposition
-      ? { deliveryDisposition: lastFollowUp.metadata.viventium.deliveryDisposition }
-      : {}),
-    ...(Array.isArray(lastFollowUp.content) &&
-    lastFollowUp.content.some((part) =>
-      Object.prototype.hasOwnProperty.call(part || {}, 'deliveryDispositionRanges'),
-    )
-      ? { content: lastFollowUp.content }
-      : {}),
+      ? { deliveryDisposition: lastFollowUp.metadata.viventium.deliveryDisposition } : {}),
+    ...(Array.isArray(lastFollowUp.content) && lastFollowUp.content.some(
+      (part) => Object.prototype.hasOwnProperty.call(part || {}, 'deliveryDispositionRanges'),
+    ) ? { content: lastFollowUp.content } : {}),
     ...(typeof lastFollowUp?.metadata?.viventium?.followUpSource === 'string'
       ? { followUpSource: lastFollowUp.metadata.viventium.followUpSource }
       : {}),
@@ -329,7 +333,7 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
   // could silently discard a saved receipt or misreport an uncertain write as unapplied.
   const [message] = await getMessages(
     { user: userId, messageId },
-    'messageId conversationId text content metadata agent_id model unfinished attachments savedMemoryWrite.status',
+    'messageId conversationId text content metadata agent_id model unfinished error aborted superseded isCreatedByUser attachments savedMemoryWrite.status',
   );
   if (!message) {
     return null;

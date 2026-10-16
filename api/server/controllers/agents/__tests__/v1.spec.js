@@ -1,11 +1,12 @@
 const { duplicateAgent, revertAgentVersion: revertAgentVersionHandler } = require('../v1');
-const { getAgent, createAgent, revertAgentVersion } = require('~/models/Agent');
+const { getAgent, getAgentVersion, createAgent, revertAgentVersion } = require('~/models/Agent');
 const { getActions } = require('~/models/Action');
 const { nanoid } = require('nanoid');
 
 jest.mock('~/models/Agent');
 jest.mock('~/models/Action');
 jest.mock('nanoid');
+getAgentVersion.mockImplementation(async (query, index) => (await getAgent(query))?.versions?.[index] ?? null);
 
 describe('duplicateAgent', () => {
   let req, res;

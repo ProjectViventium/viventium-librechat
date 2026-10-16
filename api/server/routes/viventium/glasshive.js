@@ -498,10 +498,8 @@ function isEvidenceGateFailure({ failureCode = '', message = '' } = {}) {
 }
 
 function callbackContractError(body = {}) {
-  if (
-    body.callback_created_at !== undefined &&
-    !require('@librechat/api').normalizeGlassHiveCallbackCreatedAt(body.callback_created_at)
-  ) {
+  if (body.callback_created_at !== undefined &&
+      !require('@librechat/api').normalizeGlassHiveCallbackCreatedAt(body.callback_created_at)) {
     return 'invalid_callback_creation_clock';
   }
   for (const field of ['failure_code', 'failure_class']) {
@@ -675,15 +673,10 @@ function resolveCallbackTreeParentMessageId({
 
 function latestPriorGlassHiveStatusMessage(messages, body = {}, presentation = null) {
   const matches = (Array.isArray(messages) ? messages : [])
-    .filter(
-      (message) =>
-        sameGlassHiveRun(message, body) &&
-        (!message?.metadata?.viventium?.nativeInputPresentation ||
-          require('@librechat/api').nativeWorkInputMessagePresentationMatches(
-            message.metadata.viventium.nativeInputPresentation,
-            presentation,
-          )),
-    )
+    .filter((message) => sameGlassHiveRun(message, body) &&
+      (!message?.metadata?.viventium?.nativeInputPresentation ||
+        require('@librechat/api').nativeWorkInputMessagePresentationMatches(
+          message.metadata.viventium.nativeInputPresentation, presentation)))
     .sort((a, b) => {
       const aTime = Date.parse(String(a?.updatedAt || a?.createdAt || '')) || 0;
       const bTime = Date.parse(String(b?.updatedAt || b?.createdAt || '')) || 0;
@@ -981,10 +974,8 @@ async function reconcileCallbackExternalWork({
     }
   }
   // Settled evidence returns to native Main. Native input/approval keeps its existing courier.
-  if (
-    isGlassHiveWorkTerminalCallback(body) ||
-    require('@librechat/api').shouldAdjudicateGlassHiveNeedsInput(body)
-  ) {
+  if (isGlassHiveWorkTerminalCallback(body) ||
+      require('@librechat/api').shouldAdjudicateGlassHiveNeedsInput(body)) {
     await enqueueGlassHiveMissionAdjudication({
       binding: deliveryContext,
       body,
@@ -1172,17 +1163,14 @@ async function handleGlassHiveCallback(req, res) {
         },
       });
     const terminalResultGate = isGlassHiveWorkTerminalCallback(callbackBody)
-      ? await runGlassHiveTerminalCallbackTransaction(
-          async (effectSession) => {
-            await fenceGlassHiveCallbackRunState({
-              binding: deliveryContext,
-              body: callbackBody,
-              effectSession,
-            });
-            return receiveTerminalResult();
-          },
-          { retry: 'native' },
-        )
+      ? await runGlassHiveTerminalCallbackTransaction(async (effectSession) => {
+          await fenceGlassHiveCallbackRunState({
+            binding: deliveryContext,
+            body: callbackBody,
+            effectSession,
+          });
+          return receiveTerminalResult();
+        }, { retry: 'native' })
       : await receiveTerminalResult();
     if (terminalResultGate.applies && 'error' in terminalResultGate) {
       return res.status(terminalResultGate.httpStatus).json({ error: terminalResultGate.error });
@@ -1213,14 +1201,13 @@ async function handleGlassHiveCallback(req, res) {
     return res.status(503).json({ error: 'callback_result_cas_unavailable' });
   }
   try {
-    await runTerminalEffect(
-      (effectFence, effectSession) =>
-        confirmGlassHiveCallbackContext({
-          binding: deliveryContext,
-          body: rawBody,
-          effectFence,
-          effectSession,
-        }),
+    await runTerminalEffect((effectFence, effectSession) =>
+      confirmGlassHiveCallbackContext({
+        binding: deliveryContext,
+        body: rawBody,
+        effectFence,
+        effectSession,
+      }),
       { retry: 'native' },
     );
   } catch (err) {
@@ -1289,6 +1276,43 @@ async function handleGlassHiveCallback(req, res) {
   if (await runTerminalEffect(() => isGlassHiveCleanupSourceTombstoned(cleanupSource))) {
     return suppressCleanupCallback();
   }
+  const mainNeedsInput = require('@librechat/api').shouldAdjudicateGlassHiveNeedsInput(callbackBody);
+  const prepareNativeInputForMain = async () => {
+    if (!mainNeedsInput) return null;
+    const api = require('@librechat/api');
+    const nativeBinding = api.nativeWorkInputBinding(
+      callbackBody.pending_native_input, String(callbackBody.run_id || ''),
+    );
+    if (!nativeBinding || !['question', 'permission'].includes(callbackBody.pending_native_input.kind))
+      return null;
+    const current = await require('~/server/services/viventium/GlassHiveAccountService')
+      .requestAccountApi({
+        ownerId: userId,
+        path: `/v1/work/${encodeURIComponent(deliveryContext.workRef)}`,
+      });
+    const nativeInput = current?.workRef === deliveryContext.workRef && current.state === 'needs_input'
+      ? api.nativeWorkInputMessagePresentation(current.pendingNativeInput, String(callbackBody.run_id || ''))
+      : null;
+    const offered = { version: 1, kind: callbackBody.pending_native_input.kind, binding: nativeBinding };
+    if (!nativeInput || !api.nativeWorkInputMessagePresentationMatches(offered, nativeInput.presentation))
+      return res.status(202).json({ status: 'suppressed', reason: 'native_input_request_superseded' });
+    // Carry validated current offer data to Main; response authority stays with its native owner.
+    callbackBody.pending_native_input = current.pendingNativeInput;
+    voiceTaskResolution = await runTerminalEffect((effectFence) =>
+      ensureGlassHiveVoiceTask(callbackBody, { createIfMissing: !effectFence }));
+    if (voiceTaskResolution.mismatch)
+      throw new TerminalCallbackEffectFenceError({ httpStatus: 409, error: 'voice_task_session_mismatch' });
+    if (voiceTaskResolution.task) {
+      if (await isGlassHiveVoiceTaskSuppressed(voiceTaskResolution.task))
+        return res.status(202).json({ status: 'suppressed', reason: 'voice_task_cancelled' });
+      await runTerminalEffect(() => runVoiceTaskTerminalCallbackMutation(
+        voiceTaskResolution.task.taskId, () => registerGlassHiveVoiceTaskActionCapabilities({
+          body: callbackBody, task: voiceTaskResolution.task,
+          workRef: deliveryContext.workRef, ownerId: userId,
+        })));
+    }
+    return null;
+  };
   const conversation = await db.getConvo(
     String(deliveryContext.ownerId || '').trim(),
     String(deliveryContext.conversationId || '').trim(),
@@ -1298,6 +1322,7 @@ async function handleGlassHiveCallback(req, res) {
     // deleted. Persist work truth/evidence and let Main create an account-level continuation;
     // never resurrect the deleted conversation merely to host a neutral worker card.
     try {
+      if (await prepareNativeInputForMain()) return;
       await projectTerminalVoiceTask();
       await runTerminalEffect((effectFence) =>
         reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
@@ -1324,15 +1349,11 @@ async function handleGlassHiveCallback(req, res) {
   const runOnlyTerminalEvent =
     ['run.completed', 'run.failed', 'run.cancelled', 'run.interrupted'].includes(event) &&
     !isGlassHiveWorkTerminalCallback(callbackBody);
-  const mainNeedsInput =
-    require('@librechat/api').shouldAdjudicateGlassHiveNeedsInput(callbackBody);
-  if (
-    (!STATUS_CALLBACK_EVENTS.has(event) || runOnlyTerminalEvent || mainNeedsInput) &&
-    !taskOnlyEvent
-  ) {
+  if ((!STATUS_CALLBACK_EVENTS.has(event) || runOnlyTerminalEvent || mainNeedsInput) && !taskOnlyEvent) {
     // Lifecycle-only events still drive the authoritative active-work projection. HTTP acceptance
     // means Core durably accounted for them; it must not mean "filtered before reconciliation."
     try {
+      if (await prepareNativeInputForMain()) return;
       await projectTerminalVoiceTask();
       await runTerminalEffect((effectFence) =>
         reconcileCallbackExternalWork({ deliveryContext, body: callbackBody, effectFence }),
@@ -1357,24 +1378,7 @@ async function handleGlassHiveCallback(req, res) {
   }
   // Carry only xPerfect-authored actionable text. The stored work projection stays internal;
   // native controls retain their exact run/request binding and supply the current question.
-  const pendingNativeInput = callbackBody.pending_native_input;
-  const nativeInputBinding =
-    event === 'run.needs_input'
-      ? require('@librechat/api').nativeWorkInputBinding(
-          pendingNativeInput,
-          String(callbackBody.run_id || ''),
-        )
-      : null;
-  const callbackNativeInputPresentation =
-    nativeInputBinding &&
-    ['question', 'permission'].includes(pendingNativeInput.kind) &&
-    pendingNativeInput.state === 'pending' &&
-    pendingNativeInput.mode === 'form'
-      ? { version: 1, kind: pendingNativeInput.kind, binding: nativeInputBinding }
-      : null;
-  let nativeInput = null;
-  let nativeAttentionText =
-    nativeInput?.text ||
+  const nativeAttentionText =
     (isGlassHiveNonterminalAttentionCallback(callbackBody)
       ? (event === 'run.needs_input'
           ? require('@librechat/api').sanitizeGlassHiveCallbackText
@@ -1386,7 +1390,7 @@ async function handleGlassHiveCallback(req, res) {
             '',
         )
       : '');
-  let text = nativeInput?.text || '';
+  const text = '';
   const fullText = '';
   try {
     voiceTaskResolution = await runTerminalEffect((effectFence) =>
@@ -1485,6 +1489,7 @@ async function handleGlassHiveCallback(req, res) {
     const persistedMessage = persistedCallbackMessage(messages, callbackBody);
     let deliverySummary;
     try {
+      await projectTerminalVoiceTask();
       deliverySummary = await runTerminalEffect((effectFence, effectSession) =>
         repairDuplicateSurfaceDelivery({
           body: callbackBody,
@@ -1530,49 +1535,14 @@ async function handleGlassHiveCallback(req, res) {
   // Supersession can remove that presentation; retain its ID for attribution while the existing
   // current-leaf/busy-generation path owns any new presentation. Never revive the removed reply.
   const sourceMessage = messageById(messages, requestedParentMessageId);
-  const ownedUserSourcePresent =
-    sourceMessage?.isCreatedByUser === true &&
+  const ownedUserSourcePresent = sourceMessage?.isCreatedByUser === true &&
     String(sourceMessage.user || '') === userId &&
     String(sourceMessage.conversationId || '') === conversationId;
   if (!messageById(messages, anchorMessageId) && !ownedUserSourcePresent) {
     return res.status(425).json({ error: 'callback_anchor_not_ready' });
   }
 
-  if (callbackNativeInputPresentation) {
-    let current;
-    try {
-      current =
-        await require('~/server/services/viventium/GlassHiveAccountService').requestAccountApi({
-          ownerId: userId,
-          path: `/v1/work/${encodeURIComponent(deliveryContext.workRef)}`,
-        });
-    } catch {
-      return res.status(503).json({ error: 'native_input_current_unavailable' });
-    }
-    const currentInput =
-      current?.workRef === deliveryContext.workRef && current?.state === 'needs_input'
-        ? require('@librechat/api').nativeWorkInputMessagePresentation(
-            current.pendingNativeInput,
-            String(callbackBody.run_id || ''),
-          )
-        : null;
-    if (
-      !currentInput ||
-      !require('@librechat/api').nativeWorkInputMessagePresentationMatches(
-        callbackNativeInputPresentation,
-        currentInput.presentation,
-      )
-    )
-      nativeInput = null;
-    else nativeInput = currentInput;
-  }
-  text = nativeInput?.text || '';
-  if (nativeInput) nativeAttentionText = nativeInput.text;
-  const priorStatusCandidate = latestPriorGlassHiveStatusMessage(
-    messages,
-    callbackBody,
-    nativeInput?.presentation,
-  );
+  const priorStatusCandidate = latestPriorGlassHiveStatusMessage(messages, callbackBody);
   const parentResolution = resolveCallbackTreeParentMessageId({
     messages,
     requestedParentMessageId,
@@ -1581,11 +1551,11 @@ async function handleGlassHiveCallback(req, res) {
   });
   const currentLeafMessage = parentResolution.currentLeaf?.message;
   const currentLeafId = String(parentResolution.currentLeaf?.messageId || '');
-  if (
-    parentResolution.blockedByActiveGeneration &&
-    !isGlassHiveNonterminalAttentionCallback(callbackBody)
-  ) {
-    if (!isGlassHiveWorkTerminalCallback(callbackBody)) {
+  if (parentResolution.blockedByActiveGeneration &&
+      !isGlassHiveNonterminalAttentionCallback(callbackBody)) {
+    if (
+      !isGlassHiveWorkTerminalCallback(callbackBody)
+    ) {
       return res.status(425).json({ error: 'callback_conversation_tip_not_ready' });
     }
     // The terminal result is durable independently of the conversation's active generation.
@@ -1657,7 +1627,6 @@ async function handleGlassHiveCallback(req, res) {
     previousMetadata: priorStatusMessage?.metadata,
     hasFullText: Boolean(fullText),
     deliveryContext,
-    nativeInputPresentation: nativeInput?.presentation,
   });
   if (voiceTask) {
     metadata.viventium = {

@@ -45,6 +45,7 @@ related_config:
       - worker.compiled_bootstrap
       - worker.conversation_composition
       - worker.conversation_attachment_context
+      - worker.host_mission_file_delivery
     feelings.capsule_policy:
       - feelings.numeric_kernel
       - feelings.owner_ranges
@@ -112,6 +113,12 @@ related_config:
       summary: Host conversation authority adds the registered local-file handoff contract after signed profile instructions and before the pinned Feeling tail; Docker and mission composition retain their own contracts.
       path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/conversation_provider.py
       selector: _conversation_file_delivery_instructions
+      source: worker.compiled_prompt_contract
+    worker.host_mission_file_delivery:
+      title: Host-Native Mission File Delivery
+      summary: Native host missions with declared artifact file transport compose the same registered local-file selection contract before their command and stdin. Conversation, restricted and deferred provider paths retain their existing contracts.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
+      selector: _host_mission_instruction
       source: worker.compiled_prompt_contract
     worker.conversation_attachment_context:
       title: Conversation Attachment Selection Context

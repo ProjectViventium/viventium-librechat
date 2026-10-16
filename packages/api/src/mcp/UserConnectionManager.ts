@@ -191,6 +191,35 @@ export abstract class UserConnectionManager {
     // If no valid connection exists, create a new one
     logger.info(`[MCP][User: ${userId}][${serverName}] Establishing new connection`);
 
+    /* === VIVENTIUM START ===
+     * Feature: Skip token lookup for servers explicitly known not to use OAuth.
+     * Purpose: Preserve deferred remote authentication while avoiding a needless token flow.
+     */
+    // Registry inspection can also set false when remote startup was deferred.
+    const knownNonOAuth = config.url == null;
+    const useOAuth =
+      !knownNonOAuth || config.requiresOAuth !== false || Boolean(config.oauthMetadata);
+    const contextOptions = {
+      user,
+      customUserVars,
+      allowOAuthInitiation,
+      suppressOAuthFlow,
+      requestBody,
+      connectionTimeout,
+    };
+    const connectionOptions: t.OAuthConnectionOptions | t.NonOAuthConnectionOptions = useOAuth
+      ? {
+          ...contextOptions,
+          useOAuth: true,
+          flowManager,
+          tokenMethods,
+          signal,
+          oauthStart,
+          oauthEnd,
+          returnOnOAuth,
+        }
+      : { ...contextOptions, useOAuth: false };
+    /* === VIVENTIUM END === */
     try {
       connection = await MCPConnectionFactory.create(
         {
@@ -199,21 +228,9 @@ export abstract class UserConnectionManager {
           dbSourced: !!config.dbId,
           useSSRFProtection: MCPServersRegistry.getInstance().shouldEnableSSRFProtection(),
         },
-        {
-          useOAuth: true,
-          user: user,
-          customUserVars: customUserVars,
-          flowManager: flowManager,
-          tokenMethods: tokenMethods,
-          signal: signal,
-          oauthStart: oauthStart,
-          oauthEnd: oauthEnd,
-          returnOnOAuth: returnOnOAuth,
-          allowOAuthInitiation: allowOAuthInitiation,
-          suppressOAuthFlow: suppressOAuthFlow,
-          requestBody: requestBody,
-          connectionTimeout: connectionTimeout,
-        },
+        /* === VIVENTIUM START: Preserve the typed authentication decision. === */
+        connectionOptions,
+        /* === VIVENTIUM END === */
       );
 
       if (!(await connection?.isConnected())) {

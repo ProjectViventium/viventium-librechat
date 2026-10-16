@@ -32,6 +32,9 @@ const CURRENT_RESULT_PROJECTION = {
   terminalCallbackResultDigest: 1,
   terminalCallbackResultRevision: 1,
   terminalCallbackAcceptedOperationId: 1,
+  followUpMessageId: 1,
+  dismissOperationId: 1,
+  dismissedAt: 1,
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -134,7 +137,7 @@ export function createGlassHiveActiveWorkProjectionService(
   async function currentMissionStates(
     ownerId: string,
     rows: UnknownRecord[],
-  ): Promise<Map<string, string>> {
+  ): Promise<Map<string, UnknownRecord>> {
     const identities = rows.flatMap((row) => {
       const callbackId = normalizeText(row.terminalCallbackId, 80);
       const originRef = normalizeText(row.originRef || row._id);
@@ -161,11 +164,12 @@ export function createGlassHiveActiveWorkProjectionService(
     const evidence = await missionEvidence
       .find(
         { ownerId, _id: { $in: identities.flatMap(({ id, callbackId }) => [id, callbackId]) } },
-        { projection: { ...CURRENT_RESULT_PROJECTION, ownerId: 1, runId: 1, state: 1 } },
+        { projection: { ...CURRENT_RESULT_PROJECTION, ownerId: 1, runId: 1, state: 1,
+          webPresentationMessageId: 1, webPresentedAt: 1 } },
       )
       .toArray();
     const byId = new Map(evidence.map((row) => [normalizeText(row._id), row]));
-    const states = new Map<string, string>();
+    const states = new Map<string, UnknownRecord>();
     for (const { row, originRef, callbackId, id } of identities) {
       const current = byId.get(id) || byId.get(callbackId);
       if (
@@ -183,12 +187,15 @@ export function createGlassHiveActiveWorkProjectionService(
       ) {
         continue;
       }
-      states.set(normalizeText(row.workRef), normalizeText(current.state, 32));
+      states.set(normalizeText(row.workRef), { state: normalizeText(current.state, 32),
+        followUpMessageId: normalizeText(current.followUpMessageId),
+        webPresentationMessageId: normalizeText(current.webPresentationMessageId),
+        webPresentedAt: isoDate(current.webPresentedAt) });
     }
     return states;
   }
 
-  function projectedDelivery(itemValue: unknown, rowValue?: unknown, missionState = ''): unknown {
+  function projectedDelivery(itemValue: unknown, rowValue?: unknown, missionValue?: UnknownRecord): unknown {
     const item = recordFrom(itemValue);
     if (!rowValue) {
       return item.delivery;
@@ -197,6 +204,20 @@ export function createGlassHiveActiveWorkProjectionService(
     const terminal = TERMINAL_STATES.has(normalizeText(item.state, 32));
     const deliveryState = normalizeText(row.deliveryState, 32).toLowerCase();
     const adjudicationState = normalizeText(row.adjudicationState, 32).toLowerCase();
+    const mission = recordFrom(missionValue);
+    const missionState = normalizeText(mission.state, 32);
+    const followUpMessageId = normalizeText(row.followUpMessageId);
+    const currentFollowUp = Boolean(followUpMessageId &&
+      followUpMessageId === normalizeText(mission.followUpMessageId));
+    const publicResultDelivered = currentFollowUp && (
+      ['sent', 'acknowledged'].includes(deliveryState) ||
+      (normalizeText(mission.webPresentationMessageId) === followUpMessageId &&
+        Boolean(mission.webPresentedAt)));
+    // Native pending/false is the execution owner's explicit dismissed_at projection.
+    // Main choosing silence, or transport accepting an empty notification, is not a read receipt.
+    const nativeDelivery = recordFrom(item.delivery);
+    const dismissed = Boolean(row.dismissOperationId && isoDate(row.dismissedAt)) ||
+      (nativeDelivery.state === 'pending' && nativeDelivery.unreadTerminal === false);
     const currentPending = ['pending', 'processing'].includes(missionState);
     const currentFailed = ['failed', 'delivery_pending', 'deadletter'].includes(missionState);
 
@@ -206,7 +227,7 @@ export function createGlassHiveActiveWorkProjectionService(
     } else if (currentFailed || adjudicationState === 'failed') {
       state = 'failed';
     } else if (missionState === 'silent' || adjudicationState === 'silent') {
-      state = 'silent';
+      state = publicResultDelivered ? (deliveryState === 'acknowledged' ? 'acknowledged' : 'delivered') : 'silent';
     } else if (deliveryState === 'sent') {
       state = 'delivered';
     } else if (deliveryState === 'unknown') {
@@ -226,12 +247,11 @@ export function createGlassHiveActiveWorkProjectionService(
     return {
       state,
       unreadTerminal:
-        terminal &&
-        (currentPending ||
-          currentFailed ||
-          adjudicationState === 'failed' ||
-          row.attentionPending !== false) &&
-        !['delivered', 'acknowledged', 'silent'].includes(state),
+        terminal && !dismissed && (
+          (missionState === 'silent' && !publicResultDelivered) ||
+          (!['delivered', 'acknowledged', 'silent'].includes(state) &&
+            (currentPending || currentFailed || adjudicationState === 'failed' ||
+              row.attentionPending !== false))),
     };
   }
 

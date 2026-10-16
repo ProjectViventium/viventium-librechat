@@ -66,54 +66,31 @@ describe('GlassHive active-work service', () => {
   });
 
   it('adds Core-only history on the first page without repeating it on native cursor pages', async () => {
-    const coreRows = Array.from({ length: 100 }, (_, i) => ({
-      workRef: `core-${i}`,
-      state: 'failed',
-    }));
+    const coreRows = Array.from({ length: 100 }, (_, i) => ({ workRef: `core-${i}`, state: 'failed' }));
     const nativeRows = [{ workRef: 'native-history', state: 'completed' }];
     const enrichActiveWorkSnapshot = jest.fn(async ({ snapshot, includeCoreOnlyHistory }) => ({
       ...snapshot,
       work: [...snapshot.work, ...(includeCoreOnlyHistory ? coreRows : [])],
     }));
     const service = testService({ enrichActiveWorkSnapshot });
-    const fetchImpl = jest.fn(async () =>
-      jsonResponse({
-        snapshot: 'fresh',
-        work: nativeRows,
-        cursor: 'signed.next-page',
-        overflowCount: 7,
-      }),
-    );
-    const first = await service.getActiveWorkHistoryPage({
-      ownerId: 'owner-1',
-      limit: 100,
-      fetchImpl,
-    });
+    const fetchImpl = jest.fn(async () => jsonResponse({
+      snapshot: 'fresh', work: nativeRows, cursor: 'signed.next-page', overflowCount: 7,
+    }));
+    const first = await service.getActiveWorkHistoryPage({ ownerId: 'owner-1', limit: 100, fetchImpl });
     const next = await service.getActiveWorkHistoryPage({
-      ownerId: 'owner-1',
-      cursor: 'signed.next-page',
-      limit: 100,
-      fetchImpl,
+      ownerId: 'owner-1', cursor: 'signed.next-page', limit: 100, fetchImpl,
     });
     expect(first.work).toEqual([...nativeRows, ...coreRows]);
     expect(next.work).toEqual(nativeRows);
     expect(first.cursor).toBe('signed.next-page');
     expect(next.cursor).toBe('signed.next-page');
     expect(next.overflowCount).toBe(7);
-    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        ownerId: 'owner-1',
-        includeCoreOnlyHistory: true,
-      }),
-    );
-    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        ownerId: 'owner-1',
-        includeCoreOnlyHistory: false,
-      }),
-    );
+    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      ownerId: 'owner-1', includeCoreOnlyHistory: true,
+    }));
+    expect(enrichActiveWorkSnapshot).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      ownerId: 'owner-1', includeCoreOnlyHistory: false,
+    }));
   });
 
   it('returns a cached stale snapshot when an explicit refresh is unavailable', async () => {
@@ -178,9 +155,13 @@ describe('GlassHive active-work service', () => {
         },
       });
       expect(result.snapshot).toBe(cached ? 'stale' : 'unavailable');
-      expect(logger.warn).toHaveBeenCalledWith('[VIVENTIUM][active-work] Snapshot refresh failed', {
+      const persistedMessage = jest.mocked(logger.warn).mock.calls.at(-1)?.[0] as string;
+      expect(persistedMessage).toContain('[VIVENTIUM][active-work] Snapshot refresh failed {');
+      expect(JSON.parse(persistedMessage.slice(persistedMessage.indexOf('{')))).toEqual({
         stage: 'interactive_refresh',
         errorClass: 'TimeoutError',
+        code: null,
+        httpStatus: null,
         elapsedMs: expect.any(Number),
       });
       expect(JSON.stringify(jest.mocked(logger.warn).mock.calls)).not.toContain(
@@ -191,6 +172,27 @@ describe('GlassHive active-work service', () => {
       );
     },
   );
+  it.each([true, false])('logs bounded typed cause without raw failure content: %s', async (typed) => {
+    const service = testService();
+    jest.mocked(logger.warn).mockClear();
+    const failure = Object.assign(new Error('private transport response and secret path'), {
+      code: typed ? 'scope_not_ready' : 'private/token/value',
+      status: typed ? 503 : 1000,
+      name: typed ? 'Error' : 'private/error/path',
+    });
+    const result = await service.getActiveWorkInteractiveSnapshot({
+      ownerId: 'owner-private', fetchImpl: async () => { throw failure; },
+    });
+    expect(result.snapshot).toBe('unavailable');
+    const persistedMessage = jest.mocked(logger.warn).mock.calls.at(-1)?.[0] as string;
+    const diagnostic = JSON.parse(persistedMessage.slice(persistedMessage.indexOf('{')));
+    expect(diagnostic).toMatchObject({
+      stage: 'interactive_refresh', errorClass: typed ? 'Error' : 'unknown_error',
+      code: typed ? 'scope_not_ready' : null, httpStatus: typed ? 503 : null,
+    });
+    expect(persistedMessage.length).toBeLessThan(300);
+    expect(persistedMessage).not.toContain('private');
+  });
 });
 
 function testService(overrides: Partial<ActiveWorkServiceDependencies> = {}) {
@@ -272,9 +274,13 @@ describe('owner-scoped active-work refresh deadlines', () => {
     });
     expect(signal?.aborted).toBe(false);
     expect(AbortSignal.timeout).toHaveBeenCalledWith(5000);
-    expect(logger.warn).toHaveBeenCalledWith('[VIVENTIUM][active-work] Snapshot wait expired', {
+    const persistedMessage = jest.mocked(logger.warn).mock.calls.at(-1)?.[0] as string;
+    expect(persistedMessage).toContain('[VIVENTIUM][active-work] Snapshot wait expired {');
+    expect(JSON.parse(persistedMessage.slice(persistedMessage.indexOf('{')))).toEqual({
       stage: 'snapshot_wait',
       errorClass: 'TimeoutError',
+      code: 'glasshive_active_work_wait_timeout',
+      httpStatus: null,
       elapsedMs: 100,
     });
     expect(fetchImpl).toHaveBeenCalledTimes(1);

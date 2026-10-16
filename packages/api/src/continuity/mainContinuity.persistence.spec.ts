@@ -199,7 +199,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -233,6 +233,33 @@ describe('native Main acceptance projection', () => {
     });
     return turn;
   }
+
+  it('holds Mongo source on an invented reviewed identity then promotes a valid candidate on the same lease', async () => {
+    const runtime = service();
+    for (let n = 0; n < 4; n++) await runtime.commitAcceptedMainTurn(await presentation(`typed-${n}`));
+    const claim = await runtime.claimAcceptedMainCompaction(identity);
+    expect(claim.status).toBe('claimed');
+    const valid = { version: 1 as const, summary: 'The valid synthetic requests were accepted.',
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
+    const invented = { ...valid, toolPairs: [{ callId: 'call_invented', toolName: 'read_record', outcome: 'Invented result.' }] };
+    const approve = (candidate: typeof valid | typeof invented) => ({ version: 1, approved: true,
+      sourceDigest: claim.sourceDigest, candidateDigest: mainCompactionCandidateDigest(candidate),
+      outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract) });
+    expect(await runtime.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: invented, semanticReview: approve(invented) }))
+      .toMatchObject({ status: 'invalid_summary', reason: 'schema_invalid' });
+    expect((await history()).count).toBe(4);
+    const held = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(held?.semanticCompaction).toBeNull();
+    expect(held?.compactionLease?.leaseId).toBe(claim.leaseId);
+    expect(await runtime.completeAcceptedMainCompaction({ ...identity, ...claim,
+      semanticCompaction: valid, semanticReview: approve(valid) })).toMatchObject({ status: 'compacted' });
+    const promoted = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(promoted?.summarizedThrough).toBeGreaterThan(0);
+    expect(promoted?.semanticCompaction?.summary).toBe(valid.summary);
+    expect((await history()).count).toBe(4);
+  });
 
   it('hydrates retained scheduled results from exact typed parent provenance without user authority', async () => {
     for (let index = 0; index < 4; index++) await acceptedScheduledSource(`scheduled-${index}`);
@@ -405,7 +432,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });
@@ -561,7 +588,7 @@ describe('native Main acceptance projection', () => {
             approved: true,
             sourceDigest: claim.sourceDigest,
             candidateDigest: mainCompactionCandidateDigest(candidate),
-            outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
           },
         }),
       ).toMatchObject({ status: 'compacted' });
@@ -732,7 +759,7 @@ describe('native Main acceptance projection', () => {
           approved: true,
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(candidate!),
-          outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
         },
       }),
     ).toMatchObject({ status: 'compacted' });

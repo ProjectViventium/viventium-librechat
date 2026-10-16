@@ -59,12 +59,13 @@ jest.mock('../ModelParametersSection', () => ({
 
 let formMethods: UseFormReturn<AgentForm>;
 
-function Wrapper() {
+function Wrapper({ tiers, configuredTier }: { tiers?: string[]; configuredTier?: string } = {}) {
   formMethods = useForm<AgentForm>({
     defaultValues: {
       voice_llm_provider: 'glasshive-harness',
       voice_llm_model: 'codex-cli:gpt-5.6-sol',
-      voice_llm_model_parameters: { reasoning_effort: 'low' },
+      voice_llm_model_parameters: { reasoning_effort: 'low', service_tier: configuredTier },
+      model_parameters: { reasoning_effort: 'high' },
     },
   });
   return (
@@ -85,6 +86,7 @@ function Wrapper() {
                   label: 'Codex / GPT-5.6 Sol',
                   effortChoices: ['low', 'medium', 'high'],
                   recommendedEffort: 'medium',
+                  serviceTierChoices: tiers,
                 },
               ],
             },
@@ -125,5 +127,26 @@ describe('OptionalLlmPanel capability-backed voice route', () => {
         access: 'full',
       });
     });
+  });
+  it('saves Fast only on the selected Voice route and preserves the default when cleared', () => {
+    render(<Wrapper tiers={['default', 'priority']} />);
+    const speed = screen.getByLabelText('com_ui_model_speed');
+    expect(speed).toHaveValue('');
+    fireEvent.change(speed, { target: { value: 'priority' } });
+    expect(formMethods.getValues('voice_llm_model_parameters.service_tier')).toBe('priority');
+    expect(formMethods.getValues('model_parameters')).toEqual({ reasoning_effort: 'high' });
+    fireEvent.change(speed, { target: { value: '' } });
+    expect(formMethods.getValues('voice_llm_model_parameters.service_tier')).toBeUndefined();
+  });
+
+  it('does not offer speed when the model capability does not advertise it', () => {
+    render(<Wrapper />);
+    expect(screen.queryByLabelText('com_ui_model_speed')).not.toBeInTheDocument();
+  });
+
+  it('preserves an explicit existing tier instead of silently replacing it', () => {
+    render(<Wrapper tiers={['default', 'priority']} configuredTier="auto" />);
+    expect(screen.getByLabelText('com_ui_model_speed')).toHaveValue('auto');
+    expect(formMethods.getValues('voice_llm_model_parameters.service_tier')).toBe('auto');
   });
 });

@@ -2,6 +2,11 @@ import axios from 'axios';
 import { EModelEndpoint, defaultModels } from 'librechat-data-provider';
 import {
   fetchModels,
+  getNativeConversationReplayBudget,
+  getNativeConversationReplayBudgetForRoutes,
+  nativeConversationHistoryFits,
+  nativeConversationContextBudget,
+  nativeHistoryAttachmentContextBytes,
   splitAndTrim,
   getOpenAIModels,
   getGoogleModels,
@@ -652,3 +657,179 @@ describe('getBedrockModels', () => {
     expect(models).toEqual(['anthropic.claude-v2', 'ai21.j2-ultra']);
   });
 });
+
+
+describe('cached native history admission floor', () => {
+  const { standardCache } = jest.requireMock('~/cache');
+  const cache = standardCache.mock.results[0].value;
+  it('retains only valid native floors from the authenticated existing catalog fetch', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { data: [
+      { id: 'large', native_history_admission_v1: { replay_budget_floor_bytes: 196608 } },
+      { id: 'small', native_history_admission_v1: { replay_budget_floor_bytes: 32768 } },
+      { id: 'invalid', native_history_admission_v1: { replay_budget_floor_bytes: '900000' } },
+    ] } });
+    await fetchModels({ apiKey: 'synthetic', name: 'native', baseURL: 'https://native.example/v1' });
+    const [key, value] = cache.set.mock.calls.at(-1);
+    expect(key).toMatch(/^native-history-admission:[a-f0-9]{64}$/);
+    expect(value).toEqual({ large: 196608, small: 32768 });
+    expect(key).not.toContain('synthetic');
+    cache.get.mockImplementation(async (requested: string) => requested === key ? value : undefined);
+    mockedAxios.get.mockClear();
+    expect(await getNativeConversationReplayBudgetForRoutes([
+      { provider: 'native', model: 'large' }, { provider: 'native', model: 'small' },
+    ], [{ name: 'native', baseURL: 'https://native.example/v1/' }])).toBe(32768);
+    expect(await getNativeConversationReplayBudget('native', 'https://other.example/v1', 'large')).toBeNull();
+    expect(await getNativeConversationReplayBudgetForRoutes([
+      { provider: 'native', model: 'unknown' },
+    ], [{ name: 'native', baseURL: 'https://native.example/v1' }])).toBeNull();
+    expect(mockedAxios.get).not.toHaveBeenCalled();
+  });
+  it('uses the configured primary/fallback minimum without a second host clamp or network call', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { data: [
+      { id: 'codex-cli:gpt-6.1-sol', native_history_admission_v1: { replay_budget_floor_bytes: 237500 } },
+      { id: 'claude-code:claude-opus-5-5', native_history_admission_v1: { replay_budget_floor_bytes: 500000 } },
+      { id: 'operator-capped', native_history_admission_v1: { replay_budget_floor_bytes: 65536 } },
+    ] } });
+    await fetchModels({ apiKey: 'synthetic', name: 'native', baseURL: 'https://native.example/v1' });
+    const [key, value] = cache.set.mock.calls.at(-1);
+    cache.get.mockImplementation(async (requested: string) => requested === key ? value : undefined);
+    mockedAxios.get.mockClear();
+    const endpoints = [{ name: 'native', baseURL: 'https://native.example/v1' }];
+    const routes = [{ provider: 'native', model: 'codex-cli:gpt-6.1-sol' },
+      { provider: 'native', model: 'claude-code:claude-opus-5-5' }];
+    expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints)).toBe(237500);
+    expect(await getNativeConversationReplayBudgetForRoutes([
+      ...routes, { provider: 'native', model: 'operator-capped' },
+    ], endpoints)).toBe(65536);
+    expect(await getNativeConversationReplayBudgetForRoutes([
+      ...routes, { provider: 'native', model: 'unknown' },
+    ], endpoints)).toBeNull();
+    expect(mockedAxios.get).not.toHaveBeenCalled();
+  });
+  it('counts replay data while excluding separately configured native static instructions', () => {
+    const visible = [{ role: 'user', content: 'Original words.'.repeat(5000) }];
+    const messages = [{ role: 'system', content: 'Static native configuration.'.repeat(30000) }, ...visible];
+    expect(nativeConversationHistoryFits(messages, 196608, 94000, 1000)).toBe(true);
+    expect(nativeConversationHistoryFits(messages, 32768, 94000, 1000)).toBe(false);
+    expect(nativeConversationHistoryFits([{ role: 'user', content: 'x'.repeat(253319) }], 196608, 0)).toBe(false);
+    expect(nativeConversationHistoryFits([{ role: 'user', content: 'x'.repeat(173280) }], 196608, 94000)).toBe(false);
+    expect(nativeConversationHistoryFits(messages, NaN, 0)).toBe(false);
+    expect(nativeConversationHistoryFits(messages, 196608, -1)).toBe(false);
+  });
+});
+
+
+test('native upload allowance counts metadata and duplicate paths without copying extracted document text', () => {
+  const source = { file_id: '1'.repeat(36), filename: 'A long drawing.svg', type: 'image/svg+xml',
+    source: 'local', bytes: 123, text: 'Private extracted body.'.repeat(10000) };
+  const bytes = nativeHistoryAttachmentContextBytes([source]);
+  expect(bytes).toBeGreaterThan(Buffer.byteLength(JSON.stringify({ file_id: source.file_id,
+    filename: source.filename, type: source.type, source: source.source, bytes: source.bytes })));
+  expect(bytes).toBeLessThan(2000);
+  expect(nativeHistoryAttachmentContextBytes([])).toBe(0);
+});
+
+
+test('native charged-field sizing leaves non-rendered original tool/display evidence unchanged', () => {
+  const messages = [{ role: 'assistant', content: [{ type: 'text', text: 'Original answer.' },
+    { type: 'tool_call', tool_call: { id: 'call-1', args: { full: 'evidence'.repeat(100000) }, output: 'Whole result.' } }],
+    tool_calls: [{ id: 'call-1', function: { name: 'tool', arguments: 'evidence'.repeat(100000) } }] }];
+  const before = JSON.stringify(messages);
+  expect(nativeConversationHistoryFits(messages, 32768, 1000)).toBe(true);
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+
+test.each(['image_url', 'input_image', 'file', 'input_file'])(
+  'native %s admission charges its rendered label, preserving the original media bytes', type => {
+    const source = [{ role: 'user', content: [{ type, name: 'A \"quoted\" é label',
+      image_url: { url: 'data:image/png;base64,' + Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(300000)]).toString('base64') },
+      file_data: 'b'.repeat(300000) }] }];
+    const original = JSON.stringify(source);
+    expect(nativeConversationHistoryFits(source, 196608, 131072)).toBe(true);
+    expect(JSON.stringify(source)).toBe(original);
+    source[0].content[0].name = 'z'.repeat(70000);
+    expect(nativeConversationHistoryFits(source, 196608, 131072)).toBe(false);
+  },
+);
+
+test.each([
+  { type: 'image_url' }, { type: 'input_image', name: '', filename: 'Fallback name' },
+  { type: 'file', name: 0, filename: 'Zero uses fallback' },
+  { type: 'input_file', name: false, filename: 'False uses fallback' },
+])('native media label fallback matches the native reader (%j)', part => {
+  expect(nativeConversationHistoryFits([{ role: 'user', content: [part] }], 196608, 131072)).toBe(true);
+});
+
+test.each([7, true, {}, [], ['label']])('non-string native media label %j cannot claim a capacity proof', name => {
+  expect(nativeConversationHistoryFits([{ role: 'user', content: [{ type: 'file', name }] }],
+    196608, 131072)).toBe(false);
+});
+
+
+describe('native replay media admission retains existing media capacity guards', () => {
+  const image = (bytes = 16) => ({ type: 'image_url', image_url: { url: 'data:image/png;base64,' +
+    Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(bytes - 8)]).toString('base64') } });
+  const fits = (parts: unknown[]) => nativeConversationHistoryFits([{ role: 'user', content: parts }], 196608, 131072);
+  test('two valid historical images fit, while25 retain foreground reconciliation', () => {
+    expect(fits([image(), image()])).toBe(true);
+    expect(fits(Array.from({ length: 25 }, () => image()))).toBe(false);
+  });
+  test('the existing per-image and total native media limits still bound a positive fit', () => {
+    expect(fits([image(8 * 1024 * 1024)])).toBe(true);
+    expect(fits([image(8 * 1024 * 1024 + 1)])).toBe(false);
+    expect(fits(Array.from({ length: 4 }, () => image(8 * 1024 * 1024)))).toBe(true);
+    expect(fits([...Array.from({ length: 4 }, () => image(8 * 1024 * 1024)), image()])).toBe(false);
+  });
+  test.each(['data:image/png;base64,broken', 'data:image/png;base64,YQ==',
+    'data:image/unknown;base64,iVBORw0KGgo=', 'data:image/png,notbase64'])('invalid native inline media cannot claim fit (%s)', url => {
+    expect(fits([{ type: 'image_url', image_url: { url } }])).toBe(false);
+  });
+  test('remote references and non-image file blocks retain native owner semantics', () => {
+    expect(fits([{ type: 'image_url', image_url: { url: 'https://example.invalid/image.png' } },
+      { type: 'file', file_data: 'Original bytes unchanged.' }])).toBe(true);
+  });
+});
+
+/* === VIVENTIUM START === One native aggregate owns history and dynamic context allocation. === */
+describe('native context allocation from retained source cost', () => {
+  const messages = [{ role: 'user', content: 'é🙂 retained source\n'.repeat(300) },
+    { role: 'assistant', content: 'Quoted evidence must remain intact.' }];
+  test('reserves exact UTF-8, JSON escaping, headings and attachment metadata before allocating context', () => {
+    const source = JSON.stringify(messages);
+    const budget = 196608;
+    const expected = budget - Buffer.byteLength(source) - messages.length * 128 - 4096 - 15267;
+    const remaining = nativeConversationContextBudget(messages, budget, 15267);
+    expect(remaining).toBe(expected);
+    expect(remaining).toBeGreaterThan(128 * 1024);
+    expect(nativeConversationHistoryFits(messages, budget, expected, 15267)).toBe(true);
+    expect(nativeConversationHistoryFits(messages, budget, expected + 1, 15267)).toBe(false);
+    expect(JSON.stringify(messages)).toBe(source);
+  });
+  test('the native model floor carries a complete long-conversation capsule that the old clamp rejected', () => {
+    // Synthetic byte sizes: protected memory + full recent turns + required context peers.
+    const retained = [{ role: 'user', content: 'é🙂'.repeat(4000) }];
+    const source = JSON.stringify(retained);
+    const metadataBytes = 42158 - Buffer.byteLength(source) - retained.length * 128 - 4096;
+    const completeContext = 'é🙂'.repeat(25000) + 'x'.repeat(5688);
+    const contextBytes = Buffer.byteLength(completeContext);
+    expect(contextBytes).toBe(155688);
+    expect(nativeConversationContextBudget(retained, 196608, metadataBytes)).toBe(154450);
+    expect(nativeConversationContextBudget(retained, 237500, metadataBytes)).toBe(195342);
+    expect(nativeConversationHistoryFits(retained, 196608, contextBytes, metadataBytes)).toBe(false);
+    expect(nativeConversationHistoryFits(retained, 237500, contextBytes, metadataBytes)).toBe(true);
+    expect(nativeConversationHistoryFits(retained, 65536, contextBytes, metadataBytes)).toBe(false);
+    expect(nativeConversationHistoryFits(retained, NaN, contextBytes, metadataBytes)).toBe(false);
+    expect(JSON.stringify(retained)).toBe(source);
+    expect(Buffer.byteLength(completeContext)).toBe(contextBytes);
+  });
+  test('unknown, invalid media and oversized source do not produce a positive allocation', () => {
+    expect(nativeConversationContextBudget(messages, NaN)).toBeNull();
+    expect(nativeConversationContextBudget(messages, 196608, -1)).toBeNull();
+    expect(nativeConversationContextBudget([{ role: 'user', content: [{ type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AAAA' } }] }], 196608)).toBeNull();
+    expect(nativeConversationContextBudget(messages, 1)).toBeLessThan(0);
+    expect(nativeConversationHistoryFits(messages, 1, 0)).toBe(false);
+  });
+});
+/* === VIVENTIUM END === */

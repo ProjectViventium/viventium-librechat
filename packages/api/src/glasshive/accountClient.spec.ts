@@ -183,3 +183,50 @@ describe('GlassHive account client', () => {
     expect(claims.owner_id).toBe('owner-1');
   });
 });
+
+describe('account transport deadline classification', () => {
+  beforeEach(() => {
+    process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://127.0.0.1:8766/v1';
+    process.env.VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET = 'synthetic-service-secret';
+    process.env.WPR_API_TOKEN = 'synthetic-api-token';
+  });
+  afterAll(() => { process.env = originalEnv; });
+  test.each(['headers', 'body'])('reports a timed-out mutation during %s as unconfirmed', async (phase) => {
+    const controller = new AbortController();
+    jest.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(controller.signal);
+    const expire = async () => {
+      controller.abort(new DOMException('Synthetic deadline', 'TimeoutError'));
+      throw controller.signal.reason;
+    };
+    const fetchImpl = jest.fn(async () => {
+      if (phase === 'headers') return expire();
+      const response = new Response('{}', { headers: { 'Content-Type': 'application/json' } });
+      jest.spyOn(response, 'text').mockImplementation(expire);
+      return response;
+    });
+    await expect(requestAccountApi({ ownerId: 'owner-1', path: '/v1/work/work-1/actions',
+      method: 'POST', body: { action: 'steer', idempotencyKey: 'operation-1' }, fetchImpl }))
+      .rejects.toMatchObject({ code: 'glasshive_account_request_timeout', status: 504, outcomeUnknown: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('immutable failed action receipt provenance', () => {
+  beforeEach(() => {
+    process.env.GLASSHIVE_PROVIDER_BASE_URL='http://127.0.0.1:8766/v1';
+    process.env.VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET='synthetic-service-secret';
+    process.env.WPR_API_TOKEN='synthetic-api-token';
+  });
+  afterAll(() => {process.env=originalEnv;});
+  test.each([['/v1/work/work-1/actions/receipt','failed-v1',true],['/v1/work/work-1/actions/receipt','',false],
+    ['/v1/work/work-1/actions/receipt','unknown',false],['/v1/work/work-1/actions','failed-v1',false]])(
+    'marks only native immutable receipt error at %s with %s',async(path,marker,authoritative)=>{
+      const body={detail:{code:'synthetic_native_failed',message:'Synthetic action failed.'}};
+      const fetchImpl=jest.fn(async()=>new Response(JSON.stringify(body),{status:503,
+        headers:{'Content-Type':'application/json','X-xPerfect-Action-Receipt':String(marker)}}));
+      try{await requestAccountApi({ownerId:'owner-1',path:String(path),method:'POST',fetchImpl});throw new Error('Expected rejection');}
+      catch(error){expect(error).toMatchObject({code:'synthetic_native_failed',status:503,body});
+        expect((error as {actionReceipt?:string}).actionReceipt).toBe(authoritative?'immutable_failure':undefined);}
+    });
+});

@@ -2,7 +2,7 @@
 id: main.continuity_compaction
 owner_layer: viventium_main_continuity
 target: runtime.main_continuity.compaction
-version: 3
+version: 5
 status: active
 safety_class: public_product
 required_context:
@@ -39,8 +39,12 @@ Incidental examples need not persist; newer accepted evidence can correct or ret
 Meet the supplied outputConstraints. Material references may remain verbatim within the summary
 or other category strings when a separate list entry would exceed an array limit. Compress
 wording rather than remove consequential evidence or qualifications. Do not invent missing facts.
-If priorRejection is present, use its structural details or fidelity reason to repair the proposal
-against the actual source evidence.
+If priorRejection is present, treat it as process feedback, not conversation evidence. Do not
+record this rejection, compaction attempts or their review as conversation history. When
+priorRejection.candidate is supplied, repair the cited defect against the actual source evidence,
+and carry every other part of that candidate over unchanged unless the source requires a change.
+When no candidate is supplied, regenerate from the complete source evidence under outputConstraints
+and the cited feedback. An omitted draft is not missing source evidence or permission to omit facts.
 
 <untrusted_conversation_data_v1>
 {{evidence_json}}

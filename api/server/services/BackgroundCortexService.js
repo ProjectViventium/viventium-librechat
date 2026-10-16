@@ -1922,7 +1922,7 @@ function shouldRetryCortexResultWithFallback(result) {
   );
 }
 
-const BACKGROUND_CORTEX_CANCELLATION_REASONS = new Set(['user_cancelled', 'maintenance_yield']);
+const BACKGROUND_CORTEX_CANCELLATION_REASONS = new Set(['user_cancelled', 'maintenance_yield', 'compaction_lease_lost']);
 
 function isBackgroundCortexCancellationSignal(signal) {
   return signal?.aborted === true && BACKGROUND_CORTEX_CANCELLATION_REASONS.has(signal.reason);
@@ -2016,20 +2016,21 @@ function buildCompletionInputFromActivation({
       cortexAgent?.name ||
       activationResult.cortexName ||
       activationResult.agentId,
-    insight: cancellationApplies ? null : (result?.insight ?? null),
+    insight: cancellationApplies ? null : result?.insight ?? null,
     cancelled: cancellationApplies && !cancellationUnconfirmed,
     error: cancellationUnconfirmed
       ? 'Native request release is unconfirmed.'
       : cancellationApplies
         ? null
         : error || result?.error || null,
-    errorClass: cancellationUnconfirmed
-      ? 'background_agent_error'
-      : errorClass ||
-        result?.errorClass ||
-        result?.error_class ||
-        activationResult.errorClass ||
-        null,
+    errorClass:
+      cancellationUnconfirmed
+        ? 'background_agent_error'
+        : errorClass ||
+          result?.errorClass ||
+          result?.error_class ||
+          activationResult.errorClass ||
+          null,
     activationScope: result?.activationScope || activationResult.activationScope || null,
     configuredTools: result?.configuredTools || 0,
     completedToolCalls: result?.completedToolCalls || 0,
@@ -3507,9 +3508,7 @@ ${activationFormat}`;
           abortController: attemptAbortController,
         });
         const { responseText, parsed } = await Promise.race(
-          [classifierAttemptPromise, attemptDeadlinePromise, ownerCancellationPromise].filter(
-            Boolean,
-          ),
+          [classifierAttemptPromise, attemptDeadlinePromise, ownerCancellationPromise].filter(Boolean),
         );
 
         if (shouldLogActivationPrompt()) {
@@ -3774,6 +3773,7 @@ async function prepareCortexConversationProviderCapability({
   requestBody,
   nativeTools,
   privateStructuredResponse = false,
+  deferUntilInvocation = false,
   signal = null,
   cancellationReq = req,
   attachBundle = attachConversationProviderCapabilityBundle,
@@ -3805,16 +3805,14 @@ async function prepareCortexConversationProviderCapability({
     modelParameters.configuration = configuration;
     targetAgent.model_parameters = modelParameters;
   }
-  const args = {
-    targetAgent,
-    declaredAgent,
-    req,
-    capability,
-    requestBody,
+  const args = { targetAgent, declaredAgent, req, capability, requestBody,
     ...(nativeTools !== undefined ? { nativeTools } : {}),
     ...(privateStructuredResponse ? { privateStructuredResponse: true } : {}),
   };
-  const attached = await attachBundle(args);
+  const invocationRefreshInstalled = deferUntilInvocation === true && installRefresher(args) === true;
+  const attached = await attachBundle({ ...args,
+    ...(invocationRefreshInstalled ? { deferUntilInvocation: true } : {}),
+  });
   const idempotencyKey = String(requestBody?.viventiumGlassHiveIdempotencyKey || '').trim();
   if (cancellationReq && idempotencyKey) {
     cancellationReq._viventiumHarnessExecutionEnabled = capability?.workspace_binding === true;
@@ -3841,7 +3839,7 @@ async function prepareCortexConversationProviderCapability({
       });
     }
   }
-  installRefresher(args);
+  if (deferUntilInvocation !== true) installRefresher(args);
   return attached;
 }
 
@@ -4002,6 +4000,7 @@ async function runCortexAttempt(
     resultEvidence = null,
     resultEvidencePolicy = null,
     onHarnessCancellationOutcome = null,
+    onNativeAdmission = null,
   },
   {
     initializeAgentFn = initializeAgent,
@@ -4083,7 +4082,8 @@ async function runCortexAttempt(
       Number.isFinite(executionTimeoutMs) && executionTimeoutMs > 0
         ? Math.floor(executionTimeoutMs)
         : getCortexExecutionTimeoutMs();
-    if (effectiveExecutionTimeoutMs > 0) {
+    const armExecutionDeadline = (timeoutMs) => {
+      if (abortTimer) clearTimeout(abortTimer);
       abortTimer = setTimeout(() => {
         try {
           /* === VIVENTIUM START ===
@@ -4098,8 +4098,9 @@ async function runCortexAttempt(
         } catch (_e) {
           // Ignore abort errors; we just need the run to unwind.
         }
-      }, effectiveExecutionTimeoutMs);
-    }
+      }, timeoutMs);
+    };
+    if (effectiveExecutionTimeoutMs > 0) armExecutionDeadline(effectiveExecutionTimeoutMs);
     /* === VIVENTIUM START ===
      * Fix: The guard that stops waiting for this attempt aborts it; the attempt then records the
      * deadline as its cause and can no longer accept a result.
@@ -4615,15 +4616,14 @@ async function runCortexAttempt(
     await prepareCapabilityFn({
       targetAgent: initializedAgent,
       declaredAgent: agentForRun,
+      deferUntilInvocation: true,
       req: harnessInvocationReq,
       capability: cortexCapability,
       requestBody: cortexRequestBody,
       nativeTools,
       // Private structured state is owned by the internal result consumer, never a user reply.
       privateStructuredResponse:
-        completedResultPolicy === 'internal' &&
-        insightMode === 'structured' &&
-        nativeTools === false,
+        completedResultPolicy === 'internal' && insightMode === 'structured' && nativeTools === false,
       signal: abortController.signal,
       cancellationReq: cortexCancellationReq,
     });
@@ -4640,6 +4640,23 @@ async function runCortexAttempt(
               effectiveExecutionTimeoutMs > 0 ? startTime + effectiveExecutionTimeoutMs : undefined,
             streamId: safeReq._resumableStreamId || safeReq.body?.streamId || runId,
             role: 'cortex',
+            ...(completedResultPolicy === 'internal' && insightMode === 'structured' &&
+                nativeTools === false && cortexCapability?.conversation_session === true &&
+                typeof onNativeAdmission === 'function' ? {
+              onAdmitted: async (receipt) => {
+                const accepted = !abortController.signal.aborted &&
+                  await onNativeAdmission(receipt) === true && !abortController.signal.aborted;
+                logger.info(`[VIVENTIUM][main-continuity] Native deadline admission ${JSON.stringify({
+                  requestHash: crypto.createHash('sha256').update(receipt.requestId).digest('hex').slice(0, 16),
+                  admittedDeadline: receipt.responseDeadlineAt, accepted,
+                  reason: accepted ? 'accepted' : abortController.signal.aborted ? 'late' : 'declined',
+                })}`);
+                if (!accepted) return;
+                const remainingMs = Date.parse(receipt.responseDeadlineAt) +
+                  getCortexExecutionGuardGraceMs() - Date.now();
+                if (remainingMs > 0 && remainingMs <= 2_147_483_647) armExecutionDeadline(remainingMs);
+              },
+            } : {}),
           }),
         },
       };
@@ -6619,6 +6636,7 @@ module.exports = {
   buildActivationLlmConfig,
   buildActivationProviderAttempts,
   getCortexAttemptGuardTimeoutMs,
+  getCortexExecutionGuardGraceMs,
   resolveBackgroundCortexFallbackAgent,
   sanitizeOpenAIReasoningSampling,
   buildActivationCooldownKey,

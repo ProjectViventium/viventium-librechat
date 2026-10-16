@@ -200,7 +200,7 @@ export function nativeQuestionFormFromSchema(value: unknown): NativeQuestionForm
         ![1, field.items.enum.length].includes(field.maxItems),
     ) ||
     Object.keys(properties.annotations.properties).length !== entries.length ||
-    entries.some(([key]) => !Object.hasOwn(properties.annotations.properties, key))
+    entries.some(([key]) => !Object.prototype.hasOwnProperty.call(properties.annotations.properties, key))
   )
     return null;
   return {
@@ -240,7 +240,7 @@ export function nativeQuestionContent(
       return null;
   }
   for (const key of Object.keys(content.annotations || {}))
-    if (!Object.hasOwn(content.answers, key) || !content.answers[key]?.includes('Other'))
+    if (!Object.prototype.hasOwnProperty.call(content.answers, key) || !content.answers[key]?.includes('Other'))
       return null;
   return content;
 }

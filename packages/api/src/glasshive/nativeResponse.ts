@@ -37,6 +37,8 @@ type NativeRecoveredResponse = Omit<
 /* === VIVENTIUM START ===
  * Fix: Phase B writes its cortex lifecycle parts onto the same answer row while the answer's
  * evidence is read. They are not the answer, so they cannot make an unchanged answer look replaced.
+ * The same native activity also has legacy think and canonical activity representations; use
+ * the existing finalization projection before comparing, retaining its summary and tool content.
  * === VIVENTIUM END === */
 const CORTEX_LIFECYCLE_PARTS = new Set<string>([
   ContentTypes.CORTEX_ACTIVATION,
@@ -45,7 +47,7 @@ const CORTEX_LIFECYCLE_PARTS = new Set<string>([
 ]);
 function nativeAnswerDigest(row: { text?: unknown; content?: unknown }): string {
   const content = Array.isArray(row.content)
-    ? row.content.filter((part) => !CORTEX_LIFECYCLE_PARTS.has(part?.type))
+    ? convertHarnessActivityParts(row.content.filter((part) => !CORTEX_LIFECYCLE_PARTS.has(part?.type)))
     : row.content;
   return nativeResponseDigest({ text: row.text, content });
 }
@@ -704,12 +706,14 @@ export function createNativeCapacityFetch(
     streamId,
     role,
     waitForOccupiedSession,
+    onAdmitted,
   }: {
     signal?: AbortSignal;
     deadlineAt?: number;
     streamId?: string;
     role?: 'main' | 'cortex';
     waitForOccupiedSession?: boolean;
+    onAdmitted?: (receipt: { requestId: string; responseDeadlineAt: string }) => void | Promise<void>;
   },
 ): MainContinuityFetch {
   return async (input, init) => {
@@ -720,9 +724,7 @@ export function createNativeCapacityFetch(
       init = { ...init, headers: init?.headers || input.headers, body: await input.clone().text() };
     }
     const transportSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const signals = [signal, transportSignal].filter((value): value is AbortSignal =>
-      Boolean(value),
-    );
+    const signals = [signal, transportSignal].filter((value): value is AbortSignal => Boolean(value));
     const dispatch = {
       ...init,
       signal: (
@@ -730,7 +732,7 @@ export function createNativeCapacityFetch(
       ).any(signals),
     };
     const startedAt = Date.now();
-    return recoverNativeCapacityResponse(
+    const response = await recoverNativeCapacityResponse(
       await baseFetch(input, dispatch),
       () => baseFetch(input, dispatch),
       {
@@ -742,6 +744,21 @@ export function createNativeCapacityFetch(
         waitForOccupiedSession,
       },
     );
+    const requestId = response.headers.get('X-GlassHive-Request-Id')?.trim();
+    const responseDeadlineAt = response.headers.get('X-GlassHive-Response-Deadline-At')?.trim();
+    if (onAdmitted) {
+      const deadlineMs = Date.parse(responseDeadlineAt || '');
+      const reason = !response.ok ? 'not_admitted' : !requestId || !responseDeadlineAt ? 'missing' :
+        requestId.length > 256 || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(responseDeadlineAt) ||
+        !Number.isFinite(deadlineMs) ? 'invalid' : deadlineMs <= Date.now() ? 'late' : null;
+      if (!reason) await onAdmitted({ requestId: requestId!, responseDeadlineAt: responseDeadlineAt! });
+      else logger.info(`[VIVENTIUM][main-continuity] Native deadline admission ${JSON.stringify({
+        requestHash: requestId && requestId.length <= 256 ? nativeResponseSha256(requestId).slice(0, 16) : null,
+        admittedDeadline: Number.isFinite(deadlineMs) ? new Date(deadlineMs).toISOString() : null,
+        accepted: false, reason,
+      })}`);
+    }
+    return response;
   };
 }
 

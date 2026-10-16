@@ -51,7 +51,9 @@ export class MCPConnectionFactory {
   /** Creates a new MCP connection with optional OAuth support */
   static async create(
     basic: t.BasicConnectionOptions,
-    oauth?: t.OAuthConnectionOptions,
+    /* === VIVENTIUM START: Preserve non-OAuth request context without token flow. === */
+    oauth?: t.OAuthConnectionOptions | t.NonOAuthConnectionOptions,
+    /* === VIVENTIUM END === */
   ): Promise<MCPConnection> {
     const factory = new this(basic, oauth);
     return factory.createConnection();
@@ -190,7 +192,12 @@ export class MCPConnectionFactory {
     return null;
   }
 
-  protected constructor(basic: t.BasicConnectionOptions, oauth?: t.OAuthConnectionOptions) {
+  /* === VIVENTIUM START: Typed connection context for both authentication branches. === */
+  protected constructor(
+    basic: t.BasicConnectionOptions,
+    oauth?: t.OAuthConnectionOptions | t.NonOAuthConnectionOptions,
+  ) {
+    /* === VIVENTIUM END === */
     this.serverConfig = processMCPEnv({
       user: oauth?.user,
       body: oauth?.requestBody,

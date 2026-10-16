@@ -5,6 +5,9 @@ import { createBalanceModel } from './balance';
 import { createConversationModel } from './convo';
 import { createMessageModel } from './message';
 import { createAgentModel } from './agent';
+/* === VIVENTIUM START === Separate durable Agent history. === */
+import { createAgentVersionModel } from './agentVersion';
+/* === VIVENTIUM END === */
 import { createAgentApiKeyModel } from './agentApiKey';
 import { createAgentCategoryModel } from './agentCategory';
 import { createMCPServerModel } from './mcpServer';
@@ -65,6 +68,9 @@ export function createModels(mongoose: typeof import('mongoose')) {
     Conversation: createConversationModel(mongoose),
     Message: createMessageModel(mongoose),
     Agent: createAgentModel(mongoose),
+    /* === VIVENTIUM START === Separate durable Agent history. === */
+    AgentVersion: createAgentVersionModel(mongoose),
+    /* === VIVENTIUM END === */
     AgentApiKey: createAgentApiKeyModel(mongoose),
     AgentCategory: createAgentCategoryModel(mongoose),
     MCPServer: createMCPServerModel(mongoose),

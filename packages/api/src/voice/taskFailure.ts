@@ -1,5 +1,9 @@
 /* === VIVENTIUM START === Public task failures never retain raw provider error text. === */
 const PUBLIC_FAILURES: Readonly<Record<string, string>> = Object.freeze({
+  call_context_failed: 'Context gathering did not finish. Voice continues with available context.',
+  call_context_unavailable: 'Context gathering is unavailable. Voice uses available context.',
+  call_context_deadline: 'Context gathering exceeded its time limit.',
+  call_context_interrupted: 'Context gathering was interrupted.',
   native_input_declined: 'You declined that action. It was stopped.',
   native_input_expired: 'The approval request expired, so that action was stopped. Please retry.',
   native_input_cancelled: 'That action was cancelled.',

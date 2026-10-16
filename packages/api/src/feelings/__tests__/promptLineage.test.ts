@@ -59,13 +59,13 @@ describe('Feeling compiled prompt lineage', () => {
   });
 
   it.each([
-    ['defaults', '15b1e54b1a3187391a160d6d26fcae0379b8100a735745c5d812a3790d86aaf1'],
-    ['low', 'a4676b8e70a0ffa22b521abf4ab1209f935b40ef71f03ee77ae8cbf6b4e1710f'],
-    ['high', 'f410ae9b0424871136b131c3f0335f977005eafe14a6fd62e8ce4add1f7c3c51'],
-    ['neutral', '155cb1aedbb82d9aefbf003ad19f7fb485fb0b274ff6dd15950899b17499dfa5'],
-    ['moderate', 'a903c43dd6de32027edc998a81a450e28f71070d198a98565968366ad30247f0'],
-    ['mixed', 'cc0a24adfd3298319e12352e78d769d13697ddbf1fcbacf98ee68f3066107fad'],
-    ['custom', '596d16ae6008038910cd52bd08a4272b479dce3e8c2d96c48cd09fb6946ec843'],
+    ['defaults', '235c5498b17181a5b6c44d91d4611793400f607f907a18e30c64db93a3686229'],
+    ['low', '2daf11d40e96adb2196f5a56b90653ab30d788ca3c4b8dd598344aa76d5eac91'],
+    ['high', 'a72101f9172368e1771435a26420ef86d4c3677b083ca4ab886b1598967b1b64'],
+    ['neutral', 'efd1c9b974ebd29219d17a94237f5058dfdcb53b19b2d822c2ac5e10bb04546c'],
+    ['moderate', 'aa169352a0778ded10fff6c7da22e2f279db7277e7926611426f68fa82cc4057'],
+    ['mixed', '8b406e1eae2169844c8e9a22e5f994a9fd05a3d24737f9357919dbede291e667'],
+    ['custom', 'de5cbb3e87d01294888b6f42037eae7a00730c755ad7c00b27cb0d7f48d900fe'],
   ])('preserves the recorded %s capsule bytes', (name, expectedHash) => {
     const bands = createDefaultFeelingBands(new Date(0));
     const uniform = ({ low: 0, high: 100, neutral: 50, moderate: 70 } as Record<string, number>)[

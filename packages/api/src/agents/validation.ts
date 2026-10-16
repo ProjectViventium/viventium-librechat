@@ -173,14 +173,14 @@ export const glassHiveOptionsSchema = z
       .object({
         parallel_available: z.boolean(),
         default_mode: z.enum(['focused', 'parallel']),
-        worker_profile: z.enum(['codex-cli', 'claude-code', 'openclaw-general']).optional(),
+        // The configured model catalog and native runtime own available profiles.
+        worker_profile: z.string().trim().min(1).max(160).optional(),
         worker_model: z.string().trim().max(160).optional(),
+        worker_access: z.enum(['ask', 'full']).optional(),
         worker_reasoning_effort: z.string().trim().max(32).optional(),
         fallback_worker_model: z.string().trim().max(160).optional(),
         fallback_worker_reasoning_effort: z.string().trim().max(32).optional(),
-        fallback_worker_profile: z
-          .enum(['codex-cli', 'claude-code', 'openclaw-general'])
-          .optional(),
+        fallback_worker_profile: z.string().trim().min(1).max(160).optional(),
       })
       .strict()
       .optional(),
@@ -321,6 +321,7 @@ export type ProviderCapabilityRegistry = Record<
     reviewed_mcp_projection?: 'deferred';
     models?: Array<{
       id: string;
+      harnessProfile?: string;
       effortChoices?: string[];
       recommendedEffort?: string;
     }>;
@@ -351,6 +352,7 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
         worker_profile?: string;
         fallback_worker_profile?: string;
         worker_model?: string;
+        worker_access?: 'ask' | 'full';
         worker_reasoning_effort?: string;
         fallback_worker_model?: string;
         fallback_worker_reasoning_effort?: string;
@@ -521,15 +523,38 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
       access: workspaceCapability.default_access === 'full' ? 'full' : 'workspace',
     };
   }
+  const workerOptions = next.glasshive_options?.orchestration;
+  const hasGrokWorkerRoute =
+    [workerOptions?.worker_profile, workerOptions?.fallback_worker_profile].includes(
+      'grok-build',
+    ) ||
+    [workerOptions?.worker_model, workerOptions?.fallback_worker_model].some(
+      (id) =>
+        workspaceCapability?.models?.find((model) => model.id === id)?.harnessProfile ===
+        'grok-build',
+    );
+  if (workerOptions?.worker_access === 'full' && !hasGrokWorkerRoute) {
+    throw new z.ZodError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['glasshive_options', 'orchestration', 'worker_access'],
+        message:
+          'Full Grok background access requires a declared Grok background or fallback route',
+      },
+    ]);
+  }
   if (
-    workspaceCapability &&
-    next.glasshive_options?.access === 'full' &&
-    workspaceCapability.allow_full_access !== true
+    ((workspaceCapability && next.glasshive_options?.access === 'full') ||
+      next.glasshive_options?.orchestration?.worker_access === 'full') &&
+    workspaceCapability?.allow_full_access !== true
   ) {
     throw new z.ZodError([
       {
         code: z.ZodIssueCode.custom,
-        path: ['glasshive_options', 'access'],
+        path:
+          next.glasshive_options?.orchestration?.worker_access === 'full'
+            ? ['glasshive_options', 'orchestration', 'worker_access']
+            : ['glasshive_options', 'access'],
         message: `Selected provider does not permit full host access`,
       },
     ]);

@@ -39,6 +39,7 @@ const {
   updateAgent,
   deleteAgent,
   getAgent,
+  getAgentVersion,
 } = require('~/models/Agent');
 const {
   findPubliclyAccessibleResources,
@@ -214,13 +215,13 @@ const getAgentHandler = async (req, res, expandProperties = false) => {
 
     // Permissions are validated by middleware before calling this function
     // Simply load the agent by ID
-    const agent = await getAgent({ id });
+    const agent = await getAgent({ id }, { includeVersions: expandProperties });
 
     if (!agent) {
       return res.status(404).json({ error: 'Agent not found' });
     }
 
-    agent.version = agent.versions ? agent.versions.length : 0;
+    agent.version = agent.version_count ?? agent.versions?.length ?? 0;
 
     if (agent.avatar && agent.avatar?.source === FileSources.s3) {
       try {
@@ -427,7 +428,7 @@ const updateAgentHandler = async (req, res) => {
         : existingAgent;
 
     // Add version count to the response
-    updatedAgent.version = updatedAgent.versions ? updatedAgent.versions.length : 0;
+    updatedAgent.version = updatedAgent.version_count ?? updatedAgent.versions?.length ?? 0;
 
     if (updatedAgent.author) {
       updatedAgent.author = updatedAgent.author.toString();
@@ -936,7 +937,7 @@ const revertAgentVersionHandler = async (req, res) => {
      * Feature: Provider-safe version reverts.
      * Purpose: Old versions must pass current exact model/capability policy before restore.
      */
-    const revertCandidate = existingAgent.versions?.[version_index];
+    const revertCandidate = await getAgentVersion({ id }, version_index);
     if (!revertCandidate) {
       return res.status(404).json({ error: `Version ${version_index} not found` });
     }

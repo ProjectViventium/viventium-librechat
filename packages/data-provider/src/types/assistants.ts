@@ -236,6 +236,7 @@ export type AgentModelParameters = {
   presence_penalty: AgentParameterValue;
   useResponsesApi?: boolean;
   reasoning_effort?: string | null;
+  service_tier?: string | null;
 };
 
 /* === VIVENTIUM START ===
@@ -256,6 +257,7 @@ export type GlassHiveOptions = {
     worker_profile?: string;
     fallback_worker_profile?: string;
     worker_model?: string;
+    worker_access?: 'ask' | 'full';
     worker_reasoning_effort?: string;
     fallback_worker_model?: string;
     fallback_worker_reasoning_effort?: string;

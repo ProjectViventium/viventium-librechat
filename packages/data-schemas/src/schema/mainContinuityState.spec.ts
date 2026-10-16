@@ -116,46 +116,36 @@ describe('ViventiumMainContinuityState model', () => {
   });
 });
 
+
 test('retains the full reviewed replacement and its server-owned allocation', async () => {
-  const contract = {
-    version: 1,
-    consumer: 'accepted_core',
-    carrierMaxUtf8Bytes: 12288,
-    reservedUtf8Bytes: 1200,
-    maxJsonUtf8Bytes: 11088,
-    maxSummaryUtf8Bytes: 11088,
-    maxItemsPerArray: 32,
-    maxStringItemUtf8Bytes: 1024,
-    maxToolIdentityCharacters: 256,
-  };
+  const contract = { version: 1, consumer: 'accepted_core', carrierMaxUtf8Bytes: 12288,
+    reservedUtf8Bytes: 1200, maxJsonUtf8Bytes: 11088, maxSummaryUtf8Bytes: 11088,
+    maxItemsPerArray: 32, maxStringItemUtf8Bytes: 1024, maxToolIdentityCharacters: 256 };
   const summary = 's'.repeat(8000) + ' Keep permission required.';
-  const document = new ContinuityState({
-    ...validState,
-    semanticCompactionContract: contract,
-    semanticCompaction: {
-      version: 1,
-      summary,
-      pendingAsks: [],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-      sourceDigest: 'b'.repeat(64),
-      generatedAt: new Date(),
-    },
-    compactionLease: {
-      leaseId: 'lease',
-      sourceDigest: 'b'.repeat(64),
-      sourceTurnIds: [],
-      claimedAt: new Date(),
-      expiresAt: new Date(Date.now() + 1000),
-      outputContract: contract,
-    },
-  });
+  const document = new ContinuityState({ ...validState, semanticCompactionContract: contract,
+    semanticCompaction: { version: 1, summary, pendingAsks: [], commitments: [], corrections: [],
+      decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [],
+      sourceDigest: 'b'.repeat(64), generatedAt: new Date() },
+    compactionLease: { leaseId: 'lease', sourceDigest: 'b'.repeat(64), sourceTurnIds: [],
+      claimedAt: new Date(), expiresAt: new Date(Date.now() + 1000), outputContract: contract } });
   await expect(document.validate()).resolves.toBeUndefined();
   expect(document.toObject().semanticCompaction?.summary).toBe(summary);
   expect(document.toObject().semanticCompactionContract).toEqual(contract);
   expect(document.toObject().compactionLease?.outputContract).toEqual(contract);
+});
+
+
+test('persists the typed pending repair separately from accepted semantic context', async () => {
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 1, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    correction: { code: 'semantic_fidelity', candidate: '{"summary":"unaccepted"}',
+      reason: 'Preserve the exact reference.' } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
+  await expect(new ContinuityState({ ...validState, pendingCompactionRepair: {
+    ...pendingCompactionRepair, correction: { ...pendingCompactionRepair.correction, code: 'schema_invalid' },
+  } }).validate()).rejects.toThrow();
 });

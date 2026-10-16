@@ -199,6 +199,21 @@ export interface OAuthConnectionOptions {
   connectionTimeout?: number;
 }
 
+/* === VIVENTIUM START ===
+ * Non-OAuth connections still need request-scoped environment and timeout options.
+ * Keep OAuth-only token/flow fields on the existing true discriminator.
+ */
+export type NonOAuthConnectionOptions = Pick<
+  OAuthConnectionOptions,
+  | 'user'
+  | 'requestBody'
+  | 'customUserVars'
+  | 'connectionTimeout'
+  | 'allowOAuthInitiation'
+  | 'suppressOAuthFlow'
+> & { useOAuth: false };
+/* === VIVENTIUM END === */
+
 export interface ToolDiscoveryOptions {
   serverName: string;
   user?: IUser;

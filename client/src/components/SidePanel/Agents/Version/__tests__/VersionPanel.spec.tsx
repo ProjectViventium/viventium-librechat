@@ -33,7 +33,7 @@ const mockAgentData = {
 };
 
 jest.mock('~/data-provider', () => ({
-  useGetAgentByIdQuery: jest.fn(() => ({
+  useGetExpandedAgentByIdQuery: jest.fn(() => ({
     data: mockAgentData,
     isLoading: false,
     error: null,
@@ -67,7 +67,7 @@ describe('VersionPanel', () => {
     '~/Providers/AgentPanelContext',
   ).useAgentPanelContext;
 
-  const mockUseGetAgentByIdQuery = jest.requireMock('~/data-provider').useGetAgentByIdQuery;
+  const mockUseGetAgentByIdQuery = jest.requireMock('~/data-provider').useGetExpandedAgentByIdQuery;
 
   beforeEach(() => {
     jest.clearAllMocks();

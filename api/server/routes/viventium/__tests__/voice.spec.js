@@ -6,6 +6,11 @@
 const express = require('express');
 const { EventEmitter } = require('events');
 
+let mockCallPreparationWait;
+jest.mock('~/server/services/viventium/CallPreparationService', () => ({
+  wait: (...args) => mockCallPreparationWait(...args),
+}));
+
 let mockAssertVoiceGatewayAuth;
 let mockAbandonVoiceSessionClaim;
 let mockReportVoiceSessionFailure;
@@ -177,9 +182,8 @@ jest.mock('~/server/controllers/agents/request', () => {
     }
     respond();
   };
-  controller.voiceGenerationOutcome = jest.requireActual(
-    '~/server/controllers/agents/request',
-  ).voiceGenerationOutcome;
+  controller.voiceGenerationOutcome =
+    jest.requireActual('~/server/controllers/agents/request').voiceGenerationOutcome;
   return controller;
 });
 
@@ -520,8 +524,91 @@ async function advanceVoiceRouteTimers(ms) {
 }
 
 describe('/api/viventium/voice/chat', () => {
+  test('preparation waits in ordinary chat after durable speaker evidence and keeps early text', async () => {
+    let release;
+    mockAssertVoiceGatewayAuth.mockResolvedValue({ callSessionId: 'call_session_1', userId: 'user_1',
+      agentId: 'agent_voice', conversationId: 'conv-voice-1', mode: 'call',
+      contextPreparation: { version: 1, streamId: 'prep-synthetic' } });
+    mockCallPreparationWait.mockImplementation((session) => new Promise((resolve) => {
+      release = () => resolve(session);
+    }));
+    const router = require('../voice'); const app = createTestApp(router);
+    const req = createMockReq({ url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' }, body: { text: 'Keep this early input exact.' } });
+    const res = createMockRes(); const running = dispatch(app, req, res);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockCallPreparationWait).toHaveBeenCalledTimes(1);
+    expect(mockPersistSpeakerSegments.mock.invocationCallOrder[0]).toBeLessThan(
+      mockCallPreparationWait.mock.invocationCallOrder[0]);
+    expect(mockLastRequestText).toBeNull();
+    release(); await running;
+    expect(mockLastRequestText).toBe('Keep this early input exact.');
+    expect(mockLastConversationId).toBe('conv-voice-1');
+  });
+
+  test('preparation disconnected HTTP waiter cannot admit a ghost Main turn', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValue({ callSessionId: 'call_session_1', userId: 'user_1',
+      agentId: 'agent_voice', conversationId: 'conv-voice-1', mode: 'call',
+      contextPreparation: { version: 1, streamId: 'prep-synthetic' } });
+    let signal;
+    mockCallPreparationWait.mockImplementation((session, requestSignal) => {
+      signal = requestSignal;
+      return new Promise((_, reject) => requestSignal.addEventListener('abort', () =>
+        reject(Object.assign(new Error('Abandoned'), { code: 'call_context_wait_abandoned' }))));
+    });
+    const router = require('../voice'); const app = createTestApp(router);
+    const req = createMockReq({ url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' }, body: { text: 'Retain this source.' } });
+    const res = createMockRes(); dispatch(app, req, res);
+    await new Promise((resolve) => setImmediate(resolve));
+    res.emit('close');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(signal.aborted).toBe(true);
+    expect(mockLastRequestText).toBeNull();
+    expect(mockPersistSpeakerSegments).toHaveBeenCalled();
+  });
+
+  test('preparation pending stop returns a typed retryable receipt without starting Main', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValue({ callSessionId: 'call_session_1', userId: 'user_1',
+      agentId: 'agent_voice', conversationId: 'conv-voice-1', mode: 'call',
+      contextPreparation: { version: 1, streamId: 'prep-synthetic' } });
+    mockCallPreparationWait.mockRejectedValue(Object.assign(new Error('Still stopping'),
+      { status: 409, code: 'call_context_busy' }));
+    const router = require('../voice'); const app = createTestApp(router);
+    const req = createMockReq({ url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' }, body: { text: 'Keep the same input.' } });
+    const res = createMockRes(); await dispatch(app, req, res);
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatchObject({ code: 'call_context_busy', retryable: true });
+    expect(mockLastRequestText).toBeNull();
+  });
+
+  test('ordinary chat preparation off starts no preparation', async () => {
+    const router = require('../voice'); const app = createTestApp(router);
+    const req = createMockReq({ url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' }, body: { text: 'Ordinary voice.' } });
+    await dispatch(app, req, createMockRes());
+    expect(mockCallPreparationWait).not.toHaveBeenCalled();
+    expect(mockLastRequestText).toBe('Ordinary voice.');
+  });
+
+  test('mode switch to Listen-Only during preparation starts no subsequent Main', async () => {
+    mockAssertVoiceGatewayAuth.mockResolvedValue({ callSessionId: 'call_session_1', userId: 'user_1',
+      agentId: 'agent_voice', conversationId: 'conv-voice-1', mode: 'call',
+      contextPreparation: { version: 1, streamId: 'prep-synthetic' } });
+    mockCallPreparationWait.mockImplementation(async (session) => ({ ...session,
+      mode: 'listen_only', listenOnlyModeEnabled: true }));
+    const router = require('../voice'); const app = createTestApp(router);
+    const req = createMockReq({ url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' }, body: { text: 'Ambient continuation.' } });
+    await dispatch(app, req, createMockRes());
+    expect(mockCallPreparationWait).toHaveBeenCalledTimes(1);
+    expect(mockLastRequestText).toBeNull();
+  });
+
   beforeEach(() => {
     jest.resetModules();
+    mockCallPreparationWait = jest.fn(async (session) => session);
     mockBackgroundActivationPolicy = null;
     mockObservedInfoLogs = [];
     mockConsoleLogSpy = jest.spyOn(console, 'log').mockImplementation((...args) => {
@@ -1059,34 +1146,32 @@ describe('/api/viventium/voice/chat', () => {
   });
 
   test.each(['owner_timeout', 'gateway_transport_failed'])(
-    'abandons only the exact authenticated gateway claim with declared reason %s',
-    async (reason) => {
-      const voiceRouter = require('../voice');
-      const app = createTestApp(voiceRouter);
-      const req = createMockReq({
-        method: 'POST',
-        url: '/api/viventium/voice/claim/abandon',
-        headers: {
-          'x-viventium-call-secret': 'secret',
-          'x-viventium-call-session': 'call_session_1',
-          'x-viventium-job-id': 'job-owner-wait',
-          'x-viventium-worker-id': 'worker-owner-wait',
-        },
-        body: { reason },
-      });
-      const res = createMockRes();
+    'abandons only the exact authenticated gateway claim with declared reason %s', async (reason) => {
+    const voiceRouter = require('../voice');
+    const app = createTestApp(voiceRouter);
+    const req = createMockReq({
+      method: 'POST',
+      url: '/api/viventium/voice/claim/abandon',
+      headers: {
+        'x-viventium-call-secret': 'secret',
+        'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-owner-wait',
+        'x-viventium-worker-id': 'worker-owner-wait',
+      },
+      body: { reason },
+    });
+    const res = createMockRes();
 
-      await dispatch(app, req, res);
+    await dispatch(app, req, res);
 
-      expect(res.statusCode).toBe(200);
-      expect(res.body).toEqual({ version: 1, released: true });
-      expect(mockAbandonVoiceSessionClaim).toHaveBeenCalledWith({
-        callSessionId: 'call_session_1',
-        jobId: 'job-owner-wait',
-        workerId: 'worker-owner-wait',
-      });
-    },
-  );
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ version: 1, released: true });
+    expect(mockAbandonVoiceSessionClaim).toHaveBeenCalledWith({
+      callSessionId: 'call_session_1',
+      jobId: 'job-owner-wait',
+      workerId: 'worker-owner-wait',
+    });
+  });
 
   test('rejects malformed claim-abandon requests before lease mutation', async () => {
     const voiceRouter = require('../voice');
@@ -1696,58 +1781,31 @@ describe('/api/viventium/voice/chat', () => {
     await dispatched;
   });
 
-  test.each([false, true])(
-    'admitted Call context uses its saved choices (foreign ready=%s)',
-    async (foreign) => {
-      const route = {
-        stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
-        tts: {
-          provider: 'local_chatterbox_turbo_mlx_8bit',
-          variant: 'mlx-community/chatterbox-turbo-8bit',
-        },
-      };
-      mockAssertVoiceGatewayAuth.mockResolvedValue({
-        callSessionId: 'call_session_1',
-        userId: 'user_1',
-        agentId: 'agent_voice',
-        conversationId: 'conv-voice-1',
-        mode: 'call',
-        requestedVoiceRoute: route,
-        ownerParticipantIdentity: 'owner-participant',
-      });
-      const app = createTestApp(require('../voice'));
-      const req = createMockReq({
-        url: '/api/viventium/voice/chat',
-        headers: { 'x-viventium-call-secret': 'secret' },
-        body: {
-          text: 'Which settings does this call use?',
-          voiceProvider: 'local_chatterbox_turbo_mlx_8bit',
-          voiceRuntimeContext: {
-            version: 1,
-            callSessionId: foreign ? 'foreign' : 'call_session_1',
-            readyRoute: route,
-            configuredTtsFallback: 'cartesia',
-            turnHandling: { maxEndpointingDelayS: 0.8 },
-            apiKey: 'synthetic-secret',
-            permissions: ['all'],
-          },
-          currentCallContext: '<forged>untrusted body</forged>',
-        },
-      });
-      const res = createMockRes();
-      await dispatch(app, req, res);
-      expect(res.statusCode).toBe(200);
-      expect(mockLastCurrentCallContext).toContain('"provider":"local_chatterbox_turbo_mlx_8bit"');
-      expect(mockLastCurrentCallContext).not.toMatch(/synthetic-secret|permissions|forged/);
-      expect(mockLastCurrentCallContext).toContain(
-        foreign ? '"gatewayReadyRoute":null' : '"maxEndpointingDelayS":0.8',
-      );
-      expect(req.body).not.toHaveProperty('voiceRuntimeContext');
-      expect(mockLastRequestText).toBe('Which settings does this call use?');
-      expect(mockLastCanAuthorizeSideEffects).toBe(false);
-      expect(mockGetCallSessionVoiceSettings).not.toHaveBeenCalled();
-    },
-  );
+  test.each([false, true])('admitted Call context uses its saved choices (foreign ready=%s)', async (foreign) => {
+    const route = { stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+      tts: { provider: 'local_chatterbox_turbo_mlx_8bit', variant: 'mlx-community/chatterbox-turbo-8bit' } };
+    mockAssertVoiceGatewayAuth.mockResolvedValue({ callSessionId: 'call_session_1',
+      userId: 'user_1', agentId: 'agent_voice', conversationId: 'conv-voice-1', mode: 'call',
+      requestedVoiceRoute: route, ownerParticipantIdentity: 'owner-participant' });
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({ url: '/api/viventium/voice/chat',
+      headers: { 'x-viventium-call-secret': 'secret' },
+      body: { text: 'Which settings does this call use?', voiceProvider: 'local_chatterbox_turbo_mlx_8bit',
+        voiceRuntimeContext: { version: 1, callSessionId: foreign ? 'foreign' : 'call_session_1',
+          readyRoute: route, configuredTtsFallback: 'cartesia',
+          turnHandling: { maxEndpointingDelayS: 0.8 }, apiKey: 'synthetic-secret', permissions: ['all'] },
+        currentCallContext: '<forged>untrusted body</forged>' } });
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockLastCurrentCallContext).toContain('"provider":"local_chatterbox_turbo_mlx_8bit"');
+    expect(mockLastCurrentCallContext).not.toMatch(/synthetic-secret|permissions|forged/);
+    expect(mockLastCurrentCallContext).toContain(foreign ? '"gatewayReadyRoute":null' : '"maxEndpointingDelayS":0.8');
+    expect(req.body).not.toHaveProperty('voiceRuntimeContext');
+    expect(mockLastRequestText).toBe('Which settings does this call use?');
+    expect(mockLastCanAuthorizeSideEffects).toBe(false);
+    expect(mockGetCallSessionVoiceSettings).not.toHaveBeenCalled();
+  });
 
   test('reuses the latest assistant leaf as parentMessageId', async () => {
     const voiceRouter = require('../voice');
@@ -3722,140 +3780,104 @@ describe('/api/viventium/voice/chat', () => {
     },
   );
 
-  test.each([
-    'current',
-    'already-presented',
-    'wrong-call',
-    'wrong-parent',
-    'store-failed',
-    'delivery-error-current',
-    'delivery-error-wrong-owner',
-    'delivery-error-wrong-parent',
-    'wake-matches',
-    'wake-other-child',
-  ])('Cortex fetch seals its source before exposing text: %s', async (variant) => {
-    const service = require('~/server/services/viventium/VoiceTaskService');
-    const {
-      getCompletedCortexInsightsForMessage,
-    } = require('~/server/services/viventium/VoiceCortexInsightsService');
-    const deliveryError = variant.startsWith('delivery-error')
-      ? { code: 'native_output_file_unavailable' }
-      : undefined;
-    const scope = {
-      callSessionId: 'call_session_1',
-      userId: variant === 'delivery-error-wrong-owner' ? 'another-owner' : 'user_1',
-      conversationId: 'conv-voice-1',
-    };
-    const task = service.createVoiceTask({ ...scope, streamId: 'cortex-sealed-stream' });
-    service.bindVoiceTaskStream(task.taskId, 'cortex-sealed-stream', {
-      ...scope,
-      logicalTurnId: 'cortex-turn',
-    });
-    const resultMessageId = ['wrong-parent', 'delivery-error-wrong-parent'].includes(variant)
-      ? 'another-parent'
-      : 'canonical-parent';
-    const completed = service.completeVoiceTask(task.taskId, { resultMessageId, deliveryError });
-    if (deliveryError)
-      expect(completed).toMatchObject({
-        state: 'completed',
-        type: 'result',
-        phase: 'completed',
-        resultMessageId,
+  test.each(['current', 'already-presented', 'wrong-call', 'wrong-parent', 'store-failed',
+    'delivery-error-current', 'delivery-error-wrong-owner', 'delivery-error-wrong-parent', 'wake-matches', 'wake-other-child'])(
+    'Cortex fetch seals its source before exposing text: %s',
+    async (variant) => {
+      const service = require('~/server/services/viventium/VoiceTaskService');
+      const {
+        getCompletedCortexInsightsForMessage,
+      } = require('~/server/services/viventium/VoiceCortexInsightsService');
+      const deliveryError = variant.startsWith('delivery-error')
+        ? { code: 'native_output_file_unavailable' } : undefined;
+      const scope = {
+        callSessionId: 'call_session_1',
+        userId: variant === 'delivery-error-wrong-owner' ? 'another-owner' : 'user_1',
+        conversationId: 'conv-voice-1',
+      };
+      const task = service.createVoiceTask({ ...scope, streamId: 'cortex-sealed-stream' });
+      service.bindVoiceTaskStream(task.taskId, 'cortex-sealed-stream', {
+        ...scope,
+        logicalTurnId: 'cortex-turn',
+      });
+      const resultMessageId = ['wrong-parent', 'delivery-error-wrong-parent'].includes(variant)
+        ? 'another-parent' : 'canonical-parent';
+      const completed = service.completeVoiceTask(task.taskId, { resultMessageId, deliveryError });
+      if (deliveryError) expect(completed).toMatchObject({
+        state: 'completed', type: 'result', phase: 'completed', resultMessageId,
         error: { code: 'native_output_file_unavailable' },
       });
-    getCompletedCortexInsightsForMessage.mockResolvedValueOnce({
-      messageId: 'canonical-parent',
-      conversationId: scope.conversationId,
-      insights: [],
-      followUp: { messageId: 'canonical-child', text: 'Useful additional result.' },
-      presentationRequired: true,
-      presentationContext: {
-        callSessionId: variant === 'wrong-call' ? 'another-call' : scope.callSessionId,
-        taskId: task.taskId,
-        turnId: 'cortex-turn',
-      },
-    });
-    if (variant === 'store-failed')
-      mockPrepareCortexVoicePresentation.mockRejectedValueOnce(
-        new Error('durable store unavailable'),
-      );
-    if (variant === 'already-presented')
-      mockPrepareCortexVoicePresentation.mockResolvedValueOnce(false);
-    const response = createMockRes();
-    await dispatch(
-      createTestApp(require('../voice')),
-      createMockReq({
-        method: 'GET',
-        url:
-          '/api/viventium/voice/cortex/canonical-parent' +
-          (variant.startsWith('wake-')
-            ? '?followupMessageId=' +
-              (variant === 'wake-matches' ? 'canonical-child' : 'older-child')
-            : ''),
-        headers: { 'x-viventium-call-secret': 'secret' },
-        query: variant.startsWith('wake-')
-          ? { followupMessageId: variant === 'wake-matches' ? 'canonical-child' : 'older-child' }
-          : {},
-      }),
-      response,
-    );
-    expect(getCompletedCortexInsightsForMessage).toHaveBeenCalledWith({
-      userId: 'user_1',
-      messageId: 'canonical-parent',
-      conversationId: scope.conversationId,
-      ...(variant.startsWith('wake-')
-        ? { followupMessageId: variant === 'wake-matches' ? 'canonical-child' : 'older-child' }
-        : {}),
-    });
-    if (
-      [
-        'current',
-        'already-presented',
-        'delivery-error-current',
-        'wake-matches',
-        'wake-other-child',
-      ].includes(variant)
-    ) {
-      expect(response.statusCode).toBe(200);
-      expect(response.body.followUp).toEqual(
-        ['already-presented', 'wake-other-child'].includes(variant)
-          ? null
-          : {
-              messageId: 'canonical-child',
-              text: 'Useful additional result.',
-              presentationContext: {
-                callSessionId: scope.callSessionId,
-                taskId: task.taskId,
-                streamId: 'cortex-sealed-stream',
-                turnId: 'cortex-turn',
-              },
-            },
-      );
-      if (variant === 'wake-other-child') {
-        expect(mockPrepareCortexVoicePresentation).not.toHaveBeenCalled();
-        return;
-      }
-      expect(mockPrepareCortexVoicePresentation).toHaveBeenCalledWith({
-        ownerId: scope.userId,
+      getCompletedCortexInsightsForMessage.mockResolvedValueOnce({
+        messageId: 'canonical-parent',
         conversationId: scope.conversationId,
-        parentMessageId: 'canonical-parent',
-        callSessionId: scope.callSessionId,
-        taskId: task.taskId,
-        streamId: 'cortex-sealed-stream',
-        turnId: 'cortex-turn',
-        presentationRef: 'canonical-child',
-        text: 'Useful additional result.',
-        leaseMs: expect.any(Number),
+        insights: [],
+        followUp: { messageId: 'canonical-child', text: 'Useful additional result.' },
+        presentationRequired: true,
+        presentationContext: {
+          callSessionId: variant === 'wrong-call' ? 'another-call' : scope.callSessionId,
+          taskId: task.taskId,
+          turnId: 'cortex-turn',
+        },
       });
-      expect(response.body.presentationContext).toBeUndefined();
-    } else {
-      expect(response.statusCode).toBe(variant === 'store-failed' ? 500 : 403);
-      expect(response.body.followUp).toBeUndefined();
-      expect(mockConfirmCortexVoicePresentation).not.toHaveBeenCalled();
-      if (variant.startsWith('delivery-error'))
-        expect(mockPrepareCortexVoicePresentation).not.toHaveBeenCalled();
-    }
-  });
+      if (variant === 'store-failed')
+        mockPrepareCortexVoicePresentation.mockRejectedValueOnce(
+          new Error('durable store unavailable'),
+        );
+      if (variant === 'already-presented')
+        mockPrepareCortexVoicePresentation.mockResolvedValueOnce(false);
+      const response = createMockRes();
+      await dispatch(
+        createTestApp(require('../voice')),
+        createMockReq({
+          method: 'GET',
+          url: '/api/viventium/voice/cortex/canonical-parent' + (variant.startsWith('wake-') ?
+            '?followupMessageId=' + (variant === 'wake-matches' ? 'canonical-child' : 'older-child') : ''),
+          headers: { 'x-viventium-call-secret': 'secret' },
+          query: variant.startsWith('wake-')
+            ? { followupMessageId: variant === 'wake-matches' ? 'canonical-child' : 'older-child' } : {},
+        }),
+        response,
+      );
+      expect(getCompletedCortexInsightsForMessage).toHaveBeenCalledWith({
+        userId: 'user_1', messageId: 'canonical-parent', conversationId: scope.conversationId,
+        ...(variant.startsWith('wake-')
+          ? { followupMessageId: variant === 'wake-matches' ? 'canonical-child' : 'older-child' } : {}),
+      });
+      if (['current', 'already-presented', 'delivery-error-current', 'wake-matches', 'wake-other-child'].includes(variant)) {
+        expect(response.statusCode).toBe(200);
+        expect(response.body.followUp).toEqual(
+          ['already-presented','wake-other-child'].includes(variant)
+            ? null
+            : {
+                messageId: 'canonical-child',
+                text: 'Useful additional result.',
+                presentationContext: {callSessionId:scope.callSessionId,taskId:task.taskId,
+                  streamId:'cortex-sealed-stream',turnId:'cortex-turn'},
+              },
+        );
+        if(variant==='wake-other-child') {expect(mockPrepareCortexVoicePresentation).not.toHaveBeenCalled();return;}
+        expect(mockPrepareCortexVoicePresentation).toHaveBeenCalledWith({
+          ownerId: scope.userId,
+          conversationId: scope.conversationId,
+          parentMessageId: 'canonical-parent',
+          callSessionId: scope.callSessionId,
+          taskId: task.taskId,
+          streamId: 'cortex-sealed-stream',
+          turnId: 'cortex-turn',
+          presentationRef: 'canonical-child',
+          text: 'Useful additional result.',
+          leaseMs: expect.any(Number),
+        });
+        expect(response.body.presentationContext).toBeUndefined();
+      } else {
+        expect(response.statusCode).toBe(variant === 'store-failed' ? 500 : 403);
+        expect(response.body.followUp).toBeUndefined();
+        expect(mockConfirmCortexVoicePresentation).not.toHaveBeenCalled();
+        if (variant.startsWith('delivery-error'))
+          expect(mockPrepareCortexVoicePresentation).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   test('rejects private content and mismatched Voice trace authority before recording', async () => {
     const { GenerationJobManager } = require('@librechat/api');
@@ -5611,47 +5633,35 @@ describe('/api/viventium/voice/chat', () => {
   }
 
   test.each(['generation_job', 'glasshive_run', 'glasshive_delivery'])(
-    'reads %s result files using private ownership while public tasks omit their owner',
-    async (kind) => {
-      const { service, task, req, res } = completedTaskFileReadFixture(kind);
-      expect(service.getVoiceTaskOwnerBinding(task.taskId)).toMatchObject({
-        taskId: task.taskId,
-        userId: 'user_1',
-        callSessionId: 'call_session_1',
-      });
-      if (kind !== 'generation_job')
-        expect(service.getVoiceTaskTraceBinding(task.taskId)).toBeNull();
-      await dispatch(createTestApp(require('../voice')), req, res);
-      expect(res.statusCode).toBe(200);
-      expect(res.body).toMatchObject({
-        version: 1,
-        event: { taskId: task.taskId, state: 'completed', resultMessageId: 'reply-result-files' },
-        resultFilenames: ['result.txt'],
-      });
-      expect(mockConversationFindOne).toHaveBeenCalledWith({
-        user: 'user_1',
-        conversationId: 'conv-voice-1',
-      });
-      expect(mockMessageFindOne).toHaveBeenCalledWith({
-        user: 'user_1',
-        conversationId: 'conv-voice-1',
-        messageId: 'reply-result-files',
-        isCreatedByUser: false,
-        unfinished: { $ne: true },
-        error: { $ne: true },
-        'metadata.viventium.visibility': { $ne: 'internal' },
-      });
-      expect(mockFileFind).toHaveBeenCalledWith({
-        user: 'user_1',
-        conversationId: 'conv-voice-1',
-        messageId: 'reply-result-files',
-        file_id: { $in: ['owned-result-file'] },
-      });
-      expect(service.getVoiceTask(task.taskId)).not.toHaveProperty('userId');
-      expect(JSON.stringify(res.body)).not.toContain('userId');
-      expect(JSON.stringify(res.body)).not.toContain('user_1');
-    },
-  );
+    'reads %s result files using private ownership while public tasks omit their owner', async (kind) => {
+    const { service, task, req, res } = completedTaskFileReadFixture(kind);
+    expect(service.getVoiceTaskOwnerBinding(task.taskId)).toMatchObject({
+      taskId: task.taskId, userId: 'user_1', callSessionId: 'call_session_1',
+    });
+    if (kind !== 'generation_job') expect(service.getVoiceTaskTraceBinding(task.taskId)).toBeNull();
+    await dispatch(createTestApp(require('../voice')), req, res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({
+      version: 1,
+      event: { taskId: task.taskId, state: 'completed', resultMessageId: 'reply-result-files' },
+      resultFilenames: ['result.txt'],
+    });
+    expect(mockConversationFindOne).toHaveBeenCalledWith({
+      user: 'user_1', conversationId: 'conv-voice-1',
+    });
+    expect(mockMessageFindOne).toHaveBeenCalledWith({
+      user: 'user_1', conversationId: 'conv-voice-1', messageId: 'reply-result-files',
+      isCreatedByUser: false, unfinished: { $ne: true }, error: { $ne: true },
+      'metadata.viventium.visibility': { $ne: 'internal' },
+    });
+    expect(mockFileFind).toHaveBeenCalledWith({
+      user: 'user_1', conversationId: 'conv-voice-1', messageId: 'reply-result-files',
+      file_id: { $in: ['owned-result-file'] },
+    });
+    expect(service.getVoiceTask(task.taskId)).not.toHaveProperty('userId');
+    expect(JSON.stringify(res.body)).not.toContain('userId');
+    expect(JSON.stringify(res.body)).not.toContain('user_1');
+  });
 
   test.each([
     ['absent', null],
@@ -5662,9 +5672,9 @@ describe('/api/viventium/voice/chat', () => {
   ])('fails task result files closed for an %s private binding', async (_label, changed) => {
     const { service, task, req, res } = completedTaskFileReadFixture();
     const binding = service.getVoiceTaskOwnerBinding(task.taskId);
-    jest
-      .spyOn(service, 'getVoiceTaskOwnerBinding')
-      .mockReturnValueOnce(changed ? { ...binding, ...changed } : null);
+    jest.spyOn(service, 'getVoiceTaskOwnerBinding').mockReturnValueOnce(
+      changed ? { ...binding, ...changed } : null,
+    );
     await dispatch(createTestApp(require('../voice')), req, res);
     expect(res.statusCode).toBe(200);
     expect(res.body.resultFilenames).toEqual([]);
@@ -5977,87 +5987,67 @@ describe('/api/viventium/voice/chat', () => {
   });
 
   test.each([
-    [false, false],
-    [false, true],
-    [true, false],
-    [true, true],
-  ])(
-    'canonical End closes replay without later writes: paged=%s failure=%s',
-    async (paged, failure) => {
-      const taskService = require('~/server/services/viventium/VoiceTaskService');
-      let finishReplay;
-      let failReplay;
-      const replay = new Promise((resolve, reject) => {
-        finishReplay = resolve;
-        failReplay = reject;
+    [false, false], [false, true], [true, false], [true, true],
+  ])('canonical End closes replay without later writes: paged=%s failure=%s', async (paged, failure) => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    let finishReplay;
+    let failReplay;
+    const replay = new Promise((resolve, reject) => { finishReplay = resolve; failReplay = reject; });
+    const emptyPage = { events: [], hasMore: false };
+    const snapshots = jest.spyOn(taskService, 'listDurableVoiceTaskSnapshots');
+    if (paged) {
+      snapshots.mockResolvedValueOnce({
+        events: [], hasMore: true,
+        nextBeforeCreatedAt: '2026-10-07T00:00:00.000Z', nextBeforeTaskId: 'task-terminal-replay',
       });
-      const emptyPage = { events: [], hasMore: false };
-      const snapshots = jest.spyOn(taskService, 'listDurableVoiceTaskSnapshots');
-      if (paged) {
-        snapshots.mockResolvedValueOnce({
-          events: [],
-          hasMore: true,
-          nextBeforeCreatedAt: '2026-10-07T00:00:00.000Z',
-          nextBeforeTaskId: 'task-terminal-replay',
-        });
-      }
-      snapshots.mockReturnValueOnce(replay);
-      const releaseTail = jest.fn();
-      let tailStopped = false;
-      const stop = jest.fn(() => {
-        if (tailStopped) return;
-        tailStopped = true;
-        releaseTail();
-      });
-      let endFromTail;
-      taskService.subscribeDurableVoiceTaskEventsForCall.mockImplementationOnce(
-        ({ onCallEnded }) => {
-          endFromTail = onCallEnded;
-          return { ready: Promise.resolve(), catchUp: jest.fn(), seed: jest.fn(), stop };
-        },
-      );
-      const app = createTestApp(require('../voice'));
-      const req = createMockReq({
-        method: 'GET',
-        url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
-        query: { callSessionId: 'call_session_1' },
-        headers: {
-          'x-viventium-call-secret': 'secret',
-          'x-viventium-call-session': 'call_session_1',
-          'x-viventium-job-id': 'job-1',
-          'x-viventium-worker-id': 'worker-1',
-        },
-      });
-      const res = createMockRes();
-      const intervals = jest.spyOn(global, 'setInterval');
-      app.handle(req, res, (error) => {
-        if (error) throw error;
-      });
-      await new Promise((resolve) => setImmediate(resolve));
-      expect(mockAssertVoiceGatewayAuth).toHaveBeenCalledWith(expect.anything(), {
-        allowEnded: false,
-      });
-      expect(typeof endFromTail).toBe('function');
-      endFromTail();
-      endFromTail();
-      await res._done;
-      if (failure) failReplay(new Error('synthetic replay failure after End'));
-      else finishReplay(emptyPage);
-      await new Promise((resolve) => setImmediate(resolve));
-      const heartbeats = intervals.mock.calls.filter(([, delay]) => delay === 15_000);
-      intervals.mock.results.forEach((result, index) => {
-        if (intervals.mock.calls[index][1] === 15_000 && result.type === 'return')
-          clearInterval(result.value);
-      });
-      intervals.mockRestore();
-      expect(heartbeats).toHaveLength(0);
-      expect(res.end).toHaveBeenCalledTimes(1);
-      expect(releaseTail).toHaveBeenCalledTimes(1);
-      expect(res.write).not.toHaveBeenCalled();
-      expect(res.json).not.toHaveBeenCalled();
-      expect(res.headers['Content-Type']).toBe(paged ? 'text/event-stream' : undefined);
-    },
-  );
+    }
+    snapshots.mockReturnValueOnce(replay);
+    const releaseTail = jest.fn();
+    let tailStopped = false;
+    const stop = jest.fn(() => {
+      if (tailStopped) return;
+      tailStopped = true;
+      releaseTail();
+    });
+    let endFromTail;
+    taskService.subscribeDurableVoiceTaskEventsForCall.mockImplementationOnce(({ onCallEnded }) => {
+      endFromTail = onCallEnded;
+      return { ready: Promise.resolve(), catchUp: jest.fn(), seed: jest.fn(), stop };
+    });
+    const app = createTestApp(require('../voice'));
+    const req = createMockReq({
+      method: 'GET',
+      url: '/api/viventium/voice/tasks/events?callSessionId=call_session_1',
+      query: { callSessionId: 'call_session_1' },
+      headers: {
+        'x-viventium-call-secret': 'secret', 'x-viventium-call-session': 'call_session_1',
+        'x-viventium-job-id': 'job-1', 'x-viventium-worker-id': 'worker-1',
+      },
+    });
+    const res = createMockRes();
+    const intervals = jest.spyOn(global, 'setInterval');
+    app.handle(req, res, (error) => { if (error) throw error; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockAssertVoiceGatewayAuth).toHaveBeenCalledWith(expect.anything(), { allowEnded: false });
+    expect(typeof endFromTail).toBe('function');
+    endFromTail();
+    endFromTail();
+    await res._done;
+    if (failure) failReplay(new Error('synthetic replay failure after End'));
+    else finishReplay(emptyPage);
+    await new Promise((resolve) => setImmediate(resolve));
+    const heartbeats = intervals.mock.calls.filter(([, delay]) => delay === 15_000);
+    intervals.mock.results.forEach((result, index) => {
+      if (intervals.mock.calls[index][1] === 15_000 && result.type === 'return') clearInterval(result.value);
+    });
+    intervals.mockRestore();
+    expect(heartbeats).toHaveLength(0);
+    expect(res.end).toHaveBeenCalledTimes(1);
+    expect(releaseTail).toHaveBeenCalledTimes(1);
+    expect(res.write).not.toHaveBeenCalled();
+    expect(res.json).not.toHaveBeenCalled();
+    expect(res.headers['Content-Type']).toBe(paged ? 'text/event-stream' : undefined);
+  });
 
   test('fails durable task replay closed without a synchronization marker', async () => {
     const taskService = require('~/server/services/viventium/VoiceTaskService');
@@ -6427,82 +6417,24 @@ describe('/api/viventium/voice/chat', () => {
   });
 
   test('keeps a native mission input HTTP response pending and retries the exact operation under current call ownership', async () => {
-    require('~/server/services/viventium/CallSessionService').assertCallSessionSecret.mockResolvedValue(
-      {
-        callSessionId: 'call_session_1',
-        userId: 'user_1',
-        ownerParticipantIdentity: 'owner-participant',
-        mode: 'call',
-      },
-    );
+    require('~/server/services/viventium/CallSessionService').assertCallSessionSecret.mockResolvedValue({ callSessionId: 'call_session_1', userId: 'user_1', ownerParticipantIdentity: 'owner-participant', mode: 'call' });
     const service = require('~/server/services/viventium/VoiceTaskService');
-    const task = service.createVoiceTask({
-      callSessionId: 'call_session_1',
-      userId: 'user_1',
-      streamId: 'glasshive:run-native',
-      owner: { kind: 'glasshive_run', id: 'run-native' },
-    });
-    const binding = {
-      version: 1,
-      requestId: 'permission-1',
-      requestFingerprint: 'a'.repeat(64),
-      runId: 'run-native',
-      attemptId: 'attempt-1',
-      sessionId: 'session-1',
-      expiresAt: '2099-01-01T00:00:00Z',
-      taskId: task.taskId,
-      workRef: 'work-native',
-      userId: 'user_1',
-      callSessionId: 'call_session_1',
-    };
-    const provideInput = jest
-      .fn()
-      .mockResolvedValueOnce({ accepted: false, confirmationPending: true })
-      .mockResolvedValueOnce({ accepted: true });
-    service.registerVoiceTaskOwnerAdapter(task.taskId, {
-      kind: 'glasshive_run',
-      provideInput,
-      nativeMissionInputBinding: binding,
-    });
-    service.observeGenerationEvent(task.taskId, {
-      event: 'needs_input',
-      data: {
-        prompt: 'Permit?',
-        inputType: 'choice',
-        choices: [{ value: 'allow_once', label: 'Allow once' }],
-      },
-    });
+    const task = service.createVoiceTask({ callSessionId: 'call_session_1', userId: 'user_1', streamId: 'glasshive:run-native', owner: { kind: 'glasshive_run', id: 'run-native' } });
+    const binding = { version: 1, requestId: 'permission-1', requestFingerprint: 'a'.repeat(64), runId: 'run-native', attemptId: 'attempt-1', sessionId: 'session-1', expiresAt: '2099-01-01T00:00:00Z', taskId: task.taskId, workRef: 'work-native', userId: 'user_1', callSessionId: 'call_session_1' };
+    const provideInput = jest.fn().mockResolvedValueOnce({ accepted: false, confirmationPending: true }).mockResolvedValueOnce({ accepted: true });
+    service.registerVoiceTaskOwnerAdapter(task.taskId, { kind: 'glasshive_run', provideInput, nativeMissionInputBinding: binding });
+    service.observeGenerationEvent(task.taskId, { event: 'needs_input', data: { prompt: 'Permit?', inputType: 'choice', choices: [{ value: 'allow_once', label: 'Allow once' }] } });
     const app = createTestApp(require('../voice'));
-    const request = () =>
-      createMockReq({
-        method: 'POST',
-        url: `/api/viventium/voice/tasks/${task.taskId}/input`,
-        headers: {
-          'x-viventium-call-secret': 'secret',
-          'x-viventium-call-session': 'call_session_1',
-        },
-        body: { input: 'allow_once' },
-      });
+    const request = () => createMockReq({ method: 'POST', url: `/api/viventium/voice/tasks/${task.taskId}/input`, headers: { 'x-viventium-call-secret': 'secret', 'x-viventium-call-session': 'call_session_1' }, body: { input: 'allow_once' } });
     const pending = createMockRes();
     await dispatch(app, request(), pending);
     expect(pending.statusCode).toBe(200);
-    expect(pending.body).toMatchObject({
-      outcome: 'pending',
-      confirmationPending: true,
-      task: { state: 'needs_input' },
-    });
-    expect(provideInput.mock.calls[0][0]).toMatchObject({
-      voiceAuthorityContext: {
-        callSessionId: 'call_session_1',
-        binding: { callSessionId: 'call_session_1', userId: 'user_1', kind: 'participant_text' },
-      },
-    });
+    expect(pending.body).toMatchObject({ outcome: 'pending', confirmationPending: true, task: { state: 'needs_input' } });
+    expect(provideInput.mock.calls[0][0]).toMatchObject({ voiceAuthorityContext: { callSessionId: 'call_session_1', binding: { callSessionId: 'call_session_1', userId: 'user_1', kind: 'participant_text' } } });
     const accepted = createMockRes();
     await dispatch(app, request(), accepted);
     expect(accepted.body).toMatchObject({ outcome: 'accepted', task: { state: 'running' } });
-    expect(provideInput.mock.calls[1][0].operationId).toBe(
-      provideInput.mock.calls[0][0].operationId,
-    );
+    expect(provideInput.mock.calls[1][0].operationId).toBe(provideInput.mock.calls[0][0].operationId);
   });
 
   test('retries a failed task only through its installed owner adapter', async () => {
@@ -7785,75 +7717,35 @@ describe('/api/viventium/voice/chat', () => {
     expect(res.body.latest.text).toBe('Worker result from content.');
   });
 
-  test.each(['sent', 'suppressed'])(
-    'POST glasshive delivery claim reports exact %s receipt without another claim',
-    async (status) => {
-      const settled = {
-        deliveryId: 'delivery-sent',
-        callbackId: require('crypto')
-          .createHash('sha256')
-          .update('cb_voice')
-          .digest('hex')
-          .replace(/^/, 'callback_sha256:'),
-        userId: 'user_1',
-        voiceCallSessionId: 'call_session_1',
-        status,
-      };
-      mockGetSettledGlassHiveDelivery.mockResolvedValueOnce(settled);
-      const res = createMockRes();
-      await dispatch(
-        createTestApp(require('../voice')),
-        createMockReq({
-          method: 'POST',
-          url: '/api/viventium/voice/glasshive/deliveries/claim',
-          headers: { 'x-viventium-call-secret': 'secret' },
-          body: { callbackId: 'cb_voice', userId: 'forged', voiceCallSessionId: 'forged' },
-        }),
-        res,
-      );
-      expect(res.statusCode).toBe(200);
-      expect(res.body).toEqual({ deliveries: [], settled });
-      expect(mockGetSettledGlassHiveDelivery).toHaveBeenCalledWith({
-        callbackId: 'cb_voice',
-        userId: 'user_1',
-        voiceCallSessionId: 'call_session_1',
-      });
-    },
-  );
+  test.each(['sent', 'suppressed'])('POST glasshive delivery claim reports exact %s receipt without another claim', async (status) => {
+    const settled = {deliveryId: 'delivery-sent', callbackId: require('crypto').createHash('sha256')
+      .update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
+      userId: 'user_1', voiceCallSessionId: 'call_session_1', status};
+    mockGetSettledGlassHiveDelivery.mockResolvedValueOnce(settled);
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../voice')), createMockReq({method: 'POST',
+      url: '/api/viventium/voice/glasshive/deliveries/claim',
+      headers: {'x-viventium-call-secret': 'secret'}, body: {callbackId: 'cb_voice',
+        userId: 'forged', voiceCallSessionId: 'forged'}}), res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({deliveries: [], settled});
+    expect(mockGetSettledGlassHiveDelivery).toHaveBeenCalledWith({callbackId: 'cb_voice',
+      userId: 'user_1', voiceCallSessionId: 'call_session_1'});
+  });
 
   test('POST glasshive delivery claim rejects foreign or unconfirmed settled receipts', async () => {
-    const settled = {
-      deliveryId: 'delivery-sent',
-      callbackId: require('crypto')
-        .createHash('sha256')
-        .update('cb_voice')
-        .digest('hex')
-        .replace(/^/, 'callback_sha256:'),
-      userId: 'user_1',
-      voiceCallSessionId: 'call_session_1',
-      status: 'sent',
-    };
-    for (const changes of [
-      { userId: 'foreign' },
-      { voiceCallSessionId: 'foreign' },
-      { callbackId: 'callback_sha256:' + 'b'.repeat(64) },
-      { status: 'claimed' },
-      { deliveryId: '' },
-    ]) {
-      mockGetSettledGlassHiveDelivery.mockResolvedValueOnce({ ...settled, ...changes });
+    const settled = {deliveryId: 'delivery-sent', callbackId: require('crypto').createHash('sha256')
+      .update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
+      userId: 'user_1', voiceCallSessionId: 'call_session_1', status: 'sent'};
+    for (const changes of [{userId: 'foreign'}, {voiceCallSessionId: 'foreign'},
+      {callbackId: 'callback_sha256:' + 'b'.repeat(64)}, {status: 'claimed'}, {deliveryId: ''}]) {
+      mockGetSettledGlassHiveDelivery.mockResolvedValueOnce({...settled, ...changes});
       const res = createMockRes();
-      await dispatch(
-        createTestApp(require('../voice')),
-        createMockReq({
-          method: 'POST',
-          url: '/api/viventium/voice/glasshive/deliveries/claim',
-          headers: { 'x-viventium-call-secret': 'secret' },
-          body: { callbackId: 'cb_voice' },
-        }),
-        res,
-      );
+      await dispatch(createTestApp(require('../voice')), createMockReq({method: 'POST',
+        url: '/api/viventium/voice/glasshive/deliveries/claim',
+        headers: {'x-viventium-call-secret': 'secret'}, body: {callbackId: 'cb_voice'}}), res);
       expect(res.statusCode).toBe(409);
-      expect(res.body).toEqual({ error: 'delivery_scope_mismatch' });
+      expect(res.body).toEqual({error: 'delivery_scope_mismatch'});
     }
   });
 
@@ -7861,11 +7753,7 @@ describe('/api/viventium/voice/chat', () => {
     mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
       {
         deliveryId: 'ghcd_voice',
-        callbackId: require('crypto')
-          .createHash('sha256')
-          .update('cb_voice')
-          .digest('hex')
-          .replace(/^/, 'callback_sha256:'),
+        callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
         text: 'Worker finished.',
         claimId: 'claim_voice',
         userId: 'user_1',
@@ -7898,29 +7786,9 @@ describe('/api/viventium/voice/chat', () => {
 
   test('POST glasshive delivery claim rejects a substituted callback or a different owner/call', async () => {
     for (const mismatch of [
-      {
-        callbackId: 'callback_sha256:' + 'b'.repeat(64),
-        userId: 'user_1',
-        voiceCallSessionId: 'call_session_1',
-      },
-      {
-        callbackId: require('crypto')
-          .createHash('sha256')
-          .update('cb_voice')
-          .digest('hex')
-          .replace(/^/, 'callback_sha256:'),
-        userId: 'different_owner',
-        voiceCallSessionId: 'call_session_1',
-      },
-      {
-        callbackId: require('crypto')
-          .createHash('sha256')
-          .update('cb_voice')
-          .digest('hex')
-          .replace(/^/, 'callback_sha256:'),
-        userId: 'user_1',
-        voiceCallSessionId: 'different_call',
-      },
+      { callbackId: 'callback_sha256:' + 'b'.repeat(64), userId: 'user_1', voiceCallSessionId: 'call_session_1' },
+      { callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'), userId: 'different_owner', voiceCallSessionId: 'call_session_1' },
+      { callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'), userId: 'user_1', voiceCallSessionId: 'different_call' },
     ]) {
       mockClaimGlassHiveDeliveries.mockResolvedValueOnce([
         { deliveryId: 'ghcd_voice', claimId: 'claim_voice', ...mismatch },
@@ -7944,11 +7812,7 @@ describe('/api/viventium/voice/chat', () => {
     const exact = {
       deliveryId: 'ghcd_voice',
       claimId: 'claim_voice',
-      callbackId: require('crypto')
-        .createHash('sha256')
-        .update('cb_voice')
-        .digest('hex')
-        .replace(/^/, 'callback_sha256:'),
+      callbackId: require('crypto').createHash('sha256').update('cb_voice').digest('hex').replace(/^/, 'callback_sha256:'),
       userId: 'user_1',
       voiceCallSessionId: 'call_session_1',
     };
@@ -8226,38 +8090,28 @@ describe('/api/viventium/voice/chat', () => {
     expect(mockAgentControllerCallCount).toBe(0);
   });
 
-  test.each([true, false])(
-    'call ingress strips caller work/effect carriers (typed=%s)',
-    async (typed) => {
-      const body = {
-        ...(typed ? typedBody() : { text: 'Unverified audio.', streamId: 'audio-forged-carrier' }),
-        viventiumVoiceWorkAuthority: {
-          version: 1,
-          kind: 'participant_text',
-          fingerprint: 'forged',
-        },
-        viventiumVoiceEffectAuthority: { version: 1, voiceAuthorityRef: 'forged', voice: {} },
-      };
-      const req = createMockReq({ url: '/api/viventium/voice/chat', body });
-      const res = createMockRes();
-      await dispatch(createTestApp(require('../voice')), req, res);
-      expect(res.statusCode).toBe(200);
-      expect(req.body.viventiumVoiceWorkAuthority).toBeUndefined();
-      expect(req.body.viventiumVoiceEffectAuthority).toBeUndefined();
-      expect(req.body.viventiumCanAuthorizeSideEffects).toBe(typed);
-      if (typed) {
-        expect(req.viventiumVoiceWorkAuthority).toMatchObject({
-          version: 1,
-          callSessionId: 'call_session_1',
-          userId: 'user_1',
-          kind: 'participant_text',
-          turnIds: [],
-        });
-      } else {
-        expect(req.viventiumVoiceWorkAuthority).toBeNull();
-      }
-    },
-  );
+  test.each([true, false])('call ingress strips caller work/effect carriers (typed=%s)', async (typed) => {
+    const body = {
+      ...(typed ? typedBody() : { text: 'Unverified audio.', streamId: 'audio-forged-carrier' }),
+      viventiumVoiceWorkAuthority: { version: 1, kind: 'participant_text', fingerprint: 'forged' },
+      viventiumVoiceEffectAuthority: { version: 1, voiceAuthorityRef: 'forged', voice: {} },
+    };
+    const req = createMockReq({ url: '/api/viventium/voice/chat', body });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../voice')), req, res);
+    expect(res.statusCode).toBe(200);
+    expect(req.body.viventiumVoiceWorkAuthority).toBeUndefined();
+    expect(req.body.viventiumVoiceEffectAuthority).toBeUndefined();
+    expect(req.body.viventiumCanAuthorizeSideEffects).toBe(typed);
+    if (typed) {
+      expect(req.viventiumVoiceWorkAuthority).toMatchObject({
+        version: 1, callSessionId: 'call_session_1', userId: 'user_1',
+        kind: 'participant_text', turnIds: [],
+      });
+    } else {
+      expect(req.viventiumVoiceWorkAuthority).toBeNull();
+    }
+  });
 
   test('typed Call retains separate rapid typed and audio ingress', async () => {
     process.env.VIVENTIUM_VOICE_LIVE_TURN_COALESCE_WINDOW_MS = '10';
@@ -8416,372 +8270,170 @@ describe('/api/viventium/voice/chat', () => {
   test('authenticated native started projection exposes completed speech Stop without canceling its job', async () => {
     const { GenerationJobManager } = require('@librechat/api');
     const service = require('~/server/services/viventium/VoiceTaskService');
-    const task = service.createVoiceTask({
-      callSessionId: 'call_session_1',
-      userId: 'user_1',
-      streamId: 'stream-playout',
-      conversationId: 'conv-voice-1',
-      owner: { kind: 'generation_job', id: 'stream-playout' },
-    });
-    service.completeVoiceTask(task.taskId, { resultMessageId: 'result-playout' });
-    GenerationJobManager.getJob.mockResolvedValueOnce({
-      metadata: {
-        userId: 'user_1',
-        viventiumCallSessionId: 'call_session_1',
-        viventiumVoiceTaskId: task.taskId,
-        interactionContext: { surface: 'voice', logical_turn_id: 'logical-playout' },
-      },
-    });
+    const task = service.createVoiceTask({callSessionId: 'call_session_1', userId: 'user_1',
+      streamId: 'stream-playout', conversationId: 'conv-voice-1',
+      owner: {kind: 'generation_job', id: 'stream-playout'}});
+    service.completeVoiceTask(task.taskId, {resultMessageId: 'result-playout'});
+    GenerationJobManager.getJob.mockResolvedValueOnce({metadata: {
+      userId: 'user_1', viventiumCallSessionId: 'call_session_1', viventiumVoiceTaskId: task.taskId,
+      interactionContext: {surface: 'voice', logical_turn_id: 'logical-playout'},
+    }});
     const start = createMockRes();
-    await dispatch(
-      createTestApp(require('../voice')),
-      createMockReq({
-        url: '/api/viventium/voice/trace/stages',
-        headers: { 'x-viventium-call-secret': 'secret' },
-        body: {
-          version: 1,
-          callSessionId: 'call_session_1',
-          turnId: 'logical-playout',
-          taskId: task.taskId,
-          streamId: task.streamId,
-          presentationRef: 'speech-playout',
-          stage: 'audio.started',
-          startedAtMs: 1000,
-        },
-      }),
-      start,
-    );
+    await dispatch(createTestApp(require('../voice')), createMockReq({
+      url: '/api/viventium/voice/trace/stages', headers: {'x-viventium-call-secret': 'secret'},
+      body: {version: 1, callSessionId: 'call_session_1', turnId: 'logical-playout',
+        taskId: task.taskId, streamId: task.streamId, presentationRef: 'speech-playout',
+        stage: 'audio.started', startedAtMs: 1000},
+    }), start);
     expect(start.statusCode).toBe(200);
-    expect(service.snapshotEvent(task.taskId)).toMatchObject({
-      state: 'completed',
-      resultMessageId: 'result-playout',
-      presentation: { ref: 'speech-playout', state: 'speaking' },
-    });
+    expect(service.snapshotEvent(task.taskId)).toMatchObject({state: 'completed',
+      resultMessageId: 'result-playout', presentation: {ref: 'speech-playout', state: 'speaking'}});
     expect(mockRecordVoiceOrchestrationTrace).not.toHaveBeenCalled();
     const stop = createMockRes();
-    await dispatch(
-      createTestApp(require('../voice')),
-      createMockReq({
-        url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
-        headers: {
-          'x-viventium-call-secret': 'secret',
-          'x-viventium-call-session': 'call_session_1',
-        },
-        body: { presentationRef: 'speech-playout' },
-      }),
-      stop,
-    );
+    await dispatch(createTestApp(require('../voice')), createMockReq({
+      url: `/api/viventium/voice/tasks/${task.taskId}/cancel`,
+      headers: {'x-viventium-call-secret': 'secret', 'x-viventium-call-session': 'call_session_1'},
+      body: {presentationRef: 'speech-playout'},
+    }), stop);
     expect(stop.statusCode).toBe(200);
-    expect(stop.body).toMatchObject({
-      version: 1,
-      outcome: 'playout_stop_requested',
-      event: {
-        state: 'completed',
-        resultMessageId: 'result-playout',
-        cancellable: false,
-        presentation: { ref: 'speech-playout', state: 'stop_requested' },
-      },
-    });
+    expect(stop.body).toMatchObject({version: 1, outcome: 'playout_stop_requested',
+      event: {state: 'completed', resultMessageId: 'result-playout', cancellable: false,
+        presentation: {ref: 'speech-playout', state: 'stop_requested'}}});
     expect(service.isVoiceTaskSuppressed(task.taskId)).toBe(false);
   });
 
+
   function canonicalWorkerTask(service, overrides = {}) {
-    const delivery = {
-      deliveryId: 'worker-delivery',
-      claimId: 'claim-worker',
-      userId: 'user_1',
-      surface: 'voice',
-      voiceCallSessionId: 'call_session_1',
-      conversationId: 'conv-voice-1',
-      voiceRequestId: 'own-worker-turn',
-      callbackMessageId: 'canonical-worker-result',
-      status: 'claimed',
-      runId: 'worker-run',
-      anchorMessageId: 'NO_PARENT',
-      ...overrides,
-    };
-    const task = service.registerVoiceTaskDeliveryPresentation(delivery, {
-      userId: 'user_1',
-      callSessionId: 'call_session_1',
-    });
-    return { delivery, task };
+    const delivery = {deliveryId: 'worker-delivery', claimId: 'claim-worker', userId: 'user_1',
+      surface: 'voice', voiceCallSessionId: 'call_session_1', conversationId: 'conv-voice-1',
+      voiceRequestId: 'own-worker-turn', callbackMessageId: 'canonical-worker-result',
+      status: 'claimed', runId: 'worker-run', anchorMessageId: 'NO_PARENT', ...overrides};
+    const task = service.registerVoiceTaskDeliveryPresentation(delivery,
+      {userId: 'user_1', callSessionId: 'call_session_1'});
+    return {delivery, task};
   }
   test.each(['audio.started', 'audio.interrupted', 'audio.completed'])(
-    'canonical Worker %s uses only its delivery owner and a single terminal writer',
-    async (stage) => {
-      const { GenerationJobManager } = require('@librechat/api');
+    'canonical Worker %s uses only its delivery owner and a single terminal writer', async (stage) => {
+      const {GenerationJobManager} = require('@librechat/api');
       const service = require('~/server/services/viventium/VoiceTaskService');
-      const { delivery, task } = canonicalWorkerTask(service);
-      mockResolveGlassHiveVoicePresentation.mockResolvedValueOnce({
-        ...delivery,
-        presentationRef: 'worker-speech',
-        turnId: delivery.voiceRequestId,
-      });
-      const proof = {
-        deliveryId: delivery.deliveryId,
-        claimId: delivery.claimId,
-        dispatchPermit: { permitId: 'exact-current-permit' },
-      };
+      const {delivery, task} = canonicalWorkerTask(service);
+      mockResolveGlassHiveVoicePresentation.mockResolvedValueOnce({...delivery,
+        presentationRef: 'worker-speech', turnId: delivery.voiceRequestId});
+      const proof = {deliveryId: delivery.deliveryId, claimId: delivery.claimId,
+        dispatchPermit: {permitId: 'exact-current-permit'}};
       const res = createMockRes();
-      await dispatch(
-        createTestApp(require('../voice')),
-        createMockReq({
-          url: '/api/viventium/voice/trace/stages',
-          headers: { 'x-viventium-call-secret': 'secret' },
-          body: {
-            version: 1,
-            callSessionId: delivery.voiceCallSessionId,
-            turnId: delivery.voiceRequestId,
-            taskId: task.taskId,
-            streamId: task.streamId,
-            presentationRef: 'worker-speech',
-            stage,
-            startedAtMs: 2000,
-            workerDelivery: proof,
-          },
-        }),
-        res,
-      );
+      await dispatch(createTestApp(require('../voice')), createMockReq({
+        url: '/api/viventium/voice/trace/stages', headers: {'x-viventium-call-secret': 'secret'},
+        body: {version: 1, callSessionId: delivery.voiceCallSessionId, turnId: delivery.voiceRequestId,
+          taskId: task.taskId, streamId: task.streamId, presentationRef: 'worker-speech',
+          stage, startedAtMs: 2000, workerDelivery: proof},
+      }), res);
       expect(res.statusCode).toBe(stage === 'audio.started' ? 200 : 400);
-      expect(mockResolveGlassHiveVoicePresentation).toHaveBeenCalledWith({
-        ...proof,
-        presentationRef: 'worker-speech',
-        turnId: delivery.voiceRequestId,
-        userId: 'user_1',
-        voiceCallSessionId: delivery.voiceCallSessionId,
-        conversationId: delivery.conversationId,
-      });
+      expect(mockResolveGlassHiveVoicePresentation).toHaveBeenCalledWith({...proof,
+        presentationRef: 'worker-speech', turnId: delivery.voiceRequestId, userId: 'user_1',
+        voiceCallSessionId: delivery.voiceCallSessionId, conversationId: delivery.conversationId});
       expect(GenerationJobManager.getJob).not.toHaveBeenCalled();
-      if (stage === 'audio.started')
-        expect(service.snapshotEvent(task.taskId)).toMatchObject({
-          state: 'completed',
-          resultMessageId: delivery.callbackMessageId,
-          presentation: { ref: 'worker-speech', state: 'speaking' },
-        });
+      if (stage === 'audio.started') expect(service.snapshotEvent(task.taskId)).toMatchObject({
+        state: 'completed', resultMessageId: delivery.callbackMessageId,
+        presentation: {ref: 'worker-speech', state: 'speaking'}});
       else expect(service.snapshotEvent(task.taskId).presentation).toBeUndefined();
       expect(mockConfirmCortexVoicePresentation).not.toHaveBeenCalled();
       expect(mockRecordVoiceOrchestrationTrace).not.toHaveBeenCalled();
-    },
-  );
+    });
 
   test.each(['unverified', 'foreign-task', 'malformed-proof'])(
-    'rejects %s Worker proof without falling back to Main authority',
-    async (failure) => {
+    'rejects %s Worker proof without falling back to Main authority', async (failure) => {
       const service = require('~/server/services/viventium/VoiceTaskService');
-      const task = service.createVoiceTask({
-        callSessionId: 'call_session_1',
-        userId: 'user_1',
-        streamId: 'main-stream',
-        conversationId: 'conv-voice-1',
-      });
-      service.bindVoiceTaskStream(task.taskId, task.streamId, {
-        callSessionId: 'call_session_1',
-        userId: 'user_1',
-        logicalTurnId: 'main-turn',
-      });
-      service.completeVoiceTask(task.taskId, { resultMessageId: 'main-anchor' });
-      const proof = {
-        deliveryId: 'exact-delivery',
-        claimId: 'exact-claim',
-        dispatchPermit: { permitId: 'permit' },
-      };
+      const task = service.createVoiceTask({callSessionId: 'call_session_1', userId: 'user_1',
+        streamId: 'main-stream', conversationId: 'conv-voice-1'});
+      service.bindVoiceTaskStream(task.taskId, task.streamId, {callSessionId: 'call_session_1',
+        userId: 'user_1', logicalTurnId: 'main-turn'});
+      service.completeVoiceTask(task.taskId, {resultMessageId: 'main-anchor'});
+      const proof = {deliveryId: 'exact-delivery', claimId: 'exact-claim', dispatchPermit: {permitId: 'permit'}};
       if (failure === 'malformed-proof') proof.extra = 'not-authority';
       const res = createMockRes();
-      await dispatch(
-        createTestApp(require('../voice')),
-        createMockReq({
-          url: '/api/viventium/voice/trace/stages',
-          headers: { 'x-viventium-call-secret': 'secret' },
-          body: {
-            version: 1,
-            callSessionId: 'call_session_1',
-            turnId: 'main-turn',
-            taskId: failure === 'foreign-task' ? 'foreign-task' : task.taskId,
-            streamId: task.streamId,
-            presentationRef: 'worker-speech',
-            stage: 'audio.started',
-            startedAtMs: 2000,
-            workerDelivery: proof,
-          },
-        }),
-        res,
-      );
+      await dispatch(createTestApp(require('../voice')), createMockReq({
+        url: '/api/viventium/voice/trace/stages', headers: {'x-viventium-call-secret': 'secret'},
+        body: {version: 1, callSessionId: 'call_session_1', turnId: 'main-turn',
+          taskId: failure === 'foreign-task' ? 'foreign-task' : task.taskId,
+          streamId: task.streamId, presentationRef: 'worker-speech', stage: 'audio.started',
+          startedAtMs: 2000, workerDelivery: proof},
+      }), res);
       expect(res.statusCode).toBe(failure === 'malformed-proof' ? 400 : 403);
       expect(service.snapshotEvent(task.taskId).presentation).toBeUndefined();
-    },
-  );
+    });
 
   test.each(['sent', 'delivery_unknown'])(
-    'verified Worker %s settlement carries its exact terminal state without another request',
-    async (status) => {
+    'verified Worker %s settlement carries its exact terminal state without another request', async (status) => {
       const service = require('~/server/services/viventium/VoiceTaskService');
-      const { delivery, task } = canonicalWorkerTask(service);
-      service.recordVoiceTaskDeliveryPresentation(task.taskId, {
-        userId: 'user_1',
-        callSessionId: delivery.voiceCallSessionId,
-        streamId: task.streamId,
-        deliveryId: delivery.deliveryId,
-        presentationRef: 'worker-ref',
-        stage: 'audio.started',
-        startedAtMs: 2000,
-      });
-      const settled = {
-        ...delivery,
-        status,
-        workerCompletionPresentation: { presentationRef: 'worker-ref' },
-      };
-      if (status === 'sent')
-        mockCompleteGlassHiveWorkerCompletionPresentation.mockResolvedValueOnce(settled);
+      const {delivery, task} = canonicalWorkerTask(service);
+      service.recordVoiceTaskDeliveryPresentation(task.taskId, {userId: 'user_1',
+        callSessionId: delivery.voiceCallSessionId, streamId: task.streamId,
+        deliveryId: delivery.deliveryId, presentationRef: 'worker-ref', stage: 'audio.started', startedAtMs: 2000});
+      const settled = {...delivery, status, workerCompletionPresentation: {presentationRef: 'worker-ref'}};
+      if (status === 'sent') mockCompleteGlassHiveWorkerCompletionPresentation.mockResolvedValueOnce(settled);
       else mockMarkGlassHiveDeliveryUnknown.mockResolvedValueOnce(settled);
       const res = createMockRes();
-      await dispatch(
-        createTestApp(require('../voice')),
-        createMockReq({
-          url:
-            status === 'sent'
-              ? '/api/viventium/voice/glasshive/deliveries/worker-delivery/presentation-complete'
-              : '/api/viventium/voice/glasshive/deliveries/worker-delivery/status',
-          headers: { 'x-viventium-call-secret': 'secret' },
-          body: {
-            claimId: delivery.claimId,
-            dispatchPermit: { permitId: 'permit' },
-            status,
-            presentationRef: 'worker-ref',
-            taskPresentation: {
-              taskId: task.taskId,
-              streamId: task.streamId,
-              presentationRef: 'worker-ref',
-              startedAtMs: 2000,
-              stage: status === 'sent' ? 'audio.completed' : 'audio.interrupted',
-            },
-          },
-        }),
-        res,
-      );
+      await dispatch(createTestApp(require('../voice')), createMockReq({
+        url: status === 'sent' ? '/api/viventium/voice/glasshive/deliveries/worker-delivery/presentation-complete'
+          : '/api/viventium/voice/glasshive/deliveries/worker-delivery/status',
+        headers: {'x-viventium-call-secret': 'secret'},
+        body: {claimId: delivery.claimId, dispatchPermit: {permitId: 'permit'}, status,
+          presentationRef: 'worker-ref', taskPresentation: {taskId: task.taskId, streamId: task.streamId,
+            presentationRef: 'worker-ref', startedAtMs: 2000,
+            stage: status === 'sent' ? 'audio.completed' : 'audio.interrupted'}},
+      }), res);
       expect(res.statusCode).toBe(200);
-      expect(service.snapshotEvent(task.taskId)).toMatchObject({
-        state: 'completed',
-        resultMessageId: delivery.callbackMessageId,
-        presentation: { ref: 'worker-ref', state: status === 'sent' ? 'completed' : 'interrupted' },
-      });
+      expect(service.snapshotEvent(task.taskId)).toMatchObject({state: 'completed',
+        resultMessageId: delivery.callbackMessageId, presentation: {ref: 'worker-ref',
+          state: status === 'sent' ? 'completed' : 'interrupted'}});
       expect(service.isVoiceTaskSuppressed(task.taskId)).toBe(false);
       expect(mockResolveGlassHiveVoicePresentation).not.toHaveBeenCalled();
-    },
-  );
+    });
 
   test.each(['foreign-task', 'foreign-call', 'wrong-result', 'fake-completed', 'old-ref'])(
-    'Worker settled metadata %s cannot change another live presentation',
-    async (failure) => {
+    'Worker settled metadata %s cannot change another live presentation', async (failure) => {
       const service = require('~/server/services/viventium/VoiceTaskService');
-      const { delivery, task } = canonicalWorkerTask(service);
-      service.recordVoiceTaskDeliveryPresentation(task.taskId, {
-        userId: 'user_1',
-        callSessionId: delivery.voiceCallSessionId,
-        streamId: task.streamId,
-        deliveryId: delivery.deliveryId,
-        presentationRef: 'current-ref',
-        stage: 'audio.started',
-        startedAtMs: 3000,
-      });
-      const settled = {
-        ...delivery,
-        status: 'delivery_unknown',
-        workerCompletionPresentation: {
-          presentationRef: failure === 'old-ref' ? 'old-ref' : 'current-ref',
-        },
-      };
+      const {delivery, task} = canonicalWorkerTask(service);
+      service.recordVoiceTaskDeliveryPresentation(task.taskId, {userId: 'user_1',
+        callSessionId: delivery.voiceCallSessionId, streamId: task.streamId,
+        deliveryId: delivery.deliveryId, presentationRef: 'current-ref', stage: 'audio.started', startedAtMs: 3000});
+      const settled = {...delivery, status: 'delivery_unknown',
+        workerCompletionPresentation: {presentationRef: failure === 'old-ref' ? 'old-ref' : 'current-ref'}};
       if (failure === 'foreign-call') settled.voiceCallSessionId = 'foreign';
       if (failure === 'wrong-result') settled.callbackMessageId = 'other-result';
       mockMarkGlassHiveDeliveryUnknown.mockResolvedValueOnce(settled);
       const res = createMockRes();
-      await dispatch(
-        createTestApp(require('../voice')),
-        createMockReq({
-          url: '/api/viventium/voice/glasshive/deliveries/worker-delivery/status',
-          headers: { 'x-viventium-call-secret': 'secret' },
-          body: {
-            claimId: delivery.claimId,
-            dispatchPermit: { permitId: 'permit' },
-            status: 'delivery_unknown',
-            taskPresentation: {
-              taskId: failure === 'foreign-task' ? 'foreign' : task.taskId,
-              streamId: task.streamId,
-              presentationRef: failure === 'old-ref' ? 'old-ref' : 'current-ref',
-              startedAtMs: failure === 'old-ref' ? 2000 : 3000,
-              stage: failure === 'fake-completed' ? 'audio.completed' : 'audio.interrupted',
-            },
-          },
-        }),
-        res,
-      );
+      await dispatch(createTestApp(require('../voice')), createMockReq({
+        url: '/api/viventium/voice/glasshive/deliveries/worker-delivery/status',
+        headers: {'x-viventium-call-secret': 'secret'}, body: {claimId: delivery.claimId,
+          dispatchPermit: {permitId: 'permit'}, status: 'delivery_unknown',
+          taskPresentation: {taskId: failure === 'foreign-task' ? 'foreign' : task.taskId,
+            streamId: task.streamId, presentationRef: failure === 'old-ref' ? 'old-ref' : 'current-ref',
+            startedAtMs: failure === 'old-ref' ? 2000 : 3000,
+            stage: failure === 'fake-completed' ? 'audio.completed' : 'audio.interrupted'}},
+      }), res);
       expect(res.statusCode).toBe(200);
       expect(service.snapshotEvent(task.taskId).presentation.state).toBe('speaking');
-    },
-  );
+    });
 
   test('ended same-worker status admits only exact unknown settlement, never sent or new starts', async () => {
     for (const status of ['delivery_unknown', 'sent', 'failed', 'suppressed']) {
-      mockAssertVoiceGatewayAuth.mockResolvedValueOnce({
-        callSessionId: 'call_session_1',
-        userId: 'user_1',
-        conversationId: 'conv-voice-1',
-        status: 'ended',
-      });
-      mockMarkGlassHiveDeliveryUnknown.mockResolvedValueOnce({
-        deliveryId: 'worker-delivery',
-        status,
-        userId: 'user_1',
-        voiceCallSessionId: 'call_session_1',
-      });
+      mockAssertVoiceGatewayAuth.mockResolvedValueOnce({callSessionId: 'call_session_1', userId: 'user_1',
+        conversationId: 'conv-voice-1', status: 'ended'});
+      mockMarkGlassHiveDeliveryUnknown.mockResolvedValueOnce({deliveryId: 'worker-delivery', status,
+        userId: 'user_1', voiceCallSessionId: 'call_session_1'});
       const res = createMockRes();
-      await dispatch(
-        createTestApp(require('../voice')),
-        createMockReq({
-          url: '/api/viventium/voice/glasshive/deliveries/worker-delivery/status',
-          headers: { 'x-viventium-call-secret': 'secret' },
-          body: { claimId: 'claim', status, dispatchPermit: { permitId: 'exact-current-permit' } },
-        }),
-        res,
-      );
+      await dispatch(createTestApp(require('../voice')), createMockReq({
+        url: '/api/viventium/voice/glasshive/deliveries/worker-delivery/status',
+        headers: {'x-viventium-call-secret': 'secret'}, body: {claimId: 'claim', status,
+          dispatchPermit: {permitId: 'exact-current-permit'}},
+      }), res);
       expect(res.statusCode).toBe(status === 'delivery_unknown' ? 200 : 410);
-      expect(mockAssertVoiceGatewayAuth).toHaveBeenLastCalledWith(expect.any(Object), {
-        allowEnded: true,
-      });
-      if (status === 'delivery_unknown')
-        expect(mockMarkGlassHiveDeliveryUnknown).toHaveBeenLastCalledWith(
-          expect.objectContaining({
-            requireIssuedPermit: true,
-            userId: 'user_1',
-            voiceCallSessionId: 'call_session_1',
-          }),
-        );
+      expect(mockAssertVoiceGatewayAuth).toHaveBeenLastCalledWith(expect.any(Object), {allowEnded: true});
+      if (status === 'delivery_unknown') expect(mockMarkGlassHiveDeliveryUnknown).toHaveBeenLastCalledWith(
+        expect.objectContaining({requireIssuedPermit: true, userId: 'user_1', voiceCallSessionId: 'call_session_1'}));
     }
   });
 
-  test('abandons only the exact authenticated gateway claim with a declared startup failure', async () => {
-    const voiceRouter = require('../voice');
-    const app = createTestApp(voiceRouter);
-    const req = createMockReq({
-      method: 'POST',
-      url: '/api/viventium/voice/claim/abandon',
-      headers: {
-        'x-viventium-call-secret': 'secret',
-        'x-viventium-call-session': 'call_session_1',
-        'x-viventium-job-id': 'job-owner-wait',
-        'x-viventium-worker-id': 'worker-owner-wait',
-      },
-      body: { reason: 'owner_timeout' },
-    });
-    const res = createMockRes();
-
-    await dispatch(app, req, res);
-
-    expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ version: 1, released: true });
-    expect(mockAbandonVoiceSessionClaim).toHaveBeenCalledWith({
-      callSessionId: 'call_session_1',
-      jobId: 'job-owner-wait',
-      workerId: 'worker-owner-wait',
-    });
-  });
 });

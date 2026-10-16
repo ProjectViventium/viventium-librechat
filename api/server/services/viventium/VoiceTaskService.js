@@ -574,17 +574,10 @@ function restoreTaskFromSuppression(tombstone) {
 }
 
 function applyTaskSuppression(task, suppressionTask) {
-  if (
-    !task ||
-    !suppressionTask ||
-    task.taskId !== suppressionTask.taskId ||
-    task.userId !== suppressionTask.userId ||
-    task.callSessionId !== suppressionTask.callSessionId ||
-    task.streamId !== suppressionTask.streamId ||
-    task.owner?.kind !== suppressionTask.owner?.kind ||
-    task.owner?.id !== suppressionTask.owner?.id
-  )
-    return suppressionTask;
+  if (!task || !suppressionTask || task.taskId !== suppressionTask.taskId ||
+      task.userId !== suppressionTask.userId || task.callSessionId !== suppressionTask.callSessionId ||
+      task.streamId !== suppressionTask.streamId || task.owner?.kind !== suppressionTask.owner?.kind ||
+      task.owner?.id !== suppressionTask.owner?.id) return suppressionTask;
   const createdAt = task.createdAt;
   const events = task.events.some((event) => event.eventId === suppressionTask.lastEvent?.eventId)
     ? task.events
@@ -903,8 +896,7 @@ function publicTask(task) {
     sequence: task.sequence,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
-    cancellable:
-      task.state === 'failed' ? canCancelFailedProviderAttention(task) : task.cancellable,
+    cancellable: task.state === 'failed' ? canCancelFailedProviderAttention(task) : task.cancellable,
     retryable: task.retryable,
     owner: { ...task.owner },
     ...(task.current?.presentation ? { presentation: { ...task.current.presentation } } : {}),
@@ -913,18 +905,12 @@ function publicTask(task) {
 
 function canCancelFailedProviderAttention(task, code = task?.current?.error?.code) {
   const failedAttention = task?.state === 'failed' && code === 'provider_progress_stalled';
-  const recoveringStop =
-    task?.state === 'recovering' &&
-    task.suppressed === true &&
+  const recoveringStop = task?.state === 'recovering' && task.suppressed === true &&
     task.cancelOperation?.failedProviderCode === 'provider_progress_stalled' &&
     task.cancelOperation.operationId === task.ownerOperationId;
-  if (
-    (!failedAttention && !recoveringStop) ||
-    !['generation_job', 'remote_generation'].includes(task.owner?.kind) ||
-    !task.streamId ||
-    task.owner.id !== task.streamId
-  )
-    return false;
+  if ((!failedAttention && !recoveringStop) ||
+      !['generation_job', 'remote_generation'].includes(task.owner?.kind) ||
+      !task.streamId || task.owner.id !== task.streamId) return false;
   const adapter = getOwnerAdapter(task);
   return adapter?.cancelFailedProviderAttention === true && typeof adapter.cancel === 'function';
 }
@@ -1008,30 +994,15 @@ function sanitizeNeedsInput(data) {
           )
           .map(({ value, label }) => ({ value, label }))
       : [];
-  const nativeInputRequest = nativeInputRequestSchema.safeParse(data?.nativeInputRequest);
-  const questionForm = nativeQuestionFormSchema.safeParse(data?.questionForm);
-  if (inputType === 'native_question' && !questionForm.success) return null;
+  const nativeInputRequest=nativeInputRequestSchema.safeParse(data?.nativeInputRequest);
+  const questionForm=nativeQuestionFormSchema.safeParse(data?.questionForm);
+  if(inputType==='native_question' && !questionForm.success) return null;
   const operationTitle = data?.operationTitle;
-  if (
-    operationTitle !== undefined &&
-    (inputType !== 'choice' ||
-      !nativeInputRequest.success ||
-      nativeInputRequest.data.kind !== 'permission' ||
-      typeof operationTitle !== 'string' ||
-      operationTitle.length === 0 ||
-      operationTitle.length > 8000)
-  )
-    return null;
-  return {
-    prompt,
-    inputType,
-    ...(operationTitle !== undefined ? { operationTitle } : {}),
-    ...(choices.length ? { choices } : {}),
-    ...(nativeInputRequest.success ? { nativeInputRequest: nativeInputRequest.data } : {}),
-    ...(inputType === 'native_question' && questionForm.success
-      ? { questionForm: questionForm.data }
-      : {}),
-  };
+  if (operationTitle !== undefined &&
+      (inputType !== 'choice' || !nativeInputRequest.success ||
+       nativeInputRequest.data.kind !== 'permission' || typeof operationTitle !== 'string' ||
+       operationTitle.length === 0 || operationTitle.length > 8000)) return null;
+  return { prompt, inputType, ...(operationTitle !== undefined ? {operationTitle} : {}), ...(choices.length ? { choices } : {}),...(nativeInputRequest.success ? {nativeInputRequest:nativeInputRequest.data} : {}),...(inputType==='native_question' && questionForm.success ? {questionForm:questionForm.data} : {}) };
 }
 
 function sanitizeProgress(data) {
@@ -1103,11 +1074,8 @@ function nextEvent(task, fields) {
     ...(fields.progress ? { progress: event.progress } : {}),
     ...(fields.needsInput ? { needsInput: event.needsInput } : {}),
     ...(fields.resultMessageId ? { resultMessageId: event.resultMessageId } : {}),
-    ...(fields.phase === 'follow_up' && fields.source
-      ? { source: { ...fields.source } }
-      : !fields.phase && task.current?.source
-        ? { source: { ...task.current.source } }
-        : {}),
+    ...(fields.phase === 'follow_up' && fields.source ? { source: { ...fields.source } }
+      : !fields.phase && task.current?.source ? { source: { ...task.current.source } } : {}),
     ...(fields.error ? { error: event.error } : {}),
     ...(event.presentation ? { presentation: { ...event.presentation } } : {}),
   };
@@ -1191,6 +1159,7 @@ async function runVoiceTaskTerminalCallbackMutation(taskId, operation) {
 }
 
 function createVoiceTask({
+  label,
   callSessionId,
   userId,
   conversationId,
@@ -1239,7 +1208,7 @@ function createVoiceTask({
   }
   nextEvent(task, { type: 'state', phase: 'queued', label: 'Queued' });
   task.state = 'running';
-  nextEvent(task, { type: 'state', phase: 'starting', label: 'Starting' });
+  nextEvent(task, { type: 'state', phase: 'starting', label: safeText(label, 160) || 'Starting' });
   logger.info('[VIVENTIUM][VoiceTask] task_started', {
     taskId: task.taskId,
     callSessionId: task.callSessionId,
@@ -1413,9 +1382,7 @@ function registerVoiceTaskOwnerAdapter(
     ...(typeof isNativeInputCurrent === 'function' ? { isNativeInputCurrent } : {}),
     ...(typeof retry === 'function' ? { retry } : {}),
     ...(typeof cancel === 'function' ? { cancel } : {}),
-    ...(typeof cancelFailedProviderAttention === 'boolean'
-      ? { cancelFailedProviderAttention }
-      : {}),
+    ...(typeof cancelFailedProviderAttention === 'boolean' ? { cancelFailedProviderAttention } : {}),
     ...(Number.isFinite(Number(expiresAtMs)) ? { expiresAtMs: Number(expiresAtMs) } : {}),
     ...(Number.isFinite(Number(inputExpiresAtMs))
       ? { inputExpiresAtMs: Number(inputExpiresAtMs) }
@@ -1464,44 +1431,18 @@ async function submitVoiceTaskInput(taskId, input, { userId, voiceAuthorityConte
   if (!adapter?.provideInput) {
     return operationFailure(task, 'input_unsupported', 'This task owner does not accept input.');
   }
-  const questionBinding =
-    task.nativeMissionInputBinding?.inputKind === 'question'
-      ? nativeMissionVoiceBinding(task.nativeMissionInputBinding, task)
-      : null;
-  const questionForm =
-    questionBinding?.questionForm ||
-    (task.current?.needsInput?.inputType === 'native_question'
-      ? task.current.needsInput.questionForm
-      : null);
-  const normalizedInput = questionForm
-    ? typeof input === 'string' && Buffer.byteLength(input, 'utf8') <= 65536
-      ? input
-      : ''
-    : safeText(input, 1000);
-  if (questionForm) {
-    let content;
-    try {
-      content = JSON.parse(normalizedInput);
-    } catch {
-      return operationFailure(
-        task,
-        'input_invalid_choice',
-        'Choose an answer to the current question.',
-      );
-    }
-    if (!nativeQuestionContent(content, questionForm))
-      return operationFailure(
-        task,
-        'input_invalid_choice',
-        'Choose an answer to the current question.',
-      );
+  const questionBinding=task.nativeMissionInputBinding?.inputKind==='question' ? nativeMissionVoiceBinding(task.nativeMissionInputBinding,task) : null;
+  const questionForm=questionBinding?.questionForm || (task.current?.needsInput?.inputType==='native_question' ? task.current.needsInput.questionForm : null);
+  const normalizedInput=questionForm ? (typeof input==='string' && Buffer.byteLength(input,'utf8')<=65536 ? input : '') : safeText(input,1000);
+  if(questionForm) {
+    let content; try {content=JSON.parse(normalizedInput);} catch {return operationFailure(task,'input_invalid_choice','Choose an answer to the current question.');}
+    if(!nativeQuestionContent(content,questionForm)) return operationFailure(task,'input_invalid_choice','Choose an answer to the current question.');
   }
   if (!normalizedInput) {
     return operationFailure(task, 'input_required', 'Input is required.');
   }
   if (
-    task.nativeMissionInputBinding &&
-    !questionBinding &&
+    task.nativeMissionInputBinding && !questionBinding &&
     !task.current?.needsInput?.choices?.some((choice) => choice.value === normalizedInput)
   )
     return operationFailure(task, 'input_invalid_choice', 'Choose one of the offered options.');
@@ -1539,9 +1480,7 @@ async function submitVoiceTaskInput(taskId, input, { userId, voiceAuthorityConte
     task.inputOperation?.hash === inputHash ? task.inputOperation.operationId : crypto.randomUUID();
   const operation = {
     hash: inputHash,
-    ...(task.current?.needsInput?.nativeInputRequest
-      ? { nativeRequestFingerprint: task.current.needsInput.nativeInputRequest.requestFingerprint }
-      : {}),
+    ...(task.current?.needsInput?.nativeInputRequest ? {nativeRequestFingerprint:task.current.needsInput.nativeInputRequest.requestFingerprint} : {}),
     operationId,
     promise: null,
     result: null,
@@ -1827,8 +1766,7 @@ function snapshotEventForTask(task) {
     ...(task.current?.error ? { error: task.current.error } : {}),
     ...(task.current?.presentation ? { presentation: { ...task.current.presentation } } : {}),
     ...(task.sources?.length ? { sources: task.sources.map((source) => ({ ...source })) } : {}),
-    cancellable:
-      task.state === 'failed' ? canCancelFailedProviderAttention(task) : task.cancellable,
+    cancellable: task.state === 'failed' ? canCancelFailedProviderAttention(task) : task.cancellable,
     retryable: task.retryable,
     owner: { ...task.owner },
   };
@@ -2509,11 +2447,8 @@ function observeGenerationEvent(taskId, generationEvent) {
     followUpData.messageId !== task?.current?.resultMessageId &&
     followUpData.parentMessageId === task?.current?.resultMessageId &&
     followUpData.conversationId === task?.conversationId;
-  if (
-    !task ||
-    task.suppressed ||
-    (TERMINAL_STATES.has(task.state) && !isDelayedOwnerSource && !isPersistedFollowUp)
-  ) {
+  if (!task || task.suppressed ||
+      (TERMINAL_STATES.has(task.state) && !isDelayedOwnerSource && !isPersistedFollowUp)) {
     return null;
   }
   const data =
@@ -2521,11 +2456,7 @@ function observeGenerationEvent(taskId, generationEvent) {
   const toolResult = data?.result && typeof data.result === 'object' ? data.result : null;
   const ownerEventId = safeText(
     (isPersistedFollowUp ? data.messageId : '') ||
-      data.id ||
-      data.runId ||
-      data.eventId ||
-      toolResult?.id ||
-      toolResult?.tool_call?.id,
+      data.id || data.runId || data.eventId || toolResult?.id || toolResult?.tool_call?.id,
     160,
   );
   const observedKey = ownerEventId
@@ -2577,15 +2508,12 @@ function observeGenerationEvent(taskId, generationEvent) {
     return nextEvent(task, {
       type: 'progress',
       phase: isToolStep
-        ? eventType === 'on_run_step_completed'
-          ? 'tool_completed'
-          : 'tool'
+        ? eventType === 'on_run_step_completed' ? 'tool_completed' : 'tool'
         : 'agent',
       label:
         toolName ||
         safeText(data.name, 160) ||
-        (data.type === StepTypes.MESSAGE_CREATION ||
-        data.stepDetails?.type === StepTypes.MESSAGE_CREATION
+        (data.type === StepTypes.MESSAGE_CREATION || data.stepDetails?.type === StepTypes.MESSAGE_CREATION
           ? 'Writing reply'
           : safeText(data.type, 160)) ||
         'Working',
@@ -2778,8 +2706,7 @@ function completeVoiceTask(taskId, { resultMessageId, deliveryError } = {}) {
 }
 
 async function refreshVoiceTaskCommittedPresentation(result, adapterSurface) {
-  if (adapterSurface !== 'voice' || !result?.ownerStreamId || !result.presentation?.userId)
-    return null;
+  if (adapterSurface !== 'voice' || !result?.ownerStreamId || !result.presentation?.userId) return null;
   const hydrated = await hydrateVoiceTaskByStreamId(result.ownerStreamId, {
     userId: result.presentation.userId,
     requireDurable: true,
@@ -2795,80 +2722,47 @@ async function refreshVoiceTaskCommittedPresentation(result, adapterSurface) {
 }
 
 /* === VIVENTIUM START === A delivery task owns only its exact followup speech, never Main work. === */
-function registerVoiceTaskDeliveryPresentation(delivery, { userId, callSessionId } = {}) {
+function registerVoiceTaskDeliveryPresentation(delivery, {userId, callSessionId} = {}) {
   const deliveryId = safeText(delivery?.deliveryId, 120);
   const turnId = safeText(delivery?.voiceRequestId, 160);
   const resultMessageId = safeText(delivery?.callbackMessageId, 160);
   const conversationId = safeText(delivery?.conversationId, 160);
   const callbackRef = safeText(delivery?.callbackId, 160);
-  const pendingPublication =
-    delivery?.status === 'pending' &&
+  const pendingPublication = delivery?.status === 'pending' &&
     /^callback_sha256:[a-f0-9]{64}$/.test(callbackRef) &&
-    (nativeWorkInputPresentation(delivery) ||
-      verifyVoiceWorkerCompletionPresentation(delivery.workerCompletionPresentation, {
-        ownerId: userId,
-        conversationId,
-        callSessionId,
-        responseMessageId: resultMessageId,
-        responseText: delivery.text,
-      }));
-  if (
-    !deliveryId ||
-    !turnId ||
-    !resultMessageId ||
-    !conversationId ||
-    !userId ||
-    !callSessionId ||
-    delivery?.surface !== 'voice' ||
-    delivery.userId !== userId ||
-    delivery.voiceCallSessionId !== callSessionId ||
-    (!pendingPublication && (delivery.status !== 'claimed' || !safeText(delivery.claimId, 160)))
-  )
-    return null;
+    (nativeWorkInputPresentation(delivery) || verifyVoiceWorkerCompletionPresentation(delivery.workerCompletionPresentation, {
+      ownerId: userId, conversationId, callSessionId,
+      responseMessageId: resultMessageId, responseText: delivery.text,
+    }));
+  if (!deliveryId || !turnId || !resultMessageId || !conversationId || !userId || !callSessionId ||
+      delivery?.surface !== 'voice' || delivery.userId !== userId ||
+      delivery.voiceCallSessionId !== callSessionId ||
+      (!pendingPublication && (delivery.status !== 'claimed' || !safeText(delivery.claimId, 160)))) return null;
   const streamId = `glasshive-delivery:${deliveryId}`;
   const existingId = taskIdByStreamId.get(streamId);
   const existing = tasks.get(existingId);
-  if (
-    existing &&
-    (existing.userId !== userId ||
-      existing.callSessionId !== callSessionId ||
-      existing.conversationId !== conversationId ||
-      existing.turnId !== turnId ||
-      existing.owner?.kind !== 'glasshive_delivery' ||
-      existing.owner.id !== deliveryId ||
-      existing.current?.resultMessageId !== resultMessageId)
-  )
-    return null;
+  if (existing && (existing.userId !== userId || existing.callSessionId !== callSessionId ||
+      existing.conversationId !== conversationId || existing.turnId !== turnId ||
+      existing.owner?.kind !== 'glasshive_delivery' || existing.owner.id !== deliveryId ||
+      existing.current?.resultMessageId !== resultMessageId)) return null;
   const publish = (task) => {
     if (pendingPublication && task.current?.source?.id !== callbackRef) {
-      nextEvent(task, {
-        ...task.current,
-        type: 'snapshot',
-        phase: 'follow_up',
-        source: { id: callbackRef },
-      });
+      nextEvent(task, {...task.current, type: 'snapshot', phase: 'follow_up',
+        source: {id: callbackRef}});
     }
     return publicTask(task);
   };
   if (existing) return publish(existing);
-  const bindings = delivery.workerCompletionPresentation?.bindings || [{ runId: delivery.runId }];
+  const bindings = delivery.workerCompletionPresentation?.bindings || [{runId: delivery.runId}];
   const parents = new Set();
   let allRunsBound = Array.isArray(bindings) && bindings.length > 0;
   for (const binding of Array.isArray(bindings) ? bindings : []) {
     const child = tasks.get(taskIdByStreamId.get(`glasshive:${safeText(binding?.runId, 160)}`));
     const parent = tasks.get(child?.parentTaskId);
-    if (
-      !child ||
-      child.userId !== userId ||
-      child.callSessionId !== callSessionId ||
-      child.conversationId !== conversationId ||
-      child.owner?.kind !== 'glasshive_run' ||
-      child.owner.id !== binding.runId ||
-      !parent ||
-      parent.userId !== userId ||
-      parent.callSessionId !== callSessionId ||
-      parent.conversationId !== conversationId
-    ) {
+    if (!child || child.userId !== userId || child.callSessionId !== callSessionId ||
+        child.conversationId !== conversationId || child.owner?.kind !== 'glasshive_run' ||
+        child.owner.id !== binding.runId || !parent || parent.userId !== userId ||
+        parent.callSessionId !== callSessionId || parent.conversationId !== conversationId) {
       allRunsBound = false;
       continue;
     }
@@ -2876,145 +2770,63 @@ function registerVoiceTaskDeliveryPresentation(delivery, { userId, callSessionId
   }
   let parentTaskId = allRunsBound && parents.size === 1 ? [...parents][0] : '';
   const anchor = safeText(delivery.anchorMessageId, 160);
-  const anchored =
-    anchor &&
-    [...tasks.values()].find(
-      (task) =>
-        task.userId === userId &&
-        task.callSessionId === callSessionId &&
-        task.conversationId === conversationId &&
-        task.current?.resultMessageId === anchor,
-    );
+  const anchored = anchor && [...tasks.values()].find((task) => task.userId === userId &&
+    task.callSessionId === callSessionId && task.conversationId === conversationId &&
+    task.current?.resultMessageId === anchor);
   if (anchored && anchored.taskId !== parentTaskId) parentTaskId = '';
-  const task = createVoiceTask({
-    userId,
-    callSessionId,
-    conversationId,
-    turnId,
-    streamId,
-    ...(parentTaskId ? { parentTaskId } : {}),
-    owner: { kind: 'glasshive_delivery', id: deliveryId },
-  });
-  completeVoiceTask(task.taskId, { resultMessageId });
+  const task = createVoiceTask({userId, callSessionId, conversationId, turnId, streamId,
+    ...(parentTaskId ? {parentTaskId} : {}), owner: {kind: 'glasshive_delivery', id: deliveryId}});
+  completeVoiceTask(task.taskId, {resultMessageId});
   return publish(tasks.get(task.taskId));
 }
 
 function recordVoiceTaskDeliveryPresentation(taskId, input) {
   const task = tasks.get(String(taskId || ''));
-  if (
-    !task ||
-    !input.deliveryId ||
-    task.owner?.kind !== 'glasshive_delivery' ||
-    task.owner.id !== input.deliveryId ||
-    task.streamId !== `glasshive-delivery:${input.deliveryId}`
-  )
+  if (!task || !input.deliveryId || task.owner?.kind !== 'glasshive_delivery' ||
+      task.owner.id !== input.deliveryId || task.streamId !== `glasshive-delivery:${input.deliveryId}`)
     return null;
   return recordTaskSpeechPresentation(task, input);
 }
 /* === VIVENTIUM END === */
 
-async function claimVoiceNativeInputSpeechOffer(taskId, input) {
-  const task = tasks.get(String(taskId || ''));
-  const offer = nativeInputSpeechOffer(task, { ...input, taskId });
-  const answeredOrAnswering = () =>
-    task.inputOperation?.nativeRequestFingerprint ===
-      offer?.nativeInputRequest.requestFingerprint &&
-    (task.inputOperation.promise || task.inputOperation.result?.ok);
-  if (!offer || answeredOrAnswering() || !persistenceAvailable(ViventiumVoiceTask)) return null;
+async function claimVoiceNativeInputSpeechOffer(taskId,input) {
+  const task=tasks.get(String(taskId||''));
+  const offer=nativeInputSpeechOffer(task,{...input,taskId});
+  const answeredOrAnswering=()=>task.inputOperation?.nativeRequestFingerprint===offer?.nativeInputRequest.requestFingerprint && (task.inputOperation.promise || task.inputOperation.result?.ok);
+  if(!offer || answeredOrAnswering() || !persistenceAvailable(ViventiumVoiceTask)) return null;
   // Persist current task first. The offer is separate from coalesced payload writes.
   await withPersistenceDeadline(persistVoiceTaskBatch([taskPersistenceEntry(task)]));
-  const adapter = getOwnerAdapter(task);
-  if (
-    answeredOrAnswering() ||
-    !nativeInputSpeechOffer(task, { ...input, taskId }) ||
-    typeof adapter?.isNativeInputCurrent !== 'function'
-  )
-    return null;
-  const row = await withPersistenceDeadline(
-    ViventiumVoiceTask.findOneAndUpdate(
-      {
-        taskId,
-        userId: offer.userId,
-        callSessionId: offer.callSessionId,
-        streamId: offer.streamId,
-        sequence: task.sequence,
-        'payload.state': 'needs_input',
-        'payload.suppressed': { $ne: true },
-        'payload.owner.kind': task.owner.kind,
-        'payload.owner.id': offer.streamId,
-        'payload.current.needsInput.prompt': offer.prompt,
-        ...Object.fromEntries(
-          Object.entries(offer.nativeInputRequest).map(([key, value]) => [
-            'payload.current.needsInput.nativeInputRequest.' + key,
-            value,
-          ]),
-        ),
-        'nativeInputSpeechOffer.requestKey': { $ne: offer.requestKey },
-      },
-      {
-        $set: {
-          nativeInputSpeechOffer: {
-            requestKey: offer.requestKey,
-            promptDigest: offer.promptDigest,
-            claimedAtMs: Date.now(),
-            outcome: 'offered_unknown',
-          },
-        },
-      },
-      { new: true },
-    ).lean(),
-  );
-  if (!row || answeredOrAnswering() || !nativeInputSpeechOffer(task, { ...input, taskId }))
-    return null;
+  const adapter=getOwnerAdapter(task);
+  if(answeredOrAnswering() || !nativeInputSpeechOffer(task,{...input,taskId}) || typeof adapter?.isNativeInputCurrent!=='function') return null;
+  const row=await withPersistenceDeadline(ViventiumVoiceTask.findOneAndUpdate({
+    taskId,userId:offer.userId,callSessionId:offer.callSessionId,streamId:offer.streamId,sequence:task.sequence,
+    'payload.state':'needs_input','payload.suppressed':{$ne:true},'payload.owner.kind':task.owner.kind,'payload.owner.id':offer.streamId,
+    'payload.current.needsInput.prompt':offer.prompt,
+    ...Object.fromEntries(Object.entries(offer.nativeInputRequest).map(([key,value])=>['payload.current.needsInput.nativeInputRequest.'+key,value])),
+    'nativeInputSpeechOffer.requestKey':{$ne:offer.requestKey},
+  },{$set:{nativeInputSpeechOffer:{requestKey:offer.requestKey,promptDigest:offer.promptDigest,claimedAtMs:Date.now(),outcome:'offered_unknown'}}},{new:true}).lean());
+  if(!row || answeredOrAnswering() || !nativeInputSpeechOffer(task,{...input,taskId})) return null;
   // The native owner is authoritative even when another surface answered without changing this snapshot.
-  if (
-    !(await adapter.isNativeInputCurrent(offer.nativeInputRequest)) ||
-    answeredOrAnswering() ||
-    !nativeInputSpeechOffer(task, { ...input, taskId })
-  )
-    return null;
-  return {
-    version: 1,
-    requestKey: offer.requestKey,
-    outcome: 'offered_unknown',
-    nativeInputRequest: offer.nativeInputRequest,
-  };
+  if(!await adapter.isNativeInputCurrent(offer.nativeInputRequest) || answeredOrAnswering() || !nativeInputSpeechOffer(task,{...input,taskId})) return null;
+  return {version:1,requestKey:offer.requestKey,outcome:'offered_unknown',nativeInputRequest:offer.nativeInputRequest};
 }
 
 function recordVoiceTaskPresentation(taskId, input) {
   const task = tasks.get(String(taskId || ''));
-  if (
-    !task ||
-    task.owner?.id !== input.streamId ||
-    !['generation_job', 'remote_generation'].includes(task.owner?.kind)
-  )
-    return null;
+  if (!task || task.owner?.id !== input.streamId ||
+      !['generation_job', 'remote_generation'].includes(task.owner?.kind)) return null;
   return recordTaskSpeechPresentation(task, input);
 }
 
 function recordTaskSpeechPresentation(
-  task,
-  { userId, callSessionId, streamId, presentationRef, stage, startedAtMs },
+  task, {userId, callSessionId, streamId, presentationRef, stage, startedAtMs},
 ) {
   const ref = safeText(presentationRef, 160);
-  const states = {
-    'audio.started': 'speaking',
-    'audio.completed': 'completed',
-    'audio.interrupted': 'interrupted',
-    'audio.superseded': 'superseded',
-    'audio.failed': 'failed',
-  };
+  const states = {'audio.started': 'speaking', 'audio.completed': 'completed',
+    'audio.interrupted': 'interrupted', 'audio.superseded': 'superseded', 'audio.failed': 'failed'};
   const state = states[stage];
-  if (
-    !task ||
-    !ref ||
-    !state ||
-    task.userId !== userId ||
-    task.callSessionId !== callSessionId ||
-    !streamId ||
-    task.streamId !== streamId
-  )
-    return null;
+  if (!task || !ref || !state || task.userId !== userId || task.callSessionId !== callSessionId ||
+      !streamId || task.streamId !== streamId) return null;
   const current = task.current?.presentation;
   if (stage === 'audio.started') {
     if (!Number.isSafeInteger(startedAtMs) || startedAtMs <= 0) return null;
@@ -3029,30 +2841,20 @@ function recordTaskSpeechPresentation(
       const previous = other.current?.presentation;
       if (previous && ['speaking', 'stop_requested'].includes(previous.state)) {
         nextEvent(other, {
-          ...other.current,
-          type: 'snapshot',
+          ...other.current, type: 'snapshot',
           presentation: { ...previous, state: 'superseded' },
         });
       }
     }
   } else if (current?.ref !== ref) {
-    if (
-      !Number.isSafeInteger(startedAtMs) ||
-      startedAtMs <= 0 ||
-      (current && current.startedAtMs >= startedAtMs)
-    )
-      return null;
+    if (!Number.isSafeInteger(startedAtMs) || startedAtMs <= 0 ||
+        (current && current.startedAtMs >= startedAtMs)) return null;
   } else if (current.state === state) {
     return task.lastEvent;
   }
   return nextEvent(task, {
-    ...task.current,
-    type: 'snapshot',
-    presentation: {
-      ref,
-      state,
-      startedAtMs: current?.ref === ref ? current.startedAtMs : startedAtMs,
-    },
+    ...task.current, type: 'snapshot',
+    presentation: { ref, state, startedAtMs: current?.ref === ref ? current.startedAtMs : startedAtMs },
   });
 }
 
@@ -3159,11 +2961,9 @@ function linkVoiceTaskOwnerChild(
   if (task.completionPending) {
     return completeVoiceTask(task.taskId, {
       resultMessageId: task.pendingCompletionResultMessageId,
-      ...(task.pendingCompletionDeliveryErrorCode
-        ? {
-            deliveryError: { code: task.pendingCompletionDeliveryErrorCode },
-          }
-        : {}),
+      ...(task.pendingCompletionDeliveryErrorCode ? {
+        deliveryError: { code: task.pendingCompletionDeliveryErrorCode },
+      } : {}),
     });
   }
   return nextEvent(task, {
@@ -3247,46 +3047,33 @@ async function restoreCompletedVoiceTaskAfterCancellation(task) {
 
 async function requestVoiceTaskOwnerCancellation(
   taskId,
-  {
-    userId,
-    deferUnsupportedSettlement = false,
-    stopPresentationIfCompleted = false,
-    presentationRef,
-  } = {},
+  { userId, deferUnsupportedSettlement = false, stopPresentationIfCompleted = false, presentationRef } = {},
 ) {
   const task = tasks.get(String(taskId || ''));
   if (!task || (userId && task.userId !== String(userId))) {
     return null;
   }
   const failedProviderCode = canCancelFailedProviderAttention(task)
-    ? 'provider_progress_stalled'
-    : null;
+    ? 'provider_progress_stalled' : null;
   const presentation = task.current?.presentation;
   if (
-    stopPresentationIfCompleted &&
-    task.state === 'completed' &&
+    stopPresentationIfCompleted && task.state === 'completed' &&
     ['speaking', 'stop_requested'].includes(presentation?.state) &&
     (!presentationRef || presentationRef === presentation.ref) &&
-    task.streamId &&
-    ((task.owner?.id === task.streamId &&
-      ['generation_job', 'remote_generation'].includes(task.owner?.kind)) ||
-      (task.owner?.kind === 'glasshive_delivery' &&
-        task.owner.id &&
-        task.streamId === `glasshive-delivery:${task.owner.id}`))
+    task.streamId && (
+      (task.owner?.id === task.streamId &&
+       ['generation_job', 'remote_generation'].includes(task.owner?.kind)) ||
+      (task.owner?.kind === 'glasshive_delivery' && task.owner.id &&
+       task.streamId === `glasshive-delivery:${task.owner.id}`)
+    )
   ) {
     // A retry must cross the event-ID/sequence gate even if the speech state is unchanged.
     const event = nextEvent(task, {
-      ...task.current,
-      type: 'state',
+      ...task.current, type: 'state',
       presentation: { ...presentation, state: 'stop_requested' },
     });
-    return {
-      task: publicTask(task),
-      event,
-      presentationStopRequested: true,
-      ownerSupported: false,
-      ownerAccepted: false,
-    };
+    return { task: publicTask(task), event, presentationStopRequested: true,
+      ownerSupported: false, ownerAccepted: false };
   }
   const cancellation = cancelVoiceTask(taskId, { userId, deferEvent: true });
   if (cancellation?.alreadyCompleted) {
@@ -3309,12 +3096,8 @@ async function requestVoiceTaskOwnerCancellation(
   }
   const adapter = getOwnerAdapter(task);
   task.ownerOperationId = task.ownerOperationId || crypto.randomUUID();
-  if (failedProviderCode)
-    task.cancelOperation = {
-      ...task.cancelOperation,
-      operationId: task.ownerOperationId,
-      failedProviderCode,
-    };
+  if (failedProviderCode) task.cancelOperation = { ...task.cancelOperation,
+    operationId: task.ownerOperationId, failedProviderCode };
   task.ownerDeliveryPending = Boolean(adapter?.cancel);
   task.ownerCancellationAccepted = false;
   // The local barrier is authoritative only after the independent 24-hour durable tombstone is
@@ -3390,12 +3173,8 @@ async function requestVoiceTaskOwnerCancellation(
   }
 
   const operationId = task.ownerOperationId;
-  const operation = {
-    operationId,
-    promise: null,
-    result: null,
-    ...(failedProviderCode ? { failedProviderCode } : {}),
-  };
+  const operation = { operationId, promise: null, result: null,
+    ...(failedProviderCode ? { failedProviderCode } : {}) };
   const delivery = (async () => {
     try {
       const ownerResult = await adapter.cancel({
@@ -3471,42 +3250,25 @@ async function requestVoiceTaskOwnerCancellationForJob(job, { streamId, userId }
   const taskId = metadata?.viventiumVoiceTaskId;
   const callSessionId = metadata?.viventiumCallSessionId;
   if (!taskId && !callSessionId) return null;
-  const unavailable = () =>
-    Object.assign(new Error('Voice task is unavailable'), {
-      status: 404,
-      code: 'voice_task_unavailable',
-    });
-  if (
-    !streamId ||
-    !userId ||
-    !taskId ||
-    !callSessionId ||
-    metadata.userId !== userId ||
-    job.streamId !== streamId ||
-    !metadata.conversationId
-  )
-    throw unavailable();
+  const unavailable = () => Object.assign(new Error('Voice task is unavailable'), {
+    status: 404, code: 'voice_task_unavailable',
+  });
+  if (!streamId || !userId || !taskId || !callSessionId || metadata.userId !== userId ||
+      job.streamId !== streamId || !metadata.conversationId) throw unavailable();
   await hydrateVoiceTask(taskId, { userId, callSessionId });
   const task = tasks.get(taskId);
   const taskCreatedAt = task?.createdAt;
   const ownerKind = task?.owner?.kind;
-  const ownsTask = () =>
-    tasks.get(taskId) === task &&
-    task?.createdAt === taskCreatedAt &&
-    task?.userId === userId &&
-    task.callSessionId === callSessionId &&
-    task.conversationId === metadata.conversationId &&
-    task.streamId === streamId &&
-    task.owner?.id === streamId &&
-    task.owner?.kind === ownerKind &&
+  const ownsTask = () => tasks.get(taskId) === task &&
+    task?.createdAt === taskCreatedAt && task?.userId === userId && task.callSessionId === callSessionId &&
+    task.conversationId === metadata.conversationId && task.streamId === streamId &&
+    task.owner?.id === streamId && task.owner?.kind === ownerKind &&
     ['generation_job', 'remote_generation'].includes(task.owner?.kind);
   if (!ownsTask()) throw unavailable();
   // Local generations keep the normal chat abort path; Native requires its capacity ACK owner.
   if (task.owner.kind !== 'remote_generation') return null;
   const { GenerationJobManager } = require('@librechat/api');
-  const ownsJob = (current) =>
-    ownsTask() &&
-    current?.createdAt === job.createdAt &&
+  const ownsJob = (current) => ownsTask() && current?.createdAt === job.createdAt &&
     current?.abortController?.signal === job.abortController?.signal &&
     current?.metadata?.responseMessageId === metadata.responseMessageId &&
     current?.metadata?.userId === userId &&
@@ -3515,16 +3277,11 @@ async function requestVoiceTaskOwnerCancellationForJob(job, { streamId, userId }
     current?.metadata?.viventiumVoiceTaskId === taskId;
   if (!ownsJob(await GenerationJobManager.getJob(streamId))) throw unavailable();
   const cancellation = await requestVoiceTaskOwnerCancellation(taskId, {
-    userId,
-    deferUnsupportedSettlement: true,
+    userId, deferUnsupportedSettlement: true,
   });
-  if (
-    cancellation?.ownerSupported === false &&
-    !cancellation.alreadyCompleted &&
-    !cancellation.alreadyCancelled &&
-    !cancellation.alreadyInactive &&
-    !cancellation.alreadyCancelling
-  ) {
+  if (cancellation?.ownerSupported === false && !cancellation.alreadyCompleted &&
+      !cancellation.alreadyCancelled && !cancellation.alreadyInactive &&
+      !cancellation.alreadyCancelling) {
     // Match the existing Voice route/tool fallback after the durable barrier. A local abort
     // cannot prove Native capacity release. Recheck the pinned job after persistence yields.
     const operation = { operationId: cancellation.operationId, promise: null, result: null };
@@ -3535,26 +3292,20 @@ async function requestVoiceTaskOwnerCancellationForJob(job, { streamId, userId }
           ? await GenerationJobManager.abortJob(streamId, 'user_cancelled', userId)
           : null;
         const stoppedJob = stopped?.jobData;
-        if (
-          ownsTask() &&
-          ['committed', 'pending'].includes(stopped?.nativeResponse) &&
-          stoppedJob?.createdAt === job.createdAt &&
-          stoppedJob.streamId === streamId &&
-          stoppedJob.userId === userId &&
-          stoppedJob.conversationId === metadata.conversationId &&
-          stoppedJob.responseMessageId === metadata.responseMessageId &&
-          stoppedJob.viventiumCallSessionId === callSessionId &&
-          stoppedJob.viventiumVoiceTaskId === taskId
-        ) {
+        if (ownsTask() && ['committed', 'pending'].includes(stopped?.nativeResponse) &&
+            stoppedJob?.createdAt === job.createdAt && stoppedJob.streamId === streamId &&
+            stoppedJob.userId === userId && stoppedJob.conversationId === metadata.conversationId &&
+            stoppedJob.responseMessageId === metadata.responseMessageId &&
+            stoppedJob.viventiumCallSessionId === callSessionId &&
+            stoppedJob.viventiumVoiceTaskId === taskId) {
           await restoreCompletedVoiceTaskAfterCancellation(task);
           return;
         }
         await settleVoiceTaskCancellation(taskId, {
           confirmed: false,
-          detail:
-            stopped?.success === true
-              ? 'Local generation stopped, but remote owner cancellation could not be confirmed; late output remains suppressed.'
-              : 'The owner could not confirm cancellation; late output remains suppressed.',
+          detail: stopped?.success === true
+            ? 'Local generation stopped, but remote owner cancellation could not be confirmed; late output remains suppressed.'
+            : 'The owner could not confirm cancellation; late output remains suppressed.',
         });
       } catch {
         await settleVoiceTaskCancellation(taskId, {
@@ -3565,9 +3316,7 @@ async function requestVoiceTaskOwnerCancellationForJob(job, { streamId, userId }
     })();
     operation.promise = delivery;
     task.cancelOperation = operation;
-    void delivery.finally(() => {
-      operation.promise = null;
-    });
+    void delivery.finally(() => { operation.promise = null; });
   }
   return cancellation;
 }

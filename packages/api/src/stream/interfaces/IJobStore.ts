@@ -72,6 +72,7 @@ export interface ClientPresentation {
 export interface DurableEffectReceipt {
   effect_kind: 'durable_work_accepted' | 'durable_work_action_accepted';
   effect_ref: string;
+  confirmation_pending?: boolean;
   source_event_id: string;
   response_message_id: string;
   committed_at: number;

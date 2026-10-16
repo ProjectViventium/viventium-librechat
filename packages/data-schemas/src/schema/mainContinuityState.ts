@@ -10,6 +10,7 @@ import type {
   IMainContinuityAcceptedRevision,
   IMainContinuityAcceptedTurn,
   IMainContinuityCompactionLease,
+  IMainContinuityCompactionRepair,
   IMainContinuityToolPair,
   IMainSemanticCompaction,
   IMainCompactionOutputContract,
@@ -125,6 +126,13 @@ const outputContractSchema = new Schema<IMainCompactionOutputContract>(
   { _id: false },
 );
 
+const legacySourceRangeSchema = new Schema({
+  artifactId: { type: String, required: true },
+  start: { type: Number, min: 0, required: true },
+  end: { type: Number, min: 0, required: true },
+  total: { type: Number, min: 0, required: true },
+}, { _id: false });
+
 const compactionLeaseSchema = new Schema<IMainContinuityCompactionLease>(
   {
     leaseId: { type: String, required: true, maxlength: 96 },
@@ -139,17 +147,29 @@ const compactionLeaseSchema = new Schema<IMainContinuityCompactionLease>(
     legacyMessageCursor: String,
     legacyComplete: Boolean,
     legacySourceOffset: { type: Number, min: 0 },
-    legacySourceRange: {
-      type: new Schema(
-        {
-          artifactId: { type: String, required: true },
-          start: { type: Number, min: 0, required: true },
-          end: { type: Number, min: 0, required: true },
-          total: { type: Number, min: 0, required: true },
-        },
-        { _id: false },
-      ),
-      default: undefined,
+    legacySourceRange: { type: legacySourceRangeSchema, default: undefined },
+  },
+  { _id: false },
+);
+
+const compactionRepairSchema = new Schema<IMainContinuityCompactionRepair>(
+  {
+    version: { type: Number, required: true, enum: [1] },
+    sourceDigest: { type: String, required: true, maxlength: 64 },
+    contractKey: { type: String, required: true, maxlength: 4096 },
+    semanticAttempts: { type: Number, required: true, min: 1 },
+    transportRetries: { type: Number, required: true, min: 0 },
+    sourceGeneration: { type: Number, required: true, min: 0 },
+    sourceTurnKeys: { type: [String], required: true },
+    legacySourceRange: { type: legacySourceRangeSchema, default: undefined },
+    outputContract: { type: outputContractSchema, default: undefined },
+    correction: {
+      type: new Schema({
+        code: { type: String, required: true, enum: ['semantic_fidelity'] },
+        candidate: { type: String, required: true },
+        reason: { type: String, maxlength: 2000 },
+      }, { _id: false }),
+      required: true,
     },
   },
   { _id: false },
@@ -176,6 +196,7 @@ const mainContinuityStateSchema = new Schema<IViventiumMainContinuityState>(
       default: 'empty',
     },
     compactionLease: { type: compactionLeaseSchema, default: null },
+    pendingCompactionRepair: { type: compactionRepairSchema, default: null },
     lastCompactionError: { type: String, default: '', maxlength: 120 },
     acceptedPosition: { type: Number, min: 0 },
     legacyAvailable: Boolean,

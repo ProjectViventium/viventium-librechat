@@ -5,6 +5,7 @@ jest.mock('../GlassHiveMissionAdjudicationService', () => ({
 const mockCommitProjection = jest.fn();
 const mockProjectionComplete = jest.fn();
 const mockRecover = jest.fn();
+const mockAdmit = jest.fn();
 const mockRejectUnaccepted = jest.fn();
 const mockConfig = jest.fn();
 const mockLoadAgent = jest.fn();
@@ -44,51 +45,37 @@ jest.mock('@librechat/api', () => ({
   createNativeResponseFetch: (...args) => mockCreateNativeResponseFetch(...args),
   createNativeResponseRecoveryService: (options) => {
     mockNativeProjection = options.projectMessage;
-    return {
-      recover: mockRecover,
-      rejectUnaccepted: mockRejectUnaccepted,
-      projectForTransmit: async (_identity, message) => message,
-    };
+    return ({
+    recover: mockRecover,
+    admit: mockAdmit,
+    rejectUnaccepted: mockRejectUnaccepted,
+    projectForTransmit: async (_identity, message) => message,
+    });
   },
   projectNativeToolEvidence: (_identity, _response, message) => message,
-  collectGlassHiveNativeMediaReferences: (...args) =>
-    jest.requireActual('@librechat/api').collectGlassHiveNativeMediaReferences(...args),
-  renderGlassHiveNativeMediaAttachmentLinks: (...args) =>
-    jest.requireActual('@librechat/api').renderGlassHiveNativeMediaAttachmentLinks(...args),
-  inspectProviderDeliveryDisposition: (...args) =>
-    jest.requireActual('@librechat/api').inspectProviderDeliveryDisposition(...args),
-  inspectProviderDeliveryRanges: (...args) =>
-    jest.requireActual('@librechat/api').inspectProviderDeliveryRanges(...args),
-  resolveEffectiveDeliveryDisposition: (...args) =>
-    jest.requireActual('@librechat/api').resolveEffectiveDeliveryDisposition(...args),
+  collectGlassHiveNativeMediaReferences: (...args) => jest.requireActual('@librechat/api').collectGlassHiveNativeMediaReferences(...args),
+  renderGlassHiveNativeMediaAttachmentLinks: (...args) => jest.requireActual('@librechat/api').renderGlassHiveNativeMediaAttachmentLinks(...args),
+  inspectProviderDeliveryDisposition: (...args) => jest.requireActual('@librechat/api').inspectProviderDeliveryDisposition(...args),
+  inspectProviderDeliveryRanges: (...args) => jest.requireActual('@librechat/api').inspectProviderDeliveryRanges(...args),
+  resolveEffectiveDeliveryDisposition: (...args) => jest.requireActual('@librechat/api').resolveEffectiveDeliveryDisposition(...args),
   isAcceptedMainProjectionComplete: (...args) => mockProjectionComplete(...args),
-  prepareNativeSourceRecovery: (...args) =>
-    jest.requireActual('@librechat/api').prepareNativeSourceRecovery(...args),
+  prepareNativeSourceRecovery: (...args) => jest.requireActual('@librechat/api').prepareNativeSourceRecovery(...args),
   GenerationJobManager: mockJobs,
   nativeIdentityJson: (...args) => jest.requireActual('@librechat/api').nativeIdentityJson(...args),
   nativeJobMatches: (...args) => jest.requireActual('@librechat/api').nativeJobMatches(...args),
   sanitizeMessageForTransmit: (message) => message,
-  interactionPresentationSequence: (...args) =>
-    jest.requireActual('@librechat/api').interactionPresentationSequence(...args),
-  isAudioDeliveryRequested: (...args) =>
-    jest.requireActual('@librechat/api').isAudioDeliveryRequested(...args),
-  supportsMessagingDeliveryDisposition: (...args) =>
-    jest.requireActual('@librechat/api').supportsMessagingDeliveryDisposition(...args),
+  interactionPresentationSequence: (...args) => jest.requireActual('@librechat/api').interactionPresentationSequence(...args),
+  isAudioDeliveryRequested: (...args) => jest.requireActual('@librechat/api').isAudioDeliveryRequested(...args),
+  supportsMessagingDeliveryDisposition: (...args) => jest.requireActual('@librechat/api').supportsMessagingDeliveryDisposition(...args),
 }));
 jest.mock('../interactionContext', () => {
   const { getTrustedInteractionContext, setTrustedInteractionContext } =
     jest.requireActual('@librechat/api');
   return { getTrustedInteractionContext, setTrustedInteractionContext };
 });
-jest.mock('../GlassHiveConversationProviderService', () => ({
-  probeHarnessFamilyRelease: jest.fn(),
-}));
-jest.mock('../CallSessionService', () => ({
-  getCallSession: (...args) => mockGetCallSession(...args),
-}));
-jest.mock('../InteractionDurableEffectService', () => ({
-  getSourceRecoverySnapshot: (...args) => mockSourceSnapshot(...args),
-}));
+jest.mock('../GlassHiveConversationProviderService', () => ({ probeHarnessFamilyRelease: jest.fn() }));
+jest.mock('../CallSessionService', () => ({ getCallSession: (...args) => mockGetCallSession(...args) }));
+jest.mock('../InteractionDurableEffectService', () => ({ getSourceRecoverySnapshot: (...args) => mockSourceSnapshot(...args) }));
 jest.mock('~/models', () => mockModels);
 jest.mock('~/server/services/Config', () => ({ getAppConfig: (...args) => mockConfig(...args) }));
 jest.mock('~/models/Agent', () => ({ loadAgent: (...args) => mockLoadAgent(...args) }));
@@ -124,47 +111,20 @@ const {
 } = require('../nativeResponseService');
 
 describe('native authenticated audio projection', () => {
-  test.each(['voice', 'telegram'])(
-    'retains raw %s public offsets only for authenticated transmit',
-    (surface) => {
-      getService();
-      const text = '<whisper>Public 🟢.</whisper>';
-      const part = {
-        type: 'text',
-        text,
-        deliveryDispositionRanges: [{ start: 0, end: text.length }],
-      };
-      const message = { text, content: [part] };
-      const identity = {
-        deliveryContext: { surface, authenticated: true, audioRequested: true },
-        deliveryDispositionRequired: true,
-      };
-      expect(mockNativeProjection(identity, {}, message, 'transmit').content[0]).toEqual(part);
-      expect(mockNativeProjection(identity, {}, message, 'terminal').content[0]).toEqual({
-        type: 'text',
-        text: 'Public 🟢.',
-      });
-      expect(
-        mockNativeProjection(
-          { ...identity, deliveryContext: { ...identity.deliveryContext, authenticated: false } },
-          {},
-          message,
-          'transmit',
-        ).content[0],
-      ).not.toHaveProperty('deliveryDispositionRanges');
-      if (surface === 'voice') {
-        const withPrivate = {
-          ...message,
-          content: [
-            { type: 'think', think: 'Synthetic private block.' },
-            part,
-            { type: 'reasoning', text: 'Synthetic private block.' },
-          ],
-        };
-        expect(mockNativeProjection(identity, {}, withPrivate, 'transmit').content).toEqual([part]);
-      }
-    },
-  );
+  test.each(['voice', 'telegram'])('retains raw %s public offsets only for authenticated transmit', (surface) => {
+    getService();
+    const text = '<whisper>Public 🟢.</whisper>';
+    const part = { type: 'text', text, deliveryDispositionRanges: [{ start: 0, end: text.length }] };
+    const message = { text, content: [part] };
+    const identity = { deliveryContext: { surface, authenticated: true, audioRequested: true }, deliveryDispositionRequired: true };
+    expect(mockNativeProjection(identity, {}, message, 'transmit').content[0]).toEqual(part);
+    expect(mockNativeProjection(identity, {}, message, 'terminal').content[0]).toEqual({ type: 'text', text: 'Public 🟢.' });
+    expect(mockNativeProjection({ ...identity, deliveryContext: { ...identity.deliveryContext, authenticated: false } }, {}, message, 'transmit').content[0]).not.toHaveProperty('deliveryDispositionRanges');
+    if (surface === 'voice') {
+      const withPrivate = { ...message, content: [{ type: 'think', think: 'Synthetic private block.' }, part, { type: 'reasoning', text: 'Synthetic private block.' }] };
+      expect(mockNativeProjection(identity, {}, withPrivate, 'transmit').content).toEqual([part]);
+    }
+  });
 });
 
 describe('native canonical per-part audio projection', () => {
@@ -858,9 +818,9 @@ describe('native graph participant file identity', () => {
     baseFetch = jest.fn(async () => new Response('{}'));
   });
 
+
   it.each(['native', 'unknown_route'])(
-    'clears the previous refusal before each subsequent Main fetch: %s',
-    async (mode) => {
+    'clears the previous refusal before each subsequent Main fetch: %s', async (mode) => {
       mockCreateNativeResponseFetch.mockReturnValueOnce(baseFetch);
       if (mode === 'unknown_route') req.config.endpoints.agents.providerCapabilities = {};
       mockJobs.getJob.mockResolvedValue({ createdAt: 1 });
@@ -875,34 +835,23 @@ describe('native graph participant file identity', () => {
     },
   );
 
-  it.each([true, false])(
-    'marks only an exactly released unaccepted response: %s',
-    async (released) => {
-      mockRejectUnaccepted.mockReset();
-      mockCreateNativeResponseFetch.mockReturnValueOnce(baseFetch);
-      wrapNativeResponseFetch(req, 'specialist', baseFetch, route);
-      const callback = mockCreateNativeResponseFetch.mock.calls.at(-1)[5];
-      const identity = {
-        streamId: 'stream',
-        userId: 'owner',
-        responseMessageId: 'answer',
-        jobCreatedAt: 1,
-      };
-      expect(callback).toEqual(expect.any(Function));
-      if (!released)
-        mockRejectUnaccepted.mockRejectedValueOnce(
-          new Error('native_response_handoff_unavailable'),
-        );
-      if (released) {
-        await callback(identity);
-        expect(req._viventiumNativeResponseUnaccepted).toBe(identity);
-      } else {
-        await expect(callback(identity)).rejects.toThrow('native_response_handoff_unavailable');
-        expect(req._viventiumNativeResponseUnaccepted).toBeUndefined();
-      }
-      expect(mockRejectUnaccepted).toHaveBeenCalledWith(identity);
-    },
-  );
+  it.each([true, false])('marks only an exactly released unaccepted response: %s', async (released) => {
+    mockRejectUnaccepted.mockReset();
+    mockCreateNativeResponseFetch.mockReturnValueOnce(baseFetch);
+    wrapNativeResponseFetch(req, 'specialist', baseFetch, route);
+    const callback = mockCreateNativeResponseFetch.mock.calls.at(-1)[5];
+    const identity = { streamId: 'stream', userId: 'owner', responseMessageId: 'answer', jobCreatedAt: 1 };
+    expect(callback).toEqual(expect.any(Function));
+    if (!released) mockRejectUnaccepted.mockRejectedValueOnce(new Error('native_response_handoff_unavailable'));
+    if (released) {
+      await callback(identity);
+      expect(req._viventiumNativeResponseUnaccepted).toBe(identity);
+    } else {
+      await expect(callback(identity)).rejects.toThrow('native_response_handoff_unavailable');
+      expect(req._viventiumNativeResponseUnaccepted).toBeUndefined();
+    }
+    expect(mockRejectUnaccepted).toHaveBeenCalledWith(identity);
+  });
 
   function envelope(init) {
     const headers = new Headers(init.headers);
@@ -1249,50 +1198,23 @@ describe('installed native source recovery', () => {
   test('authenticates the predecessor route and queries source outcomes after the real release gate', async () => {
     const now = Date.now();
     const previous = {
-      streamId: 'prior-source',
-      createdAt: now - 1,
-      userId: 'owner',
-      conversationId: 'chat',
-      status: 'superseded',
-      responseMessageId: 'prior-response',
-      nativeResponseCancelled: true,
+      streamId: 'prior-source', createdAt: now - 1, userId: 'owner', conversationId: 'chat',
+      status: 'superseded', responseMessageId: 'prior-response', nativeResponseCancelled: true,
       adapterCapabilities: { supersede_scope: 'response_only' },
       interactionContext: { logical_turn_id: 'turn', revision: 1, source_event_id: 'S1' },
       nativeResponse: {
-        userId: 'owner',
-        agentId: 'agent_synthetic',
-        providerId: 'native-provider',
-        responseMessageId: 'prior-response',
-        invocationId: 'prior-invocation',
-        logicalTurnId: 'turn',
-        revision: 1,
+        userId: 'owner', agentId: 'agent_synthetic', providerId: 'native-provider',
+        responseMessageId: 'prior-response', invocationId: 'prior-invocation', logicalTurnId: 'turn', revision: 1,
       },
-      nativeAcceptedSources: {
-        invocationId: 'prior-invocation',
-        sources: [{ id: 'S1', sha256: 'a'.repeat(64) }],
-      },
+      nativeAcceptedSources: { invocationId: 'prior-invocation', sources: [{ id: 'S1', sha256: 'a'.repeat(64) }] },
       deliveryAcknowledgement: { logical_turn_id: 'turn', revision: 1, state: 'partial_removed' },
     };
     const current = {
-      streamId: 'current-source',
-      createdAt: now,
-      userId: 'owner',
-      conversationId: 'chat',
-      status: 'running',
+      streamId: 'current-source', createdAt: now, userId: 'owner', conversationId: 'chat', status: 'running',
       adapterCapabilities: { supersede_scope: 'response_only' },
-      nativePredecessor: {
-        streamId: previous.streamId,
-        createdAt: previous.createdAt,
-        responseMessageId: 'prior-response',
-        invocationId: 'prior-invocation',
-      },
+      nativePredecessor: { streamId: previous.streamId, createdAt: previous.createdAt, responseMessageId: 'prior-response', invocationId: 'prior-invocation' },
       nativeReleaseTargets: ['prior-response'],
-      interactionContext: {
-        logical_turn_id: 'turn',
-        revision: 2,
-        source_event_id: 'S2',
-        source_segments: [{ source_event_id: 'S1' }, { source_event_id: 'S2' }],
-      },
+      interactionContext: { logical_turn_id: 'turn', revision: 2, source_event_id: 'S2', source_segments: [{ source_event_id: 'S1' }, { source_event_id: 'S2' }] },
     };
     const events = [];
     const { probeHarnessFamilyRelease } = require('../GlassHiveConversationProviderService');
@@ -1303,21 +1225,13 @@ describe('installed native source recovery', () => {
     mockModels.findUser.mockResolvedValue({ _id: 'owner', role: 'USER' });
     mockLoadAgent.mockResolvedValue({ _id: 'agent-record' });
     mockPermission.mockResolvedValue(true);
-    mockConfig.mockResolvedValue({
-      endpoints: {
-        agents: {
-          providerCapabilities: {
-            'native-provider': { conversation_session: true, workspace_binding: true },
-          },
-        },
-        custom: [
-          { name: 'native-provider', baseURL: 'http://native.test/v1', apiKey: 'synthetic-key' },
-        ],
-      },
-    });
+    mockConfig.mockResolvedValue({ endpoints: {
+      agents: { providerCapabilities: { 'native-provider': { conversation_session: true, workspace_binding: true } } },
+      custom: [{ name: 'native-provider', baseURL: 'http://native.test/v1', apiKey: 'synthetic-key' }],
+    } });
     mockJobs.renewNativeDispatchLease.mockResolvedValue(true);
     mockJobs.getJobStore.mockReturnValue({
-      getJob: jest.fn(async (id) => (id === current.streamId ? current : previous)),
+      getJob: jest.fn(async (id) => id === current.streamId ? current : previous),
       isNativeResponseUnboundCancelled: jest.fn(async () => false),
       isCurrentLogicalTurn: jest.fn(async () => true),
     });
@@ -1330,51 +1244,18 @@ describe('installed native source recovery', () => {
     const recovery = mockJobs.setNativeSourceRecovery.mock.calls.at(-1)[0];
     await expect(recovery(current, previous)).resolves.toEqual(facts);
     expect(events).toEqual(['released', 'facts']);
-    expect(probeHarnessFamilyRelease).toHaveBeenCalledWith({
-      baseURL: 'http://native.test/v1',
-      apiKey: 'synthetic-key',
-      ownerId: 'owner',
-      messageId: 'prior-response',
-    });
-    expect(mockSourceSnapshot).toHaveBeenCalledWith({
-      ownerId: 'owner',
-      conversationId: 'chat',
-      logicalTurnId: 'turn',
-      sourceEventIds: ['S1', 'S2'],
-    });
+    expect(probeHarnessFamilyRelease).toHaveBeenCalledWith({ baseURL: 'http://native.test/v1', apiKey: 'synthetic-key', ownerId: 'owner', messageId: 'prior-response' });
+    expect(mockSourceSnapshot).toHaveBeenCalledWith({ ownerId: 'owner', conversationId: 'chat', logicalTurnId: 'turn', sourceEventIds: ['S1', 'S2'] });
     probeHarnessFamilyRelease.mockClear();
-    mockJobs.getJobStore.mockReturnValue({
-      getJob: jest.fn(async (id) =>
-        id === current.streamId ? { ...current, userId: 'other' } : previous,
-      ),
-      isCurrentLogicalTurn: jest.fn(async () => true),
-    });
-    await expect(recovery(current, previous)).rejects.toMatchObject({
-      name: 'AbortError',
-      code: 'superseded',
-    });
+    mockJobs.getJobStore.mockReturnValue({ getJob: jest.fn(async (id) => id === current.streamId ? { ...current, userId: 'other' } : previous), isCurrentLogicalTurn: jest.fn(async () => true) });
+    await expect(recovery(current, previous)).rejects.toMatchObject({ name: 'AbortError', code: 'superseded' });
     expect(probeHarnessFamilyRelease).not.toHaveBeenCalled();
     expect(mockSourceSnapshot).toHaveBeenCalledTimes(1);
-    const voiceCurrent = {
-      ...current,
-      viventiumCallSessionId: 'owning-call',
-      interactionContext: { ...current.interactionContext, surface: 'voice' },
-    };
-    mockJobs.getJobStore.mockReturnValue({
-      getJob: jest.fn(async (id) => (id === current.streamId ? voiceCurrent : previous)),
-      isNativeResponseUnboundCancelled: jest.fn(async () => false),
-      isCurrentLogicalTurn: jest.fn(async () => true),
-    });
+    const voiceCurrent = { ...current, viventiumCallSessionId: 'owning-call', interactionContext: { ...current.interactionContext, surface: 'voice' } };
+    mockJobs.getJobStore.mockReturnValue({ getJob: jest.fn(async (id) => id === current.streamId ? voiceCurrent : previous), isNativeResponseUnboundCancelled: jest.fn(async () => false), isCurrentLogicalTurn: jest.fn(async () => true) });
     for (const status of ['ended', 'failed']) {
-      mockGetCallSession.mockResolvedValue({
-        callSessionId: 'owning-call',
-        userId: 'owner',
-        conversationId: 'chat',
-        status,
-      });
-      await expect(recovery(voiceCurrent, previous)).rejects.toMatchObject({
-        code: 'native_source_delivery_terminal',
-      });
+      mockGetCallSession.mockResolvedValue({ callSessionId: 'owning-call', userId: 'owner', conversationId: 'chat', status });
+      await expect(recovery(voiceCurrent, previous)).rejects.toMatchObject({ code: 'native_source_delivery_terminal' });
     }
     expect(probeHarnessFamilyRelease).not.toHaveBeenCalled();
     expect(mockSourceSnapshot).toHaveBeenCalledTimes(1);
@@ -1382,105 +1263,43 @@ describe('installed native source recovery', () => {
 });
 /* === VIVENTIUM END === */
 
+
 describe('current Main immutable background source read for later graph dispatch', () => {
   const previousReviewedPin = process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
   const { readCurrentMainBackgroundInputs } = require('../nativeResponseService');
   const { setTrustedInteractionContext } = require('../interactionContext');
   const crypto = require('crypto');
   const text = 'Completed exact synthetic cohort evidence.';
-  const input = {
-    version: 1,
-    invocationId: 'invocation',
-    deliveryId: 'd'.repeat(64),
-    text,
+  const input = { version: 1, invocationId: 'invocation', deliveryId: 'd'.repeat(64), text,
     textSha256: crypto.createHash('sha256').update(text).digest('hex'),
-    sources: [{ cortexId: 'cortex', insightSha256: 'e'.repeat(64) }],
-  };
+    sources: [{ cortexId: 'cortex', insightSha256: 'e'.repeat(64) }] };
   let req, row, identity, job, current, store;
   beforeEach(() => {
-    jest.clearAllMocks();
-    current = true;
+    jest.clearAllMocks(); current = true;
     process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = 'a'.repeat(64);
-    identity = {
-      userId: 'owner',
-      conversationId: 'conversation',
-      responseMessageId: 'answer',
-      streamId: 'stream',
-      jobCreatedAt: 1,
-      logicalTurnId: 'turn',
-      revision: 2,
-      sourceOrderScope: 'a'.repeat(64),
-      sourceSequence: 4,
-      invocationId: 'invocation',
-      bodySha256: 'b'.repeat(64),
-      originSha256: 'c'.repeat(64),
-      providerId: 'native',
-      agentId: 'main',
-      admittedAt: 2,
-      recoverUntil: 3,
-      source: { id: 'source-row', messageId: 'question', digest: 'f'.repeat(64) },
-    };
-    req = {
-      user: { id: 'owner' },
-      _resumableStreamId: 'stream',
-      _viventiumGraphHandoffStarted: true,
-      _viventiumNativeResponseIdentity: identity,
-      _viventiumNativeResponseSource: {
-        conversationId: 'conversation',
-        responseMessageId: 'answer',
-        proof: identity.source,
-      },
-    };
-    setTrustedInteractionContext(req, {
-      actor_kind: 'external_user',
-      origin: 'interactive',
-      surface: 'voice',
-      conversation_id: 'conversation',
-      source_event_id: 'event',
-      logical_turn_id: 'turn',
-      revision: 2,
-      source_order_scope: identity.sourceOrderScope,
-      source_sequence: 4,
-    });
-    job = {
-      userId: 'owner',
-      streamId: 'stream',
-      createdAt: 1,
-      status: 'running',
-      conversationId: 'conversation',
-      responseMessageId: 'answer',
-      userMessage: { messageId: 'question' },
-      interactionContext: {
-        logical_turn_id: 'turn',
-        revision: 2,
-        source_order_scope: identity.sourceOrderScope,
-        source_sequence: 4,
-      },
-      nativeResponse: identity,
-      nativeResponseSettled: true,
-      nativeResponseCancelled: false,
-    };
-    row = {
-      user: 'owner',
-      conversationId: 'conversation',
-      messageId: 'answer',
-      parentMessageId: 'question',
-      isCreatedByUser: false,
-      unfinished: true,
-      nativeResponse: { ...identity, status: 'unsupported' },
-      metadata: {
-        viventium: {
-          backgroundInputs: [input],
-          backgroundInputReceipts: [
-            { status: 'unavailable', deliveryId: input.deliveryId, textSha256: input.textSha256 },
-          ],
-        },
-      },
-    };
-    store = {
-      getJob: jest.fn(async () => job),
-      isCurrentLogicalTurn: jest.fn(async () => current),
-    };
+    identity = { userId: 'owner', conversationId: 'conversation', responseMessageId: 'answer',
+      streamId: 'stream', jobCreatedAt: 1, logicalTurnId: 'turn', revision: 2,
+      sourceOrderScope: 'a'.repeat(64), sourceSequence: 4,
+      invocationId: 'invocation', bodySha256: 'b'.repeat(64), originSha256: 'c'.repeat(64),
+      providerId: 'native', agentId: 'main', admittedAt: 2, recoverUntil: 3,
+      source: { id: 'source-row', messageId: 'question', digest: 'f'.repeat(64) } };
+    req = { user: { id: 'owner' }, _resumableStreamId: 'stream',
+      _viventiumGraphHandoffStarted: true, _viventiumNativeResponseIdentity: identity,
+      _viventiumNativeResponseSource: { conversationId: 'conversation', responseMessageId: 'answer',
+        proof: identity.source } };
+    setTrustedInteractionContext(req, { actor_kind: 'external_user', origin: 'interactive', surface: 'voice',
+      conversation_id: 'conversation', source_event_id: 'event', logical_turn_id: 'turn', revision: 2,
+      source_order_scope: identity.sourceOrderScope, source_sequence: 4 });
+    job = { userId: 'owner', streamId: 'stream', createdAt: 1, status: 'running',
+      conversationId: 'conversation', responseMessageId: 'answer', userMessage: { messageId: 'question' },
+      interactionContext: { logical_turn_id: 'turn', revision: 2,
+        source_order_scope: identity.sourceOrderScope, source_sequence: 4 },
+      nativeResponse: identity, nativeResponseSettled: true, nativeResponseCancelled: false };
+    row = { user: 'owner', conversationId: 'conversation', messageId: 'answer', parentMessageId: 'question',
+      isCreatedByUser: false, unfinished: true, nativeResponse: { ...identity, status: 'unsupported' },
+      metadata: { viventium: { backgroundInputs: [input], backgroundInputReceipts: [
+        { status: 'unavailable', deliveryId: input.deliveryId, textSha256: input.textSha256 }] } } };
+    store = { getJob: jest.fn(async () => job), isCurrentLogicalTurn: jest.fn(async () => current) };
     mockJobs.getJobStore.mockReturnValue(store);
     mockJobs.observeSourceOrder.mockResolvedValue({ stale: false, latest_source_sequence: 4 });
     mockModels.getNativeResponse.mockImplementation(async () => row);
@@ -1490,56 +1309,39 @@ describe('current Main immutable background source read for later graph dispatch
     if (previousReviewedPin === undefined) delete process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
     else process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = previousReviewedPin;
   });
-  test.each([undefined, 'invalid'])(
-    'retains accepted background facts without a host artifact pin: %s',
-    async (pin) => {
-      if (pin === undefined) delete process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
-      else process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = pin;
-      const preimage = JSON.stringify(row);
-      expect(await readCurrentMainBackgroundInputs(req, 'main')).toEqual([input]);
-      expect(mockModels.getNativeResponse).toHaveBeenCalledWith('owner', 'answer');
-      expect(mockModels.nativeResponseSourceMatches).toHaveBeenCalledWith(identity);
-      expect(store.isCurrentLogicalTurn).toHaveBeenCalledTimes(2);
-      expect(JSON.stringify(row)).toBe(preimage);
-    },
-  );
-  test.each(['web', 'voice', 'telegram'])(
-    'retains exact offered source after native handoff on %s',
-    async (surface) => {
-      setTrustedInteractionContext(req, {
-        actor_kind: 'external_user',
-        origin: 'interactive',
-        surface,
-        conversation_id: 'conversation',
-        source_event_id: 'event',
-        logical_turn_id: 'turn',
-        revision: 2,
-        source_order_scope: identity.sourceOrderScope,
-        source_sequence: 4,
-      });
-      const preimage = JSON.stringify(row);
-      expect(await readCurrentMainBackgroundInputs(req, 'main')).toEqual([input]);
-      expect(mockModels.getNativeResponse).toHaveBeenCalledWith('owner', 'answer');
-      expect(mockModels.nativeResponseSourceMatches).toHaveBeenCalledWith(identity);
-      expect(JSON.stringify(row)).toBe(preimage);
-    },
-  );
-  test.each(['pending', 'released'])(
-    'matches the real host handoff ownership state: %s',
-    async (mode) => {
-      if (mode === 'pending') {
-        row.nativeResponse.status = 'pending';
-        job.nativeResponseSettled = false;
-      } else {
-        row.unfinished = false;
-        row.error = true;
-        delete job.nativeResponse;
-        delete job.nativeResponseCancelled;
-        job.nativeResponseSettled = false;
-      }
-      expect(await readCurrentMainBackgroundInputs(req, 'main')).toEqual([input]);
-    },
-  );
+  test.each([undefined, 'invalid'])('retains accepted background facts without a host artifact pin: %s', async (pin) => {
+    if (pin === undefined) delete process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
+    else process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = pin;
+    const preimage = JSON.stringify(row);
+    expect(await readCurrentMainBackgroundInputs(req, 'main')).toEqual([input]);
+    expect(mockModels.getNativeResponse).toHaveBeenCalledWith('owner', 'answer');
+    expect(mockModels.nativeResponseSourceMatches).toHaveBeenCalledWith(identity);
+    expect(store.isCurrentLogicalTurn).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(row)).toBe(preimage);
+  });
+  test.each(['web', 'voice', 'telegram'])('retains exact offered source after native handoff on %s', async (surface) => {
+    setTrustedInteractionContext(req, { actor_kind: 'external_user', origin: 'interactive', surface,
+      conversation_id: 'conversation', source_event_id: 'event', logical_turn_id: 'turn', revision: 2,
+      source_order_scope: identity.sourceOrderScope, source_sequence: 4 });
+    const preimage = JSON.stringify(row);
+    expect(await readCurrentMainBackgroundInputs(req, 'main')).toEqual([input]);
+    expect(mockModels.getNativeResponse).toHaveBeenCalledWith('owner', 'answer');
+    expect(mockModels.nativeResponseSourceMatches).toHaveBeenCalledWith(identity);
+    expect(JSON.stringify(row)).toBe(preimage);
+  });
+  test.each(['pending', 'released'])('matches the real host handoff ownership state: %s', async (mode) => {
+    if (mode === 'pending') {
+      row.nativeResponse.status = 'pending';
+      job.nativeResponseSettled = false;
+    } else {
+      row.unfinished = false;
+      row.error = true;
+      delete job.nativeResponse;
+      delete job.nativeResponseCancelled;
+      job.nativeResponseSettled = false;
+    }
+    expect(await readCurrentMainBackgroundInputs(req, 'main')).toEqual([input]);
+  });
   test('reads exact released source for a current fallback without a graph handoff flag', async () => {
     req._viventiumGraphHandoffStarted = false;
     req._viventiumFallbackLlmAttempt = true;
@@ -1552,232 +1354,115 @@ describe('current Main immutable background source read for later graph dispatch
     expect(await readCurrentMainBackgroundInputs(req, 'main')).toEqual([]);
     expect(mockModels.getNativeResponse).not.toHaveBeenCalled();
   });
-  test.each([
-    'user',
-    'conversation',
-    'parent',
-    'invocation',
-    'cancelled',
-    'pending_error',
-    'invalid_hash',
-    'foreign_input',
-    'finished',
-    'source_changed',
-  ])('refuses another or invalid source: %s', async (mode) => {
-    if (mode === 'user') row.user = 'other';
-    if (mode === 'conversation') row.conversationId = 'other';
-    if (mode === 'parent') row.parentMessageId = 'other';
-    if (mode === 'invocation') row.nativeResponse.invocationId = 'other';
-    if (mode === 'cancelled') row.nativeResponse.status = 'cancelled';
-    if (mode === 'pending_error') {
-      row.nativeResponse.status = 'pending';
-      row.error = true;
-    }
-    if (mode === 'invalid_hash')
-      row.metadata.viventium.backgroundInputs[0] = { ...input, textSha256: '0'.repeat(64) };
-    if (mode === 'foreign_input')
-      row.metadata.viventium.backgroundInputs[0] = { ...input, invocationId: 'other' };
-    if (mode === 'finished') job.generationCompleted = true;
-    if (mode === 'source_changed') mockModels.nativeResponseSourceMatches.mockResolvedValue(false);
-    await expect(readCurrentMainBackgroundInputs(req, 'main')).rejects.toThrow();
-  });
-  test.each(['logical_owner', 'sequence', 'stop', 'incarnation', 'identity'])(
-    'refuses ownership moving during canonical source read: %s',
-    async (mode) => {
+  test.each(['user', 'conversation', 'parent', 'invocation', 'cancelled', 'pending_error', 'invalid_hash', 'foreign_input', 'finished', 'source_changed'])
+    ('refuses another or invalid source: %s', async (mode) => {
+      if (mode === 'user') row.user = 'other';
+      if (mode === 'conversation') row.conversationId = 'other';
+      if (mode === 'parent') row.parentMessageId = 'other';
+      if (mode === 'invocation') row.nativeResponse.invocationId = 'other';
+      if (mode === 'cancelled') row.nativeResponse.status = 'cancelled';
+      if (mode === 'pending_error') { row.nativeResponse.status = 'pending'; row.error = true; }
+      if (mode === 'invalid_hash') row.metadata.viventium.backgroundInputs[0] = { ...input, textSha256: '0'.repeat(64) };
+      if (mode === 'foreign_input') row.metadata.viventium.backgroundInputs[0] = { ...input, invocationId: 'other' };
+      if (mode === 'finished') job.generationCompleted = true;
+      if (mode === 'source_changed') mockModels.nativeResponseSourceMatches.mockResolvedValue(false);
+      await expect(readCurrentMainBackgroundInputs(req, 'main')).rejects.toThrow();
+    });
+  test.each(['logical_owner', 'sequence', 'stop', 'incarnation', 'identity'])
+    ('refuses ownership moving during canonical source read: %s', async (mode) => {
       mockModels.nativeResponseSourceMatches.mockImplementation(async () => {
         if (mode === 'logical_owner') current = false;
-        if (mode === 'sequence')
-          mockJobs.observeSourceOrder.mockResolvedValue({
-            stale: false,
-            latest_source_sequence: 5,
-          });
+        if (mode === 'sequence') mockJobs.observeSourceOrder.mockResolvedValue({ stale: false, latest_source_sequence: 5 });
         if (mode === 'stop') job.nativeResponseCancelled = true;
         if (mode === 'incarnation') job.createdAt = 9;
         if (mode === 'identity') job.nativeResponse = { ...identity, invocationId: 'other' };
         return true;
       });
-      await expect(readCurrentMainBackgroundInputs(req, 'main')).rejects.toMatchObject({
-        code: 'superseded',
-      });
-    },
-  );
+      await expect(readCurrentMainBackgroundInputs(req, 'main')).rejects.toMatchObject({ code: 'superseded' });
+    });
 });
+
 
 describe('terminal mission current Native Main courier', () => {
   const native = require('../nativeResponseService');
   let identity, row, job, store, offer;
-  const insights = [
-    {
-      cortexName: 'Mission evidence',
-      insight: 'The owner declined this inspection.',
-      authority: { kind: 'durable_terminal_callback', runId: 'child-run' },
-    },
-  ];
-  const input = {
-    ownerId: 'owner',
-    conversationId: 'conversation',
-    mainAgentId: 'main',
-    currentLeafMessageId: 'answer',
-    messages: [
-      { messageId: 'answer', parentMessageId: 'question', isCreatedByUser: false },
-      { messageId: 'question', isCreatedByUser: true },
-    ],
-    insights,
-  };
+  const insights = [{ cortexName: 'Mission evidence', insight: 'The owner declined this inspection.',
+    authority: { kind: 'durable_terminal_callback', runId: 'child-run' } }];
+  const input = { ownerId: 'owner', conversationId: 'conversation', mainAgentId: 'main',
+    currentLeafMessageId: 'answer', messages: [{ messageId: 'answer', parentMessageId: 'question',
+      isCreatedByUser: false }, { messageId: 'question', isCreatedByUser: true }], insights };
   beforeEach(() => {
     jest.clearAllMocks();
-    identity = {
-      userId: 'owner',
-      conversationId: 'conversation',
-      responseMessageId: 'answer',
-      streamId: 'stream',
-      jobCreatedAt: 1,
-      logicalTurnId: 'turn',
-      revision: 2,
-      sourceOrderScope: 'a'.repeat(64),
-      sourceSequence: 4,
-      invocationId: 'invocation',
-      bodySha256: 'b'.repeat(64),
-      originSha256: 'c'.repeat(64),
-      providerId: 'native',
-      agentId: 'main',
-      admittedAt: 2,
-      recoverUntil: 3,
-      source: { id: 'source-row', messageId: 'question', digest: 'f'.repeat(64) },
-    };
-    row = {
-      user: 'owner',
-      conversationId: 'conversation',
-      messageId: 'answer',
-      parentMessageId: 'question',
-      isCreatedByUser: false,
-      unfinished: true,
-      nativeResponse: { ...identity, status: 'pending' },
-    };
-    job = {
-      userId: 'owner',
-      streamId: 'stream',
-      createdAt: 1,
-      status: 'running',
-      conversationId: 'conversation',
-      responseMessageId: 'answer',
-      userMessage: { messageId: 'question' },
-      interactionContext: {
-        logical_turn_id: 'turn',
-        revision: 2,
-        source_order_scope: identity.sourceOrderScope,
-        source_sequence: 4,
-      },
-      nativeResponse: identity,
-    };
+    identity = { userId: 'owner', conversationId: 'conversation', responseMessageId: 'answer',
+      streamId: 'stream', jobCreatedAt: 1, logicalTurnId: 'turn', revision: 2,
+      sourceOrderScope: 'a'.repeat(64), sourceSequence: 4,
+      invocationId: 'invocation', bodySha256: 'b'.repeat(64), originSha256: 'c'.repeat(64),
+      providerId: 'native', agentId: 'main', admittedAt: 2, recoverUntil: 3,
+      source: { id: 'source-row', messageId: 'question', digest: 'f'.repeat(64) } };
+    row = { user: 'owner', conversationId: 'conversation', messageId: 'answer', parentMessageId: 'question',
+      isCreatedByUser: false, unfinished: true, nativeResponse: { ...identity, status: 'pending' } };
+    job = { userId: 'owner', streamId: 'stream', createdAt: 1, status: 'running',
+      conversationId: 'conversation', responseMessageId: 'answer', userMessage: { messageId: 'question' },
+      interactionContext: { logical_turn_id: 'turn', revision: 2,
+        source_order_scope: identity.sourceOrderScope, source_sequence: 4 }, nativeResponse: identity };
     store = { getJob: jest.fn(async () => job), isCurrentLogicalTurn: jest.fn(async () => true) };
     mockJobs.getJobStore.mockReturnValue(store);
     mockJobs.observeSourceOrder.mockResolvedValue({ stale: false, latest_source_sequence: 4 });
     mockModels.getNativeResponse.mockImplementation(async () => row);
     mockModels.nativeResponseSourceMatches.mockResolvedValue(true);
-    offer = jest
-      .spyOn(native, 'deliverCompletedCortexBatchToRunningMain')
+    offer = jest.spyOn(native, 'deliverCompletedCortexBatchToRunningMain')
       .mockResolvedValue({ status: 'queued', deliveryId: 'd'.repeat(64) });
   });
   afterEach(() => offer.mockRestore());
   test('offers exact evidence through Native and defers without claiming consumption', async () => {
     expect(await native.offerMissionEvidenceToCurrentMain(input)).toBe(true);
-    expect(offer).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ownerId: 'owner',
-        conversationId: 'conversation',
-        parentMessageId: 'answer',
-        streamId: 'stream',
-        insights,
-        context: JSON.stringify({ terminal_evidence: insights }),
-      }),
-      expect.any(Function),
-    );
+    expect(offer).toHaveBeenCalledWith(expect.objectContaining({
+      ownerId: 'owner', conversationId: 'conversation', parentMessageId: 'answer',
+      streamId: 'stream', insights, context: JSON.stringify({ terminal_evidence: insights }),
+    }), expect.any(Function));
     expect(row.unfinished).toBe(true);
   });
-  test.each([false, true])(
-    'nonterminal and mixed evidence preserve honest accepted-work metadata (%s)',
-    async (mixed) => {
-      const attention = {
-        cortexName: 'Accepted mission',
-        insight: 'An authorization renewal is needed.',
-        authority: {
-          kind: 'durable_work_callback',
-          runId: 'child-run',
-          event: 'run.needs_input',
-          workState: 'needs_input',
-        },
-      };
-      const accepted = mixed ? [insights[0], attention] : [attention];
-      expect(await native.offerMissionEvidenceToCurrentMain({ ...input, insights: accepted })).toBe(
-        true,
-      );
-      expect(offer).toHaveBeenCalledWith(
-        expect.objectContaining({
-          insights: accepted,
-          context: JSON.stringify({ accepted_work_evidence: accepted }),
-        }),
-        expect.any(Function),
-      );
-      expect(attention.authority).not.toHaveProperty('resultKey');
-      expect(attention.authority.kind).toBe('durable_work_callback');
-    },
-  );
+  test.each([false, true])('nonterminal and mixed evidence preserve honest accepted-work metadata (%s)', async (mixed) => {
+    const attention = { cortexName: 'Accepted mission', insight: 'An authorization renewal is needed.',
+      authority: { kind: 'durable_work_callback', runId: 'child-run', event: 'run.needs_input', workState: 'needs_input' } };
+    const accepted = mixed ? [insights[0], attention] : [attention];
+    expect(await native.offerMissionEvidenceToCurrentMain({ ...input, insights: accepted })).toBe(true);
+    expect(offer).toHaveBeenCalledWith(expect.objectContaining({ insights: accepted,
+      context: JSON.stringify({ accepted_work_evidence: accepted }) }), expect.any(Function));
+    expect(attention.authority).not.toHaveProperty('resultKey');
+    expect(attention.authority.kind).toBe('durable_work_callback');
+  });
   test('provider terminal before committed Main reply still defers', async () => {
     row.nativeResponse.status = 'completed';
     expect(await native.offerMissionEvidenceToCurrentMain(input)).toBe(true);
     expect(offer).toHaveBeenCalledTimes(1);
   });
-  test.each([
-    'failed',
-    'cancelled',
-    'replayed',
-    'no_job',
-    'superseded',
-    'generation_complete',
-    'wrong_owner',
-    'wrong_conversation',
-    'wrong_invocation',
-    'not_current',
-    'stale_order',
-    'user_leaf',
-    'no_native_binding',
-    'unsupported_admission',
-  ])('does not hold or steer an ineligible Main: %s', async (mode) => {
-    if (['failed', 'cancelled'].includes(mode)) row.nativeResponse.status = mode;
-    if (mode === 'replayed') row.nativeResponse.finalReplayStoredAt = 10;
-    if (mode === 'no_job') job = null;
-    if (mode === 'no_native_binding') delete job.nativeResponse;
-    if (mode === 'unsupported_admission') row.nativeResponse.status = 'unsupported';
-    if (mode === 'superseded') job.status = 'superseded';
-    if (mode === 'generation_complete') job.generationCompleted = true;
-    if (mode === 'wrong_owner') row.nativeResponse.userId = 'foreign';
-    if (mode === 'wrong_conversation') row.conversationId = 'foreign';
-    if (mode === 'wrong_invocation') job.nativeResponse = { ...identity, invocationId: 'foreign' };
-    if (mode === 'not_current') store.isCurrentLogicalTurn.mockResolvedValue(false);
-    if (mode === 'stale_order') mockJobs.observeSourceOrder.mockResolvedValue({ stale: true });
-    expect(
-      await native.offerMissionEvidenceToCurrentMain(
-        mode === 'user_leaf'
-          ? {
-              ...input,
-              currentLeafMessageId: 'question',
-            }
-          : input,
-      ),
-    ).toBe(false);
-    expect(offer).not.toHaveBeenCalled();
-  });
+  test.each(['failed', 'cancelled', 'replayed', 'no_job', 'superseded', 'generation_complete',
+    'wrong_owner', 'wrong_conversation', 'wrong_invocation', 'not_current', 'stale_order', 'user_leaf',
+    'no_native_binding', 'unsupported_admission'])(
+    'does not hold or steer an ineligible Main: %s', async (mode) => {
+      if (['failed', 'cancelled'].includes(mode)) row.nativeResponse.status = mode;
+      if (mode === 'replayed') row.nativeResponse.finalReplayStoredAt = 10;
+      if (mode === 'no_job') job = null;
+      if (mode === 'no_native_binding') delete job.nativeResponse;
+      if (mode === 'unsupported_admission') row.nativeResponse.status = 'unsupported';
+      if (mode === 'superseded') job.status = 'superseded';
+      if (mode === 'generation_complete') job.generationCompleted = true;
+      if (mode === 'wrong_owner') row.nativeResponse.userId = 'foreign';
+      if (mode === 'wrong_conversation') row.conversationId = 'foreign';
+      if (mode === 'wrong_invocation') job.nativeResponse = { ...identity, invocationId: 'foreign' };
+      if (mode === 'not_current') store.isCurrentLogicalTurn.mockResolvedValue(false);
+      if (mode === 'stale_order') mockJobs.observeSourceOrder.mockResolvedValue({ stale: true });
+      expect(await native.offerMissionEvidenceToCurrentMain(mode === 'user_leaf' ? {
+        ...input, currentLeafMessageId: 'question',
+      } : input)).toBe(false);
+      expect(offer).not.toHaveBeenCalled();
+    },
+  );
   test('post-release readiness checks the exact author once without another native offer', async () => {
     let recheck;
-    expect(
-      await native.offerMissionEvidenceToCurrentMain({
-        ...input,
-        onPending: (check) => {
-          recheck = check;
-        },
-      }),
-    ).toBe(true);
+    expect(await native.offerMissionEvidenceToCurrentMain({ ...input,
+      onPending: (check) => { recheck = check; } })).toBe(true);
     expect(await recheck()).toBe(false);
     row.nativeResponse.finalReplayStoredAt = 10;
     expect(await recheck()).toBe(true);
@@ -1792,161 +1477,155 @@ describe('terminal mission current Native Main courier', () => {
   });
   test('changed canonical source retains evidence through existing failure recovery', async () => {
     mockModels.nativeResponseSourceMatches.mockResolvedValue(false);
-    await expect(native.offerMissionEvidenceToCurrentMain(input)).rejects.toThrow(
-      'mission_current_main_source_unavailable',
-    );
+    await expect(native.offerMissionEvidenceToCurrentMain(input)).rejects
+      .toThrow('mission_current_main_source_unavailable');
     expect(offer).not.toHaveBeenCalled();
   });
   test('canonical replay wakes only after exact Mongo commit and job settlement', async () => {
     const order = [];
-    mockModels.markNativeResponseReplayStored.mockImplementation(async () => {
-      order.push('mongo');
-      return true;
-    });
-    mockJobs.settleNativeResponse.mockImplementation(async () => {
-      order.push('settle');
-      return true;
-    });
+    mockModels.markNativeResponseReplayStored.mockImplementation(async () => { order.push('mongo'); return true; });
+    mockJobs.settleNativeResponse.mockImplementation(async () => { order.push('settle'); return true; });
     mockWakeMission.mockImplementation(() => order.push('wake'));
     expect(await native.markNativeResponseReplayStored(identity)).toBe(true);
     expect(order).toEqual(['mongo', 'settle', 'wake']);
-    expect(mockWakeMission).toHaveBeenCalledWith({
-      ownerId: 'owner',
-      conversationId: 'conversation',
-    });
-    mockWakeMission.mockClear();
-    mockJobs.settleNativeResponse.mockResolvedValue(false);
+    expect(mockWakeMission).toHaveBeenCalledWith({ ownerId: 'owner', conversationId: 'conversation' });
+    mockWakeMission.mockClear(); mockJobs.settleNativeResponse.mockResolvedValue(false);
     expect(await native.markNativeResponseReplayStored(identity)).toBe(false);
     expect(mockWakeMission).not.toHaveBeenCalled();
   });
 });
 
+
 describe('native background courier capability ownership', () => {
-  test.each([undefined, 'invalid'])(
-    'forwards typed unsupported without a host artifact pin: %s',
-    async (pin) => {
-      const previousPin = process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
-      try {
-        if (pin === undefined) delete process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
-        else process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = pin;
-        const input = {
-          ownerId: 'owner',
-          conversationId: 'conversation',
-          mainAgentId: 'main',
-          currentLeafMessageId: 'answer',
-          insights: [],
-        };
-        const isEligible = jest.fn(async () => true);
-        const unsupported = { status: 'unsupported', deliveryId: 'd'.repeat(64) };
-        mockDeliverCortexBatch.mockReset().mockResolvedValue(unsupported);
-        const result =
-          await require('../nativeResponseService').deliverCompletedCortexBatchToRunningMain(
-            input,
-            isEligible,
-          );
-        expect(mockDeliverCortexBatch).toHaveBeenCalledWith(
-          input,
-          expect.objectContaining({
-            liveContextEnabled: true,
-            isEligible,
-            getJob: expect.any(Function),
-            readAdmission: expect.any(Function),
-            resolveRoute: expect.any(Function),
-            isCurrentLogicalTurn: expect.any(Function),
-            observeSourceOrder: expect.any(Function),
-            prepareInput: expect.any(Function),
-            recordInputReceipt: expect.any(Function),
-          }),
-        );
-        expect(result).toBe(unsupported);
-        expect(result).not.toHaveProperty('consumed');
-      } finally {
-        if (previousPin === undefined) delete process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
-        else process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = previousPin;
-      }
-    },
-  );
+  test.each([undefined, 'invalid'])('forwards typed unsupported without a host artifact pin: %s', async (pin) => {
+    const previousPin = process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
+    try {
+      if (pin === undefined) delete process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
+      else process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = pin;
+      const input = { ownerId: 'owner', conversationId: 'conversation', mainAgentId: 'main',
+        currentLeafMessageId: 'answer', insights: [] };
+      const isEligible = jest.fn(async () => true);
+      const unsupported = { status: 'unsupported', deliveryId: 'd'.repeat(64) };
+      mockDeliverCortexBatch.mockReset().mockResolvedValue(unsupported);
+      const result = await require('../nativeResponseService').deliverCompletedCortexBatchToRunningMain(input, isEligible);
+      expect(mockDeliverCortexBatch).toHaveBeenCalledWith(input, expect.objectContaining({
+        liveContextEnabled: true, isEligible,
+        getJob: expect.any(Function), readAdmission: expect.any(Function),
+        resolveRoute: expect.any(Function), isCurrentLogicalTurn: expect.any(Function),
+        observeSourceOrder: expect.any(Function), prepareInput: expect.any(Function),
+        recordInputReceipt: expect.any(Function),
+      }));
+      expect(result).toBe(unsupported);
+      expect(result).not.toHaveProperty('consumed');
+    } finally {
+      if (previousPin === undefined) delete process.env.WPR_GROK_REVIEWED_BINARY_SHA256;
+      else process.env.WPR_GROK_REVIEWED_BINARY_SHA256 = previousPin;
+    }
+  });
 });
 
 describe('ordinary native Main selected File presentation', () => {
   const original = 'https://artifacts.example.test/v1/link-refs/ghr_original12345678';
   const download = 'https://artifacts.example.test/v1/link-refs/ghr_download12345678';
-  const file = {
-    user: 'owner',
-    file_id: 'native_' + 'a'.repeat(64),
-    filename: 'Capture.jpg',
-    filepath: '/uploads/owner/capture.jpg',
-    type: 'image/jpeg',
-    bytes: 12,
-    source: 'local',
-    object: 'file',
-    nativeOutputFile: {
-      version: 1,
-      status: 'available',
-      messageId: 'answer',
-      downloadUrl: download,
-      selectedReferences: [original],
-    },
-  };
-  test.each(['persist', 'transmit'])(
-    'projects only exact imported aliases and hides Web controls at %s',
-    (purpose) => {
-      getService();
-      const identity = {
-        userId: 'owner',
-        responseMessageId: 'answer',
-        deliveryContext: { surface: 'web' },
-      };
-      const text = `![Capture](${original})\n[Source](https://docs.example.test)\n{SKIP_VOICE}`;
-      const message = { text, content: [{ type: 'text', text }], attachments: [file] };
-      const actual = mockNativeProjection(identity, {}, message, purpose);
-      expect(actual.text).toBe(`![Capture](${download})\n[Source](https://docs.example.test)`);
-      expect(actual.content[0].text).toBe(actual.text);
-      expect(message.text).toBe(text);
-      expect(file.nativeOutputFile.selectedReferences).toEqual([original]);
-      const foreign = mockNativeProjection({ ...identity, userId: 'other' }, {}, message, purpose);
-      expect(foreign.text).toContain(original);
-    },
-  );
+  const file = { user: 'owner', file_id: 'native_' + 'a'.repeat(64), filename: 'Capture.jpg',
+    filepath: '/uploads/owner/capture.jpg', type: 'image/jpeg', bytes: 12, source: 'local', object: 'file',
+    nativeOutputFile: { version: 1, status: 'available', messageId: 'answer', downloadUrl: download,
+      selectedReferences: [original] } };
+  test.each(['persist', 'transmit'])('projects only exact imported aliases and hides Web controls at %s', (purpose) => {
+    getService();
+    const identity = { userId: 'owner', responseMessageId: 'answer', deliveryContext: { surface: 'web' } };
+    const text = `![Capture](${original})\n[Source](https://docs.example.test)\n{SKIP_VOICE}`;
+    const message = { text, content: [{ type: 'text', text }], attachments: [file] };
+    const actual = mockNativeProjection(identity, {}, message, purpose);
+    expect(actual.text).toBe(`![Capture](${download})\n[Source](https://docs.example.test)`);
+    expect(actual.content[0].text).toBe(actual.text);
+    expect(message.text).toBe(text);
+    expect(file.nativeOutputFile.selectedReferences).toEqual([original]);
+    const foreign = mockNativeProjection({ ...identity, userId: 'other' }, {}, message, purpose);
+    expect(foreign.text).toContain(original);
+  });
   test('selected-alias projection preserves model-owned audio clause boundaries', () => {
     getService();
     const quiet = `![Capture](${original})`;
     const text = quiet + '\n\nSummary.';
     const choice = (audio) => ({ version: 1, audio, required: true, valid: true, source: 'model' });
-    const response = {
-      choices: [
-        {
-          message: {
-            role: 'assistant',
-            content: text,
-            provider_specific_fields: {
-              viventium: {
-                delivery_disposition: choice('eligible'),
-                deliveryDispositionRanges: [
-                  { start: 0, end: quiet.length, disposition: choice('skip') },
-                  { start: quiet.length, end: text.length, disposition: choice('eligible') },
-                ],
-              },
-            },
-          },
-        },
-      ],
-    };
-    const actual = mockNativeProjection(
-      {
-        userId: 'owner',
-        responseMessageId: 'answer',
-        deliveryDispositionRequired: true,
-        deliveryContext: { surface: 'telegram', authenticated: true },
-      },
-      response,
-      { text, content: [{ type: 'text', text }], attachments: [file] },
-      'transmit',
-    );
+    const response = { choices: [{ message: { role: 'assistant', content: text,
+      provider_specific_fields: { viventium: { delivery_disposition: choice('eligible'),
+        deliveryDispositionRanges: [{ start: 0, end: quiet.length, disposition: choice('skip') },
+          { start: quiet.length, end: text.length, disposition: choice('eligible') }] } } } }] };
+    const actual = mockNativeProjection({ userId: 'owner', responseMessageId: 'answer',
+      deliveryDispositionRequired: true, deliveryContext: { surface: 'telegram', authenticated: true } },
+      response, { text, content: [{ type: 'text', text }], attachments: [file] }, 'transmit');
     const mappedQuiet = `![Capture](${download})`;
     expect(actual.content[0].deliveryDispositionRanges).toEqual([
       { start: 0, end: mappedQuiet.length, disposition: choice('skip') },
-      { start: mappedQuiet.length, end: actual.text.length, disposition: choice('eligible') },
-    ]);
+      { start: mappedQuiet.length, end: actual.text.length, disposition: choice('eligible') }]);
+  });
+});
+
+
+describe('passive native response phase timing', () => {
+  const { wrapNativeResponseFetch } = require('../nativeResponseService');
+  const { logger } = require('@librechat/data-schemas');
+  const route = { agentId: 'main', endpoint: 'native-provider' };
+  const request = (enabled = true) => ({
+    body: {}, viventiumVoiceLogLatency: enabled,
+    viventiumVoiceRequestId: 'SYNTHETIC_PRIVATE_REQUEST_ID',
+    headers: { Authorization: 'SYNTHETIC_SECRET_MUST_NOT_BE_LOGGED' },
+  });
+  const phases = (req, baseFetch) => {
+    wrapNativeResponseFetch(req, 'main', baseFetch, route);
+    const args = mockCreateNativeResponseFetch.mock.calls.at(-1);
+    return { send: args[0], admit: args[2] };
+  };
+  beforeEach(() => jest.clearAllMocks());
+
+  test.each(['admit', 'send'])('%s records only completion and numeric clocks after its real operation', async (phase) => {
+    let release;
+    const result = { exactResult: true };
+    const pending = new Promise((resolve) => { release = () => resolve(result); });
+    const operation = jest.fn(() => pending);
+    mockAdmit.mockImplementation(operation);
+    const controls = phases(request(), operation);
+    const completion = controls[phase]('SYNTHETIC_PRIVATE_PAYLOAD');
+    expect(logger.debug).not.toHaveBeenCalled();
+    release();
+    await expect(completion).resolves.toBe(result);
+    expect(logger.debug).toHaveBeenCalledTimes(1);
+    const [message, fields] = logger.debug.mock.calls[0];
+    expect(message).toBe('[VoiceLatency][LC][Timing]');
+    expect(fields.source).toBe('native_response');
+    expect(fields.stage).toBe(phase === 'admit' ? 'host_native_admission_completed' : 'provider_response_headers_completed');
+    expect(fields.stage_ms_f).toBeGreaterThanOrEqual(0);
+    expect(fields.request_sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(logger.debug.mock.calls)).not.toMatch(/SYNTHETIC_PRIVATE|SYNTHETIC_SECRET/);
+  });
+
+  test.each(['admit', 'send'])('%s preserves exact failure and logs failure separately', async (phase) => {
+    const error = new Error('SYNTHETIC_PRIVATE_FAILURE');
+    const operation = jest.fn(async () => { throw error; });
+    mockAdmit.mockImplementation(operation);
+    await expect(phases(request(), operation)[phase]('private')).rejects.toBe(error);
+    expect(logger.debug.mock.calls[0][1].stage.endsWith('_failed')).toBe(true);
+    expect(JSON.stringify(logger.debug.mock.calls)).not.toContain(error.message);
+  });
+
+  test.each(['admit', 'send'])('%s does no logging or promise replacement when timing is off', async (phase) => {
+    const result = Promise.resolve({ exactResult: true });
+    const operation = jest.fn(() => result);
+    mockAdmit.mockImplementation(operation);
+    expect(phases(request(false), operation)[phase]('private')).toBe(result);
+    expect(logger.debug).not.toHaveBeenCalled();
+    await result;
+  });
+
+  test.each([false, true])('logger failure never changes transport success or failure (rejected=%s)', async (rejected) => {
+    const error = new Error('SYNTHETIC_PRIVATE_FAILURE');
+    const result = { exactResult: true };
+    logger.debug.mockImplementationOnce(() => { throw new Error('diagnostic only'); });
+    const operation = jest.fn(async () => { if (rejected) throw error; return result; });
+    const response = phases(request(), operation).send('private');
+    if (rejected) await expect(response).rejects.toBe(error);
+    else await expect(response).resolves.toBe(result);
   });
 });

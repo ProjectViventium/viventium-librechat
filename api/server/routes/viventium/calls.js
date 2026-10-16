@@ -13,6 +13,7 @@
 const express = require('express');
 const { logger } = require('@librechat/data-schemas');
 const { isEnabled } = require('@librechat/api');
+const { SystemRoles } = require('librechat-data-provider');
 const { requireJwtAuth } = require('~/server/middleware');
 const {
   createCallSession,
@@ -37,7 +38,8 @@ const {
   shouldPreferPublicPlaygroundForRequest,
   verifyPlaygroundReadiness,
 } = require('~/server/services/viventium/callLaunch');
-const { getConvo } = require('~/models');
+const { getConvo, getUserById } = require('~/models');
+const { getModelsConfig } = require('~/server/controllers/ModelController');
 const {
   assertVoiceAgentAccess,
 } = require('~/server/services/viventium/VoiceAgentAuthorizationService');
@@ -481,12 +483,33 @@ router.post('/:callSessionId/dispatch/claim', dispatchAuth, async (req, res) => 
       return res.status(400).json({ error: 'roomName and agentName are required' });
     }
 
+    /* VIVENTIUM: actual Start owns prep; merely opening Voice settings starts no model. */
+    if (session.contextPreparation && session.mode !== 'listen_only') {
+      void require('~/server/services/viventium/CallPreparationService').start(session).catch(() => undefined);
+    }
+
     const result = await claimDispatch({
       callSessionId: session.callSessionId,
       roomName: normalizedRoom,
       agentName: normalizedAgent,
       reclaimConfirmed: reclaimConfirmed === true,
     });
+
+    // Warm the unchanged catalog only after Start is accepted. RTC connection does not wait.
+    if (result.status === 'claimed' && (result.session?.mode ?? session.mode) !== 'listen_only') {
+      const warmStartedAt = Date.now();
+      void getUserById(session.userId, '-password -__v -totpSecret -backupCodes')
+        .then((user) => {
+          if (!user) throw new Error('Call owner is unavailable');
+          return getModelsConfig({
+            user: { ...user, id: user._id.toString(), role: user.role || SystemRoles.USER },
+          });
+        })
+        .then(() => logger.debug('[VIVENTIUM][calls] model_catalog_warm_complete', {
+          durationMs: Date.now() - warmStartedAt,
+        }))
+        .catch(() => logger.warn('[VIVENTIUM][calls] model_catalog_warm_failed'));
+    }
 
     return res.json({
       status: result.status,

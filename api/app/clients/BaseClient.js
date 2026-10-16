@@ -64,6 +64,9 @@ const {
 const { checkBalance } = require('~/models/balanceMethods');
 const { truncateToolCallOutputs } = require('./prompts');
 const TextStream = require('./TextStream');
+/* === VIVENTIUM START === Measure the existing history owner without changing its result. === */
+const { observeVoiceLatencyOperation } = require('~/server/services/viventium/voiceLatencyTiming');
+/* === VIVENTIUM END === */
 
 class BaseClient {
   constructor(apiKey, options = {}) {
@@ -253,7 +256,10 @@ class BaseClient {
       overrideUserMessageId ?? opts.overrideParentMessageId ?? crypto.randomUUID();
     let responseMessageId = opts.responseMessageId ?? crypto.randomUUID();
     let head = isEdited ? responseMessageId : parentMessageId;
-    this.currentMessages = (await this.loadHistory(conversationId, head, parentMessageId)) ?? [];
+    this.currentMessages = (await observeVoiceLatencyOperation(
+      logger, this.options?.req, 'base_client', 'history_load',
+      () => this.loadHistory(conversationId, head, parentMessageId),
+    )) ?? [];
     this.conversationId = conversationId;
 
     if (isEdited && !isContinued) {

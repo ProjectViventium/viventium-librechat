@@ -19,12 +19,8 @@ const {
 
 const { logger } = require('@librechat/data-schemas');
 const { loadWebSearchAuth, reportCortexHostToolResult } = require('@librechat/api');
-const {
-  assertCurrentGlassHiveSourceAuthor,
-  GenerationJobManager,
-  executeManagedSourceMutation,
-  isManagedSourceMutation,
-} = require('@librechat/api');
+const { assertCurrentGlassHiveSourceAuthor, GenerationJobManager,
+  executeManagedSourceMutation, isManagedSourceMutation } = require('@librechat/api');
 const durableEffects = require('./InteractionDurableEffectService');
 const {
   audioTranscriptionDefinition,
@@ -110,18 +106,16 @@ const { activeMemoryWriterTool } = require('./memoryWriterCoordinator');
 async function recordManagedDurableReceipt(row, streamId) {
   try {
     await GenerationJobManager.markDurableEffectReceipt({
-      streamId,
-      userId: row.ownerId,
-      sourceEventId: row.sourceEventId,
-      responseMessageId: row.responseMessageId,
-      effectKind: row.effectKind,
+      streamId, userId: row.ownerId, sourceEventId: row.sourceEventId,
+      responseMessageId: row.responseMessageId, effectKind: row.effectKind,
       effectRef: row.providerReceiptRef,
+      ...(row.effectKind === 'durable_work_action_accepted' &&
+          row.replayResult?.result?.confirmationPending === true
+        ? { confirmationPending: true } : {}),
     });
   } catch (error) {
-    logger.warn(
-      '[VIVENTIUM][glasshive-capability-broker] Durable presentation projection unavailable',
-      { code: error?.code || 'durable_receipt_projection_unavailable' },
-    );
+    logger.warn('[VIVENTIUM][glasshive-capability-broker] Durable presentation projection unavailable',
+      { code: error?.code || 'durable_receipt_projection_unavailable' });
   }
 }
 /* === VIVENTIUM END === */
@@ -371,7 +365,7 @@ async function requestedServersFromGrant(grant, user, registry, requestedServerN
   /* === VIVENTIUM END === */
 }
 
-async function discoverServerTools({ user, serverName, serverConfig, signal } = {}) {
+async function oauthDiscoveryBlocker({ user, serverName, serverConfig } = {}) {
   const requiresOAuth = Boolean(serverConfig?.requiresOAuth || serverConfig?.oauthMetadata);
   if (requiresOAuth) {
     let credentialState = null;
@@ -399,6 +393,12 @@ async function discoverServerTools({ user, serverName, serverConfig, signal } = 
       };
     }
   }
+  return null;
+}
+
+async function discoverServerTools({ user, serverName, serverConfig, signal } = {}) {
+  const blocker = await oauthDiscoveryBlocker({ user, serverName, serverConfig });
+  if (blocker) return blocker;
   const discoverOnce = () =>
     reinitMCPServer({
       user,
@@ -467,11 +467,7 @@ function omissionReasonForDiscovery(discovered) {
 }
 
 async function buildCapabilityCatalog({
-  grant,
-  signal,
-  requestedServerNames,
-  requestedHostToolName,
-  appConfig,
+  grant, signal, requestedServerNames, requestedHostToolName, appConfig,
 } = {}) {
   const user = await userForGrant(grant);
   const registry = getMCPServersRegistry();
@@ -497,25 +493,18 @@ async function buildCapabilityCatalog({
     let resources = grant?.host_tool_resources?.[toolName];
     if (toolName === DELEGATION_TOOL_NAME && resources?.file_selection?.version === 1) {
       const body = resources.request_body || {};
-      const currentIds = new Set(
-        trustedUploadedFilesFromRequestBody(body).map((file) => file.file_id),
-      );
+      const currentIds = new Set(trustedUploadedFilesFromRequestBody(body).map((file) => file.file_id));
       let history;
       try {
-        history = await resolveSelectedHistoryAttachments(
-          {
-            userId: String(user.id),
-            conversationId: body.conversationId,
-            parentMessageId: body.parentMessageId,
-          },
-          { getMessages, getFiles },
-        );
+        history = await resolveSelectedHistoryAttachments({
+          userId: String(user.id), conversationId: body.conversationId,
+          parentMessageId: body.parentMessageId,
+        }, { getMessages, getFiles });
       } catch {
         omissions.push({ reason: 'delegation_file_choices_unavailable', tool: toolName });
         continue;
       }
-      const choices = history
-        .filter((file) => !currentIds.has(file.file_id))
+      const choices = history.filter((file) => !currentIds.has(file.file_id))
         .map(({ file_id, filename }) => ({ file_id, filename }));
       resources = { ...resources, file_selection: { version: 1, choices } };
     }
@@ -525,13 +514,7 @@ async function buildCapabilityCatalog({
         : HOST_TOOL_DEFINITIONS[toolName];
     const baseDefinition =
       toolName === DELEGATION_TOOL_NAME && declaredDefinition
-        ? {
-            ...declaredDefinition,
-            inputSchema: mainDelegationJsonSchema(
-              resources?.request_body,
-              resources?.file_selection?.choices,
-            ),
-          }
+        ? { ...declaredDefinition, inputSchema: mainDelegationJsonSchema(resources?.request_body, resources?.file_selection?.choices) }
         : declaredDefinition;
     const definition =
       baseDefinition &&
@@ -602,20 +585,22 @@ async function buildCapabilityCatalog({
       omissions.push(logOmission('policy_not_authorized', serverName));
       continue;
     }
-    const explicitDeferredRequest = Array.isArray(requestedServerNames);
-    let discovered = explicitDeferredRequest ? null : cachedServerDiscovery(grant, serverName);
+    let discovered = cachedServerDiscovery(grant, serverName);
     if (discovered) {
-      logger.info('[VIVENTIUM][glasshive-capability-broker] Reused grant-scoped discovery', {
-        grantId: grant.grant_id,
-        serverName,
-        toolCount: discovered.tools.length,
-      });
+      const blocker = await oauthDiscoveryBlocker({ user, serverName, serverConfig });
+      if (blocker) {
+        discovered = blocker;
+      } else {
+        logger.info('[VIVENTIUM][glasshive-capability-broker] Reused grant-scoped discovery', {
+          grantId: grant.grant_id,
+          serverName,
+          toolCount: discovered.tools.length,
+        });
+      }
     } else {
       try {
         discovered = await discoverServerTools({ user, serverName, serverConfig, signal });
-        if (!explicitDeferredRequest) {
-          rememberServerDiscovery(grant, serverName, discovered);
-        }
+        rememberServerDiscovery(grant, serverName, discovered);
       } catch (error) {
         omissions.push(logOmission('discovery_failed', serverName, { message: error?.message }));
         continue;
@@ -845,21 +830,11 @@ function glassHiveDelegationNeedsInput(result) {
 
 function validActiveWorkActionArgs(args = {}) {
   let canonical;
-  try {
-    canonical = canonicalConversationOrchestrationArguments('active_work_action', args);
-  } catch {
-    return null;
-  }
+  try { canonical = canonicalConversationOrchestrationArguments('active_work_action', args); } catch { return null; }
   const { workRef, action, instruction = '', fileIds, nativeInput } = canonical;
   if (!WORK_REF_PATTERN.test(workRef) || !ACTIVE_WORK_ACTIONS.has(action)) return null;
   if (['queue', 'message', 'steer'].includes(action) && !instruction) return null;
-  return {
-    workRef,
-    action,
-    ...(instruction ? { instruction } : {}),
-    ...(fileIds ? { fileIds } : {}),
-    ...(nativeInput ? { nativeInput } : {}),
-  };
+  return { workRef, action, ...(instruction ? { instruction } : {}), ...(fileIds ? { fileIds } : {}), ...(nativeInput ? { nativeInput } : {}) };
 }
 
 function glassHiveMissionServerName() {
@@ -929,29 +904,17 @@ async function invokeConversationDelegation({
     };
   }
   const resources = hostTool.resources || {};
-  const fileChoices =
-    resources.file_selection?.version === 1 ? resources.file_selection.choices : undefined;
+  const fileChoices = resources.file_selection?.version === 1
+    ? resources.file_selection.choices : undefined;
   if (Array.isArray(fileChoices) && fileChoices.length && canonicalArgs.fileIds === undefined) {
-    return {
-      status: 'blocked',
-      reason: 'file_selection_required',
-      tool: hostTool.toolName,
-      retryable: false,
-      needsInput: false,
-    };
+    return { status: 'blocked', reason: 'file_selection_required', tool: hostTool.toolName,
+      retryable: false, needsInput: false };
   }
-  if (
-    Array.isArray(fileChoices) &&
-    fileChoices.length &&
-    canonicalArgs.fileIds?.some((id) => !fileChoices.some((file) => file.file_id === id))
-  ) {
-    return {
-      status: 'blocked',
-      reason: 'delegation_file_selection_unauthorized',
-      tool: hostTool.toolName,
-      retryable: false,
-      needsInput: false,
-    };
+  if (Array.isArray(fileChoices) && fileChoices.length && canonicalArgs.fileIds?.some(
+    (id) => !fileChoices.some((file) => file.file_id === id),
+  )) {
+    return { status: 'blocked', reason: 'delegation_file_selection_unauthorized',
+      tool: hostTool.toolName, retryable: false, needsInput: false };
   }
   const { args: routedArgs, authority: workerRouteAuthority } = resolveBackgroundWorkerRoute(
     canonicalArgs,
@@ -974,14 +937,9 @@ async function invokeConversationDelegation({
   }
   const requestBody = selection.requestBody;
   const fileSelection = await resolveSelectedDelegationAttachments(
-    {
-      userId: String(catalog.user.id),
-      conversationId: baseRequestBody.conversationId,
-      parentMessageId: baseRequestBody.parentMessageId,
-    },
-    trustedUploadedFilesFromRequestBody(requestBody),
-    routedArgs.fileIds,
-    { getMessages, getFiles },
+    { userId: String(catalog.user.id), conversationId: baseRequestBody.conversationId,
+      parentMessageId: baseRequestBody.parentMessageId },
+    trustedUploadedFilesFromRequestBody(requestBody), routedArgs.fileIds, { getMessages, getFiles },
     trustedUploadedFilesFromRequestBody(baseRequestBody),
   );
   if (fileSelection.error) {
@@ -1064,102 +1022,83 @@ async function invokeConversationDelegation({
     }
     /* === VIVENTIUM START === Reserve this exact occurrence before its final author check. === */
     return await executeManagedSourceMutation({
-      userId: catalog.user.id,
-      requestBody,
-      adapterId: 'glasshive.worker_delegate.v1',
-      routeId: serverName,
-      operation: 'worker_delegate_once',
-      effectKind: 'durable_work_accepted',
+      userId: catalog.user.id, requestBody,
+      adapterId: 'glasshive.worker_delegate.v1', routeId: serverName,
+      operation: 'worker_delegate_once', effectKind: 'durable_work_accepted',
       occurrenceId: stableInvocationId,
-      providerIdempotencyKey:
-        effectiveToolArguments.bootstrap_bundle_json?.viventium_delegation_identity
-          ?.idempotency_key || '',
-      providerIdempotencyMode: 'native_key',
-      canonicalArgs: args,
+      providerIdempotencyKey: effectiveToolArguments.bootstrap_bundle_json?.viventium_delegation_identity?.idempotency_key || '',
+      providerIdempotencyMode: 'native_key', canonicalArgs: args,
       service: durableEffects,
       getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
       signal,
       rejectDispatch: (error) => markGlassHiveLaunchDispatchRejected(effectiveToolArguments, error),
       recordReceipt: (row) => recordManagedDurableReceipt(row, requestBody.viventiumStreamId),
       dispatch: async () => {
-        dispatchStage = 'mcp_transport';
-        const rawResult = await mcpManager.callTool({
-          serverName,
-          toolName: 'worker_delegate_once',
-          provider: DEFAULT_PROVIDER,
-          toolArguments: effectiveToolArguments,
-          options: { signal },
-          user: catalog.user,
-          requestBody,
-          flowManager: getFlowStateManager(getLogStores(CacheKeys.FLOWS)),
-          tokenMethods: { findToken, createToken, updateToken, deleteToken },
-          oauthStart: async () => {
-            throw new Error('OAuth authentication required for the GlassHive mission service');
-          },
-          oauthEnd: async () => {},
-          graphTokenResolver: getGraphApiToken,
-          returnRawResponse: true,
-        });
-        dispatchStage = 'mcp_result_classification';
-        const result = decodedGlassHiveMcpResult(rawResult);
-        const dispatchStatus = cleanBoundedString(result?.status, 64).toLowerCase();
-        if (['blocked', 'failed', 'rejected'].includes(dispatchStatus)) {
-          const blockedError = new Error(safeDelegationFailureCode(result));
-          blockedError.code = blockedError.message;
-          try {
-            await markGlassHiveLaunchDispatchRejected(effectiveToolArguments, blockedError);
-          } catch (cleanupError) {
-            await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments).catch(() => {});
-            logger.warn(
-              '[VIVENTIUM][glasshive-capability-broker] Main delegation rejection cleanup deferred',
-              {
-                code: safeDelegationDiagnosticCode(cleanupError, 'launch_rejection_cleanup_failed'),
-              },
-            );
-          }
-          return {
-            noEffect: true,
-            result: {
-              status: 'blocked',
-              reason: blockedError.code,
-              tool: hostTool.toolName,
-              retryable: glassHiveDelegationRetryable(result),
-              needsInput: glassHiveDelegationNeedsInput(result),
-            },
-          };
-        }
-        if (glassHiveMcpToolError(rawResult) && !result?.work_ref && !result?.workRef) {
-          await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments).catch(() => {});
-          return {
-            result: {
-              status: 'blocked',
-              reason: 'glasshive_delegation_tool_error',
-              tool: hostTool.toolName,
-              retryable: false,
-              needsInput: false,
-            },
-          };
-        }
-        dispatchStage = 'receipt_reconciliation';
-        const receipt = await reconcileGlassHiveLaunchResult({
-          toolArguments: effectiveToolArguments,
-          result,
-        });
-        if (!receipt?.workRef) {
-          const error = new Error('glasshive_delegation_receipt_unconfirmed');
-          error.code = 'glasshive_delegation_receipt_unconfirmed';
-          throw error;
-        }
-        invalidateActiveWorkSnapshot({ ownerId: catalog.user.id });
-        return {
-          receiptRef: receipt.workRef,
-          result: {
-            status: 'ok',
-            tool: hostTool.toolName,
-            workRef: receipt.workRef,
-            dispatch: result,
-          },
-        };
+    dispatchStage = 'mcp_transport';
+    const rawResult = await mcpManager.callTool({
+      serverName,
+      toolName: 'worker_delegate_once',
+      provider: DEFAULT_PROVIDER,
+      toolArguments: effectiveToolArguments,
+      options: { signal },
+      user: catalog.user,
+      requestBody,
+      flowManager: getFlowStateManager(getLogStores(CacheKeys.FLOWS)),
+      tokenMethods: { findToken, createToken, updateToken, deleteToken },
+      oauthStart: async () => {
+        throw new Error('OAuth authentication required for the GlassHive mission service');
+      },
+      oauthEnd: async () => {},
+      graphTokenResolver: getGraphApiToken,
+      returnRawResponse: true,
+    });
+    dispatchStage = 'mcp_result_classification';
+    const result = decodedGlassHiveMcpResult(rawResult);
+    const dispatchStatus = cleanBoundedString(result?.status, 64).toLowerCase();
+    if (['blocked', 'failed', 'rejected'].includes(dispatchStatus)) {
+      const blockedError = new Error(safeDelegationFailureCode(result));
+      blockedError.code = blockedError.message;
+      try {
+        await markGlassHiveLaunchDispatchRejected(effectiveToolArguments, blockedError);
+      } catch (cleanupError) {
+        await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments).catch(() => {});
+        logger.warn(
+          '[VIVENTIUM][glasshive-capability-broker] Main delegation rejection cleanup deferred',
+          { code: safeDelegationDiagnosticCode(cleanupError, 'launch_rejection_cleanup_failed') },
+        );
+      }
+      return { noEffect: true, result: {
+        status: 'blocked',
+        reason: blockedError.code,
+        tool: hostTool.toolName,
+        retryable: glassHiveDelegationRetryable(result),
+        needsInput: glassHiveDelegationNeedsInput(result),
+      } };
+    }
+    if (glassHiveMcpToolError(rawResult) && !result?.work_ref && !result?.workRef) {
+      await markGlassHiveLaunchDispatchUnknown(effectiveToolArguments).catch(() => {});
+      return { result: {
+        status: 'blocked',
+        reason: 'glasshive_delegation_tool_error',
+        tool: hostTool.toolName,
+        retryable: false,
+        needsInput: false,
+      } };
+    }
+    dispatchStage = 'receipt_reconciliation';
+    const receipt = await reconcileGlassHiveLaunchResult({
+      toolArguments: effectiveToolArguments,
+      result,
+    });
+    if (!receipt?.workRef) {
+      const error = new Error('glasshive_delegation_receipt_unconfirmed');
+      error.code = 'glasshive_delegation_receipt_unconfirmed';
+      throw error;
+    }
+    invalidateActiveWorkSnapshot({ ownerId: catalog.user.id });
+    return { receiptRef: receipt.workRef, result: {
+      status: 'ok', tool: hostTool.toolName, workRef: receipt.workRef, dispatch: result,
+    } };
       },
     });
     /* === VIVENTIUM END === */
@@ -1210,6 +1149,7 @@ async function executeMainDelegation({
   workerProfile = '',
   workerModel = '',
   workerReasoningEffort = '',
+  workerAccess = '',
   fallbackWorkerProfile = '',
   fallbackWorkerModel = '',
   fallbackWorkerReasoningEffort = '',
@@ -1246,6 +1186,7 @@ async function executeMainDelegation({
           workerProfile,
           workerModel,
           workerReasoningEffort,
+          workerAccess,
           fallbackWorkerProfile,
           fallbackWorkerModel,
           fallbackWorkerReasoningEffort,
@@ -1302,59 +1243,48 @@ async function invokeConversationOrchestrationTool({
     try {
       const requestBody = hostTool.resources.request_body;
       return await executeManagedSourceMutation({
-        userId: catalog.user.id,
-        requestBody,
-        adapterId: 'glasshive.work_action.v1',
-        routeId: 'glasshive.account',
-        operation: input.action,
-        effectKind: 'durable_work_action_accepted',
+        userId: catalog.user.id, requestBody,
+        adapterId: 'glasshive.work_action.v1', routeId: 'glasshive.account',
+        operation: input.action, effectKind: 'durable_work_action_accepted',
         occurrenceId: stableInvocationId,
         providerIdempotencyKey: isManagedSourceMutation(requestBody)
           ? require('./GlassHiveAccountService').buildTrustedActionIdempotencyKey({
-              ownerId: catalog.user.id,
-              ...input,
-              operationId: stableInvocationId,
-            })
-          : stableInvocationId,
-        providerIdempotencyMode: 'native_key',
-        canonicalArgs: input,
+              ownerId: catalog.user.id, ...input, operationId: stableInvocationId,
+            }) : stableInvocationId,
+        providerIdempotencyMode: 'native_key', canonicalArgs: input,
         service: durableEffects,
         getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
         signal,
         recordReceipt: (row) => recordManagedDurableReceipt(row, requestBody?.viventiumStreamId),
         dispatch: async () => {
-          const result = await executeGlassHiveWorkAction({
-            ownerId: catalog.user.id,
-            ...input,
-            ...(input.nativeInput || input.action === 'resume' ? { requestBody } : {}),
-            operationId: stableInvocationId,
-            ...(isManagedSourceMutation(requestBody)
-              ? {
-                  durableEffectContext: {
-                    streamId: requestBody.viventiumStreamId,
-                    sourceEventId: requestBody.viventiumAuthoringSourceEventId,
-                    sourceRevision: requestBody.viventiumAuthoringSourceRevision,
-                    sourceSurface: requestBody.viventiumAuthoringSurface,
-                    responseMessageId: requestBody.messageId || requestBody.responseMessageId,
-                  },
-                }
-              : {}),
-            ...(input.fileIds
-              ? { requestBody, serverReq: { user: catalog.user, config: catalog.appConfig } }
-              : {}),
-            ...(hostTool.resources.request_body?.viventiumVoiceCallSessionId
-              ? {
-                  voiceAuthorityContext: {
-                    callSessionId: hostTool.resources.request_body.viventiumVoiceCallSessionId,
-                    binding: hostTool.resources.request_body.viventiumVoiceWorkAuthority,
-                  },
-                }
-              : {}),
-          });
-          return {
-            receiptRef: stableInvocationId,
-            result: { status: 'ok', tool: hostTool.toolName, result },
-          };
+      const result = await executeGlassHiveWorkAction({
+        ownerId: catalog.user.id,
+        ...input,
+        ...(input.nativeInput || input.action === 'resume' ? { requestBody } : {}),
+        operationId: stableInvocationId,
+        ...(isManagedSourceMutation(requestBody)
+          ? {
+              durableEffectContext: {
+                streamId: requestBody.viventiumStreamId,
+                sourceEventId: requestBody.viventiumAuthoringSourceEventId,
+                sourceRevision: requestBody.viventiumAuthoringSourceRevision,
+                sourceSurface: requestBody.viventiumAuthoringSurface,
+                responseMessageId: requestBody.messageId || requestBody.responseMessageId,
+              },
+            }
+          : {}),
+        ...(input.fileIds ? { requestBody, serverReq: { user: catalog.user, config: catalog.appConfig } } : {}),
+        ...(hostTool.resources.request_body?.viventiumVoiceCallSessionId
+          ? {
+              voiceAuthorityContext: {
+                callSessionId: hostTool.resources.request_body.viventiumVoiceCallSessionId,
+                binding: hostTool.resources.request_body.viventiumVoiceWorkAuthority,
+              },
+            }
+          : {}),
+      });
+      return { receiptRef: stableInvocationId,
+        result: { status: 'ok', tool: hostTool.toolName, result } };
         },
       });
     } catch (error) {
@@ -1595,22 +1525,18 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
     };
   }
   /* === VIVENTIUM START === Typed writes reserve an occurrence before the final author check. === */
-  const sourceRequestBody =
-    policyDecision.toolPolicy?.access === 'write' &&
+  const sourceRequestBody = policyDecision.toolPolicy?.access === 'write' &&
     grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
-      ? Object.values(grant.host_tool_resources || {}).find(
-          (resource) => resource?.request_body?.viventiumStreamId,
-        )?.request_body
-      : undefined;
+    ? Object.values(grant.host_tool_resources || {}).find(
+        (resource) => resource?.request_body?.viventiumStreamId,
+      )?.request_body : undefined;
   const managedWrite = isManagedSourceMutation(sourceRequestBody);
   /* === VIVENTIUM END === */
-  const replay = managedWrite
-    ? { accepted: true }
-    : await rememberInvocation({
-        grantId: grant.grant_id,
-        invocationId,
-        ttlMs: grantReplayTtlMs(grant),
-      });
+  const replay = managedWrite ? { accepted: true } : await rememberInvocation({
+    grantId: grant.grant_id,
+    invocationId,
+    ttlMs: grantReplayTtlMs(grant),
+  });
   if (!replay.accepted) {
     return {
       status: 'blocked',
@@ -1657,74 +1583,59 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
   );
   try {
     result = await executeManagedSourceMutation({
-      userId: catalog.user.id,
-      requestBody: sourceRequestBody,
-      adapterId: 'mcp.provider_mutation.v1',
-      routeId: nativeTool.serverName,
-      operation: nativeTool.toolName,
-      effectKind: 'provider_mutation_returned',
-      occurrenceId: invocationId,
-      providerIdempotencyKey: invocationId,
-      providerIdempotencyMode: 'none',
-      canonicalArgs: toolArguments,
+      userId: catalog.user.id, requestBody: sourceRequestBody,
+      adapterId: 'mcp.provider_mutation.v1', routeId: nativeTool.serverName,
+      operation: nativeTool.toolName, effectKind: 'provider_mutation_returned',
+      occurrenceId: invocationId, providerIdempotencyKey: invocationId,
+      providerIdempotencyMode: 'none', canonicalArgs: toolArguments,
       service: durableEffects,
       getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
       signal,
       dispatch: async () => {
         const returned = await Promise.race([
-          mcpManager.callTool({
-            serverName: nativeTool.serverName,
-            toolName: nativeTool.toolName,
-            provider: DEFAULT_PROVIDER,
-            toolArguments,
-            options: requestOptions,
-            user: catalog.user,
-            requestBody: {
-              conversationId: grant.conversation_id,
-              parentMessageId: grant.parent_message_id,
-              messageId: grant.message_id,
-            },
-            flowManager,
-            tokenMethods: {
-              findToken,
-              createToken,
-              updateToken,
-              deleteToken,
-            },
-            oauthStart: async () => {
-              throw new Error('OAuth authentication required for this MCP server');
-            },
-            oauthEnd: async () => {},
-            graphTokenResolver: getGraphApiToken,
-          }),
-          new Promise((_resolve, reject) => {
-            timeoutHandle = setTimeout(() => {
-              timedOut = true;
-              reject(new Error(`broker provider call timed out after ${providerTimeoutMs}ms`));
-            }, providerTimeoutMs);
-          }),
-        ]);
-        return {
-          result: returned ?? null,
+      mcpManager.callTool({
+        serverName: nativeTool.serverName,
+        toolName: nativeTool.toolName,
+        provider: DEFAULT_PROVIDER,
+        toolArguments,
+        options: requestOptions,
+        user: catalog.user,
+        requestBody: {
+          conversationId: grant.conversation_id,
+          parentMessageId: grant.parent_message_id,
+          messageId: grant.message_id,
+        },
+        flowManager,
+        tokenMethods: {
+          findToken,
+          createToken,
+          updateToken,
+          deleteToken,
+        },
+        oauthStart: async () => {
+          throw new Error('OAuth authentication required for this MCP server');
+        },
+        oauthEnd: async () => {},
+        graphTokenResolver: getGraphApiToken,
+      }),
+      new Promise((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(`broker provider call timed out after ${providerTimeoutMs}ms`));
+        }, providerTimeoutMs);
+      }),
+    ]);
+        return { result: returned ?? null,
           ...(!glassHiveMcpToolError(returned) && returned !== undefined
-            ? { receiptRef: invocationId }
-            : {}),
+            ? { receiptRef: invocationId } : {}),
         };
       },
     });
   } catch (error) {
-    if (
-      managedWrite &&
-      (String(error?.code || '').startsWith('source_') ||
-        String(error?.code || '').startsWith('durable_effect_'))
-    ) {
-      return {
-        status: 'blocked',
-        reason: error.code,
-        server: nativeTool.serverName,
-        tool: nativeTool.toolName,
-        retryable: false,
-      };
+    if (managedWrite && (String(error?.code || '').startsWith('source_') ||
+      String(error?.code || '').startsWith('durable_effect_'))) {
+      return { status: 'blocked', reason: error.code,
+        server: nativeTool.serverName, tool: nativeTool.toolName, retryable: false };
     }
     const message = String((error && error.message) || '');
     const isTimeout =
@@ -1841,25 +1752,14 @@ async function handleToolCall({
     });
   }
   const catalog = await buildCapabilityCatalog({
-    grant,
-    signal,
-    appConfig,
-    requestedHostToolName: toolName,
+    grant, signal, appConfig, requestedHostToolName: toolName,
   });
-  if (
-    toolName === DELEGATION_TOOL_NAME &&
-    catalog.omissions.some(
-      (omission) =>
-        omission.tool === toolName && omission.reason === 'delegation_file_choices_unavailable',
-    )
-  ) {
-    return {
-      status: 'blocked',
-      reason: 'delegation_file_choices_unavailable',
-      tool: toolName,
-      retryable: true,
-      needsInput: false,
-    };
+  if (toolName === DELEGATION_TOOL_NAME && catalog.omissions.some(
+    (omission) => omission.tool === toolName &&
+      omission.reason === 'delegation_file_choices_unavailable',
+  )) {
+    return { status: 'blocked', reason: 'delegation_file_choices_unavailable',
+      tool: toolName, retryable: true, needsInput: false };
   }
   const hostTool = findHostTool(catalog, toolName);
   if (hostTool) {

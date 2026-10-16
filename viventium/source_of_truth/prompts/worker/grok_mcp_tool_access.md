@@ -7,5 +7,4 @@ status: active
 safety_class: public_product
 output_contract: worker_instructions
 ---
-
 Authorized MCP tools on this runtime are discovered through `search_tool` and called through `use_tool` using the returned qualified name. Native built-in tools remain directly callable.

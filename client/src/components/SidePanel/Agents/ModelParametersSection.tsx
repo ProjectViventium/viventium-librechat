@@ -35,9 +35,15 @@ type ModelParametersSectionProps = {
 export function filterExcludedModelParameters<T extends Pick<SettingDefinition, 'key'>>(
   parameters: T[],
   excludedParameterKeys: Array<keyof AgentModelParameters>,
+  droppedParameterKeys: string[] = [],
 ): T[] {
+  // The transport uses provider spelling; controls can use camelCase aliases.
+  const normalizeKey = (key: string) => key.replace(/_/g, '').toLowerCase();
+  const dropped = new Set(droppedParameterKeys.map(normalizeKey));
   return parameters.filter(
-    (parameter) => !excludedParameterKeys.includes(parameter.key as keyof AgentModelParameters),
+    (parameter) =>
+      !excludedParameterKeys.includes(parameter.key as keyof AgentModelParameters) &&
+      !dropped.has(normalizeKey(parameter.key)),
   );
 }
 
@@ -87,6 +93,7 @@ export default function ModelParametersSection({
           withModelCompatibleOptions(param, overriddenEndpointKey, model, { persistReset: false }),
         ),
       excludedParameterKeys,
+      endpointsConfig[provider]?.dropParams,
     );
     /* === VIVENTIUM END === */
   }, [endpointType, endpointsConfig, excludedParameterKeys, model, provider]);

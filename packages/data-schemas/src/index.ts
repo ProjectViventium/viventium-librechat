@@ -4,6 +4,10 @@ export * from './crypto';
 export * from './schema';
 export * from './utils';
 export { createModels } from './models';
+/* === VIVENTIUM START === Durable agent history uses native MongoDB storage. === */
+export { agentVersionCount, isAgentBsonOverflow, createAgentVersionMethods } from './methods/agentVersions';
+export { createAgentVersionModel } from './models/agentVersion';
+/* === VIVENTIUM END === */
 /* === VIVENTIUM START === Automatic titles preserve confirmed renames and retention. === */
 export {
   omitUserTitleMarker,

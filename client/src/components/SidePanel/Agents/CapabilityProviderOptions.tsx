@@ -50,6 +50,7 @@ export default function CapabilityProviderOptions({
     () => providerCapability?.models?.find((candidate) => candidate.id === model),
     [model, providerCapability?.models],
   );
+  const isDirectApi = modelCapability?.executionBackend === 'direct-api';
   const readinessQuery = useQuery<ProviderReadiness>(
     ['agent-provider-readiness', provider],
     () =>
@@ -70,13 +71,15 @@ export default function CapabilityProviderOptions({
     ? 'checking'
     : selectedReadiness?.status || readinessQuery.data?.status || 'unavailable';
   const readinessLabel =
-    readinessStatus === 'ready'
-      ? localize('com_ui_glasshive_authenticated_ready')
-      : readinessStatus === 'authentication_required'
-        ? localize('com_ui_glasshive_sign_in_required')
-        : readinessStatus === 'checking'
-          ? localize('com_ui_glasshive_checking')
-          : localize('com_ui_unavailable');
+    readinessStatus === 'ready_to_try'
+      ? localize('com_ui_glasshive_connection_configured')
+      : readinessStatus === 'ready'
+        ? localize('com_ui_glasshive_authenticated_ready')
+        : readinessStatus === 'authentication_required'
+          ? localize('com_ui_glasshive_sign_in_required')
+          : readinessStatus === 'checking'
+            ? localize('com_ui_glasshive_checking')
+            : localize('com_ui_unavailable');
   const readinessDetail =
     readinessStatus === 'checking'
       ? ''
@@ -145,8 +148,54 @@ export default function CapabilityProviderOptions({
     </div>
   );
 
+  const speedControl = (modelCapability?.serviceTierChoices?.length ?? 0) > 0 && (
+    <div className="model-panel-section mt-3">
+      <label
+        className="model-panel-label mb-1 block font-medium text-text-primary"
+        htmlFor={`${parameterField}-service-tier`}
+      >
+        {localize('com_ui_model_speed')}
+      </label>
+      <Controller
+        name={`${parameterField}.service_tier` as never}
+        control={control}
+        render={({ field }) => (
+          <select
+            {...field}
+            value={field.value ?? ''}
+            onChange={(event) => field.onChange(event.target.value || undefined)}
+            id={`${parameterField}-service-tier`}
+            className="h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
+          >
+            <option value="">{localize('com_ui_model_speed_current_default')}</option>
+            {field.value && !modelCapability?.serviceTierChoices?.includes(field.value) && (
+              <option value={field.value}>{field.value}</option>
+            )}
+            {modelCapability?.serviceTierChoices?.map((tier) => (
+              <option key={tier} value={tier}>
+                {tier === 'priority'
+                  ? localize('com_ui_model_speed_fast')
+                  : tier === 'default'
+                    ? localize('com_ui_model_speed_standard')
+                    : tier}
+              </option>
+            ))}
+          </select>
+        )}
+      />
+      <p className="mt-1 text-xs text-text-secondary">
+        {localize('com_ui_model_speed_description')}
+      </p>
+    </div>
+  );
+
   if (!hasWorkspaceBinding) {
-    return effortControl || null;
+    return effortControl || speedControl ? (
+      <>
+        {effortControl}
+        {speedControl}
+      </>
+    ) : null;
   }
 
   return (
@@ -155,7 +204,11 @@ export default function CapabilityProviderOptions({
         <div>
           <div className="font-medium">{localize('com_ui_glasshive_harness')}</div>
           <div className="text-xs text-text-secondary">
-            {localize('com_ui_glasshive_harness_description')}
+            {localize(
+              isDirectApi
+                ? 'com_ui_glasshive_direct_description'
+                : 'com_ui_glasshive_harness_description',
+            )}
           </div>
         </div>
         <span
@@ -227,40 +280,48 @@ export default function CapabilityProviderOptions({
         />
       )}
 
-      <label
-        className="mb-1 block text-sm font-medium"
-        htmlFor={`${parameterField}-glasshive-access`}
-      >
-        {localize('com_ui_glasshive_access')}
-      </label>
-      <Controller
-        name="glasshive_options.access"
-        control={control}
-        render={({ field }) => (
-          <select
-            {...field}
-            id={`${parameterField}-glasshive-access`}
-            className="mb-3 h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
+      {!isDirectApi && (
+        <>
+          <label
+            className="mb-1 block text-sm font-medium"
+            htmlFor={`${parameterField}-glasshive-access`}
           >
-            {providerCapability?.allow_full_access === true && (
-              <option value="full">{localize('com_ui_glasshive_full_access')}</option>
+            {localize('com_ui_glasshive_access')}
+          </label>
+          <Controller
+            name="glasshive_options.access"
+            control={control}
+            render={({ field }) => (
+              <select
+                {...field}
+                id={`${parameterField}-glasshive-access`}
+                className="mb-3 h-10 w-full rounded-lg border border-border-light bg-surface-primary px-3"
+              >
+                {providerCapability?.allow_full_access === true && (
+                  <option value="full">{localize('com_ui_glasshive_full_access')}</option>
+                )}
+                <option value="workspace">
+                  {localize('com_ui_glasshive_workspace_writes_only')}
+                </option>
+              </select>
             )}
-            <option value="workspace">{localize('com_ui_glasshive_workspace_writes_only')}</option>
-          </select>
-        )}
-      />
-      <p className="-mt-2 text-xs text-text-secondary">
-        {glassHiveOptions?.access === 'full'
-          ? localize('com_ui_glasshive_full_access_warning')
-          : localize('com_ui_glasshive_workspace_access_description')}
-      </p>
-      {(providerCapability?.worker_native_tools === true ||
-        providerCapability?.native_tools === true) && (
-        <p className="mt-3 text-xs text-text-secondary">
-          {localize('com_ui_glasshive_native_tools_description')}
-        </p>
+          />
+          <p className="-mt-2 text-xs text-text-secondary">
+            {glassHiveOptions?.access === 'full'
+              ? localize('com_ui_glasshive_full_access_warning')
+              : localize('com_ui_glasshive_workspace_access_description')}
+          </p>
+        </>
       )}
+      {!isDirectApi &&
+        (providerCapability?.worker_native_tools === true ||
+          providerCapability?.native_tools === true) && (
+          <p className="mt-3 text-xs text-text-secondary">
+            {localize('com_ui_glasshive_native_tools_description')}
+          </p>
+        )}
       {effortControl}
+      {speedControl}
     </div>
   );
 }

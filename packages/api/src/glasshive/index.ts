@@ -29,6 +29,7 @@ export * from './nativeToolEvidence';
 export * from './terminalCallbackOutbox';
 export * from './callbackBinding';
 export * from './callbackDeliveryDispatch';
+export * from './telegramDeliveryWake';
 export * from './interactionSourceSegments';
 export * from './launchReconciliation';
 /* === VIVENTIUM END === */

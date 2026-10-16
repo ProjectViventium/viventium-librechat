@@ -403,6 +403,7 @@ describe('orchestration trace ledger', () => {
                   ? 'titleModel'
                   : stage.split('.')[0],
           outcome: stage === 'action.accepted' ? 'accepted' : 'completed',
+          confirmationPending: stage === 'action.accepted',
         },
       });
     }
@@ -418,6 +419,7 @@ describe('orchestration trace ledger', () => {
       installedArtifactDigest: `sha256:${'5'.repeat(64)}`,
       effectPlane: 'control',
       outcome: 'accepted',
+      confirmationPending: true,
     });
   });
 

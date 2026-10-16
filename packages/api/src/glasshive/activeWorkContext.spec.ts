@@ -1,8 +1,4 @@
-import {
-  projectActiveWorkRoster,
-  createActiveWorkContextService,
-  formatActiveWorkContext,
-} from './activeWorkContext';
+import { projectActiveWorkRoster, createActiveWorkContextService, formatActiveWorkContext } from './activeWorkContext';
 
 const {
   applyTimeContextDelivery,
@@ -16,207 +12,88 @@ const snapshot = { snapshot: 'fresh', work, overflowCount: 0 };
 type Snapshot = Parameters<typeof formatActiveWorkContext>[0]['snapshot'];
 const facts = (capsule: string) => JSON.parse(capsule.split('\n').slice(2).join('\n'));
 const nativeQuestion = (key = 'Which colour?') => ({
-  version: 1,
-  kind: 'question',
-  state: 'pending',
-  mode: 'form',
-  runtimeName: 'native',
-  requestId: 'request-1',
-  requestFingerprint: 'a'.repeat(64),
-  runId: 'run-1',
-  attemptId: 'attempt-1',
-  sessionId: 'session-1',
-  expiresAt: '2099-01-01T00:00:00Z',
-  message: 'Which colour?',
-  requestedSchema: {
-    type: 'object',
-    required: ['answers'],
-    additionalProperties: false,
+  version: 1, kind: 'question', state: 'pending', mode: 'form', runtimeName: 'native',
+  requestId: 'request-1', requestFingerprint: 'a'.repeat(64), runId: 'run-1',
+  attemptId: 'attempt-1', sessionId: 'session-1', expiresAt: '2099-01-01T00:00:00Z',
+  message: 'Which colour?', requestedSchema: {
+    type: 'object', required: ['answers'], additionalProperties: false,
     properties: {
-      answers: {
-        type: 'object',
-        additionalProperties: false,
-        minProperties: 1,
-        maxProperties: 16,
-        properties: {
-          [key]: {
-            type: 'array',
-            uniqueItems: true,
-            minItems: 1,
-            maxItems: 1,
-            items: { type: 'string', enum: ['Blue', 'Other'] },
-          },
-        },
-      },
-      annotations: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          [key]: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['notes'],
-            properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } },
-          },
-        },
-      },
+      answers: { type: 'object', additionalProperties: false, minProperties: 1, maxProperties: 16,
+        properties: { [key]: { type: 'array', uniqueItems: true, minItems: 1, maxItems: 1,
+          items: { type: 'string', enum: ['Blue', 'Other'] } } } },
+      annotations: { type: 'object', additionalProperties: false, properties: {
+        [key]: { type: 'object', additionalProperties: false, required: ['notes'],
+          properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } } } } },
     },
   },
 });
 const nativePermission = () => ({
-  ...nativeQuestion(),
-  kind: 'permission',
-  message: 'Write the drawing?',
-  requestedSchema: {
-    type: 'object',
-    required: ['optionId'],
-    properties: {
-      optionId: {
-        type: 'string',
-        enum: ['once', 'always', 'deny'],
-        enumNames: ['Allow once', 'Always allow', 'Reject once'],
-        enumKinds: ['allow_once', 'allow_always', 'reject_once'],
-        description: 'Write drawing.svg',
-      },
-    },
-  },
+  ...nativeQuestion(), kind: 'permission', message: 'Write the drawing?',
+  requestedSchema: { type: 'object', required: ['optionId'], properties: {
+    optionId: { type: 'string', enum: ['once', 'always', 'deny'],
+      enumNames: ['Allow once', 'Always allow', 'Reject once'],
+      enumKinds: ['allow_once', 'allow_always', 'reject_once'], description: 'Write drawing.svg' },
+  } },
 });
 
 describe('current native input in existing bounded work context', () => {
-  test.each(['fresh', 'stale'])(
-    'does not invent an omitted input form in %s work facts',
-    (freshness) => {
-      const current = {
-        snapshot: freshness,
-        work: [
-          {
-            workRef: 'work-1',
-            state: 'needs_input',
-            attention: { kind: 'auth', code: 'capability_authorization_horizon_expired' },
-            actions: ['message', 'resume', 'stop'],
-          },
-        ],
-      };
-      const projected = [
-        facts(
-          formatActiveWorkContext({
-            snapshot: current,
-            preferredMode: 'parallel',
-            available: true,
-          }),
-        ),
-        projectActiveWorkRoster(current, 'active'),
-      ];
-      for (const result of projected) {
-        expect(result.work[0]).not.toHaveProperty('nativeInputOmitted');
-        expect(result.work[0]).toMatchObject({
-          workRef: 'work-1',
-          state: 'needs_input',
-          attention: current.work[0].attention,
-          actions: current.work[0].actions,
-        });
-        expect(result.work[0]).not.toHaveProperty('pendingNativeInput');
-      }
-    },
-  );
+  test.each(['fresh', 'stale'])('does not invent an omitted input form in %s work facts', (freshness) => {
+    const current = { snapshot: freshness, work: [{ workRef: 'work-1', state: 'needs_input',
+      attention: { kind: 'auth', code: 'capability_authorization_horizon_expired' },
+      actions: ['message', 'resume', 'stop'] }] };
+    const projected = [
+      facts(formatActiveWorkContext({ snapshot: current, preferredMode: 'parallel', available: true })),
+      projectActiveWorkRoster(current, 'active'),
+    ];
+    for (const result of projected) {
+      expect(result.work[0]).not.toHaveProperty('nativeInputOmitted');
+      expect(result.work[0]).toMatchObject({ workRef: 'work-1', state: 'needs_input',
+        attention: current.work[0].attention, actions: current.work[0].actions });
+      expect(result.work[0]).not.toHaveProperty('pendingNativeInput');
+    }
+  });
 
-  test.each(['Which colour? 🔵', '__proto__'])(
-    'retains exact question key %s on every surface',
-    (key) => {
-      const pending = nativeQuestion(key);
-      const current = {
-        snapshot: 'fresh',
-        work: [{ workRef: 'work-1', state: 'needs_input', pendingNativeInput: pending }],
-      };
-      const textFacts = facts(
-        formatActiveWorkContext({ snapshot: current, preferredMode: 'parallel', available: true }),
-      );
-      const voiceFacts = facts(
-        formatActiveWorkContext({
-          snapshot: current,
-          preferredMode: 'parallel',
-          available: true,
-          voice: true,
-        }),
-      );
-      expect(voiceFacts).toEqual(textFacts);
-      expect(textFacts.work[0].pendingNativeInput).toMatchObject({
-        version: 1,
-        kind: 'question',
-        requestId: pending.requestId,
-        requestFingerprint: pending.requestFingerprint,
-        runId: pending.runId,
-        attemptId: pending.attemptId,
-        sessionId: pending.sessionId,
-        expiresAt: pending.expiresAt,
-        message: pending.message,
-        questionForm: {
-          questions: [
-            {
-              key,
-              label: key,
-              multiSelect: false,
-              options: [
-                { value: 'Blue', label: 'Blue' },
-                { value: 'Other', label: 'Other' },
-              ],
-            },
-          ],
-        },
-      });
-      expect(textFacts.work[0]).not.toHaveProperty('nativeInputOmitted');
-    },
-  );
+  test.each(['Which colour? 🔵', '__proto__'])('retains exact question key %s on every surface', (key) => {
+    const pending = nativeQuestion(key);
+    const current = { snapshot: 'fresh', work: [{ workRef: 'work-1', state: 'needs_input',
+      pendingNativeInput: pending }] };
+    const textFacts = facts(formatActiveWorkContext({ snapshot: current, preferredMode: 'parallel', available: true }));
+    const voiceFacts = facts(formatActiveWorkContext({ snapshot: current, preferredMode: 'parallel', available: true, voice: true }));
+    expect(voiceFacts).toEqual(textFacts);
+    expect(textFacts.work[0].pendingNativeInput).toMatchObject({
+      version: 1, kind: 'question', requestId: pending.requestId,
+      requestFingerprint: pending.requestFingerprint, runId: pending.runId,
+      attemptId: pending.attemptId, sessionId: pending.sessionId, expiresAt: pending.expiresAt,
+      message: pending.message,
+      questionForm: { questions: [{ key, label: key, multiSelect: false,
+        options: [{ value: 'Blue', label: 'Blue' }, { value: 'Other', label: 'Other' }] }] },
+    });
+    expect(textFacts.work[0]).not.toHaveProperty('nativeInputOmitted');
+  });
 
   test('retains exact permission option IDs with their native consent kinds', () => {
     const pending = nativePermission();
-    const result = facts(
-      formatActiveWorkContext({
-        snapshot: {
-          snapshot: 'fresh',
-          work: [{ workRef: 'work-1', state: 'needs_input', pendingNativeInput: pending }],
-        },
-        preferredMode: 'parallel',
-        available: true,
-      }),
-    );
-    expect(result.work[0].pendingNativeInput).toMatchObject({
-      kind: 'permission',
-      requestId: 'request-1',
-      requestFingerprint: 'a'.repeat(64),
-      operationTitle: 'Write drawing.svg',
-      choices: [
-        { value: 'once', label: 'Allow once', kind: 'allow_once' },
+    const result = facts(formatActiveWorkContext({ snapshot: { snapshot: 'fresh', work: [
+      { workRef: 'work-1', state: 'needs_input', pendingNativeInput: pending },
+    ] }, preferredMode: 'parallel', available: true }));
+    expect(result.work[0].pendingNativeInput).toMatchObject({ kind: 'permission',
+      requestId: 'request-1', requestFingerprint: 'a'.repeat(64), operationTitle: 'Write drawing.svg',
+      choices: [{ value: 'once', label: 'Allow once', kind: 'allow_once' },
         { value: 'always', label: 'Always allow', kind: 'allow_always' },
-        { value: 'deny', label: 'Reject once', kind: 'reject_once' },
-      ],
-    });
+        { value: 'deny', label: 'Reject once', kind: 'reject_once' }] });
   });
 
   test.each(['stale', 'unavailable', 'expired', 'malformed', 'running', 'permission-kinds'])(
-    'keeps basic work truth while omitting %s input',
-    (mutation) => {
+    'keeps basic work truth while omitting %s input', (mutation) => {
       const pending: any = mutation === 'permission-kinds' ? nativePermission() : nativeQuestion();
       if (mutation === 'expired') pending.expiresAt = '2000-01-01T00:00:00Z';
       if (mutation === 'malformed') pending.requestFingerprint = 'invalid';
-      if (mutation === 'permission-kinds')
-        pending.requestedSchema.properties.optionId.enumKinds.pop();
-      const result = facts(
-        formatActiveWorkContext({
-          snapshot: {
-            snapshot: ['stale', 'unavailable'].includes(mutation) ? mutation : 'fresh',
-            work: [
-              {
-                workRef: 'work-1',
-                state: mutation === 'running' ? 'running' : 'needs_input',
-                pendingNativeInput: pending,
-              },
-            ],
-          },
-          preferredMode: 'parallel',
-          available: true,
-        }),
-      );
+      if (mutation === 'permission-kinds') pending.requestedSchema.properties.optionId.enumKinds.pop();
+      const result = facts(formatActiveWorkContext({ snapshot: {
+        snapshot: ['stale', 'unavailable'].includes(mutation) ? mutation : 'fresh', work: [
+          { workRef: 'work-1', state: mutation === 'running' ? 'running' : 'needs_input', pendingNativeInput: pending },
+        ],
+      }, preferredMode: 'parallel', available: true }));
       expect(result.work[0].workRef).toBe('work-1');
       expect(result.work[0]).not.toHaveProperty('pendingNativeInput');
       if (mutation !== 'running') expect(result.work[0].nativeInputOmitted).toBe(true);
@@ -225,26 +102,15 @@ describe('current native input in existing bounded work context', () => {
 
   test('omits a whole oversized form before sacrificing common work rows', () => {
     const pending = nativeQuestion('🌲'.repeat(4000));
-    const current = {
-      snapshot: 'fresh',
-      work: [
-        { workRef: 'work-1', state: 'needs_input', pendingNativeInput: pending },
-        { workRef: 'work-2', state: 'running', actions: ['steer'] },
-      ],
-    };
-    const context = formatActiveWorkContext({
-      snapshot: current,
-      preferredMode: 'parallel',
-      available: true,
-    });
+    const current = { snapshot: 'fresh', work: [
+      { workRef: 'work-1', state: 'needs_input', pendingNativeInput: pending },
+      { workRef: 'work-2', state: 'running', actions: ['steer'] },
+    ] };
+    const context = formatActiveWorkContext({ snapshot: current, preferredMode: 'parallel', available: true });
     const result = facts(context);
     expect(Buffer.byteLength(context)).toBeLessThanOrEqual(16 * 1024);
     expect(result.work).toHaveLength(2);
-    expect(result.work[0]).toMatchObject({
-      workRef: 'work-1',
-      state: 'needs_input',
-      nativeInputOmitted: true,
-    });
+    expect(result.work[0]).toMatchObject({ workRef: 'work-1', state: 'needs_input', nativeInputOmitted: true });
     expect(result.work[0]).not.toHaveProperty('pendingNativeInput');
     expect(result.omittedVisibleWork).toBe(0);
   });
@@ -496,46 +362,30 @@ describe('readiness capsule facts: native text and voice projection', () => {
   });
 });
 
+
 describe('compact native tool roster projection', () => {
   test('keeps every fetched identity, complete mask, scope and cursor before optional fields', () => {
-    const deliveryScope = {
-      originConversationId: 'prior-chat',
-      destinations: ['telegram'],
-      resultRunId: 'retained-run',
-      resultRevision: 2,
-    };
+    const deliveryScope = { originConversationId: 'prior-chat', destinations: ['telegram'],
+      resultRunId: 'retained-run', resultRevision: 2 };
     const actions = Array.from({ length: 15 }, (_, index) => `native-action-${index}`);
     const rows = Array.from({ length: 73 }, (_, index) => ({
-      workRef: `work-${index}-${'x'.repeat(165)}`,
-      title: `Work ${index}`,
+      workRef: `work-${index}-${'x'.repeat(165)}`, title: `Work ${index}`,
       state: index === 72 ? 'needs_input' : index > 49 ? 'failed' : 'completed',
-      actions,
-      deliveryScope,
-      updatedAt: '2026-01-01T00:00:00Z',
-      queue: { instructions: 'verbose'.repeat(1000) },
-      artifactLinks: { items: ['verbose'] },
+      actions, deliveryScope, updatedAt: '2026-01-01T00:00:00Z',
+      queue: { instructions: 'verbose'.repeat(1000) }, artifactLinks: { items: ['verbose'] },
     }));
-    const result = projectActiveWorkRoster(
-      { snapshot: 'fresh', work: rows, overflowCount: 227, cursor: 'native.cursor' },
-      'history',
-    ) as {
-      work: typeof rows;
-      scope: string;
-      cursor: string;
-      overflowCount: number;
-      omittedVisibleWork: number;
-      exceedsCompactBudget: boolean;
-      fullOutputRequired?: boolean;
-      nativeSavedOutputRequiredIfTruncated?: boolean;
-    };
+    const result = projectActiveWorkRoster({ snapshot: 'fresh', work: rows,
+      overflowCount: 227, cursor: 'native.cursor' }, 'history') as {
+        work: typeof rows; scope: string; cursor: string; overflowCount: number;
+        omittedVisibleWork: number; exceedsCompactBudget: boolean;
+        fullOutputRequired?: boolean; nativeSavedOutputRequiredIfTruncated?: boolean;
+      };
     expect(result.scope).toBe('history');
     expect(result.cursor).toBe('native.cursor');
     expect(result.overflowCount).toBe(227);
     expect(result.omittedVisibleWork).toBe(0);
     expect(result.work).toHaveLength(73);
-    expect(new Set(result.work.map((row) => row.workRef))).toEqual(
-      new Set(rows.map((row) => row.workRef)),
-    );
+    expect(new Set(result.work.map((row) => row.workRef))).toEqual(new Set(rows.map((row) => row.workRef)));
     for (const row of result.work) {
       expect(row.actions).toEqual(actions);
       expect(row.deliveryScope).toEqual(deliveryScope);
@@ -551,28 +401,12 @@ describe('compact native tool roster projection', () => {
 
   test('retains current native forms whole when valid and omits oversized forms without losing rows', () => {
     for (const key of ['Which colour?', '🌲'.repeat(8000)]) {
-      const result = projectActiveWorkRoster(
-        {
-          snapshot: 'fresh',
-          work: [
-            {
-              workRef: 'work-question',
-              state: 'needs_input',
-              actions: ['resume', 'stop'],
-              pendingNativeInput: nativeQuestion(key),
-            },
-            { workRef: 'work-other', state: 'running', actions: ['steer'] },
-          ],
-        },
-        'active',
-      ) as {
-        work: Array<{
-          workRef: string;
-          pendingNativeInput?: unknown;
-          nativeInputOmitted?: boolean;
-        }>;
-        omittedVisibleWork: number;
-      };
+      const result = projectActiveWorkRoster({ snapshot: 'fresh', work: [
+        { workRef: 'work-question', state: 'needs_input', actions: ['resume', 'stop'],
+          pendingNativeInput: nativeQuestion(key) },
+        { workRef: 'work-other', state: 'running', actions: ['steer'] },
+      ] }, 'active') as { work: Array<{ workRef: string; pendingNativeInput?: unknown;
+        nativeInputOmitted?: boolean }>; omittedVisibleWork: number };
       expect(result.work).toHaveLength(2);
       expect(result.omittedVisibleWork).toBe(0);
       if (key.length < 100) expect(result.work[0].pendingNativeInput).toBeDefined();
@@ -586,23 +420,24 @@ describe('compact native tool roster projection', () => {
   test('unavailable and malformed rows do not become a fresh empty roster', () => {
     const unavailable = { snapshot: 'unavailable', work: null };
     expect(projectActiveWorkRoster(unavailable, 'active')).toBe(unavailable);
-    expect(
-      projectActiveWorkRoster(
-        {
-          snapshot: 'stale',
-          work: [
-            null,
-            { state: 'needs_input' },
-            { workRef: 'work-retained', state: 'needs_input' },
-          ],
-          overflowCount: 0,
-        },
-        'active',
-      ),
-    ).toMatchObject({
-      snapshot: 'stale',
-      omittedVisibleWork: 2,
-      work: [{ workRef: 'work-retained', state: 'needs_input' }],
-    });
+    expect(projectActiveWorkRoster({ snapshot: 'stale', work: [null,
+      { state: 'needs_input' }, { workRef: 'work-retained', state: 'needs_input' }],
+      overflowCount: 0 }, 'active')).toMatchObject({ snapshot: 'stale', omittedVisibleWork: 2,
+      work: [{ workRef: 'work-retained', state: 'needs_input' }] });
   });
+});
+
+
+test.each(['active', 'history'] as const)('compact %s work retains delivery uncertainty as a fact, not an action', (scope) => {
+  const work = ['unknown', 'failed', 'delivered', 'pending'].map((state, index) => ({
+    workRef: `work-${index}`, title: 'Work item', state: 'completed', actions: ['message'],
+    delivery: { state, unreadTerminal: state !== 'delivered' }, updatedAt: '2026-01-01T00:00:00Z',
+  }));
+  const result = projectActiveWorkRoster({ snapshot: 'fresh', work }, scope);
+  expect(result.work.map((item: { deliveryState: string }) => item.deliveryState))
+    .toEqual(work.map((item) => item.delivery.state));
+  for (const item of result.work) {
+    expect(item.actions).toEqual(['message']);
+    expect(item).not.toHaveProperty('updatedAt');
+  }
 });

@@ -79,14 +79,52 @@ describe('MCPConnectionFactory', () => {
 
       expect(connection).toBe(mockConnectionInstance);
       expect(mockProcessMCPEnv).toHaveBeenCalledWith({ options: mockServerConfig });
-      expect(mockMCPConnection).toHaveBeenCalledWith(expect.objectContaining({
-        serverName: 'test-server',
-        serverConfig: mockServerConfig,
-        userId: undefined,
-        oauthTokens: null,
-      }));
+      expect(mockMCPConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverName: 'test-server',
+          serverConfig: mockServerConfig,
+          userId: undefined,
+          oauthTokens: null,
+        }),
+      );
       expect(mockConnectionInstance.connect).toHaveBeenCalled();
     });
+
+    /* === VIVENTIUM START === */
+    it('preserves user environment without allocating a non-OAuth token flow', async () => {
+      mockConnectionInstance.isConnected.mockResolvedValue(true);
+      const customUserVars = { EXAMPLE_SETTING: 'synthetic-value' };
+      await MCPConnectionFactory.create(
+        {
+          serverName: 'test-server',
+          serverConfig: mockServerConfig,
+          dbSourced: true,
+        },
+        {
+          useOAuth: false,
+          user: mockUser,
+          customUserVars,
+          connectionTimeout: 2500,
+          allowOAuthInitiation: false,
+          suppressOAuthFlow: true,
+        },
+      );
+      expect(mockProcessMCPEnv).toHaveBeenCalledWith({
+        user: mockUser,
+        body: undefined,
+        dbSourced: true,
+        options: mockServerConfig,
+        customUserVars,
+      });
+      expect(mockMCPConnection).toHaveBeenCalledWith(
+        expect.objectContaining({ oauthTokens: null }),
+      );
+      expect(mockConnectionInstance.connect).toHaveBeenCalledTimes(1);
+      expect(mockFlowManager.createFlowWithHandler).not.toHaveBeenCalled();
+      expect(mockConnectionInstance.on).not.toHaveBeenCalled();
+      expect(mockMCPOAuthHandler.refreshOAuthTokens).not.toHaveBeenCalled();
+    });
+    /* === VIVENTIUM END === */
 
     it('should create a connection with OAuth', async () => {
       const basicOptions = {
@@ -121,12 +159,14 @@ describe('MCPConnectionFactory', () => {
 
       expect(connection).toBe(mockConnectionInstance);
       expect(mockProcessMCPEnv).toHaveBeenCalledWith({ options: mockServerConfig, user: mockUser });
-      expect(mockMCPConnection).toHaveBeenCalledWith(expect.objectContaining({
-        serverName: 'test-server',
-        serverConfig: mockServerConfig,
-        userId: 'user123',
-        oauthTokens: mockTokens,
-      }));
+      expect(mockMCPConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverName: 'test-server',
+          serverConfig: mockServerConfig,
+          userId: 'user123',
+          oauthTokens: mockTokens,
+        }),
+      );
     });
   });
 
@@ -182,12 +222,14 @@ describe('MCPConnectionFactory', () => {
       const connection = await MCPConnectionFactory.create(basicOptions, oauthOptions);
 
       expect(connection).toBe(mockConnectionInstance);
-      expect(mockMCPConnection).toHaveBeenCalledWith(expect.objectContaining({
-        serverName: 'test-server',
-        serverConfig: mockServerConfig,
-        userId: 'user123',
-        oauthTokens: null,
-      }));
+      expect(mockMCPConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverName: 'test-server',
+          serverConfig: mockServerConfig,
+          userId: 'user123',
+          oauthTokens: null,
+        }),
+      );
       expect(mockLogger.debug).toHaveBeenCalledWith(
         expect.stringContaining('No existing tokens found or error loading tokens'),
         expect.any(Error),

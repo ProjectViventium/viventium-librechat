@@ -153,54 +153,30 @@ describe('processAgentFileUpload', () => {
       async (mimetype) => {
         const { createFile } = require('~/models');
         const handleFileUpload = jest.fn().mockResolvedValue({
-          bytes: 145,
-          filename: 'drawing.svg',
-          filepath: '/uploads/user-123/drawing.svg',
-          width: 12,
-          height: 9,
+          bytes: 145, filename: 'drawing.svg', filepath: '/uploads/user-123/drawing.svg',
+          width: 12, height: 9,
         });
         const handleImageUpload = jest.fn().mockResolvedValue({
-          bytes: 2326,
-          filepath: '/images/user-123/drawing.png',
-          width: 12,
-          height: 9,
+          bytes: 2326, filepath: '/images/user-123/drawing.png', width: 12, height: 9,
         });
         getStrategyFunctions.mockReturnValue({ handleFileUpload, handleImageUpload });
         const req = makeReq({ mimetype });
         req.file.originalname = 'drawing.svg';
         req.body.endpoint = req.body.endpointType = 'agents';
-        req.config.endpoints = {
-          agents: {
-            providerCapabilities: {
-              openAI: { workspace_binding: true, worker_native_tools: true },
-            },
-          },
-        };
+        req.config.endpoints = { agents: { providerCapabilities: {
+          'openAI': { workspace_binding: true, worker_native_tools: true },
+        } } };
         getAgent.mockResolvedValueOnce({ provider: 'openAI', model_parameters: {} });
-        await processAgentFileUpload({
-          req,
-          res: mockRes,
-          metadata: makeMetadata({
-            tool_resource: undefined,
-            message_file: true,
-          }),
-        });
+        await processAgentFileUpload({ req, res: mockRes, metadata: makeMetadata({
+          tool_resource: undefined, message_file: true,
+        }) });
         expect(handleImageUpload).not.toHaveBeenCalled();
-        expect(handleFileUpload).toHaveBeenCalledWith(
-          expect.objectContaining({ basePath: 'uploads', nativeOriginalImage: true }),
-        );
+        expect(handleFileUpload).toHaveBeenCalledWith(expect.objectContaining({ basePath: 'uploads', nativeOriginalImage: true }));
         expect(createFile).toHaveBeenCalledTimes(1);
-        expect(createFile).toHaveBeenCalledWith(
-          expect.objectContaining({
-            type: mimetype,
-            bytes: 145,
-            filename: 'drawing.svg',
-            file_id: 'file-uuid-123',
-            filepath: '/uploads/user-123/drawing.svg',
-            source: FileSources.local,
-          }),
-          true,
-        );
+        expect(createFile).toHaveBeenCalledWith(expect.objectContaining({
+          type: mimetype, bytes: 145, filename: 'drawing.svg', file_id: 'file-uuid-123',
+          filepath: '/uploads/user-123/drawing.svg', source: FileSources.local,
+        }), true);
       },
     );
 
@@ -208,41 +184,23 @@ describe('processAgentFileUpload', () => {
       'keeps ordinary image conversion when %s is absent',
       async (missingCapability) => {
         const handleFileUpload = jest.fn().mockResolvedValue({
-          bytes: 145,
-          filepath: '/uploads/user-123/drawing.png',
-          width: 12,
-          height: 9,
+          bytes: 145, filepath: '/uploads/user-123/drawing.png', width: 12, height: 9,
         });
         const handleImageUpload = jest.fn().mockResolvedValue({
-          bytes: 2326,
-          filepath: '/images/user-123/drawing.png',
-          width: 12,
-          height: 9,
+          bytes: 2326, filepath: '/images/user-123/drawing.png', width: 12, height: 9,
         });
         getStrategyFunctions.mockReturnValue({ handleFileUpload, handleImageUpload });
         const req = makeReq({ mimetype: 'image/png' });
         req.file.originalname = 'drawing.png';
         req.body.endpoint = req.body.endpointType = 'agents';
-        req.config.endpoints = {
-          agents: {
-            providerCapabilities: {
-              openAI: {
-                workspace_binding: true,
-                worker_native_tools: true,
-                [missingCapability]: false,
-              },
-            },
-          },
-        };
+        req.config.endpoints = { agents: { providerCapabilities: {
+          'openAI': { workspace_binding: true, worker_native_tools: true,
+            [missingCapability]: false },
+        } } };
         getAgent.mockResolvedValueOnce({ provider: 'openAI', model_parameters: {} });
-        await processAgentFileUpload({
-          req,
-          res: mockRes,
-          metadata: makeMetadata({
-            tool_resource: undefined,
-            message_file: true,
-          }),
-        });
+        await processAgentFileUpload({ req, res: mockRes, metadata: makeMetadata({
+          tool_resource: undefined, message_file: true,
+        }) });
         expect(handleImageUpload).toHaveBeenCalledTimes(1);
       },
     );
@@ -263,12 +221,14 @@ describe('processAgentFileUpload', () => {
           },
         };
         const handleFileUpload = jest.fn();
-        const handleImageUpload = jest.fn().mockResolvedValue({
-          bytes: 2326,
-          filepath: '/images/user-123/drawing.png',
-          width: 12,
-          height: 9,
-        });
+        const handleImageUpload = jest
+          .fn()
+          .mockResolvedValue({
+            bytes: 2326,
+            filepath: '/images/user-123/drawing.png',
+            width: 12,
+            height: 9,
+          });
         getStrategyFunctions.mockReturnValue({ handleFileUpload, handleImageUpload });
         await processImageFile({
           req,
@@ -291,66 +251,66 @@ describe('processAgentFileUpload', () => {
       ['missing workspace binding', { workspace_binding: false, worker_native_tools: true }, false],
       ['missing native tools', { workspace_binding: true, worker_native_tools: false }, false],
       ['ordinary custom provider', {}, false],
-    ])(
-      'preserves the existing image route contract for %s',
-      async (_label, capabilities, native) => {
-        const express = require('express');
-        const request = require('supertest');
-        const fs = require('fs');
-        const path = require('path');
-        const root = fs.mkdtempSync(path.join(require('os').tmpdir(), 'native-image-route-'));
-        const input = path.join(root, 'drawing.svg');
-        fs.writeFileSync(input, '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="9"/>');
-        const { createFile } = require('~/models');
-        createFile.mockImplementationOnce(async (file) => file);
-        const handleFileUpload = jest.fn().mockResolvedValue({
-          bytes: 145,
+    ])('preserves the existing image route contract for %s', async (_label, capabilities, native) => {
+      const express = require('express');
+      const request = require('supertest');
+      const fs = require('fs');
+      const path = require('path');
+      const root = fs.mkdtempSync(path.join(require('os').tmpdir(), 'native-image-route-'));
+      const input = path.join(root, 'drawing.svg');
+      fs.writeFileSync(input, '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="9"/>');
+      const { createFile } = require('~/models');
+      createFile.mockImplementationOnce(async (file) => file);
+      const handleFileUpload = jest.fn().mockResolvedValue({
+        bytes: 145,
+        filename: 'drawing.svg',
+        filepath: '/uploads/user-123/drawing.svg',
+        width: 12,
+        height: 9,
+      });
+      const handleImageUpload = jest.fn().mockResolvedValue({
+        bytes: 2326,
+        filepath: '/images/user-123/drawing.png',
+        width: 12,
+        height: 9,
+      });
+      getStrategyFunctions.mockReturnValue({ handleFileUpload, handleImageUpload });
+      mergeFileConfig.mockImplementation(
+        jest.requireActual('librechat-data-provider').mergeFileConfig,
+      );
+      getAgent.mockResolvedValue({ provider: 'synthetic-workspace', model_parameters: {} });
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.user = { id: 'user-123' };
+        req.file = {
+          path: input,
           filename: 'drawing.svg',
-          filepath: '/uploads/user-123/drawing.svg',
-          width: 12,
-          height: 9,
-        });
-        const handleImageUpload = jest.fn().mockResolvedValue({
-          bytes: 2326,
-          filepath: '/images/user-123/drawing.png',
-          width: 12,
-          height: 9,
-        });
-        getStrategyFunctions.mockReturnValue({ handleFileUpload, handleImageUpload });
-        mergeFileConfig.mockImplementation(
-          jest.requireActual('librechat-data-provider').mergeFileConfig,
-        );
-        getAgent.mockResolvedValue({ provider: 'synthetic-workspace', model_parameters: {} });
-        const app = express();
-        app.use(express.json());
-        app.use((req, _res, next) => {
-          req.user = { id: 'user-123' };
-          req.file = {
-            path: input,
-            filename: 'drawing.svg',
-            originalname: 'drawing.svg',
-            mimetype: 'image/svg+xml',
-            size: 145,
-          };
-          req.file_id = '22222222-2222-4222-8222-222222222222';
-          req.config = {
-            imageOutputType: 'png',
-            fileStrategy: 'local',
-            fileConfig: { endpoints: { agents: { supportedMimeTypes: ['^image/svg\\+xml$'] } } },
-            paths: { imageOutput: root },
-            endpoints: {
-              agents: {
-                providerCapabilities: {
-                  'synthetic-workspace': capabilities,
-                },
+          originalname: 'drawing.svg',
+          mimetype: 'image/svg+xml',
+          size: 145,
+        };
+        req.file_id = '22222222-2222-4222-8222-222222222222';
+        req.config = {
+          imageOutputType: 'png',
+          fileStrategy: 'local',
+          fileConfig: { endpoints: { agents: { supportedMimeTypes: ['^image/svg\\+xml$'] } } },
+          paths: { imageOutput: root },
+          endpoints: {
+            agents: {
+              providerCapabilities: {
+                'synthetic-workspace': capabilities,
               },
             },
-          };
-          next();
-        });
-        app.use('/images', require('~/server/routes/files/images'));
-        try {
-          const result = await request(app).post('/images').send({
+          },
+        };
+        next();
+      });
+      app.use('/images', require('~/server/routes/files/images'));
+      try {
+        const result = await request(app)
+          .post('/images')
+          .send({
             endpoint: 'agents',
             endpointType: 'agents',
             agent_id: 'agent-abc',
@@ -359,36 +319,35 @@ describe('processAgentFileUpload', () => {
             width: '12',
             height: '9',
           });
-          expect({
-            status: result.status,
-            errors: require('@librechat/data-schemas').logger.error.mock.calls.map(
-              (c) => c[1]?.message,
-            ),
-          }).toEqual({ status: 200, errors: [] });
-          if (native) {
-            expect(result.body).toEqual(
-              expect.objectContaining({
-                file_id: '22222222-2222-4222-8222-222222222222',
-                type: 'image/svg+xml',
-                bytes: 145,
-                filepath: '/uploads/user-123/drawing.svg',
-              }),
-            );
-            expect(handleImageUpload).not.toHaveBeenCalled();
-            expect(handleFileUpload).toHaveBeenCalledTimes(1);
-            expect(getAgent).toHaveBeenCalledTimes(1);
-          } else {
-            expect(result.body.type).toBe('image/png');
-            expect(handleImageUpload).toHaveBeenCalledTimes(1);
-            expect(handleFileUpload).not.toHaveBeenCalled();
-          }
-          expect(fs.existsSync(input)).toBe(false);
-        } finally {
-          fs.rmSync(root, { recursive: true, force: true });
-          mergeFileConfig.mockReset();
+        expect({
+          status: result.status,
+          errors: require('@librechat/data-schemas').logger.error.mock.calls.map(
+            (c) => c[1]?.message,
+          ),
+        }).toEqual({ status: 200, errors: [] });
+        if (native) {
+          expect(result.body).toEqual(
+            expect.objectContaining({
+              file_id: '22222222-2222-4222-8222-222222222222',
+              type: 'image/svg+xml',
+              bytes: 145,
+              filepath: '/uploads/user-123/drawing.svg',
+            }),
+          );
+          expect(handleImageUpload).not.toHaveBeenCalled();
+          expect(handleFileUpload).toHaveBeenCalledTimes(1);
+          expect(getAgent).toHaveBeenCalledTimes(1);
+        } else {
+          expect(result.body.type).toBe('image/png');
+          expect(handleImageUpload).toHaveBeenCalledTimes(1);
+          expect(handleFileUpload).not.toHaveBeenCalled();
         }
-      },
-    );
+        expect(fs.existsSync(input)).toBe(false);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        mergeFileConfig.mockReset();
+      }
+    });
   });
 
   describe('OCR strategy selection', () => {

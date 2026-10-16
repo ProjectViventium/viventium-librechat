@@ -1,5 +1,6 @@
 'use strict';
 jest.mock('../ViventiumMainContinuityService', () => require('./fixtures/mainContinuity')());
+jest.mock('../CallSessionService', () => ({ getActiveCallSessionForMainMaintenance: jest.fn(async () => null) }));
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -46,6 +47,7 @@ const {
   buildCompactionPrompt,
   compactorAgent,
   ensureAcceptedMainCompaction,
+  flushEndedCallMainCompactions,
   loadAcceptedMainContextForAdmission,
   parseSemanticCompactionOutput,
   yieldAcceptedMainCompaction,
@@ -86,230 +88,106 @@ describe('ViventiumMainCompactionService', () => {
   afterEach(() => setMainContinuityPersistenceForTests(null));
 
   test('final renewed size call uses its current admitted budget after prompt preparation', async () => {
-    let elapsedMs = 100000,
-      generated = 0,
-      advanced = false;
-    const fitting = {
-      version: 1,
-      summary: 'Permission remains pending.',
-      pendingAsks: [],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-    };
-    const wholeSource = [
-      {
-        logicalTurnId: 'bounded-source',
-        revision: 1,
-        userText: 'Keep pending permission.',
-        assistantText: 'Permission remains pending.',
-      },
-    ];
-    const claim = {
-      status: 'claimed',
-      leaseId: 'exact-renewal',
-      domainEpochKey: 'clock-domain',
-      sourceDigest: 'c'.repeat(64),
-      sourceBytes: 500,
-      previousSemanticCompaction: null,
-      leaseExpiresAt: new Date(300000),
-    };
-    Object.defineProperty(claim, 'sourceTurns', {
-      get() {
-        // Two milliseconds of preparation crosses the existing measured admission threshold.
-        if (generated === 2 && !advanced) {
-          elapsedMs += 2;
-          advanced = true;
-        }
-        return wholeSource;
-      },
-    });
-    const renewal = jest.fn(async (input) => ({
-      status: 'renewed',
-      leaseExpiresAt: input.expiresAt,
-    }));
+    let elapsedMs = 100000, generated = 0, advanced = false;
+    const fitting = { version: 1, summary: 'Permission remains pending.', pendingAsks: [],
+      commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
+    const wholeSource = [{ logicalTurnId: 'bounded-source', revision: 1,
+      userText: 'Keep pending permission.', assistantText: 'Permission remains pending.' }];
+    const claim = { status: 'claimed', leaseId: 'exact-renewal', domainEpochKey: 'clock-domain',
+      sourceDigest: 'c'.repeat(64), sourceBytes: 500, previousSemanticCompaction: null,
+      leaseExpiresAt: new Date(300000) };
+    Object.defineProperty(claim, 'sourceTurns', { get() {
+      // Two milliseconds of preparation crosses the existing measured admission threshold.
+      if (generated === 2 && !advanced) { elapsedMs += 2; advanced = true; }
+      return wholeSource;
+    }});
+    const renewal = jest.fn(async input => ({ status: 'renewed', leaseExpiresAt: input.expiresAt }));
     const calls = [];
-    const result = await ensureAcceptedMainCompaction({
-      ...identity,
-      now: () => elapsedMs,
-      deadlineAt: new Date(600000).toISOString(),
-      executionBudget: {
-        completionReserveMs: 200000,
-        slowestCallMs: 160000,
-        slowestCompactionCallMs: 160000,
-        slowestReviewCallMs: 16000,
-      },
-      claimCompaction: async () => claim,
-      renewCompaction: renewal,
+    const result = await ensureAcceptedMainCompaction({ ...identity,
+      now: () => elapsedMs, deadlineAt: new Date(600000).toISOString(),
+      executionBudget: { completionReserveMs: 200000, slowestCallMs: 160000,
+        slowestCompactionCallMs: 160000, slowestReviewCallMs: 16000 },
+      claimCompaction: async () => claim, renewCompaction: renewal,
       completeCompaction: async () => ({ status: 'compacted' }),
       rejectCompaction: async () => ({ status: 'degraded' }),
-      executeCompactor: async (call) => {
+      executeCompactor: async call => {
         calls.push({ stage: call.stage || 'compaction', timeoutMs: call.timeoutMs });
         call.reportCapacityRelease(true);
-        if (call.stage === 'review') {
-          elapsedMs += 16000;
-          return reviewApproved;
-        }
+        if (call.stage === 'review') { elapsedMs += 16000; return reviewApproved; }
         generated += 1;
         const duration = generated === 1 ? 10000 : generated === 2 ? 13999 : 170000;
         if (call.timeoutMs < duration) {
           elapsedMs += call.timeoutMs;
-          throw Object.assign(new Error('Owned attempt deadline'), {
-            code: 'main_compaction_provider_failed',
-          });
+          throw Object.assign(new Error('Owned attempt deadline'), { code: 'main_compaction_provider_failed' });
         }
         elapsedMs += duration;
-        return JSON.stringify(
-          generated <= 2
-            ? {
-                ...fitting,
-                pendingAsks: Array.from(
-                  { length: 18 - generated },
-                  (_, i) => `${i}:${'a'.repeat(900)}`,
-                ),
-              }
-            : fitting,
-        );
+        return JSON.stringify(generated <= 2 ? { ...fitting,
+          pendingAsks: Array.from({length:18-generated}, (_,i)=>`${i}:${'a'.repeat(900)}`) }
+          : fitting);
       },
     });
     expect(renewal).toHaveBeenCalledTimes(1);
     expect(claim.leaseExpiresAt).toEqual(new Date(400000));
-    expect(calls[2]).toEqual({ stage: 'compaction', timeoutMs: 240000 });
-    expect(result).toMatchObject({ status: 'compacted', attempts: 3 });
+    expect(calls[2]).toEqual({stage:'compaction',timeoutMs:240000});
+    expect(result).toMatchObject({status:'compacted',attempts:3});
   });
 
   test('awaited additional repair renewal rejection closes its exact claim', async () => {
-    let elapsedMs = 100000,
-      generated = 0;
-    const fitting = {
-      version: 1,
-      summary: 'Permission remains pending.',
-      pendingAsks: [],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-    };
-    const claim = {
-      status: 'claimed',
-      leaseId: 'failed-renewal',
-      domainEpochKey: 'failure-domain',
-      sourceDigest: 'd'.repeat(64),
-      sourceBytes: 500,
-      previousSemanticCompaction: null,
-      sourceTurns: [
-        {
-          logicalTurnId: 'complete-unit',
-          revision: 1,
-          userText: 'Keep permission.',
-          assistantText: 'Permission remains pending.',
-        },
-      ],
-      leaseExpiresAt: new Date(300000),
-    };
-    const rejection = jest.fn(async () => ({ status: 'degraded' }));
-    const calls = [];
-    const renewal = jest.fn(async () => {
-      throw new Error('Synthetic store unavailable');
-    });
+    let elapsedMs = 100000, generated = 0;
+    const fitting = { version: 1, summary: 'Permission remains pending.', pendingAsks: [],
+      commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
+    const claim = { status: 'claimed', leaseId: 'failed-renewal', domainEpochKey: 'failure-domain',
+      sourceDigest: 'd'.repeat(64), sourceBytes: 500, previousSemanticCompaction: null,
+      sourceTurns: [{ logicalTurnId: 'complete-unit', revision: 1,
+        userText: 'Keep permission.', assistantText: 'Permission remains pending.' }],
+      leaseExpiresAt: new Date(300000) };
+    const rejection = jest.fn(async () => ({status:'degraded'}));
+    const calls=[];
+    const renewal=jest.fn(async () => { throw new Error('Synthetic store unavailable'); });
     let result, failure;
     try {
-      result = await ensureAcceptedMainCompaction({
-        ...identity,
-        now: () => elapsedMs,
-        deadlineAt: new Date(600000).toISOString(),
-        executionBudget: {
-          completionReserveMs: 200000,
-          slowestCallMs: 160000,
-          slowestCompactionCallMs: 160000,
-          slowestReviewCallMs: 16000,
-        },
-        claimCompaction: async () => claim,
-        renewCompaction: renewal,
-        completeCompaction: async () => ({ status: 'compacted' }),
-        rejectCompaction: rejection,
-        executeCompactor: async (call) => {
-          calls.push(call.stage || 'compaction');
-          call.reportCapacityRelease(true);
-          generated += 1;
-          elapsedMs += generated === 1 ? 20000 : 30000;
-          return JSON.stringify({
-            ...fitting,
-            pendingAsks: Array.from(
-              { length: 18 - generated },
-              (_, i) => `${i}:${'a'.repeat(900)}`,
-            ),
-          });
-        },
-      });
-    } catch (error) {
-      failure = error.message;
-    }
+      result=await ensureAcceptedMainCompaction({...identity,now:()=>elapsedMs,
+        deadlineAt:new Date(600000).toISOString(),
+        executionBudget:{completionReserveMs:200000,slowestCallMs:160000,
+          slowestCompactionCallMs:160000,slowestReviewCallMs:16000},
+        claimCompaction:async()=>claim,renewCompaction:renewal,
+        completeCompaction:async()=>({status:'compacted'}),rejectCompaction:rejection,
+        executeCompactor:async call=>{
+          calls.push(call.stage||'compaction');call.reportCapacityRelease(true);
+          generated+=1;elapsedMs+=generated===1?20000:30000;
+          return JSON.stringify({...fitting,pendingAsks:Array.from({length:18-generated},(_,i)=>`${i}:${'a'.repeat(900)}`)});
+        }});
+    }catch(error){failure=error.message;}
     expect(renewal).toHaveBeenCalledTimes(1);
     expect(calls).toHaveLength(2);
     expect(rejection).toHaveBeenCalledTimes(1);
-    expect(rejection).toHaveBeenCalledWith(expect.objectContaining({ leaseId: claim.leaseId }));
+    expect(rejection).toHaveBeenCalledWith(expect.objectContaining({leaseId:claim.leaseId}));
     expect(failure).toBeUndefined();
     expect(result.status).toBe('degraded');
   });
 
   test.each(['rejected', 'stopped'])(
-    'review renewal closes the exact claim before child dispatch (%s)',
-    async (mode) => {
-      let elapsedMs = 100000,
-        generated = 0,
-        advanced = false;
+    'review renewal closes the exact claim before child dispatch (%s)', async mode => {
+      let elapsedMs = 100000, generated = 0, advanced = false;
       const controller = new AbortController();
-      const source = [
-        {
-          logicalTurnId: 'review-source',
-          revision: 1,
-          userText: 'Keep permission pending.',
-          assistantText: 'Permission is pending.',
-        },
-      ];
+      const source = [{ logicalTurnId: 'review-source', revision: 1,
+        userText: 'Keep permission pending.', assistantText: 'Permission is pending.' }];
       const original = structuredClone(source);
-      const candidate = {
-        version: 1,
-        summary: 'Permission remains pending.',
-        pendingAsks: [],
-        commitments: [],
-        corrections: [],
-        decisions: [],
-        durableIdentifiers: [],
-        recurrenceOutcomes: [],
-        toolPairs: [],
-      };
-      const claim = {
-        status: 'claimed',
-        leaseId: 'review-renewal',
-        domainEpochKey: 'review-domain',
-        sourceDigest: 'f'.repeat(64),
-        sourceBytes: 500,
-        previousSemanticCompaction: null,
-        leaseExpiresAt: new Date(300000),
-      };
-      Object.defineProperty(claim, 'sourceTurns', {
-        get() {
-          if (generated === 1 && !advanced) {
-            elapsedMs += 2;
-            advanced = true;
-          }
-          return source;
-        },
-      });
-      const renewal = jest.fn(async (input) => {
-        expect(input).toMatchObject({
-          leaseId: claim.leaseId,
-          sourceDigest: claim.sourceDigest,
-          leaseExpiresAt: new Date(300000),
-          expiresAt: new Date(400000),
-        });
+      const candidate = { version: 1, summary: 'Permission remains pending.', pendingAsks: [],
+        commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+        recurrenceOutcomes: [], toolPairs: [] };
+      const claim = { status: 'claimed', leaseId: 'review-renewal', domainEpochKey: 'review-domain',
+        sourceDigest: 'f'.repeat(64), sourceBytes: 500, previousSemanticCompaction: null,
+        leaseExpiresAt: new Date(300000) };
+      Object.defineProperty(claim, 'sourceTurns', { get() {
+        if (generated === 1 && !advanced) { elapsedMs += 2; advanced = true; }
+        return source;
+      }});
+      const renewal = jest.fn(async input => {
+        expect(input).toMatchObject({ leaseId: claim.leaseId, sourceDigest: claim.sourceDigest,
+          leaseExpiresAt: new Date(300000), expiresAt: new Date(400000) });
         if (mode === 'rejected') throw new Error('Synthetic review store unavailable');
         controller.abort('user_cancelled');
         return { status: 'renewed', leaseExpiresAt: input.expiresAt };
@@ -317,125 +195,66 @@ describe('ViventiumMainCompactionService', () => {
       const rejection = jest.fn(async () => ({ status: 'degraded' }));
       const completed = jest.fn(async () => ({ status: 'compacted' }));
       const calls = [];
-      const result = await ensureAcceptedMainCompaction({
-        ...identity,
-        signal: controller.signal,
-        now: () => elapsedMs,
-        deadlineAt: new Date(600000).toISOString(),
-        executionBudget: {
-          completionReserveMs: 200000,
-          slowestCallMs: 160000,
-          slowestCompactionCallMs: 160000,
-          slowestReviewCallMs: 16000,
-        },
-        claimCompaction: async () => claim,
-        renewCompaction: renewal,
-        completeCompaction: completed,
-        rejectCompaction: rejection,
-        executeCompactor: async (call) => {
-          calls.push(call.stage || 'compaction');
-          call.reportCapacityRelease(true);
+      const result = await ensureAcceptedMainCompaction({ ...identity, signal: controller.signal,
+        now: () => elapsedMs, deadlineAt: new Date(600000).toISOString(),
+        executionBudget: { completionReserveMs: 200000, slowestCallMs: 160000,
+          slowestCompactionCallMs: 160000, slowestReviewCallMs: 16000 },
+        claimCompaction: async () => claim, renewCompaction: renewal,
+        completeCompaction: completed, rejectCompaction: rejection,
+        executeCompactor: async call => {
+          calls.push(call.stage || 'compaction'); call.reportCapacityRelease(true);
           expect(call.timeoutMs).toBe(184000);
-          generated += 1;
-          elapsedMs += 184000;
+          generated += 1; elapsedMs += 184000;
           return JSON.stringify(candidate);
         },
       });
       expect(renewal).toHaveBeenCalledTimes(1);
-      expect(calls).toEqual(['compaction']);
-      expect(completed).not.toHaveBeenCalled();
+      expect(calls).toEqual(['compaction']); expect(completed).not.toHaveBeenCalled();
       expect(rejection).toHaveBeenCalledTimes(1);
       expect(rejection).toHaveBeenCalledWith(expect.objectContaining({ leaseId: claim.leaseId }));
       expect(source).toEqual(original);
-      expect(result).toMatchObject({
-        status: 'degraded',
-        attempts: 1,
-        reason: mode === 'stopped' ? 'compaction_cancelled' : 'review_provider_failed',
-      });
-    },
-  );
+      expect(result).toMatchObject({ status: 'degraded', attempts: 1,
+        reason: mode === 'stopped' ? 'compaction_cancelled' : 'review_provider_failed' });
+    });
 
   test('review store renewal rejection closes its exact claim without a review child', async () => {
     let elapsedMs = 100000;
-    const source = [
-      {
-        logicalTurnId: 'review-await-source',
-        revision: 1,
-        userText: 'Keep pending permission.',
-        assistantText: 'Permission is pending.',
-      },
-    ];
+    const source = [{ logicalTurnId: 'review-await-source', revision: 1,
+      userText: 'Keep pending permission.', assistantText: 'Permission is pending.' }];
     const original = structuredClone(source);
-    const candidate = {
-      version: 1,
-      summary: 'Permission remains pending.',
-      pendingAsks: [],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-    };
+    const candidate = { version: 1, summary: 'Permission remains pending.', pendingAsks: [],
+      commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
     const { createMainCompactionOutputContract } = require('@librechat/api');
-    const claim = {
-      status: 'claimed',
-      leaseId: 'review-store-renewal',
-      domainEpochKey: 'review-store-domain',
-      sourceDigest: '9'.repeat(64),
-      sourceBytes: 500,
-      sourceTurns: source,
-      previousSemanticCompaction: null,
-      leaseExpiresAt: new Date(300000),
-      outputContract: createMainCompactionOutputContract({
-        consumer: 'accepted_core',
-        carrierMaxUtf8Bytes: 128 * 1024,
-        reservedUtf8Bytes: 1000,
-      }),
-    };
-    const renewal = jest.fn(async () => {
-      throw new Error('Synthetic review store unavailable');
-    });
+    const claim = { status: 'claimed', leaseId: 'review-store-renewal', domainEpochKey: 'review-store-domain',
+      sourceDigest: '9'.repeat(64), sourceBytes: 500, sourceTurns: source,
+      previousSemanticCompaction: null, leaseExpiresAt: new Date(300000),
+      outputContract: createMainCompactionOutputContract({ consumer: 'accepted_core',
+        carrierMaxUtf8Bytes: 128 * 1024, reservedUtf8Bytes: 1000 }) };
+    const renewal = jest.fn(async () => { throw new Error('Synthetic review store unavailable'); });
     const rejection = jest.fn(async () => ({ status: 'degraded' }));
     const completed = jest.fn(async () => ({ status: 'compacted' }));
     const calls = [];
-    const result = await ensureAcceptedMainCompaction({
-      ...identity,
-      now: () => elapsedMs,
-      deadlineAt: new Date(600000).toISOString(),
-      executionBudget: {
-        completionReserveMs: 200000,
-        slowestCallMs: 160000,
-        slowestCompactionCallMs: 160000,
-        slowestReviewCallMs: 16000,
-      },
-      claimCompaction: async () => claim,
-      renewCompaction: renewal,
-      completeCompaction: completed,
-      rejectCompaction: rejection,
+    const result = await ensureAcceptedMainCompaction({ ...identity,
+      now: () => elapsedMs, deadlineAt: new Date(600000).toISOString(),
+      executionBudget: { completionReserveMs: 200000, slowestCallMs: 160000,
+        slowestCompactionCallMs: 160000, slowestReviewCallMs: 16000 },
+      claimCompaction: async () => claim, renewCompaction: renewal,
+      completeCompaction: completed, rejectCompaction: rejection,
       inspectCandidateCarrier: async () => {
         // An awaited carrier inspection consumes time after generation but before review admission.
-        elapsedMs += 165000;
-        return { ok: true };
+        elapsedMs += 165000; return { ok: true };
       },
-      executeCompactor: async (call) => {
-        calls.push(call.stage || 'compaction');
-        call.reportCapacityRelease(true);
-        elapsedMs += 20000;
-        return JSON.stringify(candidate);
+      executeCompactor: async call => {
+        calls.push(call.stage || 'compaction'); call.reportCapacityRelease(true);
+        elapsedMs += 20000; return JSON.stringify(candidate);
       },
     });
-    expect(renewal).toHaveBeenCalledTimes(1);
-    expect(calls).toEqual(['compaction']);
-    expect(completed).not.toHaveBeenCalled();
-    expect(source).toEqual(original);
+    expect(renewal).toHaveBeenCalledTimes(1); expect(calls).toEqual(['compaction']);
+    expect(completed).not.toHaveBeenCalled(); expect(source).toEqual(original);
     expect(rejection).toHaveBeenCalledTimes(1);
     expect(rejection).toHaveBeenCalledWith(expect.objectContaining({ leaseId: claim.leaseId }));
-    expect(result).toMatchObject({
-      status: 'degraded',
-      attempts: 1,
-      reason: 'review_provider_failed',
-    });
+    expect(result).toMatchObject({ status: 'degraded', attempts: 1, reason: 'review_provider_failed' });
   });
 
   test('parses a JSON object without accepting prose around it', () => {
@@ -446,6 +265,35 @@ describe('ViventiumMainCompactionService', () => {
     ).toMatchObject({ version: 1, summary: 'Earlier state.' });
     expect(parseSemanticCompactionOutput('Here is the summary: {"version":1}')).toBeNull();
   });
+  test('repairs candidate-only tool identities before spending an independent review call', async () => {
+    const pair = { callId: 'call_opaque_001', toolName: 'read_record', outcome: 'Record value is 7.' };
+    const candidate = { version: 1, summary: 'Record value is 7.', pendingAsks: [], commitments: [],
+      corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [pair] };
+    const claim = { status: 'claimed', leaseId: 'typed-identity-repair', domainEpochKey: 'typed-identity-domain',
+      sourceDigest: 'b'.repeat(64), sourceBytes: 500, previousSemanticCompaction: null,
+      sourceTurns: [{ toolPairs: [pair] }], leaseExpiresAt: new Date(Date.now() + 300000) };
+    const stages = [], prompts = [];
+    let generated = 0;
+    const result = await ensureAcceptedMainCompaction({ ...identity,
+      claimCompaction: async () => claim,
+      completeCompaction: async () => ({ status: 'compacted' }),
+      rejectCompaction: async () => ({ status: 'degraded' }),
+      executeCompactor: async call => {
+        stages.push(call.stage || 'compaction'); prompts.push(call.prompt);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') return reviewApproved;
+        generated += 1;
+        return JSON.stringify(generated === 1 ? { ...candidate,
+          toolPairs: [{ ...pair, callId: 'call_opaque_00I' }] } : candidate);
+      },
+    });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
+    expect(stages).toEqual(['compaction', 'compaction', 'review']);
+    expect(prompts[1]).toContain('"constraint":"source_identity"');
+    expect(prompts[2]).toContain('"typedToolIdentityComparison":{"version":1,"exactMatches":');
+    expect(prompts[2]).toContain('"sourceLocations":["sourceTurns.0.toolPairs.0"]');
+  });
+
   test('renders the same legacy provenance and retirement evidence into generation and review', () => {
     const legacyInputs = [
       {
@@ -512,7 +360,9 @@ describe('ViventiumMainCompactionService', () => {
     expect(calls).toHaveLength(2);
     for (const call of calls) {
       expect(call.stage).not.toBe('review');
-      expect(call.prompt).toContain('"consumer":"accepted_core"');
+      expect(call.prompt).toContain(
+        '"consumer":"accepted_core"',
+      );
     }
     const payloads = calls.map(({ prompt }) =>
       JSON.parse(
@@ -540,7 +390,7 @@ describe('ViventiumMainCompactionService', () => {
   });
 
   test.each(['max_bytes', 'shape'])(
-    'repairs the exact rejected candidate after %s without replacing accepted source',
+    'repairs %s without replacing accepted source or echoing an oversized draft',
     async (constraint) => {
       const { mainCompactionOutputConstraints } = require('@librechat/api');
       for (let index = 1; index <= 4; index += 1) {
@@ -595,16 +445,15 @@ describe('ViventiumMainCompactionService', () => {
       );
       expect(payloads[1].priorRejection).toMatchObject({
         code: 'schema_invalid',
-        candidate: rejected,
         issue: { constraint },
       });
+      if (constraint === 'max_bytes') expect(payloads[1].priorRejection.candidate).toBeUndefined();
+      else expect(payloads[1].priorRejection.candidate).toBe(rejected);
       if (constraint === 'max_bytes') {
         // The whole-proposal overflow names where its bytes are, so the repair can target them.
         const proposal = JSON.parse(rejected);
         const { issue } = payloads[1].priorRejection;
-        expect(issue.excessBytes).toBe(
-          issue.actual - payloads[0].outputConstraints.maxJsonUtf8Bytes,
-        );
+        expect(issue.excessBytes).toBe(issue.actual - payloads[0].outputConstraints.maxJsonUtf8Bytes);
         expect(issue.excessBytes).toBeGreaterThan(0);
         expect(payloads[1].priorRejection.issue).toMatchObject({
           path: '',
@@ -629,107 +478,97 @@ describe('ViventiumMainCompactionService', () => {
     },
   );
 
-  test('repairs an item byte limit on the same source even when a smaller whole claim exists', async () => {
-    const valid = {
-      version: 1,
-      summary: 'The source remains pending.',
-      pendingAsks: ['Keep permission required.'],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-    };
-    const invalid = JSON.stringify({ ...valid, pendingAsks: ['p'.repeat(1025)] });
+  test('an indivisible source fits a size correction without duplicating its rejected draft', async () => {
+    const valid = { version: 1, summary: 'Permission and the pending task remain unresolved.',
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] };
+    const previousSemanticCompaction = { ...valid, summary: 's'.repeat(80000) };
+    const legacyInputs = [{ kind: 'legacy_state', id: 'legacy-artifact',
+      semanticCompaction: { ...valid, summary: 'l'.repeat(39000) },
+      sourceTurns: [{ logicalTurnId: 'whole-turn', revision: 1, userText: 'Keep permission required.',
+        assistantText: 'The task is still pending.', toolPairs: [] }],
+      sourceRange: { artifactId: 'legacy-artifact', start: 0, end: 1, total: 3 } }];
+    const rejected = JSON.stringify({ ...valid, summary: 'd'.repeat(90000) });
+    const outputContract = { version: 1, consumer: 'accepted_core', carrierMaxUtf8Bytes: 131072,
+      reservedUtf8Bytes: 57388, maxJsonUtf8Bytes: 73684, maxSummaryUtf8Bytes: 73684,
+      maxItemsPerArray: 32, maxStringItemUtf8Bytes: 1024, maxToolIdentityCharacters: 256 };
+    const claim = { status: 'claimed', leaseId: 'indivisible-size', domainEpochKey: 'size-domain',
+      sourceDigest: '9'.repeat(64), sourceBytes: 121050, sourceTurns: [], legacyInputs,
+      previousSemanticCompaction, outputContract, canReduceSource: false,
+      leaseExpiresAt: new Date(Date.now() + 300000) };
+    const original = structuredClone(claim);
+    const completeCompaction = jest.fn(async () => ({ status: 'compacted' }));
+    const rejectCompaction = jest.fn();
     const calls = [];
-    const completeCompaction = jest.fn().mockResolvedValue({ status: 'compacted' });
-    const result = await ensureAcceptedMainCompaction({
-      ...identity,
-      claimCompaction: async () => ({
-        status: 'claimed',
-        leaseId: 'item-limit',
-        sourceDigest: 'a'.repeat(64),
-        domainEpochKey: 'item-limit-epoch',
-        sourceTurns: [],
-        sourceBytes: 8000,
-        previousSemanticCompaction: null,
-        canReduceSource: true,
-        leaseExpiresAt: new Date(Date.now() + 300000),
-      }),
-      completeCompaction,
-      rejectCompaction: jest.fn().mockResolvedValue({ status: 'rejected' }),
-      executeCompactor: async (call) => {
+    const result = await ensureAcceptedMainCompaction({ ...identity,
+      claimCompaction: async () => claim, completeCompaction, rejectCompaction,
+      executeCompactor: async call => {
         calls.push(call);
-        return calls.length === 1
-          ? invalid
-          : call.stage === 'review'
-            ? reviewApproved
-            : JSON.stringify(valid);
-      },
-    });
+        if (Buffer.byteLength(call.prompt) > 196608)
+          throw Object.assign(new Error('Request exceeds native byte budget'), { errorStatus: 413 });
+        return calls.length === 1 ? rejected : call.stage === 'review' ? reviewApproved : JSON.stringify(valid);
+      } });
     expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
     expect(calls).toHaveLength(3);
-    const payload = JSON.parse(
-      calls[1].prompt.match(
-        /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
-      )[1],
-    );
-    expect(payload.priorRejection.issue).toMatchObject({
-      path: 'pendingAsks.0',
-      constraint: 'max_bytes',
-    });
+    const payloads = calls.map(({ prompt }) => JSON.parse(prompt.match(
+      /<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/)[1]));
+    const correction = payloads[1];
+    expect(correction.priorRejection).toMatchObject({ code: 'schema_invalid',
+      issue: { constraint: 'max_bytes', limit: 73684 } });
+    expect(correction.priorRejection.candidate).toBeUndefined();
+    const oldCorrection = { ...correction,
+      priorRejection: { ...correction.priorRejection, candidate: rejected } };
+    expect(Buffer.byteLength(JSON.stringify(oldCorrection))).toBeGreaterThan(196608);
+    for (const payload of payloads) {
+      expect(payload.previousSemanticCompaction).toEqual(original.previousSemanticCompaction);
+      expect(payload.legacyInputs).toEqual(original.legacyInputs);
+      expect(payload.acceptedOlderTurns).toEqual(original.sourceTurns);
+      expect(payload.sourceDigest).toBe(original.sourceDigest);
+      expect(payload.outputConstraints).toEqual(original.outputContract);
+    }
+    expect(calls[2].stage).toBe('review');
+    expect(payloads[2].candidate).toEqual(valid);
+    expect(completeCompaction).toHaveBeenCalledTimes(1);
+    expect(completeCompaction.mock.calls[0][0].semanticReview.approved).toBe(true);
+    expect(rejectCompaction).not.toHaveBeenCalled();
+  });
+
+  test('repairs an item byte limit on the same source even when a smaller whole claim exists', async () => {
+    const valid = { version: 1, summary: 'The source remains pending.', pendingAsks: ['Keep permission required.'],
+      commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
+    const invalid = JSON.stringify({ ...valid, pendingAsks: ['p'.repeat(1025)] });
+    const calls = []; const completeCompaction = jest.fn().mockResolvedValue({ status: 'compacted' });
+    const result = await ensureAcceptedMainCompaction({ ...identity,
+      claimCompaction: async () => ({ status: 'claimed', leaseId: 'item-limit',
+        sourceDigest: 'a'.repeat(64), domainEpochKey: 'item-limit-epoch', sourceTurns: [],
+        sourceBytes: 8000, previousSemanticCompaction: null, canReduceSource: true,
+        leaseExpiresAt: new Date(Date.now() + 300000) }), completeCompaction,
+      rejectCompaction: jest.fn().mockResolvedValue({ status: 'rejected' }),
+      executeCompactor: async call => { calls.push(call); return calls.length === 1 ? invalid :
+        call.stage === 'review' ? reviewApproved : JSON.stringify(valid); } });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
+    expect(calls).toHaveLength(3);
+    const payload = JSON.parse(calls[1].prompt.match(
+      /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/)[1]);
+    expect(payload.priorRejection.issue).toMatchObject({ path: 'pendingAsks.0', constraint: 'max_bytes' });
     expect(payload.sourceDigest).toBe('a'.repeat(64));
     expect(completeCompaction).toHaveBeenCalledTimes(1);
   });
 
   test('reuses the same identity and version of hydrated Core under final selected headroom without model work', async () => {
-    const turns = [1, 2, 3].map((index) => ({
-      logicalTurnId: `turn-${index}`,
-      revision: 1,
-      conversationId: 'conversation',
-      userMessageId: `user-${index}`,
-      assistantMessageId: `assistant-${index}`,
-      origin: 'interactive',
-      userText: 'u'.repeat(2048),
-      assistantText: 'a'.repeat(2048),
-      toolPairs: [],
-      committedAt: new Date(),
-    }));
-    const semanticCompaction = {
-      version: 1,
-      summary: 'Keep approval required.',
-      pendingAsks: [],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-    };
-    const context = Object.freeze({
-      status: 'available',
-      turns,
-      sourceTurns: turns,
-      semanticCompaction,
-      version: 42,
-      legacyPending: false,
-      pendingCompactionTurns: [],
-    });
+    const turns = [1, 2, 3].map(index => ({ logicalTurnId: `turn-${index}`, revision: 1,
+      conversationId: 'conversation', userMessageId: `user-${index}`, assistantMessageId: `assistant-${index}`,
+      origin: 'interactive', userText: 'u'.repeat(2048), assistantText: 'a'.repeat(2048),
+      toolPairs: [], committedAt: new Date() }));
+    const semanticCompaction = { version: 1, summary: 'Keep approval required.', pendingAsks: [],
+      commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
+    const context = Object.freeze({ status: 'available', turns, sourceTurns: turns,
+      semanticCompaction, version: 42, legacyPending: false, pendingCompactionTurns: [] });
     const req = { _viventiumAcceptedMainCarrierContextV1: { identity, context } };
     const ensureCompaction = jest.fn();
-    const result = await loadAcceptedMainContextForAdmission({
-      ...identity,
-      req,
-      ensureCompaction,
-      outputCarrier: { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: 12000 },
-    });
-    expect(result).toMatchObject({
-      status: 'available',
-      version: 42,
-      sourceTurns: turns,
-      semanticCompaction,
-    });
+    const result = await loadAcceptedMainContextForAdmission({ ...identity, req, ensureCompaction,
+      outputCarrier: { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: 12000 } });
+    expect(result).toMatchObject({ status: 'available', version: 42, sourceTurns: turns, semanticCompaction });
     expect(result.capsule).toContain(semanticCompaction.summary);
     for (const turn of turns) expect(result.capsule).toContain(turn.userText);
     expect(ensureCompaction).not.toHaveBeenCalled();
@@ -740,130 +579,69 @@ describe('ViventiumMainCompactionService', () => {
     const outputCarrier = { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: 25000 };
     const claimCompaction = jest.fn().mockResolvedValue({ status: 'empty' });
     const executeCompactor = jest.fn();
-    await expect(
-      ensureAcceptedMainCompaction({
-        ...identity,
-        req: { _viventiumAcceptedMainOutputCarrierV1: outputCarrier },
-        claimCompaction,
-        executeCompactor,
-      }),
-    ).resolves.toMatchObject({ status: 'empty' });
+    await expect(ensureAcceptedMainCompaction({ ...identity,
+      req: { _viventiumAcceptedMainOutputCarrierV1: outputCarrier }, claimCompaction, executeCompactor }))
+      .resolves.toMatchObject({ status: 'empty' });
     expect(claimCompaction).toHaveBeenCalledWith(expect.objectContaining({ outputCarrier }));
     expect(executeCompactor).not.toHaveBeenCalled();
   });
 
-  test.each(['available', 'context_budget'])(
-    'uses one guarded admission repair and requires actual %s reload',
-    async (state) => {
-      const req = {};
-      const source = {
-        status: 'context_budget',
-        sourceTurns: [{ exactSource: true }],
-        semanticCompaction: { summary: 'Keep all prior permission state.' },
-      };
-      const loadContext = jest
-        .fn()
-        .mockResolvedValueOnce(source)
-        .mockResolvedValue({ ...source, status: state });
-      const ensureCompaction = jest.fn().mockResolvedValue({ status: 'compacted' });
-      const operation = loadAcceptedMainContextForAdmission({
-        ...identity,
-        req,
-        loadContext,
-        ensureCompaction,
-      });
-      if (state === 'available')
-        await expect(operation).resolves.toMatchObject({ status: 'available' });
-      else {
-        await expect(operation).rejects.toMatchObject({
-          code: 'source_context_unavailable',
-          status: 413,
-        });
-        await expect(
-          loadAcceptedMainContextForAdmission({ ...identity, req, loadContext, ensureCompaction }),
-        ).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
-      }
-      expect(ensureCompaction).toHaveBeenCalledTimes(1);
-      expect(ensureCompaction).toHaveBeenCalledWith(
-        expect.objectContaining({
-          foreground: true,
-          trigger: 'context_carrier',
-          reallocateOutputCarrier: true,
-        }),
-      );
-      expect(source.sourceTurns).toEqual([{ exactSource: true }]);
-    },
-  );
+  test.each(['available', 'context_budget'])('uses one guarded admission repair and requires actual %s reload', async state => {
+    const req = {}; const source = { status: 'context_budget', sourceTurns: [{ exactSource: true }],
+      semanticCompaction: { summary: 'Keep all prior permission state.' } };
+    const loadContext = jest.fn().mockResolvedValueOnce(source).mockResolvedValue({ ...source, status: state });
+    const ensureCompaction = jest.fn().mockResolvedValue({ status: 'compacted' });
+    const operation = loadAcceptedMainContextForAdmission({ ...identity, req, loadContext, ensureCompaction });
+    if (state === 'available') await expect(operation).resolves.toMatchObject({ status: 'available' });
+    else {
+      await expect(operation).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+      await expect(loadAcceptedMainContextForAdmission({ ...identity, req, loadContext, ensureCompaction }))
+        .rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+    }
+    expect(ensureCompaction).toHaveBeenCalledTimes(1);
+    expect(ensureCompaction).toHaveBeenCalledWith(expect.objectContaining({
+      foreground: true, trigger: 'context_carrier', reallocateOutputCarrier: true }));
+    expect(source.sourceTurns).toEqual([{ exactSource: true }]);
+  });
 
-  test.each(['complete', 'source_changed', 'stopped', 'expired', 'provider_failed'])(
-    'cold real runner retains full reviewed source within existing bounds (%s)',
-    async (mode) => {
-      let elapsedMs = 2061;
-      const controller = new AbortController();
+  test.each(['complete', 'source_changed', 'stopped', 'expired', 'provider_failed']) (
+    'cold real runner retains full reviewed source within existing bounds (%s)', async mode => {
+      let elapsedMs = 2061; const controller = new AbortController();
       if (mode === 'stopped') controller.abort('user_cancelled');
-      const sourceTurns = [
-        {
-          logicalTurnId: 'cold-turn',
-          revision: 1,
-          userText: 'Keep the pending permission and exact locator.',
-          assistantText: 'Permission is pending; locator /workspace/evidence/check.md.',
-        },
-      ];
+      const sourceTurns = [{ logicalTurnId: 'cold-turn', revision: 1,
+        userText: 'Keep the pending permission and exact locator.',
+        assistantText: 'Permission is pending; locator /workspace/evidence/check.md.' }];
       const original = structuredClone(sourceTurns);
-      const candidate = {
-        version: 1,
-        summary: 'Permission remains pending.',
-        pendingAsks: ['Confirm permission before any external action.'],
-        commitments: [],
-        corrections: ['Use the corrected locator.'],
-        decisions: [],
-        durableIdentifiers: ['/workspace/evidence/check.md'],
-        recurrenceOutcomes: [],
-        toolPairs: [],
-      };
-      const claim = {
-        status: 'claimed',
-        leaseId: 'cold-lease',
-        domainEpochKey: 'cold-domain',
-        sourceDigest: 'a'.repeat(64),
-        sourceTurns,
-        sourceBytes: 500,
+      const candidate = { version: 1, summary: 'Permission remains pending.',
+        pendingAsks: ['Confirm permission before any external action.'], commitments: [],
+        corrections: ['Use the corrected locator.'], decisions: [],
+        durableIdentifiers: ['/workspace/evidence/check.md'], recurrenceOutcomes: [], toolPairs: [] };
+      const claim = { status: 'claimed', leaseId: 'cold-lease', domainEpochKey: 'cold-domain',
+        sourceDigest: 'a'.repeat(64), sourceTurns, sourceBytes: 500,
         previousSemanticCompaction: null,
-        leaseExpiresAt: new Date(mode === 'expired' ? 0 : 300000),
-      };
-      const calls = [];
-      const executionBudget = {};
-      const completeCompaction = jest.fn(async () =>
-        mode === 'source_changed' ? { status: 'stale_source' } : { status: 'compacted' },
-      );
+        leaseExpiresAt: new Date(mode === 'expired' ? 0 : 300000) };
+      const calls = []; const executionBudget = {};
+      const completeCompaction = jest.fn(async () => mode === 'source_changed'
+        ? { status: 'stale_source' } : { status: 'compacted' });
       const rejectCompaction = jest.fn(async () => ({ status: 'degraded' }));
-      const result = await ensureAcceptedMainCompaction({
-        ...identity,
-        signal: controller.signal,
-        deadlineAt: new Date(600000).toISOString(),
-        executionBudget,
-        now: () => elapsedMs,
-        claimCompaction: async () => claim,
-        completeCompaction,
-        rejectCompaction,
-        executeCompactor: async (call) => {
-          calls.push(call);
-          const duration = call.stage === 'review' ? 16000 : 160000;
+      const result = await ensureAcceptedMainCompaction({ ...identity,
+        signal: controller.signal, deadlineAt: new Date(600000).toISOString(),
+        executionBudget, now: () => elapsedMs, claimCompaction: async () => claim,
+        completeCompaction, rejectCompaction,
+        executeCompactor: async call => {
+          calls.push(call); const duration = call.stage === 'review' ? 16000 : 160000;
           call.reportCapacityRelease(true);
           if (call.timeoutMs < duration) {
             elapsedMs += call.timeoutMs;
-            throw Object.assign(new Error('Owned attempt deadline'), {
-              code: 'main_compaction_provider_failed',
-            });
+            throw Object.assign(new Error('Owned attempt deadline'),
+              { code: 'main_compaction_provider_failed' });
           }
           expect(call.timeoutMs).toBeLessThanOrEqual(240000);
           expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(claim.leaseExpiresAt.getTime());
           expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(400000);
           elapsedMs += duration;
-          if (mode === 'provider_failed')
-            throw Object.assign(new Error('Synthetic provider failure'), {
-              code: 'main_compaction_provider_failed',
-            });
+          if (mode === 'provider_failed') throw Object.assign(new Error('Synthetic provider failure'),
+            { code: 'main_compaction_provider_failed' });
           return call.stage === 'review' ? reviewApproved : JSON.stringify(candidate);
         },
       });
@@ -871,181 +649,88 @@ describe('ViventiumMainCompactionService', () => {
       if (mode === 'complete' || mode === 'source_changed')
         expect(result.status).toBe(mode === 'complete' ? 'compacted' : 'stale_source');
       const { logger } = require('@librechat/data-schemas');
-      const issued = logger.debug.mock.calls.filter(([event]) =>
-        event.endsWith('Stage call issued'),
-      );
-      const settled = logger.debug.mock.calls.filter(([event]) =>
-        event.endsWith('Stage call settled'),
-      );
-      expect(issued).toHaveLength(calls.length);
-      expect(settled).toHaveLength(calls.length);
+      const issued = logger.debug.mock.calls.filter(([event]) => event.endsWith('Stage call issued'));
+      const settled = logger.debug.mock.calls.filter(([event]) => event.endsWith('Stage call settled'));
+      expect(issued).toHaveLength(calls.length); expect(settled).toHaveLength(calls.length);
       if (mode === 'complete' || mode === 'source_changed') {
-        expect(issued[0][1]).toMatchObject({
-          stage: 'compaction',
-          timeoutMs: 240000,
-          compactionKnown: false,
-          reviewKnown: false,
-        });
-        expect(settled[0][1]).toMatchObject({
-          stage: 'compaction',
-          elapsedMs: 160000,
-          outcome: 'completed',
-        });
-        expect(settled[1][1]).toMatchObject({
-          stage: 'review',
-          elapsedMs: 16000,
-          outcome: 'completed',
-        });
+        expect(issued[0][1]).toMatchObject({ stage: 'compaction', timeoutMs: 240000,
+          compactionKnown: false, reviewKnown: false });
+        expect(settled[0][1]).toMatchObject({ stage: 'compaction', elapsedMs: 160000, outcome: 'completed' });
+        expect(settled[1][1]).toMatchObject({ stage: 'review', elapsedMs: 16000, outcome: 'completed' });
         expect(result.status).toBe(mode === 'complete' ? 'compacted' : 'stale_source');
-        expect(calls.map((c) => c.stage || 'compaction')).toEqual(['compaction', 'review']);
+        expect(calls.map(c => c.stage || 'compaction')).toEqual(['compaction', 'review']);
         expect(elapsedMs).toBe(178061);
-        expect(completeCompaction).toHaveBeenCalledWith(
-          expect.objectContaining({
-            leaseId: claim.leaseId,
-            sourceDigest: claim.sourceDigest,
-            semanticCompaction: candidate,
-            semanticReview: expect.objectContaining({ approved: true }),
-          }),
-        );
+        expect(completeCompaction).toHaveBeenCalledWith(expect.objectContaining({
+          leaseId: claim.leaseId, sourceDigest: claim.sourceDigest,
+          semanticCompaction: candidate, semanticReview: expect.objectContaining({ approved: true }) }));
       } else {
         expect(calls).toHaveLength(mode === 'provider_failed' ? 1 : 0);
-        expect(completeCompaction).not.toHaveBeenCalled();
-        expect(result.status).toBe('degraded');
-        if (mode === 'provider_failed')
-          expect(settled[0][1]).toMatchObject({
-            stage: 'compaction',
-            elapsedMs: 160000,
-            outcome: 'main_compaction_provider_failed',
-          });
+        expect(completeCompaction).not.toHaveBeenCalled(); expect(result.status).toBe('degraded');
+        if (mode === 'provider_failed') expect(settled[0][1]).toMatchObject({
+          stage: 'compaction', elapsedMs: 160000, outcome: 'main_compaction_provider_failed' });
       }
-    },
-  );
+    });
 
-  test.each(['third', 'fourth', 'stale_lease', 'stopped', 'deadline'])(
-    'converging additional size repair reaches the same live renewal owner (%s)',
-    async (mode) => {
-      let elapsedMs = 100000;
-      let generated = 0;
+  test.each(['third', 'fourth', 'stale_lease', 'stopped', 'deadline']) (
+    'converging additional size repair reaches the same live renewal owner (%s)', async mode => {
+      let elapsedMs = 100000; let generated = 0;
       const controller = new AbortController();
-      const executionBudget = {
-        completionReserveMs: 200000,
-        slowestCallMs: 160000,
-        slowestCompactionCallMs: 160000,
-        slowestReviewCallMs: 16000,
-      };
-      const sourceTurns = [
-        {
-          logicalTurnId: 'size-turn',
-          revision: 1,
-          userText: 'Retain pending permission.',
-          assistantText: 'Permission remains pending.',
-        },
-      ];
+      const executionBudget = { completionReserveMs: 200000, slowestCallMs: 160000,
+        slowestCompactionCallMs: 160000, slowestReviewCallMs: 16000 };
+      const sourceTurns = [{ logicalTurnId: 'size-turn', revision: 1,
+        userText: 'Retain pending permission.', assistantText: 'Permission remains pending.' }];
       const original = structuredClone(sourceTurns);
-      const fitting = {
-        version: 1,
-        summary: 'Permission remains pending.',
-        pendingAsks: [],
-        commitments: [],
-        corrections: [],
-        decisions: [],
-        durableIdentifiers: [],
-        recurrenceOutcomes: [],
-        toolPairs: [],
-      };
-      const claim = {
-        status: 'claimed',
-        leaseId: 'size-renewal',
-        domainEpochKey: 'size-domain',
-        sourceDigest: 'b'.repeat(64),
-        sourceTurns,
-        sourceBytes: 500,
-        previousSemanticCompaction: null,
-        leaseExpiresAt: new Date(300000),
-      };
-      const renewal = jest.fn(async (input) => {
+      const fitting = { version: 1, summary: 'Permission remains pending.', pendingAsks: [],
+        commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+        recurrenceOutcomes: [], toolPairs: [] };
+      const claim = { status: 'claimed', leaseId: 'size-renewal', domainEpochKey: 'size-domain',
+        sourceDigest: 'b'.repeat(64), sourceTurns, sourceBytes: 500,
+        previousSemanticCompaction: null, leaseExpiresAt: new Date(300000) };
+      const renewal = jest.fn(async input => {
         expect(elapsedMs).toBe(150000);
-        expect(input).toMatchObject({
-          leaseId: claim.leaseId,
-          sourceDigest: claim.sourceDigest,
-          leaseExpiresAt: new Date(300000),
-          expiresAt: new Date(400000),
-        });
+        expect(input).toMatchObject({ leaseId: claim.leaseId, sourceDigest: claim.sourceDigest,
+          leaseExpiresAt: new Date(300000), expiresAt: new Date(400000) });
         if (mode === 'stopped') controller.abort('user_cancelled');
-        return mode === 'stale_lease'
-          ? { status: 'stale_lease' }
+        return mode === 'stale_lease' ? { status: 'stale_lease' }
           : { status: 'renewed', leaseExpiresAt: input.expiresAt };
       });
-      const calls = [];
-      const complete = jest.fn(async () => ({ status: 'compacted' }));
+      const calls = []; const complete = jest.fn(async () => ({ status: 'compacted' }));
       const reject = jest.fn(async () => ({ status: 'degraded' }));
-      const result = await ensureAcceptedMainCompaction({
-        ...identity,
-        signal: controller.signal,
+      const result = await ensureAcceptedMainCompaction({ ...identity, signal: controller.signal,
         deadlineAt: new Date(mode === 'deadline' ? 525000 : 600000).toISOString(),
-        executionBudget,
-        now: () => elapsedMs,
-        claimCompaction: async () => claim,
-        renewCompaction: renewal,
-        completeCompaction: complete,
-        rejectCompaction: reject,
-        executeCompactor: async (call) => {
-          calls.push(call);
-          call.reportCapacityRelease(true);
-          if (call.stage === 'review') {
-            elapsedMs += 16000;
-            return reviewApproved;
-          }
+        executionBudget, now: () => elapsedMs, claimCompaction: async () => claim,
+        renewCompaction: renewal, completeCompaction: complete, rejectCompaction: reject,
+        executeCompactor: async call => {
+          calls.push(call); call.reportCapacityRelease(true);
+          if (call.stage === 'review') { elapsedMs += 16000; return reviewApproved; }
           generated += 1;
           const oversized = generated <= 2 || (mode === 'fourth' && generated === 3);
-          const duration =
-            generated === 1 ? 20000 : generated === 2 ? 30000 : oversized ? 30000 : 160000;
+          const duration = generated === 1 ? 20000 : generated === 2 ? 30000
+            : oversized ? 30000 : 160000;
           expect(call.timeoutMs).toBeGreaterThanOrEqual(duration);
           expect(call.timeoutMs).toBeLessThanOrEqual(240000);
           expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(claim.leaseExpiresAt.getTime());
-          expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(
-            mode === 'deadline' ? 325000 : 400000,
-          );
+          expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(mode === 'deadline' ? 325000 : 400000);
           elapsedMs += duration;
-          return JSON.stringify(
-            oversized
-              ? {
-                  ...fitting,
-                  pendingAsks: Array.from(
-                    { length: 18 - generated },
-                    (_, i) => `${i}:${'a'.repeat(900)}`,
-                  ),
-                }
-              : fitting,
-          );
+          return JSON.stringify(oversized ? { ...fitting,
+            pendingAsks: Array.from({ length: 18 - generated }, (_, i) => `${i}:${'a'.repeat(900)}`) }
+            : fitting);
         },
       });
       expect(sourceTurns).toEqual(original);
       if (mode === 'third' || mode === 'fourth') {
         expect(result).toMatchObject({ status: 'compacted', attempts: mode === 'third' ? 3 : 4 });
-        expect(renewal).toHaveBeenCalledTimes(1);
-        expect(complete).toHaveBeenCalledTimes(1);
+        expect(renewal).toHaveBeenCalledTimes(1); expect(complete).toHaveBeenCalledTimes(1);
         expect(elapsedMs).toBe(mode === 'third' ? 326000 : 356000);
         expect(calls[calls.length - 1].stage).toBe('review');
         const { logger } = require('@librechat/data-schemas');
-        const issued = logger.debug.mock.calls.filter(([event]) =>
-          event.endsWith('Stage call issued'),
-        );
-        const settled = logger.debug.mock.calls.filter(([event]) =>
-          event.endsWith('Stage call settled'),
-        );
-        expect(issued).toHaveLength(calls.length);
-        expect(settled).toHaveLength(calls.length);
-        expect(issued[2][1]).toMatchObject({
-          stage: 'compaction',
-          timeoutMs: 234000,
-          compactionObservedMs: 160000,
-          reviewObservedMs: 16000,
-          leaseRemainingMs: 250000,
-          enclosingRemainingMs: 450000,
-          completionReserveMs: 200000,
-          leaseRenewalDisposition: 'renewed',
-        });
+        const issued = logger.debug.mock.calls.filter(([event]) => event.endsWith('Stage call issued'));
+        const settled = logger.debug.mock.calls.filter(([event]) => event.endsWith('Stage call settled'));
+        expect(issued).toHaveLength(calls.length); expect(settled).toHaveLength(calls.length);
+        expect(issued[2][1]).toMatchObject({ stage: 'compaction', timeoutMs: 234000,
+          compactionObservedMs: 160000, reviewObservedMs: 16000, leaseRemainingMs: 250000,
+          enclosingRemainingMs: 450000, completionReserveMs: 200000,
+          leaseRenewalDisposition: 'renewed' });
         for (const [, payload] of [...issued, ...settled]) {
           expect(payload.claimHash).toMatch(/^[a-f0-9]{16}$/);
           expect(JSON.stringify(payload)).not.toContain('size-turn');
@@ -1054,71 +739,38 @@ describe('ViventiumMainCompactionService', () => {
           expect(JSON.stringify(payload)).not.toContain(claim.sourceDigest);
         }
       } else {
-        expect(result.status).toBe('degraded');
-        expect(complete).not.toHaveBeenCalled();
+        expect(result.status).toBe('degraded'); expect(complete).not.toHaveBeenCalled();
         expect(calls).toHaveLength(2);
         expect(renewal).toHaveBeenCalledTimes(mode === 'deadline' ? 0 : 1);
         if (mode === 'stopped') expect(result.reason).toBe('compaction_cancelled');
       }
-    },
-  );
+    });
 
-  test.each([
-    [130500, true],
-    [145000, false],
-  ])(
+  test.each([[130500, true], [145000, false]])(
     'uses observed stage durations for bounded same-source fidelity repair (%s ms generation)',
     async (generationMs, fitsRepair) => {
       let elapsedMs = 0;
       const executionBudget = {};
       const sourceDigest = 'd'.repeat(64);
-      const sourceTurns = [
-        {
-          logicalTurnId: 'evidence-turn',
-          revision: 1,
-          userText: 'Keep the evidence locator.',
-          assistantText: 'Evidence: /workspace/evidence/worker-check.md',
-        },
-      ];
-      const claim = {
-        status: 'claimed',
-        leaseId: 'timed-lease',
-        domainEpochKey: 'timed-epoch',
-        sourceDigest,
-        sourceTurns,
-        sourceBytes: 500,
-        previousSemanticCompaction: null,
-        leaseExpiresAt: new Date(300000),
-      };
-      const candidate = {
-        version: 1,
-        summary: 'The evidence locator is pending.',
-        pendingAsks: [],
-        commitments: [],
-        corrections: [],
-        decisions: [],
-        durableIdentifiers: [],
-        recurrenceOutcomes: [],
-        toolPairs: [],
-      };
+      const sourceTurns = [{ logicalTurnId: 'evidence-turn', revision: 1,
+        userText: 'Keep the evidence locator.',
+        assistantText: 'Evidence: /workspace/evidence/worker-check.md' }];
+      const claim = { status: 'claimed', leaseId: 'timed-lease', domainEpochKey: 'timed-epoch',
+        sourceDigest, sourceTurns, sourceBytes: 500, previousSemanticCompaction: null,
+        leaseExpiresAt: new Date(300000) };
+      const candidate = { version: 1, summary: 'The evidence locator is pending.',
+        pendingAsks: [], commitments: [], corrections: [], decisions: [],
+        durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
       const rejected = JSON.stringify(candidate);
-      const faithful = {
-        ...candidate,
-        durableIdentifiers: ['/workspace/evidence/worker-check.md'],
-      };
+      const faithful = { ...candidate, durableIdentifiers: ['/workspace/evidence/worker-check.md'] };
       const reason = 'The candidate omits the source evidence locator.';
       const calls = [];
       const completeCompaction = jest.fn().mockResolvedValue({ status: 'compacted' });
       const rejectCompaction = jest.fn().mockResolvedValue({ status: 'degraded' });
-      const result = await ensureAcceptedMainCompaction({
-        ...identity,
-        deadlineAt: new Date(600000).toISOString(),
-        executionBudget,
-        now: () => elapsedMs,
-        claimCompaction: async () => claim,
-        completeCompaction,
-        rejectCompaction,
-        executeCompactor: async (call) => {
+      const result = await ensureAcceptedMainCompaction({ ...identity,
+        deadlineAt: new Date(600000).toISOString(), executionBudget, now: () => elapsedMs,
+        claimCompaction: async () => claim, completeCompaction, rejectCompaction,
+        executeCompactor: async call => {
           calls.push(call);
           const durationMs = call.stage === 'review' ? 11800 : generationMs;
           expect(call.timeoutMs).toBeGreaterThanOrEqual(durationMs);
@@ -1127,50 +779,30 @@ describe('ViventiumMainCompactionService', () => {
           expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(400000);
           elapsedMs += durationMs;
           call.reportCapacityRelease(true);
-          if (call.stage === 'review')
-            return calls.length === 4
-              ? reviewApproved
-              : JSON.stringify({ approved: false, reason });
+          if (call.stage === 'review') return calls.length === 4
+            ? reviewApproved : JSON.stringify({ approved: false, reason });
           return calls.length === 1 ? rejected : JSON.stringify(faithful);
         },
       });
       if (!fitsRepair) {
-        expect(result).toMatchObject({
-          status: 'degraded',
-          attempts: 1,
-          reason: 'compaction_enclosing_deadline',
-        });
+        expect(result).toMatchObject({ status: 'degraded', attempts: 1,
+          reason: 'compaction_enclosing_deadline' });
         expect(calls).toHaveLength(2);
         expect(completeCompaction).not.toHaveBeenCalled();
         expect(rejectCompaction).toHaveBeenCalledTimes(1);
         return;
       }
       expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
-      expect(executionBudget).toEqual({
-        completionReserveMs: 200000,
-        slowestCallMs: generationMs,
-        slowestCompactionCallMs: generationMs,
-        slowestReviewCallMs: 11800,
-      });
+      expect(executionBudget).toEqual({ completionReserveMs: 200000,
+        slowestCallMs: generationMs, slowestCompactionCallMs: generationMs,
+        slowestReviewCallMs: 11800 });
       expect(elapsedMs).toBe(284600);
-      expect(calls.map((call) => call.stage || 'compaction')).toEqual([
-        'compaction',
-        'review',
-        'compaction',
-        'review',
-      ]);
-      const payloads = calls.map(({ prompt }) =>
-        JSON.parse(
-          prompt.match(
-            /<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/,
-          )[1],
-        ),
-      );
-      expect(payloads[2].priorRejection).toEqual({
-        code: 'semantic_fidelity',
-        candidate: rejected,
-        reason,
-      });
+      expect(calls.map(call => call.stage || 'compaction'))
+        .toEqual(['compaction', 'review', 'compaction', 'review']);
+      const payloads = calls.map(({ prompt }) => JSON.parse(prompt.match(
+        /<untrusted_(?:conversation_data|compaction_evidence)_v1>\s*([\s\S]*?)\s*<\/untrusted_(?:conversation_data|compaction_evidence)_v1>/,
+      )[1]));
+      expect(payloads[2].priorRejection).toEqual({ code: 'semantic_fidelity', candidate: rejected, reason });
       for (const payload of payloads) {
         expect(payload.sourceDigest).toBe(sourceDigest);
         expect(payload.acceptedOlderTurns).toEqual(sourceTurns);
@@ -1179,88 +811,52 @@ describe('ViventiumMainCompactionService', () => {
       expect(payloads[3].candidate).toEqual(faithful);
       expect(payloads[3].priorRejection).toBeUndefined();
       expect(completeCompaction).toHaveBeenCalledTimes(1);
-      expect(completeCompaction).toHaveBeenCalledWith(
-        expect.objectContaining({
-          sourceDigest,
-          leaseId: claim.leaseId,
-          semanticCompaction: faithful,
-          semanticReview: expect.objectContaining({ sourceDigest, approved: true }),
-        }),
-      );
+      expect(completeCompaction).toHaveBeenCalledWith(expect.objectContaining({
+        sourceDigest, leaseId: claim.leaseId, semanticCompaction: faithful,
+        semanticReview: expect.objectContaining({ sourceDigest, approved: true }) }));
       expect(rejectCompaction).not.toHaveBeenCalled();
     },
   );
 
-  test.each(['renewed', 'stale_lease', 'cancelled', 'insufficient'])(
-    'a bounded live lease supports the measured correction only with owned renewal (%s)',
-    async (mode) => {
+  test.each(['renewed', 'stale_lease', 'cancelled', 'insufficient']) (
+    'a bounded live lease supports the measured correction only with owned renewal (%s)', async mode => {
       let elapsedMs = 0;
       const controller = new AbortController();
-      const claim = {
-        status: 'claimed',
-        leaseId: 'renewal-lease',
-        domainEpochKey: 'renewal-domain',
-        sourceDigest: 'd'.repeat(64),
-        sourceBytes: 500,
-        sourceTurns: [],
-        leaseExpiresAt: new Date(300000),
-      };
-      const candidate = {
-        version: 1,
-        summary: 'Preserve the approved evidence.',
-        pendingAsks: [],
-        commitments: [],
-        corrections: [],
-        decisions: [],
-        durableIdentifiers: [],
-        recurrenceOutcomes: [],
-        toolPairs: [],
-      };
+      const claim = { status: 'claimed', leaseId: 'renewal-lease', domainEpochKey: 'renewal-domain',
+        sourceDigest: 'd'.repeat(64), sourceBytes: 500, sourceTurns: [],
+        leaseExpiresAt: new Date(300000) };
+      const candidate = { version: 1, summary: 'Preserve the approved evidence.',
+        pendingAsks: [], commitments: [], corrections: [], decisions: [],
+        durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
       const calls = [];
       const completeCompaction = jest.fn().mockResolvedValue({ status: 'compacted' });
       const rejectCompaction = jest.fn().mockResolvedValue({ status: 'degraded' });
-      const renewCompaction = jest.fn(async (input) => {
+      const renewCompaction = jest.fn(async input => {
         expect(elapsedMs).toBe(161370);
-        expect(input).toMatchObject({
-          leaseId: claim.leaseId,
-          sourceDigest: claim.sourceDigest,
-          leaseExpiresAt: new Date(300000),
-          expiresAt: new Date(400000),
-        });
+        expect(input).toMatchObject({ leaseId: claim.leaseId, sourceDigest: claim.sourceDigest,
+          leaseExpiresAt: new Date(300000), expiresAt: new Date(400000) });
         if (mode === 'cancelled') controller.abort('user_cancelled');
-        return mode === 'stale_lease'
-          ? { status: 'stale_lease' }
+        return mode === 'stale_lease' ? { status: 'stale_lease' }
           : { status: 'renewed', leaseExpiresAt: input.expiresAt };
       });
-      const result = await ensureAcceptedMainCompaction({
-        ...identity,
+      const result = await ensureAcceptedMainCompaction({ ...identity,
         deadlineAt: new Date(mode === 'insufficient' ? 500000 : 600000),
-        executionBudget: { completionReserveMs: 200000 },
-        now: () => elapsedMs,
-        signal: controller.signal,
-        claimCompaction: async () => claim,
-        renewCompaction,
-        completeCompaction,
-        rejectCompaction,
-        executeCompactor: async (call) => {
+        executionBudget: { completionReserveMs: 200000 }, now: () => elapsedMs,
+        signal: controller.signal, claimCompaction: async () => claim,
+        renewCompaction, completeCompaction, rejectCompaction,
+        executeCompactor: async call => {
           calls.push(call);
           const duration = call.stage === 'review' ? 15590 : 145780;
           expect(call.timeoutMs).toBeGreaterThanOrEqual(duration);
           expect(call.timeoutMs).toBeLessThanOrEqual(240000);
           expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(claim.leaseExpiresAt.getTime());
           expect(elapsedMs + call.timeoutMs).toBeLessThanOrEqual(
-            mode === 'insufficient' ? 300000 : 400000,
-          );
+            mode === 'insufficient' ? 300000 : 400000);
           elapsedMs += duration;
           call.reportCapacityRelease(true);
-          return call.stage !== 'review'
-            ? JSON.stringify(candidate)
-            : calls.length === 4
-              ? reviewApproved
-              : JSON.stringify({
-                  approved: false,
-                  reason: 'The proposal needs faithful correction.',
-                });
+          return call.stage !== 'review' ? JSON.stringify(candidate)
+            : calls.length === 4 ? reviewApproved
+              : JSON.stringify({ approved: false, reason: 'The proposal needs faithful correction.' });
         },
       });
       expect(renewCompaction).toHaveBeenCalledTimes(mode === 'insufficient' ? 0 : 1);
@@ -1270,37 +866,23 @@ describe('ViventiumMainCompactionService', () => {
         expect(completeCompaction).toHaveBeenCalledTimes(1);
         expect(rejectCompaction).not.toHaveBeenCalled();
       } else {
-        expect(result).toMatchObject({
-          status: 'degraded',
-          attempts: 1,
-          reason: mode === 'cancelled' ? 'compaction_cancelled' : 'compaction_enclosing_deadline',
-        });
+        expect(result).toMatchObject({ status: 'degraded', attempts: 1,
+          reason: mode === 'cancelled' ? 'compaction_cancelled' : 'compaction_enclosing_deadline' });
         expect(calls).toHaveLength(2);
         expect(completeCompaction).not.toHaveBeenCalled();
-        expect(rejectCompaction).toHaveBeenCalledWith(
-          expect.objectContaining({ leaseId: claim.leaseId }),
-        );
+        expect(rejectCompaction).toHaveBeenCalledWith(expect.objectContaining({ leaseId: claim.leaseId }));
       }
     },
   );
 
   test('reuses distinct observed stages when admitting the next claim under one enclosing deadline', async () => {
-    const executionBudget = {
-      completionReserveMs: 200000,
-      slowestCallMs: 130500,
-      slowestCompactionCallMs: 130500,
-      slowestReviewCallMs: 11800,
-    };
+    const executionBudget = { completionReserveMs: 200000, slowestCallMs: 130500,
+      slowestCompactionCallMs: 130500, slowestReviewCallMs: 11800 };
     const claimCompaction = jest.fn().mockResolvedValue({ status: 'empty' });
     const executeCompactor = jest.fn();
-    const result = await ensureAcceptedMainCompaction({
-      ...identity,
-      executionBudget,
-      deadlineAt: new Date(600000).toISOString(),
-      now: () => 142300,
-      claimCompaction,
-      executeCompactor,
-    });
+    const result = await ensureAcceptedMainCompaction({ ...identity, executionBudget,
+      deadlineAt: new Date(600000).toISOString(), now: () => 142300,
+      claimCompaction, executeCompactor });
     expect(result).toEqual({ status: 'empty' });
     expect(claimCompaction).toHaveBeenCalledTimes(1);
     expect(executeCompactor).not.toHaveBeenCalled();
@@ -1308,84 +890,39 @@ describe('ViventiumMainCompactionService', () => {
   });
 
   test('shares measured enclosing reserve across smaller claims and leaves Main completion time', async () => {
-    const now = 100000;
-    const executionBudget = { completionReserveMs: 200000, slowestCallMs: 100000 };
-    const claim = jest.fn();
-    const executeCompactor = jest.fn();
-    const result = await ensureAcceptedMainCompaction({
-      ...identity,
-      executionBudget,
-      deadlineAt: new Date(now + 300000).toISOString(),
-      now: () => now,
-      claimCompaction: claim,
-      executeCompactor,
-    });
-    expect(result).toMatchObject({
-      status: 'degraded',
-      attempts: 0,
-      reason: 'compaction_enclosing_deadline',
-    });
-    expect(claim).not.toHaveBeenCalled();
-    expect(executeCompactor).not.toHaveBeenCalled();
+    const now = 100000; const executionBudget = { completionReserveMs: 200000, slowestCallMs: 100000,
+      slowestCompactionCallMs: 100000, slowestReviewCallMs: 100000 };
+    const claim = jest.fn(); const executeCompactor = jest.fn();
+    const result = await ensureAcceptedMainCompaction({ ...identity, executionBudget,
+      deadlineAt: new Date(now + 300000).toISOString(), now: () => now,
+      claimCompaction: claim, executeCompactor });
+    expect(result).toMatchObject({ status: 'degraded', attempts: 0, reason: 'compaction_enclosing_deadline' });
+    expect(claim).not.toHaveBeenCalled(); expect(executeCompactor).not.toHaveBeenCalled();
   });
 
   test('a waiting generation Stop ACK cannot finish before its compactor native release', async () => {
-    const controller = new AbortController();
-    let started;
-    const begun = new Promise((resolve) => {
-      started = resolve;
-    });
-    let releaseNative;
-    const nativeReleased = new Promise((resolve) => {
-      releaseNative = resolve;
-    });
+    const controller = new AbortController(); let started;
+    const begun = new Promise(resolve => { started = resolve; }); let releaseNative;
+    const nativeReleased = new Promise(resolve => { releaseNative = resolve; });
     const rejectCompaction = jest.fn().mockResolvedValue({ status: 'degraded' });
-    const compaction = ensureAcceptedMainCompaction({
-      ...identity,
-      signal: controller.signal,
-      claimCompaction: async () => ({
-        status: 'claimed',
-        leaseId: 'cancel-lease',
-        sourceDigest: 'a'.repeat(64),
-        domainEpochKey: 'cancel-epoch',
-        sourceTurns: [],
-        sourceBytes: 500,
-        previousSemanticCompaction: null,
-        leaseExpiresAt: new Date(Date.now() + 300000),
-      }),
-      rejectCompaction,
-      executeCompactor: ({ signal, reportCapacityRelease }) =>
-        new Promise((_resolve, reject) => {
-          started();
-          signal.addEventListener(
-            'abort',
-            async () => {
-              await nativeReleased;
-              reportCapacityRelease(true);
-              reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
-            },
-            { once: true },
-          );
-        }),
-    });
-    await begun;
-    controller.abort('user_cancelled');
+    const compaction = ensureAcceptedMainCompaction({ ...identity, signal: controller.signal,
+      claimCompaction: async () => ({ status: 'claimed', leaseId: 'cancel-lease',
+        sourceDigest: 'a'.repeat(64), domainEpochKey: 'cancel-epoch', sourceTurns: [],
+        sourceBytes: 500, previousSemanticCompaction: null,
+        leaseExpiresAt: new Date(Date.now() + 300000) }), rejectCompaction,
+      executeCompactor: ({ signal, reportCapacityRelease }) => new Promise((_resolve, reject) => {
+        started(); signal.addEventListener('abort', async () => {
+          await nativeReleased; reportCapacityRelease(true);
+          reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+        }, { once: true });
+      }) });
+    await begun; controller.abort('user_cancelled');
     const delivery = controller.signal._viventiumHarnessCancellationDelivery;
-    let acknowledged = false;
-    void delivery.then(() => {
-      acknowledged = true;
-    });
-    await Promise.resolve();
-    expect(acknowledged).toBe(false);
-    releaseNative();
-    await expect(delivery).resolves.toEqual({ delivered: true });
-    await expect(compaction).resolves.toMatchObject({
-      status: 'degraded',
-      reason: 'compaction_cancelled',
-    });
-    expect(rejectCompaction).toHaveBeenCalledWith(
-      expect.objectContaining({ leaseId: 'cancel-lease' }),
-    );
+    let acknowledged = false; void delivery.then(() => { acknowledged = true; });
+    await Promise.resolve(); expect(acknowledged).toBe(false);
+    releaseNative(); await expect(delivery).resolves.toEqual({ delivered: true });
+    await expect(compaction).resolves.toMatchObject({ status: 'degraded', reason: 'compaction_cancelled' });
+    expect(rejectCompaction).toHaveBeenCalledWith(expect.objectContaining({ leaseId: 'cancel-lease' }));
   });
 
   describe('shrinking whole-proposal size repairs', () => {
@@ -1524,10 +1061,7 @@ describe('ViventiumMainCompactionService', () => {
         await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
       }
       const before = calls;
-      const repeated = await ensureAcceptedMainCompaction({
-        ...identity,
-        executeCompactor: failing,
-      });
+      const repeated = await ensureAcceptedMainCompaction({ ...identity, executeCompactor: failing });
       expect(callsAfterFirst).toBeGreaterThan(0);
       expect(calls).toBe(before);
       expect(repeated).toMatchObject({ status: 'degraded', attempts: 0, reason: 'schema_invalid' });
@@ -1574,13 +1108,13 @@ describe('ViventiumMainCompactionService', () => {
       expect(calls.map((call) => call.stage)).toEqual(['compaction', 'compaction']);
     });
 
-    test('stop when the store lease cannot hold another repair and its review', async () => {
+    test('stop when the store lease cannot hold the measured next repair stage', async () => {
       await commitTurns('lease');
       const { result, calls } = await run(
         [oversized(17), oversized(16), oversized(15), JSON.stringify(fitting)],
-        100 * 1000,
+        110 * 1000,
       );
-      expect(result).toMatchObject({ status: 'degraded', attempts: 2, reason: 'schema_invalid' });
+      expect(result).toMatchObject({ status: 'degraded', attempts: 2, reason: 'compaction_lease_expired' });
       expect(calls.map((call) => call.stage)).toEqual(['compaction', 'compaction']);
     });
   });
@@ -1922,104 +1456,52 @@ describe('ViventiumMainCompactionService', () => {
       process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = secret;
     });
     afterEach(() => {
-      if (previousSecret === undefined)
-        delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      if (previousSecret === undefined) delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
       else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = previousSecret;
     });
 
     function voiceRequest(trust = 'owner_participant', sideEffects = true) {
-      return {
-        user: { id: identity.ownerId, personalization: { memories: true } },
-        config: { ownerFixture: true },
-        viventiumCallSession: {
-          callSessionId: 'synthetic-outer-call',
-          userId: identity.ownerId,
-        },
-        body: {
-          conversationId: 'synthetic-outer-chat',
-          voiceMode: true,
-          viventiumActorTrust: trust,
-          viventiumCanAuthorizeSideEffects: sideEffects,
-          viventiumVoiceTaskId: 'synthetic-outer-task',
-        },
+      return { user: { id: identity.ownerId, personalization: { memories: true } },
+        config: { ownerFixture: true }, viventiumCallSession: {
+          callSessionId: 'synthetic-outer-call', userId: identity.ownerId,
+        }, body: { conversationId: 'synthetic-outer-chat', voiceMode: true,
+          viventiumActorTrust: trust, viventiumCanAuthorizeSideEffects: sideEffects,
+          viventiumVoiceTaskId: 'synthetic-outer-task' },
       };
     }
     function input(req) {
-      return {
-        ...identity,
-        req,
-        agent: {
-          id: identity.agentId,
-          provider: 'synthetic-native',
-          model: 'synthetic-exact-model',
-          model_parameters: { reasoning_effort: 'high' },
-        },
-        claimCompaction: jest.fn(async () => ({
-          status: 'claimed',
-          domainEpochKey: 'c'.repeat(64),
-          sourceDigest: 'a'.repeat(64),
-          leaseId: 'synthetic-claim-lease',
-          leaseExpiresAt: new Date(Date.now() + 240000).toISOString(),
-          sourceBytes: 100,
-          sourceTurns: [
-            {
-              logicalTurnId: 'synthetic-accepted-turn',
-              userText: 'Keep the selected accepted source.',
-              assistantText: 'The source stays available.',
-            },
-          ],
+      return { ...identity, req, agent: { id: identity.agentId, provider: 'synthetic-native',
+        model: 'synthetic-exact-model', model_parameters: { reasoning_effort: 'high' } },
+        claimCompaction: jest.fn(async () => ({ status: 'claimed',
+          domainEpochKey: 'c'.repeat(64), sourceDigest: 'a'.repeat(64),
+          leaseId: 'synthetic-claim-lease', leaseExpiresAt: new Date(Date.now() + 240000).toISOString(),
+          sourceBytes: 100, sourceTurns: [{ logicalTurnId: 'synthetic-accepted-turn',
+            userText: 'Keep the selected accepted source.', assistantText: 'The source stays available.' }],
         })),
         completeCompaction: jest.fn(async () => ({ status: 'compacted' })),
         rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
       };
     }
-    const structured = JSON.stringify({
-      version: 1,
-      summary: 'The selected accepted source stays available.',
-      pendingAsks: [],
-      commitments: [],
-      corrections: [],
-      decisions: [],
-      durableIdentifiers: [],
-      recurrenceOutcomes: [],
-      toolPairs: [],
-    });
+    const structured = JSON.stringify({ version: 1, summary: 'The selected accepted source stays available.',
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] });
 
     async function prepareRealBoundary(params, fetchImpl) {
       // The real initializer rematerializes transport for this isolated agent. No model is invoked.
-      const targetAgent = {
-        ...params.agent,
-        model_parameters: {
-          ...params.agent.model_parameters,
-          apiKey: endpoint.apiKey,
-          configuration: { baseURL: endpoint.baseURL },
-        },
-      };
+      const targetAgent = { ...params.agent, model_parameters: { ...params.agent.model_parameters,
+        apiKey: endpoint.apiKey, configuration: { baseURL: endpoint.baseURL } } };
       const cancellationReq = Object.create(params.req);
       cancellationReq._viventiumCortexToolEvidence = {};
       cancellationReq._viventiumHarnessIdempotencyKeys = new Set();
       cancellationReq._viventiumHarnessCancellationBoundBaseURLs = new Set();
-      const requestBody = {
-        ...params.req.body,
-        messageId: params.runId,
-        viventiumGlassHiveIdempotencyKey: provider.buildHarnessIdempotencyKey(
-          'cortex',
-          params.runId,
-          params.agent.id,
-        ),
-      };
+      const requestBody = { ...params.req.body, messageId: params.runId,
+        viventiumGlassHiveIdempotencyKey: provider.buildHarnessIdempotencyKey('cortex', params.runId, params.agent.id) };
       cancellationReq.body = requestBody;
       let bound;
       const attached = await background.prepareCortexConversationProviderCapability({
-        targetAgent,
-        declaredAgent: params.agent,
-        req: cancellationReq,
-        cancellationReq,
-        capability: { workspace_binding: true },
-        requestBody,
-        nativeTools: params.nativeTools,
-        signal: params.signal,
-        bindCancellation: (args) => {
+        targetAgent, declaredAgent: params.agent, req: cancellationReq, cancellationReq,
+        capability: { workspace_binding: true }, requestBody, nativeTools: params.nativeTools,
+        signal: params.signal, bindCancellation: (args) => {
           bound = provider.bindHarnessCancellation({ ...args, fetchImpl });
           return bound;
         },
@@ -2028,52 +1510,286 @@ describe('ViventiumMainCompactionService', () => {
     }
 
     test.each(['promotion', 'rejection', 'none', 'unresolved'])(
-      'a later Stop consumes the typed native receipt while %s waits on the store',
-      async (stage) => {
-        const controller = new AbortController();
-        let reachedStore, releaseStore;
-        const atStore = new Promise((resolve) => {
-          reachedStore = resolve;
-        });
-        const storeGate = new Promise((resolve) => {
-          releaseStore = resolve;
-        });
+      'a later Stop consumes the typed native receipt while %s waits on the store', async stage => {
+        const controller = new AbortController(); let reachedStore, releaseStore;
+        const atStore = new Promise(resolve => { reachedStore = resolve; });
+        const storeGate = new Promise(resolve => { releaseStore = resolve; });
         const args = { ...input(voiceRequest()), signal: controller.signal };
-        const operation = async () => {
-          reachedStore();
-          await storeGate;
-          return { status: 'compacted' };
-        };
+        const operation = async () => { reachedStore(); await storeGate; return { status: 'compacted' }; };
         if (stage === 'promotion' || stage === 'none') args.completeCompaction = jest.fn(operation);
         else args.rejectCompaction = jest.fn(operation);
-        const execute = jest
-          .spyOn(background, 'executeCortex')
-          .mockImplementation(async (params) => ({
-            insight:
-              stage === 'rejection'
-                ? 'invalid JSON'
-                : params.agent.id.endsWith('-review')
-                  ? reviewApproved
-                  : structured,
-            nativeOwnership:
-              stage === 'unresolved' ? 'unresolved' : stage === 'none' ? 'none' : 'ended',
-          }));
+        const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => ({
+          insight: stage === 'rejection' ? 'invalid JSON' : params.agent.id.endsWith('-review') ? reviewApproved : structured,
+          nativeOwnership: stage === 'unresolved' ? 'unresolved' : stage === 'none' ? 'none' : 'ended',
+        }));
         try {
-          const compaction = ensureAcceptedMainCompaction(args);
-          await atStore;
+          const compaction = ensureAcceptedMainCompaction(args); await atStore;
           controller.abort('user_cancelled');
           const delivery = controller.signal._viventiumHarnessCancellationDelivery;
           // Read the owner ACK at Stop, while the DB operation still holds the runner.
-          releaseStore();
-          await compaction;
-          if (stage === 'unresolved')
-            await expect(delivery).rejects.toThrow('main_compaction_native_release_unconfirmed');
+          releaseStore(); await compaction;
+          if (stage === 'unresolved') await expect(delivery).rejects.toThrow('main_compaction_native_release_unconfirmed');
           else await expect(delivery).resolves.toEqual({ delivered: true });
-        } finally {
-          execute.mockRestore();
-        }
+        } finally { execute.mockRestore(); }
       },
     );
+
+    test('a long detached native producer reaches review with a renewed live claim and its own deadline', async () => {
+      jest.useFakeTimers(); jest.setSystemTime(1000);
+      const args = input(voiceRequest());
+      args.req.config.endpoints = { agents: { providerCapabilities: {
+        'synthetic-native': { workspace_binding: true, conversation_session: true },
+      } } };
+      args.renewCompaction = jest.fn(async ({ leaseExpiresAt, expiresAt }) => {
+        expect(new Date(leaseExpiresAt).getTime()).toBeGreaterThan(Date.now());
+        return { status: 'renewed', leaseExpiresAt: expiresAt.toISOString() };
+      });
+      let started; const admitted = new Promise(resolve => { started = resolve; });
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => {
+        expect(typeof params.onNativeAdmission).toBe('function');
+        expect(await params.onNativeAdmission({ requestId: params.agent.id,
+          responseDeadlineAt: new Date(Date.now() + 660000).toISOString() })).toBe(true);
+        if (!params.agent.id.endsWith('-review')) {
+          started(); await new Promise(resolve => setTimeout(resolve, 660000));
+          return { insight: structured, nativeOwnership: 'ended' };
+        }
+        // Fresh stage admission replenishes the short lease left by the long producer.
+        expect(params.executionTimeoutMs).toBe(240000);
+        return { insight: reviewApproved, nativeOwnership: 'ended' };
+      });
+      try {
+        const result = ensureAcceptedMainCompaction(args);
+        await Promise.race([admitted, result.then(() => { throw new Error('Producer not admitted'); })]);
+        await jest.advanceTimersByTimeAsync(660000);
+        expect(await result).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+        expect(args.renewCompaction.mock.calls.length).toBeGreaterThanOrEqual(4);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally { execute.mockRestore(); jest.useRealTimers(); }
+    });
+
+    test('a finite idle batch admits a fitting native deadline and still reaches reviewed promotion', async () => {
+      jest.useFakeTimers(); jest.setSystemTime(1000);
+      const args = input(voiceRequest());
+      args.trigger = 'accepted_turn'; args.foreground = false;
+      args.req.viventiumCallSession = null;
+      args.req.config.endpoints = { agents: { providerCapabilities: {
+        'synthetic-native': { workspace_binding: true, conversation_session: true },
+      } } };
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed', leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      let started; const admitted = new Promise(resolve => { started = resolve; });
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => {
+        expect(typeof params.onNativeAdmission).toBe('function');
+        const accepted = await params.onNativeAdmission({ requestId: params.agent.id,
+          responseDeadlineAt: new Date(Date.now() + 660000).toISOString() });
+        if (!params.agent.id.endsWith('-review')) {
+          expect(accepted).toBe(true);
+          started(); await new Promise(resolve => setTimeout(resolve, 660000));
+          return { insight: structured, nativeOwnership: 'ended' };
+        }
+        // Another complete native deadline would exceed the same twenty-minute batch.
+        expect(accepted).toBe(false);
+        return { insight: reviewApproved, nativeOwnership: 'ended' };
+      });
+      try {
+        const result = ensureAcceptedMainCompaction(args);
+        await Promise.race([admitted, result.then(() => { throw new Error('Finite producer not admitted'); })]);
+        await jest.advanceTimersByTimeAsync(660000);
+        expect(await result).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+        expect(args.renewCompaction.mock.calls.length).toBeGreaterThanOrEqual(4);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally { execute.mockRestore(); jest.useRealTimers(); }
+    });
+
+    test.each([
+      { batchMs: 1200000, claims: 2 },
+      { batchMs: 800000, claims: 1 },
+      { batchMs: 1200000, claims: 3, rearm: true },
+      { batchMs: 1200000, claims: 1, completionReserveMs: 240000, producerMs: 330000, reviewMs: 30000 },
+    ])('long Native stages retain bounded continuation: %p', async ({ batchMs, claims, rearm = false,
+      completionReserveMs = 0, producerMs = 400000, reviewMs = 20000 }) => {
+        jest.useFakeTimers(); jest.setSystemTime(1000);
+        const args = input(voiceRequest());
+        args.trigger = 'accepted_turn'; args.req.viventiumCallSession = null;
+        if (!rearm) args.deadlineAt = new Date(Date.now() + batchMs).toISOString();
+        args.executionBudget = { completionReserveMs };
+        args.req.config.endpoints = { agents: { providerCapabilities: {
+          'synthetic-native': { workspace_binding: true, conversation_session: true },
+        } } };
+        args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+          status: 'renewed', leaseExpiresAt: expiresAt.toISOString(),
+        }));
+        let completed = 0;
+        args.completeCompaction = jest.fn(async () => ({
+          status: 'compacted', continuationPending: ++completed < (rearm ? 3 : 2),
+        }));
+        let started; const admitted = new Promise(resolve => { started = resolve; });
+        const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => {
+          expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+          const review = params.agent.id.endsWith('-review');
+          const accepted = await params.onNativeAdmission({ requestId: params.agent.id,
+            responseDeadlineAt: new Date(Date.now() + 660000).toISOString() });
+          if (!review) { expect(accepted).toBe(true); started(); }
+          await new Promise(resolve => setTimeout(resolve, review ? reviewMs : producerMs));
+          return { insight: review ? reviewApproved : structured, nativeOwnership: 'ended' };
+        });
+        try {
+          const result = ensureAcceptedMainCompaction(args);
+          await Promise.race([admitted, result.then(() => { throw new Error('First producer not admitted'); })]);
+          await jest.runAllTimersAsync();
+          const final = await result;
+          expect(completed).toBe(claims);
+          expect(args.claimCompaction).toHaveBeenCalledTimes(claims);
+          expect(execute).toHaveBeenCalledTimes(claims * 2);
+          expect(args.executionBudget.slowestCompactionCallMs).toBe(producerMs);
+          expect(args.executionBudget.slowestReviewCallMs).toBe(reviewMs);
+          expect(args.executionBudget.nativeCompactionAdmissionWindowMs).toBe(
+            660000 + background.getCortexExecutionGuardGraceMs());
+          expect(final).toMatchObject(claims >= 2 ? { status: 'compacted' } :
+            { status: 'compacted', continuationPending: true, reason: 'idle_budget_exhausted' });
+          expect(jest.getTimerCount()).toBe(0);
+        } finally { execute.mockRestore(); jest.useRealTimers(); }
+      },
+    );
+
+    test.each([-1, 0, 1])('native deadline plus grace/reserve respects the finite boundary (%j)', async delta => {
+      jest.useFakeTimers(); jest.setSystemTime(1000);
+      const args = input(voiceRequest());
+      args.deadlineAt = new Date(Date.now() + 1200000).toISOString();
+      args.executionBudget = { completionReserveMs: 10000 };
+      args.req.config.endpoints = { agents: { providerCapabilities: {
+        'synthetic-native': { workspace_binding: true, conversation_session: true },
+      } } };
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed', leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      const grace = background.getCortexExecutionGuardGraceMs();
+      args.renewCompaction.mockImplementation(async ({ expiresAt }) => {
+        expect(expiresAt.getTime()).toBeLessThanOrEqual(Date.parse(args.deadlineAt) - 10000);
+        return { status: 'renewed', leaseExpiresAt: expiresAt.toISOString() };
+      });
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => {
+        expect(typeof params.onNativeAdmission).toBe('function');
+        expect(await params.onNativeAdmission({ requestId: params.agent.id,
+          responseDeadlineAt: new Date(Date.parse(args.deadlineAt) - grace - 10000 + delta).toISOString(),
+        })).toBe(delta <= 0);
+        return { insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+          nativeOwnership: 'ended' };
+      });
+      try {
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+        if (delta > 0) {
+          expect(args.executionBudget.nativeCompactionAdmissionWindowMs).toBeUndefined();
+          expect(args.executionBudget.nativeReviewAdmissionWindowMs).toBeUndefined();
+        }
+      } finally { execute.mockRestore(); jest.useRealTimers(); }
+    });
+
+    test('foreground admission still cancels an admitted finite native compaction', async () => {
+      const args = input(voiceRequest());
+      args.deadlineAt = new Date(Date.now() + 1200000).toISOString();
+      args.executionBudget = { completionReserveMs: 0 };
+      args.req.config.endpoints = { agents: { providerCapabilities: {
+        'synthetic-native': { workspace_binding: true, conversation_session: true },
+      } } };
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed', leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      let started; const admitted = new Promise(resolve => { started = resolve; });
+      let observedSignal;
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => {
+        expect(await params.onNativeAdmission({ requestId: params.agent.id,
+          responseDeadlineAt: new Date(Date.now() + 660000).toISOString() })).toBe(true);
+        observedSignal = params.signal; started();
+        await new Promise(resolve => params.signal.addEventListener('abort', resolve, { once: true }));
+        params.reportCapacityRelease(true);
+        return { error: 'cancelled', nativeOwnership: 'ended' };
+      });
+      let release;
+      try {
+        const result = ensureAcceptedMainCompaction(args);
+        await Promise.race([admitted, result.then(() => { throw new Error('Finite producer not admitted'); })]);
+        release = acquireInteractiveMainAdmissionFence(identity.ownerId);
+        await yieldAcceptedMainCompaction(identity.ownerId);
+        expect(observedSignal.aborted).toBe(true);
+        expect(await result).toMatchObject({ status: 'degraded', reason: 'interactive_priority' });
+        expect(args.completeCompaction).not.toHaveBeenCalled();
+      } finally { release?.(); execute.mockRestore(); }
+    });
+
+    test('prestage CAS contention keeps the original bounded guard without cancelling valid work', async () => {
+      const args = input(voiceRequest());
+      args.req.config.endpoints = { agents: { providerCapabilities: {
+        'synthetic-native': { workspace_binding: true, conversation_session: true },
+      } } };
+      args.renewCompaction = jest.fn(async () => ({ status: 'busy' }));
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => {
+        expect(params.signal.aborted).toBe(false);
+        expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+        expect(await params.onNativeAdmission({ requestId: params.agent.id,
+          responseDeadlineAt: new Date(Date.now() + 660000).toISOString() })).toBe(false);
+        expect(params.signal.aborted).toBe(false);
+        return { insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+          nativeOwnership: 'ended' };
+      });
+      try {
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+      } finally { execute.mockRestore(); }
+    });
+
+    test.each(['foreground', 'non-native', 'no-renewal'])(
+      'keeps the legacy native deadline policy for %s', async mode => {
+        const args = input(voiceRequest());
+        args.req.config.endpoints = { agents: { providerCapabilities: {
+          'synthetic-native': { workspace_binding: true, conversation_session: true },
+        } } };
+        if (mode !== 'no-renewal') args.renewCompaction = jest.fn(async () => ({ status: 'stale_lease' }));
+        if (mode === 'foreground') args.foreground = true;
+        if (mode === 'non-native') args.req.config.endpoints.agents.providerCapabilities = {};
+        const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => {
+          expect(params.onNativeAdmission).toBeUndefined();
+          expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+          return { insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+            nativeOwnership: 'ended' };
+        });
+        try { expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' }); }
+        finally { execute.mockRestore(); }
+      },
+    );
+
+    test('uses canonical Main primary and fallback for producer and reviewer after a Voice override', async () => {
+      const args = input(voiceRequest());
+      const { retainMainCompactionRoute } = require('@librechat/api');
+      retainMainCompactionRoute(args.req, { ...args.agent, provider: 'selected-main',
+        model: 'selected-main-model', model_parameters: { reasoning_effort: 'high' },
+        fallback_llm_provider: 'selected-fallback', fallback_llm_model: 'selected-fallback-model',
+        fallback_llm_model_parameters: { reasoning_effort: 'high' } });
+      args.agent = { ...args.agent, provider: 'selected-voice', endpoint: 'selected-voice',
+        model: 'selected-voice-model', model_parameters: { reasoning_effort: 'low' },
+        viventiumFallbackLlmAssignment: { provider: 'voice-only-fallback', model: 'voice-only-model' } };
+      const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async params => ({
+        insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+        nativeOwnership: 'ended',
+      }));
+      try {
+        expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+        expect(execute).toHaveBeenCalledTimes(2);
+        for (const [params] of execute.mock.calls) {
+          expect(params.agent).toMatchObject({ provider: 'selected-main', endpoint: 'selected-main',
+            model: 'selected-main-model', model_parameters: { reasoning_effort: 'high' },
+            fallback_llm_provider: 'selected-fallback', fallback_llm_model: 'selected-fallback-model',
+            fallback_llm_model_parameters: { reasoning_effort: 'high' } });
+          expect(params.agent.viventiumFallbackLlmAssignment).toBeUndefined();
+          expect(params.nativeTools).toBe(false);
+          expect(params.req.viventiumCallSession).toBeNull();
+        }
+        expect(args.agent.model).toBe('selected-voice-model');
+      } finally { execute.mockRestore(); }
+    });
 
     test('signs zero tools and binds cancellation for both default voice claim and fidelity review', async () => {
       const outer = voiceRequest();
@@ -2083,17 +1799,12 @@ describe('ViventiumMainCompactionService', () => {
       const bindings = [];
       const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
         bindings.push(await prepareRealBoundary(params, fetchImpl));
-        return {
-          insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
-          nativeOwnership: 'ended',
-        };
+        return { insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+          nativeOwnership: 'ended' };
       });
       const args = input(outer);
       try {
-        await expect(ensureAcceptedMainCompaction(args)).resolves.toMatchObject({
-          status: 'compacted',
-          attempts: 1,
-        });
+        await expect(ensureAcceptedMainCompaction(args)).resolves.toMatchObject({ status: 'compacted', attempts: 1 });
         expect(bindings).toHaveLength(2);
         for (const binding of bindings) {
           expect(binding.attached).toBe(true);
@@ -2106,13 +1817,8 @@ describe('ViventiumMainCompactionService', () => {
           expect(JSON.parse(Buffer.from(encoded, 'base64').toString())).toEqual({
             provider_capabilities: { native_tools: false },
           });
-          expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
-            'sha256=' +
-              crypto
-                .createHmac('sha256', secret)
-                .update(`v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${encoded}`)
-                .digest('hex'),
-          );
+          expect(headers['X-GlassHive-Bootstrap-Signature']).toBe('sha256=' + crypto.createHmac('sha256', secret)
+            .update(`v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${encoded}`).digest('hex'));
           expect(headers['X-GlassHive-Access']).toBe('read_only');
           expect(headers['X-GlassHive-Provider-Session-Mode']).toBe('stateless');
           expect(binding.targetAgent.model).toBe('synthetic-exact-model');
@@ -2127,57 +1833,36 @@ describe('ViventiumMainCompactionService', () => {
         expect(Object.hasOwn(isolated, 'viventiumCallSession')).toBe(true);
         expect(isolated.user.id).toBe(outer.user.id);
         expect(isolated.config).toBe(outer.config);
-        expect(isolated.user.personalization).toMatchObject({
-          memories: false,
-          conversation_recall: false,
-        });
+        expect(isolated.user.personalization).toMatchObject({ memories: false, conversation_recall: false });
         expect(messages[0].content).toContain('synthetic-accepted-turn');
-        expect(args.completeCompaction).toHaveBeenCalledWith(
-          expect.objectContaining({
-            sourceDigest: 'a'.repeat(64),
-            semanticReview: expect.objectContaining({
-              approved: true,
-              sourceDigest: 'a'.repeat(64),
-              candidateDigest: expect.any(String),
-            }),
-          }),
-        );
+        expect(args.completeCompaction).toHaveBeenCalledWith(expect.objectContaining({
+          sourceDigest: 'a'.repeat(64), semanticReview: expect.objectContaining({ approved: true,
+            sourceDigest: 'a'.repeat(64), candidateDigest: expect.any(String) }),
+        }));
         expect(outer.viventiumCallSession).toBe(originalSession);
         expect(outer.body).toEqual(originalBody);
         expect(isVoiceActorSideEffectRestricted(outer)).toBe(false);
         expect(outer).not.toHaveProperty('_viventiumHarnessExecutionEnabled');
         expect(fetchImpl).not.toHaveBeenCalled();
-      } finally {
-        execute.mockRestore();
-      }
+      } finally { execute.mockRestore(); }
     });
 
     test('maintenance yield releases only the default voice compactor exact native attempt', async () => {
       const outer = voiceRequest();
       const originalBody = structuredClone(outer.body);
-      const fetchImpl = jest.fn(async () => ({
-        ok: true,
-        status: 200,
-        json: async () => ({ capacityReleased: true, state: 'cancelled' }),
-      }));
+      const fetchImpl = jest.fn(async () => ({ ok: true, status: 200,
+        json: async () => ({ capacityReleased: true, state: 'cancelled' }) }));
       let binding;
       let prepared;
-      const ready = new Promise((resolve) => {
-        prepared = resolve;
-      });
+      const ready = new Promise((resolve) => { prepared = resolve; });
       const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
         binding = await prepareRealBoundary(params, fetchImpl);
         prepared();
-        await new Promise((resolve) =>
-          params.signal.addEventListener('abort', resolve, { once: true }),
-        );
+        await new Promise((resolve) => params.signal.addEventListener('abort', resolve, { once: true }));
         const outcome = await binding.cancellationReq._viventiumHarnessCancellationDeliveryPromise;
         params.onHarnessCancellationOutcome(outcome || { acknowledged: false });
-        return {
-          insight: null,
-          errorClass: 'background_agent_error',
-          nativeOwnership: outcome?.acknowledged === true ? 'released' : 'unresolved',
-        };
+        return { insight: null, errorClass: 'background_agent_error',
+          nativeOwnership: outcome?.acknowledged === true ? 'released' : 'unresolved' };
       });
       const args = input(outer);
       const running = ensureAcceptedMainCompaction(args);
@@ -2188,72 +1873,39 @@ describe('ViventiumMainCompactionService', () => {
         expect(binding.bound).toBe(true);
         expect(yielded).toMatchObject({ status: 'yielded', capacityReleaseAcknowledged: true });
         expect(fetchImpl).toHaveBeenCalledTimes(1);
-        expect(fetchImpl.mock.calls[0][0]).toBe(
-          `${endpoint.baseURL}/requests/by-idempotency/${encodeURIComponent(
-            binding.requestBody.viventiumGlassHiveIdempotencyKey,
-          )}/cancel`,
-        );
-        expect(fetchImpl.mock.calls[0][1]).toMatchObject({
-          method: 'POST',
-          headers: {
-            Authorization: 'Bearer synthetic-native-key',
-            'X-Viventium-User-Id': identity.ownerId,
-          },
-        });
+        expect(fetchImpl.mock.calls[0][0]).toBe(`${endpoint.baseURL}/requests/by-idempotency/${encodeURIComponent(
+          binding.requestBody.viventiumGlassHiveIdempotencyKey)}/cancel`);
+        expect(fetchImpl.mock.calls[0][1]).toMatchObject({ method: 'POST', headers: {
+          Authorization: 'Bearer synthetic-native-key', 'X-Viventium-User-Id': identity.ownerId,
+        } });
         expect(args.completeCompaction).not.toHaveBeenCalled();
-        expect(args.rejectCompaction).toHaveBeenCalledWith(
-          expect.objectContaining({ reason: 'interactive_priority' }),
-        );
+        expect(args.rejectCompaction).toHaveBeenCalledWith(expect.objectContaining({ reason: 'interactive_priority' }));
         expect(outer.body).toEqual(originalBody);
         expect(outer.viventiumCallSession.callSessionId).toBe('synthetic-outer-call');
         expect(outer).not.toHaveProperty('_viventiumHarnessCancellationDeliveryPromise');
-      } finally {
-        await running;
-        execute.mockRestore();
-      }
+      } finally { await running; execute.mockRestore(); }
     });
 
     test.each([
-      ['owner_participant', false],
-      ['unknown', false],
-      ['guest', true],
-      [undefined, undefined],
-    ])(
-      'keeps ordinary restricted voice %s/%s closed to signing and cancellation',
-      async (trust, sideEffects) => {
-        const outer = voiceRequest(trust, sideEffects);
-        outer.body.viventiumActorTrust = trust;
-        outer.body.viventiumCanAuthorizeSideEffects = sideEffects;
-        const targetAgent = compactorAgent(input(outer).agent, 'c'.repeat(64));
-        expect(isVoiceActorSideEffectRestricted(outer)).toBe(true);
-        expect(
-          await provider.attachConversationProviderCapabilityBundle({
-            targetAgent,
-            req: outer,
-            capability: { workspace_binding: true },
-            nativeTools: false,
-          }),
-        ).toBe(false);
-        expect(targetAgent.model_parameters.configuration?.defaultHeaders || {}).not.toHaveProperty(
-          'X-GlassHive-Bootstrap-Signature',
-        );
-        const fetchImpl = jest.fn();
-        expect(
-          provider.bindHarnessCancellation({
-            req: outer,
-            signal: new AbortController().signal,
-            endpointConfig: endpoint,
-            fetchImpl,
-          }),
-        ).toBe(false);
-        expect(isVoiceActorSideEffectRestricted(outer)).toBe(true);
-        expect(outer.body).toMatchObject({
-          viventiumDeferVoiceMemory: true,
-          suppressBackgroundCortices: true,
-        });
-        expect(fetchImpl).not.toHaveBeenCalled();
-      },
-    );
+      ['owner_participant', false], ['unknown', false], ['guest', true], [undefined, undefined],
+    ])('keeps ordinary restricted voice %s/%s closed to signing and cancellation', async (trust, sideEffects) => {
+      const outer = voiceRequest(trust, sideEffects);
+      outer.body.viventiumActorTrust = trust;
+      outer.body.viventiumCanAuthorizeSideEffects = sideEffects;
+      const targetAgent = compactorAgent(input(outer).agent, 'c'.repeat(64));
+      expect(isVoiceActorSideEffectRestricted(outer)).toBe(true);
+      expect(await provider.attachConversationProviderCapabilityBundle({ targetAgent, req: outer,
+        capability: { workspace_binding: true }, nativeTools: false })).toBe(false);
+      expect(targetAgent.model_parameters.configuration?.defaultHeaders || {})
+        .not.toHaveProperty('X-GlassHive-Bootstrap-Signature');
+      const fetchImpl = jest.fn();
+      expect(provider.bindHarnessCancellation({ req: outer, signal: new AbortController().signal,
+        endpointConfig: endpoint, fetchImpl })).toBe(false);
+      expect(isVoiceActorSideEffectRestricted(outer)).toBe(true);
+      expect(outer.body).toMatchObject({ viventiumDeferVoiceMemory: true,
+        suppressBackgroundCortices: true });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
   });
 
   test('uses the real default compactor as an internal caller and preserves its valid result', async () => {
@@ -2396,14 +2048,12 @@ describe('ViventiumMainCompactionService', () => {
       });
     }
     const backgroundCortexService = require('../../BackgroundCortexService');
-    const executeCortexSpy = jest
-      .spyOn(backgroundCortexService, 'executeCortex')
-      .mockResolvedValueOnce({
-        insight: null,
-        errorClass: 'recoverable_provider_error',
-        errorStatus: 503,
-        nativeOwnership: 'unresolved',
-      });
+    const executeCortexSpy = jest.spyOn(backgroundCortexService, 'executeCortex').mockResolvedValueOnce({
+      insight: null,
+      errorClass: 'recoverable_provider_error',
+      errorStatus: 503,
+      nativeOwnership: 'unresolved',
+    });
     const sleep = jest.fn().mockResolvedValue(undefined);
     try {
       // A 503 alone would back off and retry; the unreleased native request forbids any overlap.
@@ -3028,6 +2678,483 @@ describe('source-bound independent fidelity review', () => {
     } finally {
       process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previous;
       resetPromptRegistryForTests();
+    }
+  });
+});
+
+
+describe('active Call compaction scheduling owner', () => {
+  const identity = { ownerId: 'call-owner', agentId: 'call-main', stableAuthoritySha256: 'f'.repeat(64) };
+  const call = () => ({ userId: identity.ownerId, callSessionId: 'active-call', status: 'listening', expiresAtMs: Date.now() + 60000 });
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+  test('two accepted Voice turns start no model and End enters the existing runner once with the latest input', async () => {
+    const claim = jest.fn(async () => ({ status: 'empty' })), execute = jest.fn();
+    const session = call();
+    for (const marker of ['first', 'latest']) {
+      expect(await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn', req: { viventiumCallSession: session },
+        marker, claimCompaction: claim, executeCompactor: execute })).toMatchObject({ status: 'deferred', reason: 'active_call' });
+    }
+    expect(claim).not.toHaveBeenCalled(); expect(execute).not.toHaveBeenCalled();
+    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(1);
+    expect(claim).toHaveBeenCalledTimes(1); expect(claim.mock.calls[0][0].marker).toBe('latest');
+    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(0);
+  });
+  test('required foreground recovery during a call executes and removes its deferred duplicate', async () => {
+    const session = call(), claim = jest.fn(async () => ({ status: 'empty' }));
+    const input = { ...identity, req: { viventiumCallSession: session }, claimCompaction: claim };
+    await ensureAcceptedMainCompaction({ ...input, trigger: 'accepted_turn' });
+    expect(await ensureAcceptedMainCompaction({ ...input, trigger: 'context_carrier', foreground: true })).toMatchObject({ status: 'empty' });
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(await flushEndedCallMainCompactions({ ...session, status: 'ended' })).toBe(0);
+  });
+  test('ordinary accepted scheduling and late acceptance after End use the existing runner', async () => {
+    const session = call(), claim = jest.fn(async () => ({ status: 'empty' }));
+    await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn', claimCompaction: claim });
+    await flushEndedCallMainCompactions({ ...session, status: 'ended' });
+    await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn', req: { viventiumCallSession: session }, claimCompaction: claim });
+    expect(claim).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('accepted-turn idle continuation binding', () => {
+  const identity = { ownerId: 'idle-owner', agentId: 'idle-main', stableAuthoritySha256: 'c'.repeat(64) };
+  const candidate = JSON.stringify({ version: 1, summary: 'Keep the exact pending request.',
+    pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+    recurrenceOutcomes: [], toolPairs: [] });
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+
+  test.each(['accepted_turn', 'conversation_legacy'])('%s background trigger advances successive reviewed claims through the same runner', async trigger => {
+    let completed = 0;
+    const claimCompaction = jest.fn(async () => ({ status: 'claimed', leaseId: `idle-${completed}`,
+      domainEpochKey: 'idle-domain', sourceDigest: String(completed + 1).repeat(64), sourceBytes: 100,
+      sourceTurns: [], leaseExpiresAt: new Date(Date.now() + 300000) }));
+    const result = await ensureAcceptedMainCompaction({ ...identity, trigger, foreground: false,
+      claimCompaction, executeCompactor: async call => call.stage === 'review' ? reviewApproved : candidate,
+      completeCompaction: async () => ({ status: 'compacted', continuationPending: ++completed < 3 }),
+      rejectCompaction: jest.fn() });
+    expect(result).toMatchObject({ status: 'compacted', continuationPending: false });
+    expect(claimCompaction).toHaveBeenCalledTimes(3);
+  });
+
+  test('a foreground fence between reviewed claims stops idle continuation', async () => {
+    let release;
+    const claimCompaction = jest.fn(async () => ({ status: 'claimed', leaseId: 'yield-idle',
+      domainEpochKey: 'idle-yield-domain', sourceDigest: 'd'.repeat(64), sourceBytes: 100,
+      sourceTurns: [], leaseExpiresAt: new Date(Date.now() + 300000) }));
+    try {
+      const result = await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn',
+        claimCompaction, executeCompactor: async call => call.stage === 'review' ? reviewApproved : candidate,
+        completeCompaction: async () => { release = acquireInteractiveMainAdmissionFence(identity.ownerId);
+          return { status: 'compacted', continuationPending: true }; }, rejectCompaction: jest.fn() });
+      expect(result).toMatchObject({ status: 'compacted', continuationPending: true });
+      expect(claimCompaction).toHaveBeenCalledTimes(1);
+    } finally { release?.(); }
+  });
+});
+
+describe('idle continuation after the finite batch cap', () => {
+  test.each(['accepted_turn', 'conversation_legacy'])('%s finishes a fifth reviewed claim after idle without another user acceptance', async trigger => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    let completed = 0;
+    const identity = { ownerId: 'idle-resume-owner', agentId: 'main', stableAuthoritySha256: 'b'.repeat(64) };
+    const candidate = JSON.stringify({ version: 1, summary: 'The source remains intact.',
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] });
+    const claimCompaction = jest.fn(async () => ({ status: 'claimed', leaseId: `continuation-${completed}`,
+      domainEpochKey: 'idle-resume-domain', sourceDigest: String(completed + 1).repeat(64), sourceBytes: 100,
+      sourceTurns: [], leaseExpiresAt: new Date(Date.now() + 300000) }));
+    try {
+      require('@librechat/api').resetMainCompactionSchedulingForTests();
+      const first = await ensureAcceptedMainCompaction({ ...identity, trigger, foreground: false, claimCompaction,
+        executeCompactor: async call => call.stage === 'review' ? reviewApproved : candidate,
+        completeCompaction: async () => ({ status: 'compacted', continuationPending: ++completed < 5 }),
+        rejectCompaction: jest.fn() });
+      expect(first).toMatchObject({ continuationPending: true, reason: 'idle_budget_exhausted' });
+      expect(completed).toBe(4);
+      await jest.advanceTimersByTimeAsync(30000);
+      for (let i = 0; i < 10 && completed < 5; i++) await new Promise(resolve => setImmediate(resolve));
+      expect(completed).toBe(5);
+      expect(claimCompaction).toHaveBeenCalledTimes(5);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      require('@librechat/api').resetMainCompactionSchedulingForTests();
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('fresh call liveness before historical idle claims', () => {
+  const lookup = require('../CallSessionService').getActiveCallSessionForMainMaintenance;
+  const identity = { ownerId: 'call-idle-owner', agentId: 'main', stableAuthoritySha256: 'a'.repeat(64) };
+  const candidate = JSON.stringify({ version: 1, summary: 'Retain the reviewed historical source.',
+    pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+    recurrenceOutcomes: [], toolPairs: [] });
+  beforeEach(() => { lookup.mockReset().mockResolvedValue(null); require('@librechat/api').resetMainCompactionSchedulingForTests(); });
+  afterEach(() => { lookup.mockReset().mockResolvedValue(null); require('@librechat/api').resetMainCompactionSchedulingForTests(); });
+  const inputFor = complete => ({ ...identity, trigger: 'accepted_turn',
+    claimCompaction: jest.fn(async () => ({ status: 'claimed', leaseId: 'call-idle-lease',
+      domainEpochKey: 'call-idle-domain', sourceDigest: 'e'.repeat(64), sourceBytes: 100,
+      sourceTurns: [], leaseExpiresAt: new Date(Date.now() + 300000) })),
+    executeCompactor: async call => call.stage === 'review' ? reviewApproved : candidate,
+    completeCompaction: complete, rejectCompaction: jest.fn() });
+  const liveCall = () => ({ userId: identity.ownerId, agentId: identity.agentId,
+    callSessionId: 'new-live-call', status: 'listening', expiresAtMs: Date.now() + 120000 });
+
+  test('a call starting between claims defers the next claim until the existing End flush', async () => {
+    let completed = 0;
+    const call = liveCall();
+    lookup.mockResolvedValue(call).mockResolvedValueOnce(null);
+    const input = inputFor(async () => ({ status: 'compacted', continuationPending: ++completed < 2 }));
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({ status: 'deferred', reason: 'active_call' });
+    expect(completed).toBe(1);
+    lookup.mockResolvedValue(null);
+    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+    expect(completed).toBe(2);
+    expect(input.claimCompaction).toHaveBeenCalledTimes(2);
+  });
+
+  test('a new call after the timer was armed prevents an idle claim until End', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    let completed = 0;
+    const input = inputFor(async () => ({ status: 'compacted', continuationPending: ++completed < 5 }));
+    try {
+      await ensureAcceptedMainCompaction(input);
+      expect(completed).toBe(4);
+      const call = liveCall(); lookup.mockResolvedValue(call);
+      await jest.advanceTimersByTimeAsync(30000);
+      expect(completed).toBe(4);
+      expect(input.claimCompaction).toHaveBeenCalledTimes(4);
+      lookup.mockResolvedValue(null);
+      expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+      expect(completed).toBe(5);
+      expect(input.claimCompaction).toHaveBeenCalledTimes(5);
+    } finally { require('@librechat/api').resetMainCompactionSchedulingForTests(); jest.useRealTimers(); }
+  });
+
+  test('unavailable call liveness starts no maintenance provider claim', async () => {
+    lookup.mockRejectedValue(new Error('synthetic persistence unavailable'));
+    const input = inputFor(jest.fn());
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({ status: 'deferred', reason: 'call_liveness_unavailable' });
+    expect(input.claimCompaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('legacy conversation maintenance uses the existing idle and call owners', () => {
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+  test('the idle binding waits for the foreground fence without invoking a provider', async () => {
+    jest.useFakeTimers();
+    const run = jest.fn(async () => {});
+    const release = acquireInteractiveMainAdmissionFence('legacy-idle-owner');
+    try {
+      const { scheduleMainContinuityMaintenance } = require('../ViventiumMainCompactionService');
+      expect(scheduleMainContinuityMaintenance({ ownerId: 'legacy-idle-owner', agentId: 'main',
+        stableAuthoritySha256: 'legacy-conversation', schedule: run })).toBe(true);
+      await jest.advanceTimersByTimeAsync(60000);
+      expect(run).not.toHaveBeenCalled();
+      release();
+      await jest.advanceTimersByTimeAsync(30000);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally { release(); require('@librechat/api').resetMainCompactionSchedulingForTests(); jest.useRealTimers(); }
+  });
+  test('background legacy claims wait for a fresh live call and resume once after End', async () => {
+    const call = { userId: 'legacy-call-owner', callSessionId: 'legacy-call', status: 'listening', expiresAtMs: Date.now() + 60000 };
+    const calls = require('../CallSessionService').getActiveCallSessionForMainMaintenance;
+    calls.mockResolvedValueOnce(call).mockResolvedValueOnce(null);
+    const claim = jest.fn(async () => ({ status: 'empty' }));
+    const input = { ownerId: call.userId, agentId: 'main', stableAuthoritySha256: 'legacy-conversation',
+      trigger: 'conversation_legacy', foreground: false, claimCompaction: claim, executeCompactor: jest.fn() };
+    expect(await ensureAcceptedMainCompaction(input)).toMatchObject({ status: 'deferred', reason: 'active_call' });
+    expect(claim).not.toHaveBeenCalled();
+    expect(await flushEndedCallMainCompactions({ ...call, status: 'ended' })).toBe(1);
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(input.executeCompactor).not.toHaveBeenCalled();
+  });
+});
+
+describe('idle size recovery uses the actual next claim', () => {
+  const identity = { ownerId: 'size-idle-owner', agentId: 'size-main', stableAuthoritySha256: '8'.repeat(64) };
+  const fitting = { version: 1, summary: 'Keep the original permission and pending work.',
+    pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+    recurrenceOutcomes: [], toolPairs: [] };
+  beforeEach(() => {
+    setMainContinuityPersistenceForTests(inMemoryPersistence());
+    require('@librechat/api').resetMainCompactionSchedulingForTests();
+  });
+  afterEach(() => setMainContinuityPersistenceForTests(null));
+
+  test('real history owner claims less whole source, reviews it, then promotes without dropping the rest', async () => {
+    for (let index = 0; index < 8; index++) await commitAcceptedMainTurn({ ...identity,
+      logicalTurnId: `size-turn-${index}`, revision: 1, conversationId: 'size-conversation',
+      userMessageId: `size-user-${index}`, assistantMessageId: `size-answer-${index}`,
+      origin: 'interactive', userText: `Keep permission required ${index}. ` + 'u'.repeat(1000),
+      assistantText: `Pending ${index}. ` + 'a'.repeat(500) });
+    const before = await loadAcceptedMainContext(identity);
+    const calls = [];
+    const result = await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn',
+      executeCompactor: async call => {
+        calls.push(call);
+        if (call.stage === 'review') return reviewApproved;
+        return JSON.stringify({ ...fitting, summary: calls.length === 1 ? 'x'.repeat(16 * 1024) : fitting.summary });
+      } });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 1 });
+    expect(calls).toHaveLength(3);
+    expect(calls[2].stage).toBe('review');
+    const payload = call => JSON.parse(call.prompt.match(
+      /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/)[1]);
+    const first = payload(calls[0]), second = payload(calls[1]);
+    expect(second.sourceDigest).not.toBe(first.sourceDigest);
+    expect(second.acceptedOlderTurns.length).toBeLessThan(first.acceptedOlderTurns.length);
+    const after = await loadAcceptedMainContext(identity);
+    expect(after.semanticCompaction.summary).toBe(fitting.summary);
+    expect(after.turns.map(t => t.logicalTurnId)).toEqual(before.turns.map(t => t.logicalTurnId));
+    expect(after.pendingCompactionTurns.length).toBeGreaterThan(0);
+    expect(after.pendingCompactionTurns.length).toBeLessThan(before.pendingCompactionTurns.length);
+  });
+
+  test.each(['producer', 'review'])('a %s packet rejected as too large uses the same smaller whole-source owner', async stage => {
+    for (let index = 0; index < 8; index++) await commitAcceptedMainTurn({ ...identity,
+      logicalTurnId: `packet-turn-${index}`, revision: 1, conversationId: 'packet-conversation',
+      userMessageId: `packet-user-${index}`, assistantMessageId: `packet-answer-${index}`,
+      origin: 'interactive', userText: `Keep required permission ${index}. ` + 'u'.repeat(1000),
+      assistantText: `Pending ${index}. ` + 'a'.repeat(500) });
+    const before = await loadAcceptedMainContext(identity);
+    const calls = [];
+    let rejected = false;
+    const result = await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn',
+      executeCompactor: async call => {
+        calls.push(call);
+        if (!rejected && (stage === 'review') === (call.stage === 'review')) {
+          rejected = true;
+          throw Object.assign(new Error('Packet too large'), { status: 413, code: 'invalid_request' });
+        }
+        return call.stage === 'review' ? reviewApproved : JSON.stringify(fitting);
+      } });
+    expect(result.reason).toBeUndefined();
+    expect(result).toMatchObject({ status: 'compacted' });
+    const producers = calls.filter(call => call.stage !== 'review');
+    expect(producers).toHaveLength(2);
+    const payload = call => JSON.parse(call.prompt.match(
+      /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/)[1]);
+    expect(payload(producers[1]).acceptedOlderTurns.length).toBeLessThan(payload(producers[0]).acceptedOlderTurns.length);
+    expect(payload(producers[1]).sourceDigest).not.toBe(payload(producers[0]).sourceDigest);
+    expect(calls.at(-1).stage).toBe('review');
+    const after = await loadAcceptedMainContext(identity);
+    expect(after.semanticCompaction.summary).toBe(fitting.summary);
+    expect(after.turns).toEqual(before.turns);
+    expect(after.pendingCompactionTurns.length).toBeGreaterThan(0);
+  });
+
+  test.each([
+    ['same digest', { sourceDigest: 'a'.repeat(64) }],
+    ['same bytes', { sourceBytes: 8000 }], ['larger bytes', { sourceBytes: 9000 }],
+    ['foreign domain', { domainEpochKey: 'foreign-domain' }],
+    ['missing bytes', { sourceBytes: undefined }],
+  ])('releases a %s next claim before any provider or review', async (_name, change) => {
+    let claimCount = 0;
+    const claim = { status: 'claimed', leaseId: 'size-lease', domainEpochKey: 'size-domain',
+      sourceDigest: 'a'.repeat(64), sourceBytes: 8000, previousSemanticCompaction: null,
+      sourceTurns: [], canReduceSource: true, leaseExpiresAt: new Date(Date.now() + 300000) };
+    const reject = jest.fn(async () => ({ status: 'rejected' }));
+    const complete = jest.fn();
+    const execute = jest.fn(async () => JSON.stringify({ ...fitting, summary: 'x'.repeat(7000) }));
+    const result = await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn',
+      claimCompaction: async () => ++claimCount === 1 ? claim : { ...claim,
+        leaseId: 'size-second', sourceDigest: 'b'.repeat(64), sourceBytes: 3000, ...change },
+      rejectCompaction: reject, completeCompaction: complete, executeCompactor: execute });
+    expect(result).toMatchObject({ status: 'degraded', reason: 'source_reduction_unavailable', attempts: 0 });
+    expect(claimCount).toBe(2);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(complete).not.toHaveBeenCalled();
+    expect(reject).toHaveBeenLastCalledWith(expect.objectContaining({ leaseId: 'size-second',
+      reason: change.domainEpochKey ? 'source_reduction_unavailable' : 'schema_invalid' }));
+  });
+
+  test.each(['provider', 'review', 'cancel'])('a %s failure after source reduction stops without further claims', async failure => {
+    let claims = 0, producers = 0;
+    const controller = new AbortController();
+    const complete = jest.fn();
+    const execute = jest.fn(async call => {
+      if (call.stage === 'review') throw Object.assign(new Error('unavailable'), { code: 'provider_unavailable' });
+      if (++producers === 1) {
+        if (failure === 'cancel') controller.abort('owner_stop');
+        return JSON.stringify({ ...fitting, summary: 'x'.repeat(7000) });
+      }
+      if (failure === 'provider') throw Object.assign(new Error('rejected'), { status: 400 });
+      return JSON.stringify(fitting);
+    });
+    const result = await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn',
+      signal: controller.signal, claimCompaction: async () => ({ status: 'claimed',
+        leaseId: `failure-lease-${++claims}`, domainEpochKey: 'failure-domain',
+        sourceDigest: String(claims).repeat(64), sourceBytes: claims === 1 ? 8000 : 3000,
+        sourceTurns: [], canReduceSource: true, leaseExpiresAt: new Date(Date.now() + 300000) }),
+      rejectCompaction: jest.fn(), completeCompaction: complete, executeCompactor: execute });
+    expect(result.status).toBe('degraded');
+    expect(claims).toBe(failure === 'cancel' ? 1 : 2);
+    expect(execute).toHaveBeenCalledTimes(failure === 'cancel' ? 1 : failure === 'provider' ? 2 : 3);
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  test('an indivisible source keeps bounded same-source repair and does not start another claim', async () => {
+    const claim = jest.fn(async () => ({ status: 'claimed', leaseId: 'single-lease',
+      domainEpochKey: 'single-domain', sourceDigest: 'a'.repeat(64), sourceBytes: 8000,
+      sourceTurns: [], canReduceSource: false, leaseExpiresAt: new Date(Date.now() + 300000) }));
+    const execute = jest.fn(async () => JSON.stringify({ ...fitting, summary: 'x'.repeat(7000) }));
+    const result = await ensureAcceptedMainCompaction({ ...identity, trigger: 'accepted_turn',
+      claimCompaction: claim, executeCompactor: execute, rejectCompaction: jest.fn() });
+    expect(result).toMatchObject({ status: 'degraded', reason: 'schema_invalid', attempts: 2 });
+    expect(result.canReduceSource).toBeUndefined();
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe('durable fidelity continuation through the existing idle owner', () => {
+  test.each(['promote', 'source', 'contract', 'exhausted', 'release', 'store', 'explicit-deadline'])(
+    'keeps the same repair bound and authority (%s)', async mode => {
+      jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+      jest.setSystemTime(1000000);
+      const scheduling = require('@librechat/api');
+      scheduling.resetMainCompactionSchedulingForTests();
+      const candidate = JSON.stringify({ version: 1, summary: 'Pending evidence needs review.',
+        pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+        recurrenceOutcomes: [], toolPairs: [] });
+      let pending = null, claims = 0;
+      const calls = [];
+      const completeCompaction = jest.fn(async () => { pending = null; return { status: 'compacted' }; });
+      const rejectCompaction = jest.fn(async input => {
+        pending = input.pendingCompactionRepair || null;
+        return { status: 'rejected', ...(pending && mode !== 'store' ? { repairPending: true } : {}) };
+      });
+      const args = { ownerId: 'fidelity-idle-owner', agentId: 'main', stableAuthoritySha256: 'f'.repeat(64),
+        trigger: 'accepted_turn', agent: { provider: 'native', model_parameters: { model: 'synthetic', reasoning_effort: 'high' } },
+        req: { config: { endpoints: { agents: { providerCapabilities: { native: {
+          workspace_binding: true, conversation_session: true } } } } } },
+        executionBudget: { completionReserveMs: 0 },
+        ...(mode === 'explicit-deadline' ? { deadlineAt: new Date(Date.now() + 1200000).toISOString() } : {}),
+        claimCompaction: async () => {
+          claims++;
+          return { status: 'claimed', leaseId: `repair-lease-${claims}`, domainEpochKey: 'repair-domain',
+            sourceDigest: claims > 1 && mode === 'source' ? 'e'.repeat(64) : 'd'.repeat(64),
+            sourceBytes: 1000, sourceTurns: [], leaseExpiresAt: new Date(Date.now() + 300000),
+            ...(pending ? { pendingCompactionRepair: { ...pending,
+              ...(mode === 'contract' ? { contractKey: 'different-contract' } : {}) } } : {}) };
+        },
+        renewCompaction: async ({ expiresAt }) => ({ status: 'renewed', leaseExpiresAt: expiresAt }),
+        completeCompaction, rejectCompaction,
+        executeCompactor: async call => {
+          calls.push(call);
+          expect(await call.onNativeAdmission({ requestId: `native-${calls.length}`,
+            responseDeadlineAt: new Date(Date.now() + 660000).toISOString() })).toBe(true);
+          await new Promise(resolve => setTimeout(resolve, call.stage === 'review' ? 38000 : 451000));
+          call.reportCapacityRelease(mode !== 'release');
+          return call.stage === 'review'
+            ? calls.length === 2 || mode === 'exhausted'
+              ? JSON.stringify({ approved: false, reason: 'Retain the exact pending evidence reference.' })
+              : reviewApproved
+            : candidate;
+        },
+      };
+      try {
+        const running = ensureAcceptedMainCompaction(args);
+        await jest.advanceTimersByTimeAsync(489000);
+        const result = await running;
+        const resumes = !['release', 'store', 'explicit-deadline'].includes(mode);
+        expect(result).toMatchObject({ status: 'degraded', reason: 'compaction_enclosing_deadline', attempts: 1 });
+        expect(calls).toHaveLength(2);
+        expect(completeCompaction).not.toHaveBeenCalled();
+        expect(jest.getTimerCount()).toBe(resumes ? 1 : 0);
+        if (!resumes) return;
+        expect(pending).toMatchObject({ semanticAttempts: 1, transportRetries: 0,
+          correction: { code: 'semantic_fidelity', candidate,
+            reason: 'Retain the exact pending evidence reference.' } });
+        await jest.advanceTimersByTimeAsync(30000 + 489000);
+        for (let i = 0; i < 12 && calls.length < 4; i++) await new Promise(resolve => setImmediate(resolve));
+        expect(calls).toHaveLength(4);
+        const payload = JSON.parse(calls[2].prompt.match(
+          /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/)[1]);
+        const same = !['source', 'contract'].includes(mode);
+        expect(calls[2].attempt).toBe(same ? 2 : 1);
+        if (same) expect(payload.priorRejection).toEqual({ code: 'semantic_fidelity', candidate,
+          reason: 'Retain the exact pending evidence reference.' });
+        else expect(payload.priorRejection).toBeUndefined();
+        if (mode === 'exhausted') {
+          expect(completeCompaction).not.toHaveBeenCalled();
+          expect(rejectCompaction).toHaveBeenLastCalledWith(expect.objectContaining({
+            reason: 'semantic_fidelity: Retain the exact pending evidence reference.' }));
+        } else expect(completeCompaction).toHaveBeenCalledTimes(1);
+        expect(pending).toBeNull();
+        expect(jest.getTimerCount()).toBe(0);
+      } finally { scheduling.resetMainCompactionSchedulingForTests(); jest.useRealTimers(); }
+    });
+});
+
+
+describe('resumed fidelity checkpoint during foreground cancellation', () => {
+  test.each([true, false])('keeps the earlier completed review only after native release=%s', async released => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    const persistence = inMemoryPersistence();
+    setMainContinuityPersistenceForTests(persistence);
+    const scheduling = require('@librechat/api');
+    scheduling.resetMainCompactionSchedulingForTests();
+    const continuity = require('../ViventiumMainContinuityService');
+    const identity = { ownerId: 'repair-yield-owner', agentId: 'main', stableAuthoritySha256: 'b'.repeat(64) };
+    const agent = { provider: 'synthetic', model_parameters: { model: 'same-model', reasoning_effort: 'high' } };
+    const candidate = JSON.stringify({ version: 1, summary: 'Keep the draft private until approval.',
+      pendingAsks: [], commitments: [], corrections: [], decisions: [], durableIdentifiers: [],
+      recurrenceOutcomes: [], toolPairs: [] });
+    try {
+      for (let i = 0; i < 4; i++) await commitAcceptedMainTurn({ ...identity, logicalTurnId: `yield-source-${i}`,
+        revision: 1, conversationId: 'yield-conversation', userMessageId: `u-${i}`, assistantMessageId: `a-${i}`,
+        userText: 'Keep the draft private until approval.', assistantText: 'Approval remains pending.', origin: 'interactive' });
+      const first = await continuity.claimAcceptedMainCompaction(identity);
+      const contractKey = JSON.stringify({ constraints: first.outputContract,
+        provider: 'synthetic', model: 'same-model', effort: 'high' });
+      await continuity.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: { version: 1, sourceDigest: first.sourceDigest, contractKey,
+          semanticAttempts: 1, transportRetries: 0,
+          correction: { code: 'semantic_fidelity', candidate, reason: 'Keep the original approval boundary.' } } });
+      const checkpoint = (await persistence.read(first.domainEpochKey)).pendingCompactionRepair;
+      let start;
+      const started = new Promise(resolve => { start = resolve; });
+      const input = { ...identity, agent, trigger: 'accepted_turn' };
+      const running = ensureAcceptedMainCompaction({ ...input, executeCompactor: call => {
+        expect(call.attempt).toBe(2);
+        start();
+        return new Promise((resolve, reject) => call.signal.addEventListener('abort', () => {
+          call.reportCapacityRelease(released);
+          reject(new Error('Cancelled by the foreground owner.'));
+        }, { once: true }));
+      } });
+      await started;
+      expect(await yieldAcceptedMainCompaction(identity.ownerId)).toMatchObject({
+        status: released ? 'yielded' : 'yield_unconfirmed', capacityReleaseAcknowledged: released });
+      expect(await running).toMatchObject({ status: 'degraded', reason: 'interactive_priority', attempts: 1 });
+      expect((await running).repairPending).toBeUndefined();
+      expect(jest.getTimerCount()).toBe(0);
+      expect((await persistence.read(first.domainEpochKey)).pendingCompactionRepair)
+        .toEqual(released ? checkpoint : null);
+      if (!released) return;
+      const calls = [];
+      const next = await ensureAcceptedMainCompaction({ ...input, executeCompactor: async call => {
+        calls.push(call); call.reportCapacityRelease(true);
+        return call.stage === 'review' ? reviewApproved : candidate;
+      } });
+      expect(next).toMatchObject({ status: 'compacted', attempts: 2 });
+      expect(calls).toHaveLength(2);
+      const payload = JSON.parse(calls[0].prompt.match(
+        /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/)[1]);
+      expect(payload.priorRejection).toEqual(checkpoint.correction);
+      expect(payload.sourceDigest).toBe(first.sourceDigest);
+      expect((await persistence.read(first.domainEpochKey)).pendingCompactionRepair).toBeNull();
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      scheduling.resetMainCompactionSchedulingForTests();
+      setMainContinuityPersistenceForTests(null);
+      jest.useRealTimers();
     }
   });
 });

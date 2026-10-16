@@ -442,35 +442,12 @@ async function loadPersistedCortexFollowUp({
   }).lean();
 }
 
-/* === VIVENTIUM START === Exact source authority for occupied Voice synthesis recovery. === */
-function occupiedVoiceDeliveryEvidence(parent, rows, events) {
-  if (parent.surface !== 'voice') return { occupied: false, mixed: false };
-  const retained = (Array.isArray(rows) ? rows : []).filter(
-    (row) => !['sent', 'dropped'].includes(row.status),
-  );
-  const typedIds = new Set(
-    (Array.isArray(events) ? events : [])
-      .filter(
-        (event) => event.transition === 'failure' && event.reason === 'native_session_occupied',
-      )
-      .map((event) => event.deliveryId),
-  );
-  const count = retained.filter((row) => typedIds.has(row.deliveryId)).length;
-  return {
-    occupied: retained.length > 0 && count === retained.length,
-    mixed: count > 0 && count !== retained.length,
-  };
-}
+/* === VIVENTIUM START === Exact source authority for durable Voice synthesis recovery. === */
 async function wakeRecoveredVoiceFollowUp(input) {
   return require('./BackgroundCortexFollowUpService').publishCortexVoiceFollowUp(input);
 }
 async function resolveOwnedVoiceCortexRecovery({
-  ownerId,
-  conversationId,
-  parentMessageId,
-  parentState,
-  recoveryContext = {},
-  dependencies = {},
+  ownerId, conversationId, parentMessageId, parentState, recoveryContext = {}, dependencies = {},
 }) {
   const tasks = dependencies.hydrateVoiceTask ? dependencies : require('./VoiceTaskService');
   const calls = dependencies.getCallSession ? dependencies : require('./CallSessionService');
@@ -478,106 +455,55 @@ async function resolveOwnedVoiceCortexRecovery({
   const source = metadata?.interactionContext;
   const callSessionId = String(metadata?.callSessionId || '').trim();
   const taskId = String(metadata?.voiceTaskId || '').trim();
-  const scopeError = () =>
-    Object.assign(new Error('Cortex Voice recovery source is outside its owned scope'), {
-      code: 'cortex_voice_recovery_scope_mismatch',
-    });
-  if (
-    !callSessionId ||
-    !taskId ||
-    !source?.source_event_id ||
-    !source?.logical_turn_id ||
-    source.conversation_id !== conversationId ||
-    !Number.isSafeInteger(source.revision) ||
-    source.revision < 1 ||
-    (recoveryContext.messageRevision && Number(recoveryContext.messageRevision) !== source.revision)
-  )
-    throw scopeError();
-  if (
-    await tasks.isVoiceTaskSuppressedDurably(taskId, {
-      callSessionId,
-      userId: ownerId,
-      ...(recoveryContext.streamId ? { streamId: recoveryContext.streamId } : {}),
-    })
-  )
-    return { state: 'suppressed', callSessionId, taskId };
+  const scopeError = () => Object.assign(new Error('Cortex Voice recovery source is outside its owned scope'), {
+    code: 'cortex_voice_recovery_scope_mismatch',
+  });
+  if (!callSessionId || !taskId || !source?.source_event_id || !source?.logical_turn_id ||
+      source.conversation_id !== conversationId || !Number.isSafeInteger(source.revision) ||
+      source.revision < 1 || (recoveryContext.messageRevision &&
+      Number(recoveryContext.messageRevision) !== source.revision)) throw scopeError();
+  if (await tasks.isVoiceTaskSuppressedDurably(taskId, {
+    callSessionId, userId: ownerId, ...(recoveryContext.streamId ? { streamId: recoveryContext.streamId } : {}),
+  })) return { state: 'suppressed', callSessionId, taskId };
   const restored = await tasks.hydrateVoiceTask(taskId, { callSessionId, userId: ownerId });
-  if (
-    !restored ||
-    restored.taskId !== taskId ||
-    restored.userId !== ownerId ||
-    restored.callSessionId !== callSessionId ||
-    restored.conversationId !== conversationId ||
-    !restored.streamId
-  )
-    throw scopeError();
+  if (!restored || restored.taskId !== taskId || restored.userId !== ownerId ||
+      restored.callSessionId !== callSessionId || restored.conversationId !== conversationId ||
+      !restored.streamId) throw scopeError();
   const task = await tasks.hydrateVoiceTaskByStreamId(restored.streamId, {
-    callSessionId,
-    userId: ownerId,
-    requireDurable: true,
+    callSessionId, userId: ownerId, requireDurable: true,
   });
   const binding = tasks.getVoiceTaskTraceBinding(taskId);
-  if (
-    !task ||
-    task.taskId !== taskId ||
-    task.userId !== ownerId ||
-    task.callSessionId !== callSessionId ||
-    task.conversationId !== conversationId ||
-    !binding ||
-    binding.userId !== ownerId ||
-    binding.callSessionId !== callSessionId ||
-    binding.streamId !== restored.streamId ||
-    binding.logicalTurnId !== source.logical_turn_id ||
-    (recoveryContext.streamId && binding.streamId !== recoveryContext.streamId) ||
-    tasks.snapshotEvent(taskId)?.resultMessageId !== parentMessageId
-  )
-    throw scopeError();
+  if (!task || task.taskId !== taskId || task.userId !== ownerId ||
+      task.callSessionId !== callSessionId || task.conversationId !== conversationId ||
+      !binding || binding.userId !== ownerId || binding.callSessionId !== callSessionId ||
+      binding.streamId !== restored.streamId || binding.logicalTurnId !== source.logical_turn_id ||
+      (recoveryContext.streamId && binding.streamId !== recoveryContext.streamId) ||
+      tasks.snapshotEvent(taskId)?.resultMessageId !== parentMessageId) throw scopeError();
   // Reuse Main's existing accepted-revision barrier. A retained task cannot revive a revision
   // whose durable generator was superseded, even when its old canonical parent still exists.
-  const job = await (dependencies.getJob || GenerationJobManager.getJob.bind(GenerationJobManager))(
-    binding.streamId,
-  );
-  if (
-    job &&
-    (job.metadata?.userId !== ownerId ||
-      job.metadata?.conversationId !== conversationId ||
-      job.metadata?.responseMessageId !== parentMessageId ||
-      job.metadata?.viventiumVoiceTaskId !== taskId ||
+  const job = await (dependencies.getJob || GenerationJobManager.getJob.bind(GenerationJobManager))(binding.streamId);
+  if (job && (job.metadata?.userId !== ownerId || job.metadata?.conversationId !== conversationId ||
+      job.metadata?.responseMessageId !== parentMessageId || job.metadata?.viventiumVoiceTaskId !== taskId ||
       job.metadata?.viventiumCallSessionId !== callSessionId ||
       job.metadata?.interactionContext?.logical_turn_id !== source.logical_turn_id ||
       job.metadata?.interactionContext?.source_event_id !== source.source_event_id ||
-      job.metadata?.interactionContext?.revision !== source.revision)
-  )
-    throw scopeError();
-  if (job?.status === 'superseded')
-    return {
-      state: 'suppressed',
-      dropReason: 'conversation_moved_on',
-      callSessionId,
-      taskId,
-    };
+      job.metadata?.interactionContext?.revision !== source.revision)) throw scopeError();
+  if (job?.status === 'superseded') return {
+    state: 'suppressed', dropReason: 'conversation_moved_on', callSessionId, taskId,
+  };
   const [session, activeCall] = await Promise.all([
     calls.getCallSession(callSessionId),
     calls.getActiveCallSessionForConversation({ userId: ownerId, conversationId }),
   ]);
-  if (session && (session.userId !== ownerId || session.conversationId !== conversationId))
-    throw scopeError();
-  const live =
-    session?.status !== 'ended' &&
-    session?.mode === 'call' &&
-    activeCall?.callSessionId === callSessionId &&
-    activeCall.userId === ownerId &&
+  if (session && (session.userId !== ownerId || session.conversationId !== conversationId)) throw scopeError();
+  const live = session?.status !== 'ended' && session?.mode === 'call' &&
+    activeCall?.callSessionId === callSessionId && activeCall.userId === ownerId &&
     activeCall.conversationId === conversationId;
   // An unended original Call may reclaim its gateway lease. A temporary gap must not become
   // a permanent unavailable-Voice decision or silently transfer speech to another Call.
   const state = live ? 'live' : !session || session.status === 'ended' ? 'linked_text' : 'waiting';
-  return {
-    state,
-    callSessionId,
-    taskId,
-    streamId: binding.streamId,
-    ...(live ? { session: activeCall } : {}),
-  };
+  return { state, callSessionId, taskId, streamId: binding.streamId,
+    ...(live ? { session: activeCall } : {}) };
 }
 /* === VIVENTIUM END === */
 
@@ -594,7 +520,7 @@ async function createRecoveredCortexFollowUp({
   const { getAgent } = require('~/models/Agent');
   const {
     createCortexFollowUpMessage,
-    bindOccupiedCortexRecovery,
+    bindOwnedVoiceCortexRecovery,
   } = require('~/server/services/viventium/BackgroundCortexFollowUpService');
   const parent = await Message.findOne({
     user: ownerId,
@@ -649,25 +575,10 @@ async function createRecoveredCortexFollowUp({
       : {}),
   };
   if (surface === 'voice') {
-    const events = await cortexInsightDeliveryService.listEvents({ ownerId, parentMessageId });
-    if (!occupiedVoiceDeliveryEvidence({ surface }, deliveryBatch?.claimed, events).occupied) {
-      throw Object.assign(new Error('Cortex recovery does not own an occupied Voice source'), {
-        code: 'cortex_voice_recovery_scope_mismatch',
-      });
-    }
-    bindOccupiedCortexRecovery(req, async () =>
-      resolveOwnedVoiceCortexRecovery({
-        ownerId,
-        conversationId,
-        parentMessageId,
-        recoveryContext,
-        parentState: await loadCortexRecoveryParentState({
-          ownerId,
-          conversationId,
-          parentMessageId,
-        }),
-      }),
-    );
+    bindOwnedVoiceCortexRecovery(req, async () => resolveOwnedVoiceCortexRecovery({
+      ownerId, conversationId, parentMessageId, recoveryContext,
+      parentState: await loadCortexRecoveryParentState({ ownerId, conversationId, parentMessageId }),
+    }));
   }
   return createCortexFollowUpMessage({
     req,
@@ -1317,11 +1228,7 @@ async function recoverPendingCortexInsightDeliveries({
   };
   const deferWaitingVoiceClaim = async (parent, batch) => {
     try {
-      await deliveryService.markFailed({
-        ownerId: parent.ownerId,
-        claims: batch.claimed,
-        reason: 'presentation_failed',
-      });
+      await deliveryService.markFailed({ ownerId: parent.ownerId, claims: batch.claimed, reason: 'presentation_failed' });
     } catch (error) {
       summary.failed += 1;
       logger.warn('[staleCortexMessageRecovery] Waiting Voice claim release remains pending', {
@@ -1415,29 +1322,15 @@ async function recoverPendingCortexInsightDeliveries({
       continue;
     }
     let rows = [];
-    let occupiedVoice = false;
-    if (parent.surface === 'voice') {
+    const ownedVoiceRecovery = parent.surface === 'voice';
+    if (ownedVoiceRecovery) {
       try {
-        const [retainedRows, events] = await Promise.all([
-          deliveryService.listByParent({
-            ownerId: parent.ownerId,
-            parentMessageId: parent.parentMessageId,
-          }),
-          deliveryService.listEvents({
-            ownerId: parent.ownerId,
-            parentMessageId: parent.parentMessageId,
-          }),
-        ]);
-        rows = retainedRows;
-        const evidence = occupiedVoiceDeliveryEvidence(parent, rows, events);
-        if (evidence.mixed) {
-          // Admission/settlement require one complete batch. Never slice it, widen a typed
-          // failure to unrelated rows, or discard its retained typed contribution.
-          summary.pending += rows.filter((row) => !['sent', 'dropped'].includes(row.status)).length;
-          await deferParentClaim(parent, 'parent_state_unavailable');
-          continue;
-        }
-        occupiedVoice = evidence.occupied;
+        // Recovery follows the retained source envelope, not the cause of a previous failure.
+        // The existing authority check and complete-batch claim below remain mandatory.
+        rows = (await deliveryService.listByParent({
+          ownerId: parent.ownerId, parentMessageId: parent.parentMessageId,
+        })).filter((row) => !['sent', 'dropped'].includes(row.status));
+        if (!rows.length) continue;
       } catch (error) {
         summary.failed += 1;
         summary.pending += 1;
@@ -1447,26 +1340,18 @@ async function recoverPendingCortexInsightDeliveries({
     }
     let savedVoiceSkip = false;
     let retainedScopeError = null;
-    if (occupiedVoice) {
+    if (ownedVoiceRecovery) {
       try {
-        const authority = await resolveVoiceRecovery({
-          ...parent,
-          parentState,
-          recoveryContext: { messageRevision: rows[0]?.sourceRevision || rows[0]?.messageRevision },
-        });
-        const allSaved =
-          rows.length &&
-          rows.every((row) => row.persistenceStatus === 'persisted' && row.persistedMessageId);
+        const authority = await resolveVoiceRecovery({ ...parent, parentState,
+          recoveryContext: { messageRevision: rows[0]?.sourceRevision || rows[0]?.messageRevision } });
+        const allSaved = rows.length && rows.every((row) => row.persistenceStatus === 'persisted' && row.persistedMessageId);
         if (allSaved) {
           const ids = [...new Set(rows.map((row) => row.persistedMessageId))];
-          const saved =
-            ids.length === 1 ? await loadMessage({ ...parent, messageId: ids[0] }) : null;
-          if (!saved)
-            throw Object.assign(new Error('Cortex recovery saved child is outside its scope'), {
-              code: 'cortex_recovery_persisted_message_scope_mismatch',
-            });
-          savedVoiceSkip =
-            saved.metadata?.viventium?.deliveryDisposition?.version === 1 &&
+          const saved = ids.length === 1 ? await loadMessage({ ...parent, messageId: ids[0] }) : null;
+          if (!saved) throw Object.assign(new Error('Cortex recovery saved child is outside its scope'), {
+            code: 'cortex_recovery_persisted_message_scope_mismatch',
+          });
+          savedVoiceSkip = saved.metadata?.viventium?.deliveryDisposition?.version === 1 &&
             saved.metadata.viventium.deliveryDisposition.audio === 'skip';
         }
         if (authority.state === 'waiting' && !savedVoiceSkip) {
@@ -1478,14 +1363,9 @@ async function recoverPendingCortexInsightDeliveries({
           // The retained publication/receiver owns this saved child. Never steal its claim,
           // invalidate an audio lease, or spend another synthesis attempt on a restart tick.
           try {
-            await wakeVoiceFollowUp({
-              ownerId: parent.ownerId,
-              callSessionId: authority.callSessionId,
-              voiceTaskId: authority.taskId,
-              conversationId: parent.conversationId,
-              parentMessageId: parent.parentMessageId,
-              messageId: rows[0].persistedMessageId,
-            });
+            await wakeVoiceFollowUp({ ownerId: parent.ownerId, callSessionId: authority.callSessionId,
+              voiceTaskId: authority.taskId, conversationId: parent.conversationId,
+              parentMessageId: parent.parentMessageId, messageId: rows[0].persistedMessageId });
           } catch (error) {
             summary.failed += 1;
           }
@@ -1494,12 +1374,8 @@ async function recoverPendingCortexInsightDeliveries({
           continue;
         }
       } catch (error) {
-        if (
-          [
-            'cortex_voice_recovery_scope_mismatch',
-            'cortex_recovery_persisted_message_scope_mismatch',
-          ].includes(error?.code)
-        ) {
+        if (['cortex_voice_recovery_scope_mismatch',
+          'cortex_recovery_persisted_message_scope_mismatch'].includes(error?.code)) {
           // Permanent authority conflicts use the existing claimed-attempt ceiling below.
           retainedScopeError = error;
         } else {
@@ -1542,8 +1418,7 @@ async function recoverPendingCortexInsightDeliveries({
       ...new Set(batch.claimed.flatMap((row) => row.requiredSurfaces || [])),
     ];
     const unsupportedSurfaces = requiredSurfaces.filter(
-      (surface) =>
-        !RECOVERY_PRESENTATION_SURFACES.has(surface) && !(occupiedVoice && surface === 'voice'),
+      (surface) => !RECOVERY_PRESENTATION_SURFACES.has(surface) && !(ownedVoiceRecovery && surface === 'voice'),
     );
     if (requiredSurfaces.length === 0 || unsupportedSurfaces.length > 0) {
       try {
@@ -1571,18 +1446,15 @@ async function recoverPendingCortexInsightDeliveries({
     try {
       if (retainedScopeError) throw retainedScopeError;
       let voiceRecovery = null;
-      if (occupiedVoice) {
+      if (ownedVoiceRecovery) {
         voiceRecovery = await resolveVoiceRecovery({ ...parent, parentState, recoveryContext });
         if (voiceRecovery.state === 'waiting' && !savedVoiceSkip) {
           await deferWaitingVoiceClaim(parent, batch);
           continue;
         }
         if (voiceRecovery.state === 'suppressed') {
-          const dropped = await deliveryService.markDropped({
-            ownerId: parent.ownerId,
-            claims: batch.claimed,
-            dropReason: voiceRecovery.dropReason || 'voice_task_suppressed',
-          });
+          const dropped = await deliveryService.markDropped({ ownerId: parent.ownerId,
+            claims: batch.claimed, dropReason: voiceRecovery.dropReason || 'voice_task_suppressed' });
           requireExactCortexInsightDeliverySettlement(batch.claimed, dropped);
           summary.dropped += dropped.filter((row) => row.status === 'dropped').length;
           continue;
@@ -1614,24 +1486,11 @@ async function recoverPendingCortexInsightDeliveries({
           recoveryContext,
         });
       }
-      if (!message?.messageId && occupiedVoice) {
-        const rows = await deliveryService.listByParent({
-          ownerId: parent.ownerId,
-          parentMessageId: parent.parentMessageId,
-        });
-        const terminal = rows.filter((row) =>
-          batch.claimed.some((claim) => claim.deliveryId === row.deliveryId),
-        );
-        if (
-          terminal.length === batch.claimed.length &&
-          terminal.every(
-            (row) =>
-              row.status === 'dropped' &&
-              ['semantic_suppression', 'conversation_moved_on', 'voice_task_suppressed'].includes(
-                row.dropReason,
-              ),
-          )
-        ) {
+      if (!message?.messageId && ownedVoiceRecovery) {
+        const rows = await deliveryService.listByParent({ ownerId: parent.ownerId, parentMessageId: parent.parentMessageId });
+        const terminal = rows.filter((row) => batch.claimed.some((claim) => claim.deliveryId === row.deliveryId));
+        if (terminal.length === batch.claimed.length && terminal.every((row) => row.status === 'dropped' &&
+            ['semantic_suppression', 'conversation_moved_on', 'voice_task_suppressed'].includes(row.dropReason))) {
           // The existing author already settled its exact NTA/Stop decision. Do not reinterpret
           // valid intentional silence as failed persistence or consume another attempt.
           summary.dropped += terminal.length;
@@ -1666,31 +1525,19 @@ async function recoverPendingCortexInsightDeliveries({
       });
       requireExactCortexInsightDeliverySettlement(batch.claimed, persisted);
       summary.persisted += persisted.length;
-      if (occupiedVoice) {
+      if (ownedVoiceRecovery) {
         // Recheck End/Stop after the existing author/persistence guards. Saving text is never
         // a receiver confirmation; an eligible live child stays owned by Voice prepare/confirm.
-        voiceRecovery = await resolveVoiceRecovery({
-          ...parent,
-          parentState: await loadParentState(parent),
-          recoveryContext,
-        });
-        const modelSkip =
-          message.metadata?.viventium?.deliveryDisposition?.version === 1 &&
+        voiceRecovery = await resolveVoiceRecovery({ ...parent,
+          parentState: await loadParentState(parent), recoveryContext });
+        const modelSkip = message.metadata?.viventium?.deliveryDisposition?.version === 1 &&
           message.metadata.viventium.deliveryDisposition.audio === 'skip';
-        const reason =
-          voiceRecovery.state === 'suppressed'
-            ? voiceRecovery.dropReason || 'voice_task_suppressed'
-            : voiceRecovery.state === 'linked_text'
-              ? 'unsupported_surface'
-              : modelSkip
-                ? 'semantic_suppression'
-                : '';
+        const reason = voiceRecovery.state === 'suppressed' ? voiceRecovery.dropReason || 'voice_task_suppressed' :
+          voiceRecovery.state === 'linked_text' ? 'unsupported_surface' :
+          modelSkip ? 'semantic_suppression' : '';
         if (reason) {
-          const dropped = await deliveryService.markDropped({
-            ownerId: parent.ownerId,
-            claims: batch.claimed,
-            dropReason: reason,
-          });
+          const dropped = await deliveryService.markDropped({ ownerId: parent.ownerId,
+            claims: batch.claimed, dropReason: reason });
           requireExactCortexInsightDeliverySettlement(batch.claimed, dropped);
           summary.dropped += dropped.filter((row) => row.status === 'dropped').length;
         } else summary.pending += persisted.length;
@@ -1782,7 +1629,7 @@ async function recoverPendingCortexInsightDeliveries({
       requireExactCortexInsightDeliverySettlement(batch.claimed, finalized);
       summary.sent += finalized.filter((row) => row.status === 'sent').length;
     } catch (error) {
-      if (occupiedVoice && error?.code === 'cortex_voice_recovery_authority_pending') {
+      if (ownedVoiceRecovery && error?.code === 'cortex_voice_recovery_authority_pending') {
         await deferWaitingVoiceClaim(parent, batch);
         continue;
       }

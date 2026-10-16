@@ -251,6 +251,7 @@ export function createGlassHiveMainDelegationTool(
       name: DELEGATION_TOOL_NAME,
       description: MAIN_DELEGATION_DESCRIPTION,
       schema,
+      metadata: { toolType: 'builtin' },
     },
   );
 }
@@ -278,7 +279,9 @@ export function glassHiveMainOrchestrationDefinitions(
       parameters: ACTIVE_WORK_ACTION_JSON_SCHEMA,
       allowed_callers: ['direct'],
     },
-  ].filter((definition) => requested.has(definition.name));
+  ]
+    .filter((definition) => requested.has(definition.name))
+    .map((definition) => ({ ...definition, toolType: 'builtin' }));
 }
 
 /** Reconcile the Core facade after an underlying definition reload. */

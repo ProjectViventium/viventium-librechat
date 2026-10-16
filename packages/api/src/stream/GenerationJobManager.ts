@@ -92,6 +92,7 @@ export interface DurableEffectReceiptInput {
   responseMessageId: string;
   effectKind: 'durable_work_accepted' | 'durable_work_action_accepted';
   effectRef: string;
+  confirmationPending?: boolean;
 }
 
 function normalizeCortexPresentationReceipt(
@@ -182,54 +183,23 @@ function cortexPresentationMatchesReceipt(
   );
 }
 
-export const DURABLE_WORK_ACCEPTED_TEXT =
-  'Background work started. Open Active Work to view or steer it.';
-export const DURABLE_WORK_ACTION_ACCEPTED_TEXT =
-  'Background work updated. Open Active Work to view or steer it.';
-
-function durableEffectReceiptText(
-  receipt: SerializableJobData['durableEffectReceipt'] | undefined,
-): string {
-  return receipt?.effect_kind === 'durable_work_action_accepted'
-    ? DURABLE_WORK_ACTION_ACCEPTED_TEXT
-    : DURABLE_WORK_ACCEPTED_TEXT;
-}
-
+/* === VIVENTIUM START ===
+ * A committed effect survives supersession; its receipt is control data, not another speaker.
+ * Existing adapters close/retract a superseded response and let the current Main own the reply.
+ */
 function buildDurableWorkReceiptFinalEvent(
   job: SerializableJobData,
-  responseMessageId: string,
   receipt = job.durableEffectReceipt,
 ): t.ServerSentEvent {
-  const receiptText = durableEffectReceiptText(receipt);
   return {
     final: true,
-    conversation: { conversationId: job.conversationId },
-    title: 'New Chat',
-    requestMessage: job.userMessage
-      ? {
-          ...job.userMessage,
-          conversationId: job.conversationId,
-          isCreatedByUser: true,
-        }
-      : null,
-    responseMessage: {
-      messageId: responseMessageId,
-      parentMessageId: job.userMessage?.messageId,
-      conversationId: job.conversationId,
-      text: receiptText,
-      content: [
-        {
-          type: 'text',
-          text: { value: receiptText },
-        },
-      ],
-      sender: job.sender ?? 'AI',
-      unfinished: true,
-      error: false,
-      isCreatedByUser: false,
-    },
+    superseded: true,
+    logical_turn_id: job.interactionContext?.logical_turn_id,
+    revision: job.interactionContext?.revision,
+    durableEffectReceipt: { effect_ref: receipt?.effect_ref },
   } as unknown as t.ServerSentEvent;
 }
+/* === VIVENTIUM END === */
 
 function parseStoredFinalEvent(job: SerializableJobData): Record<string, unknown> | null {
   if (!job.finalEvent) {
@@ -246,9 +216,14 @@ function parseStoredFinalEvent(job: SerializableJobData): Record<string, unknown
 
 function hasDurableWorkReceiptFinalEvent(job: SerializableJobData): boolean {
   const finalEvent = parseStoredFinalEvent(job);
-  const responseMessage = finalEvent?.responseMessage as Record<string, unknown> | undefined;
-  return [DURABLE_WORK_ACCEPTED_TEXT, DURABLE_WORK_ACTION_ACCEPTED_TEXT].includes(
-    String(responseMessage?.text || ''),
+  const receipt = finalEvent?.durableEffectReceipt as { effect_ref?: string } | undefined;
+  return Boolean(
+    job.durableEffectReceipt &&
+    finalEvent?.final === true &&
+    finalEvent?.superseded === true &&
+    finalEvent?.logical_turn_id === job.interactionContext?.logical_turn_id &&
+    finalEvent?.revision === job.interactionContext?.revision &&
+    receipt?.effect_ref === job.durableEffectReceipt.effect_ref,
   );
 }
 
@@ -1757,6 +1732,7 @@ class GenerationJobManagerClass {
       ({
         effect_kind: input.effectKind,
         effect_ref: effectRef,
+        ...(input.confirmationPending === true ? { confirmation_pending: true } : {}),
         source_event_id: sourceEventId,
         response_message_id: responseMessageId,
         committed_at: Date.now(),
@@ -1768,7 +1744,7 @@ class GenerationJobManagerClass {
      *          that can close a superseded response; web and scheduler retain their normal authoring.
      */
     const receiptFinalEvent = canPresentDurableReceipt
-      ? buildDurableWorkReceiptFinalEvent(job, responseMessageId, committedReceipt)
+      ? buildDurableWorkReceiptFinalEvent(job, committedReceipt)
       : null;
     /* === VIVENTIUM END === */
     await this.runLifecycleOperation(
@@ -2638,7 +2614,10 @@ class GenerationJobManagerClass {
     let finalEvent: t.ServerSentEvent | undefined;
     if (jobData.finalEvent) {
       try {
-        finalEvent = JSON.parse(jobData.finalEvent) as t.ServerSentEvent;
+        finalEvent =
+          jobData.status === 'superseded' && jobData.durableEffectReceipt
+            ? buildDurableWorkReceiptFinalEvent(jobData)
+            : (JSON.parse(jobData.finalEvent) as t.ServerSentEvent);
       } catch {
         // Ignore malformed persisted terminal data; the durable status still controls replay.
       }
@@ -2874,7 +2853,7 @@ class GenerationJobManagerClass {
     const stopsAuthoring = jobData.adapterCapabilities?.supersede_scope !== 'response_only';
     const durableReceipt = jobData.durableEffectReceipt;
     const presentationEvent = durableReceipt
-      ? buildDurableWorkReceiptFinalEvent(jobData, durableReceipt.response_message_id)
+      ? buildDurableWorkReceiptFinalEvent(jobData)
       : terminalEvent;
     const waitsForDurableEffectDecision =
       !stopsAuthoring && jobData.status === 'running' && !durableReceipt;
@@ -2909,10 +2888,7 @@ class GenerationJobManagerClass {
           supersededReceipt &&
           !hasDurableWorkReceiptFinalEvent(supersededJob)
         ) {
-          const receiptEvent = buildDurableWorkReceiptFinalEvent(
-            supersededJob,
-            supersededReceipt.response_message_id,
-          );
+          const receiptEvent = buildDurableWorkReceiptFinalEvent(supersededJob);
           if (runtime) {
             runtime.finalEvent = receiptEvent;
           }
@@ -3011,7 +2987,7 @@ class GenerationJobManagerClass {
 
   /**
    * Resolve the response-only window once stale authoring reaches a real terminal boundary. The
-   * newer turn suppresses prose, but an exact durable-work receipt still wins presentation.
+   * newer turn suppresses prose; an exact durable-work receipt remains internal control data.
    */
   private async finishResponseOnlySupersededJob(
     streamId: string,
@@ -3033,7 +3009,7 @@ class GenerationJobManagerClass {
     }
     const receipt = job.durableEffectReceipt;
     const finalEvent = receipt
-      ? buildDurableWorkReceiptFinalEvent(job, receipt.response_message_id)
+      ? buildDurableWorkReceiptFinalEvent(job)
       : ({
           final: true,
           superseded: true,
@@ -4568,7 +4544,10 @@ class GenerationJobManagerClass {
     const aggregatedContent = result?.content ?? [];
     const runSteps = await services.jobStore.getRunSteps(streamId);
     this.assertServiceGeneration(services.generation);
-    const finalEvent = parseStoredFinalEvent(jobData);
+    const finalEvent =
+      jobData.status === 'superseded' && jobData.durableEffectReceipt
+        ? buildDurableWorkReceiptFinalEvent(jobData)
+        : parseStoredFinalEvent(jobData);
 
     logger.debug(`[GenerationJobManager] getResumeState ${streamLogRef(streamId)}`, {
       runStepsLength: runSteps.length,
@@ -4684,10 +4663,7 @@ class GenerationJobManagerClass {
       ) {
         const terminalAlreadyPresented = hasResponseOnlySupersededFinalEvent(persisted);
         const finalEvent = persisted.durableEffectReceipt
-          ? buildDurableWorkReceiptFinalEvent(
-              persisted,
-              persisted.durableEffectReceipt.response_message_id,
-            )
+          ? buildDurableWorkReceiptFinalEvent(persisted)
           : ({
               final: true,
               superseded: true,

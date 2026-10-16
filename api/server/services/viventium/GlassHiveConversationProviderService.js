@@ -8,6 +8,9 @@ const { configuredBackgroundWorkerRoute } = require('@librechat/api');
 
 const { Constants, extractEnvVariable } = require('librechat-data-provider');
 const crypto = require('crypto');
+/* === VIVENTIUM START === Passive current-attempt capability timing. === */
+const { voiceLatencyNow, logVoiceLatencyNumericStage } = require('./voiceLatencyTiming');
+/* === VIVENTIUM END === */
 const {
   transcriptionAttachmentReferences,
   resolveSelectedHistoryAttachments,
@@ -48,6 +51,7 @@ const HARNESS_CANCELLATION_ABORT_REASONS = new Set([
   'user_cancelled',
   'superseded',
   'maintenance_yield',
+  'compaction_lease_lost',
   CORTEX_ATTEMPT_DEADLINE_REASON,
 ]);
 /* === VIVENTIUM START ===
@@ -57,6 +61,7 @@ const HARNESS_CANCELLATION_ABORT_REASONS = new Set([
 const CORTEX_ATTEMPT_RELEASE_REASON = 'cortex_attempt_release';
 const HARNESS_RELEASE_REASONS = new Set([
   'maintenance_yield',
+  'compaction_lease_lost',
   CORTEX_ATTEMPT_DEADLINE_REASON,
   CORTEX_ATTEMPT_RELEASE_REASON,
 ]);
@@ -68,12 +73,7 @@ const restrictedVoiceCancellationRoutes = Symbol('restrictedVoiceCancellationRou
  * authority, executable keys and agent configs remain subject to the destructive sanitizer.
  */
 async function prepareRestrictedVoiceCancellation({
-  req,
-  signal,
-  endpointConfig,
-  providerId,
-  fallback = false,
-  activate = true,
+  req, signal, endpointConfig, providerId, fallback = false, activate = true,
 }) {
   if (!isVoiceActorSideEffectRestricted(req)) return false;
   const session = req.viventiumCallSession;
@@ -85,118 +85,66 @@ async function prepareRestrictedVoiceCancellation({
     const { GenerationJobManager } = require('@librechat/api');
     const streamId = String(req._resumableStreamId || '').trim();
     const capability = resolveConversationProviderCapability(req, String(providerId || ''));
-    const job = streamId && (await GenerationJobManager.getJob(streamId));
+    const job = streamId && await GenerationJobManager.getJob(streamId);
     const jobCreatedAt = job?.createdAt;
     const conversationId = String(job?.metadata?.conversationId || '').trim();
-    const ownsJob = (current) =>
-      current?.createdAt === jobCreatedAt &&
+    const ownsJob = (current) => current?.createdAt === jobCreatedAt &&
       current?.metadata?.userId === ownerId &&
       current?.metadata?.conversationId === conversationId &&
-      !current?.metadata?.viventiumCallSessionId &&
-      !current?.metadata?.viventiumVoiceTaskId &&
+      !current?.metadata?.viventiumCallSessionId && !current?.metadata?.viventiumVoiceTaskId &&
       current?.metadata?.interactionContext?.actor_kind === 'external_user' &&
       current?.metadata?.interactionContext?.origin === 'interactive' &&
       current?.abortController?.signal === signal;
-    if (
-      !ownerId ||
-      !conversationId ||
-      !signal ||
-      !job ||
-      job.status !== 'running' ||
-      !ownsJob(job) ||
-      (req.body?.conversationId && req.body.conversationId !== conversationId) ||
-      capability?.conversation_session !== true ||
-      capability?.workspace_binding !== true
-    )
-      return false;
+    if (!ownerId || !conversationId || !signal || !job || job.status !== 'running' ||
+        !ownsJob(job) || (req.body?.conversationId && req.body.conversationId !== conversationId) ||
+        capability?.conversation_session !== true || capability?.workspace_binding !== true) return false;
     let responseId = '';
     const currentScope = async () => {
       const current = await GenerationJobManager.getJob(streamId);
-      if (
-        String(req.user?.id || '') !== ownerId ||
-        req._resumableStreamId !== streamId ||
-        !ownsJob(current) ||
-        ['complete', 'error', 'superseded'].includes(current.status)
-      )
-        return null;
+      if (String(req.user?.id || '') !== ownerId || req._resumableStreamId !== streamId ||
+          !ownsJob(current) || ['complete', 'error', 'superseded'].includes(current.status)) return null;
       const key = String(current.metadata?.responseMessageId || '').trim();
       if (!key || (responseId && key !== responseId)) return null;
       responseId = key;
       return { responseId };
     };
     const routes = req[restrictedVoiceCancellationRoutes] || {};
-    if (!req[restrictedVoiceCancellationRoutes])
-      Object.defineProperty(req, restrictedVoiceCancellationRoutes, {
-        value: routes,
-        enumerable: false,
-      });
-    routes[fallback ? 'fallback' : 'primary'] = Object.freeze({
-      native: true,
-      chat: true,
-      bindingKey: Symbol('restrictedChatCancellationBinding'),
-      request: req,
-      signal,
-      endpointConfig: Object.freeze({
-        baseURL: endpointConfig?.baseURL,
-        apiKey: endpointConfig?.apiKey,
-      }),
-      ownerId,
-      streamId,
-      currentScope,
+    if (!req[restrictedVoiceCancellationRoutes]) Object.defineProperty(req, restrictedVoiceCancellationRoutes, {
+      value: routes, enumerable: false,
     });
+    routes[fallback ? 'fallback' : 'primary'] = Object.freeze({ native: true, chat: true,
+      bindingKey: Symbol('restrictedChatCancellationBinding'), request: req, signal,
+      endpointConfig: Object.freeze({ baseURL: endpointConfig?.baseURL, apiKey: endpointConfig?.apiKey }),
+      ownerId, streamId, currentScope });
     return activate ? bindHarnessCancellation({ req, signal }) : true;
   }
-  if (
-    req.body?.voiceMode !== true ||
-    !ownerId ||
-    !callSessionId ||
-    String(session?.userId || '') !== ownerId
-  )
-    return false;
+  if (req.body?.voiceMode !== true || !ownerId || !callSessionId || String(session?.userId || '') !== ownerId) return false;
   const tasks = require('./VoiceTaskService');
-  const task = tasks
-    .listVoiceTasks({ userId: ownerId, callSessionId })
+  const task = tasks.listVoiceTasks({ userId: ownerId, callSessionId })
     .find((item) => item.taskId === req.body.viventiumVoiceTaskId);
   const streamId = String(req._resumableStreamId || '').trim();
-  if (
-    !task ||
-    task.streamId !== streamId ||
-    task.owner?.id !== streamId ||
-    !['generation_job', 'remote_generation'].includes(task.owner?.kind)
-  )
-    return false;
+  if (!task || task.streamId !== streamId || task.owner?.id !== streamId ||
+      !['generation_job', 'remote_generation'].includes(task.owner?.kind)) return false;
   const capability = resolveConversationProviderCapability(req, String(providerId || ''));
-  const native =
-    capability?.conversation_session === true && capability?.workspace_binding === true;
+  const native = capability?.conversation_session === true && capability?.workspace_binding === true;
   const role = fallback ? 'fallback' : 'primary';
   const routes = req[restrictedVoiceCancellationRoutes] || {};
-  if (!req[restrictedVoiceCancellationRoutes])
-    Object.defineProperty(req, restrictedVoiceCancellationRoutes, {
-      value: routes,
-      enumerable: false,
-    });
+  if (!req[restrictedVoiceCancellationRoutes]) Object.defineProperty(req, restrictedVoiceCancellationRoutes, {
+    value: routes, enumerable: false,
+  });
   if (!native) {
-    routes[role] = Object.freeze({
-      native: false,
-      ownerId,
-      callSessionId,
-      taskId: task.taskId,
-      streamId,
-    });
+    routes[role] = Object.freeze({ native: false, ownerId, callSessionId,
+      taskId: task.taskId, streamId });
     return activate ? bindHarnessCancellation({ req, signal }) : false;
   }
   // A missing transport or late response identity must never become a local-only confirmation.
-  if (activate)
-    tasks.setVoiceTaskOwnerCapabilities(task.taskId, {
-      kind: 'remote_generation',
-      ownerId: streamId,
-      cancellationConfirmable: false,
-    });
+  if (activate) tasks.setVoiceTaskOwnerCapabilities(task.taskId, {
+    kind: 'remote_generation', ownerId: streamId, cancellationConfirmable: false,
+  });
   const { GenerationJobManager } = require('@librechat/api');
   const job = await GenerationJobManager.getJob(streamId);
   const jobCreatedAt = job?.createdAt;
-  const ownsJob = (current) =>
-    current?.createdAt === jobCreatedAt &&
+  const ownsJob = (current) => current?.createdAt === jobCreatedAt &&
     current?.metadata?.userId === ownerId &&
     current?.metadata?.viventiumCallSessionId === callSessionId &&
     current?.metadata?.viventiumVoiceTaskId === task.taskId;
@@ -205,9 +153,7 @@ async function prepareRestrictedVoiceCancellation({
   let stopCompletion;
   const beginStop = () => {
     let settle;
-    stopCompletion = new Promise((resolve) => {
-      settle = resolve;
-    });
+    stopCompletion = new Promise((resolve) => { settle = resolve; });
     return settle;
   };
   const currentScope = async () => {
@@ -215,21 +161,15 @@ async function prepareRestrictedVoiceCancellation({
     // that server result before the listener reads the store; failed Stop remains closed.
     const stopped = stopCompletion ? await stopCompletion : null;
     if (stopCompletion && stopped?.success !== true) return null;
-    const current = tasks
-      .listVoiceTasks({ userId: ownerId, callSessionId })
+    const current = tasks.listVoiceTasks({ userId: ownerId, callSessionId })
       .find((item) => item.taskId === task.taskId);
-    if (
-      current?.createdAt !== task.createdAt ||
-      current?.streamId !== streamId ||
-      current?.owner?.id !== streamId ||
-      !['generation_job', 'remote_generation'].includes(current?.owner?.kind) ||
-      ['completed', 'failed'].includes(current?.state)
-    )
-      return null;
+    if (current?.createdAt !== task.createdAt || current?.streamId !== streamId ||
+        current?.owner?.id !== streamId ||
+        !['generation_job', 'remote_generation'].includes(current?.owner?.kind) ||
+        ['completed', 'failed'].includes(current?.state)) return null;
     const call = await require('./CallSessionService').getCallSession(callSessionId);
     // Hangup ends presentation, not the owner's authority to Stop this exact accepted reply.
-    if (call?.callSessionId !== callSessionId || String(call?.userId || '') !== ownerId)
-      return null;
+    if (call?.callSessionId !== callSessionId || String(call?.userId || '') !== ownerId) return null;
     const currentJob = await GenerationJobManager.getJob(streamId);
     let key;
     if (currentJob) {
@@ -237,39 +177,21 @@ async function prepareRestrictedVoiceCancellation({
       key = String(currentJob.metadata?.responseMessageId || '').trim();
     } else {
       const retired = stopped?.jobData;
-      if (
-        !retired ||
-        !signal.aborted ||
-        signal.reason !== 'user_cancelled' ||
-        retired.createdAt !== jobCreatedAt ||
-        retired.streamId !== streamId ||
-        retired.userId !== ownerId ||
-        retired.viventiumCallSessionId !== callSessionId ||
-        retired.viventiumVoiceTaskId !== task.taskId ||
-        !responseId ||
-        retired.responseMessageId !== responseId
-      )
-        return null;
+      if (!retired || !signal.aborted || signal.reason !== 'user_cancelled' ||
+          retired.createdAt !== jobCreatedAt || retired.streamId !== streamId ||
+          retired.userId !== ownerId || retired.viventiumCallSessionId !== callSessionId ||
+          retired.viventiumVoiceTaskId !== task.taskId || !responseId ||
+          retired.responseMessageId !== responseId) return null;
       key = responseId;
     }
     if (responseId && key !== responseId) return null;
     if (key) responseId = key;
     return { task: current, responseId };
   };
-  routes[role] = Object.freeze({
-    native: true,
-    bindingKey: Symbol('restrictedVoiceCancellationBinding'),
+  routes[role] = Object.freeze({ native: true, bindingKey: Symbol('restrictedVoiceCancellationBinding'),
     endpointConfig: Object.freeze({
-      baseURL: endpointConfig?.baseURL,
-      apiKey: endpointConfig?.apiKey,
-    }),
-    ownerId,
-    callSessionId,
-    taskId: task.taskId,
-    streamId,
-    currentScope,
-    beginStop,
-  });
+    baseURL: endpointConfig?.baseURL, apiKey: endpointConfig?.apiKey,
+  }), ownerId, callSessionId, taskId: task.taskId, streamId, currentScope, beginStop });
   return activate ? bindHarnessCancellation({ req, signal }) : true;
 }
 /* === VIVENTIUM END === */
@@ -351,12 +273,8 @@ async function deliverHarnessCancellation({
       responseTimeoutS =
         Number.isFinite(reportedTimeoutS) && reportedTimeoutS > 0 ? reportedTimeoutS : null;
       if (body?.capacityReleased === true) {
-        return {
-          acknowledged: true,
-          capacityReleased: true,
-          responseTimeoutS,
-          ...(includeRequestState ? { state: body?.state } : {}),
-        };
+        return { acknowledged: true, capacityReleased: true, responseTimeoutS,
+          ...(includeRequestState ? { state: body?.state } : {}) };
       }
       capacityReleasePending = true;
     }
@@ -478,27 +396,16 @@ function signBootstrapBundle(encodedBundle, issuedAt) {
     .digest('hex')}`;
 }
 
-function restrictedConversationProviderBootstrapHeaders({
-  privateStructuredResponse = false,
-} = {}) {
+function restrictedConversationProviderBootstrapHeaders({ privateStructuredResponse = false } = {}) {
   if (typeof privateStructuredResponse !== 'boolean') {
     throw new TypeError('privateStructuredResponse must be a boolean');
   }
   const encodedBundle = Buffer.from(
-    JSON.stringify({
-      provider_capabilities: {
-        native_tools: false,
-        ...(privateStructuredResponse
-          ? {
-              response_contract: {
-                version: 1,
-                visibility: 'private_machine_state',
-                format: 'json_object',
-              },
-            }
-          : {}),
-      },
-    }),
+    JSON.stringify({ provider_capabilities: { native_tools: false,
+      ...(privateStructuredResponse ? { response_contract: {
+        version: 1, visibility: 'private_machine_state', format: 'json_object',
+      } } : {}),
+    } }),
     'utf8',
   ).toString('base64');
   const issuedAt = String(Math.floor(Date.now() / 1000));
@@ -598,30 +505,28 @@ function conversationProviderUsesInvocationLocalTime(req, agentOrProvider) {
 }
 
 /** Select the declared native body courier; header-only and mixed attempts keep legacy bounds. */
-function conversationProviderUsesNativeBody(
-  req,
-  agent,
-  { alternates = [], requireTransport = false } = {},
-) {
+function conversationProviderUsesNativeBody(req, agent, { alternates = [], requireTransport = false } = {}) {
   const routes = [agent, ...alternates].filter(Boolean);
-  if (
-    !routes.length ||
-    routes.some((route) => {
-      const capability = resolveConversationProviderCapability(req, route);
-      return (
-        capability?.context_protocol !== 'main_context_v1' ||
-        capability?.native_session_authority !== 'stable_authority_v1' ||
-        capability?.time_context_delivery !== 'per_turn_header' ||
-        capability?.usage_accounting_scope !== 'visible_message_local' ||
-        capability?.workspace_binding !== true
-      );
-    })
-  )
-    return false;
+  if (!routes.length || routes.some((route) => {
+    const capability = resolveConversationProviderCapability(req, route);
+    return capability?.context_protocol !== 'main_context_v1' ||
+      capability?.native_session_authority !== 'stable_authority_v1' ||
+      capability?.time_context_delivery !== 'per_turn_header' ||
+      capability?.usage_accounting_scope !== 'visible_message_local' ||
+      capability?.workspace_binding !== true;
+  })) return false;
   if (!requireTransport) return true;
   return routes.every((route) =>
-    Boolean(route?.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']),
-  );
+    Boolean(route?.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']));
+}
+
+/** Same selected-file read for early admission sizing and the signed invocation projection. */
+function resolveConversationProviderHistoryAttachments(req, requestBody = req?.body) {
+  const body = projectTrustedClientPresentation(requestBody, req);
+  return resolveSelectedHistoryAttachments({
+    userId: String(req?.user?.id || req?.user?._id || ''),
+    conversationId: body?.conversationId, parentMessageId: body?.parentMessageId,
+  }, { getMessages, getFiles }, undefined, req);
 }
 
 function conversationProviderUsesLocalVisibleAccounting(req, agentOrProvider) {
@@ -803,37 +708,24 @@ function bindHarnessCancellation({
       ]
     : null;
   if (restricted && !readOnlyRoute) {
-    if (!req._viventiumCortexToolEvidence && req?.[restrictedVoiceCancellationRoutes])
-      req[restrictedVoiceCancellationRoutes].active = null;
+    if (!req._viventiumCortexToolEvidence && req?.[restrictedVoiceCancellationRoutes]) req[restrictedVoiceCancellationRoutes].active = null;
     return false;
   }
-  if (
-    readOnlyRoute?.chat &&
-    (readOnlyRoute.request !== req ||
-      readOnlyRoute.signal !== signal ||
+  if (readOnlyRoute?.chat && (readOnlyRoute.request !== req || readOnlyRoute.signal !== signal ||
       readOnlyRoute.ownerId !== String(req.user?.id || '') ||
-      readOnlyRoute.streamId !== req._resumableStreamId)
-  )
-    return false;
-  if (
-    readOnlyRoute &&
-    !readOnlyRoute.chat &&
-    (readOnlyRoute.ownerId !== String(req.user?.id || '') ||
+      readOnlyRoute.streamId !== req._resumableStreamId)) return false;
+  if (readOnlyRoute && !readOnlyRoute.chat && (readOnlyRoute.ownerId !== String(req.user?.id || '') ||
       readOnlyRoute.callSessionId !== req.viventiumCallSession?.callSessionId ||
       readOnlyRoute.ownerId !== String(req.viventiumCallSession?.userId || '') ||
       readOnlyRoute.taskId !== req.body?.viventiumVoiceTaskId ||
-      readOnlyRoute.streamId !== req._resumableStreamId)
-  )
-    return false;
+      readOnlyRoute.streamId !== req._resumableStreamId)) return false;
   if (readOnlyRoute?.native === false) {
     if (req._viventiumCortexToolEvidence) return false;
     const tasks = require('./VoiceTaskService');
     if (tasks.isVoiceTaskSuppressed(readOnlyRoute.taskId)) return false;
     req[restrictedVoiceCancellationRoutes].active = null;
     const directTask = tasks.setVoiceTaskOwnerCapabilities(readOnlyRoute.taskId, {
-      kind: 'generation_job',
-      ownerId: readOnlyRoute.streamId,
-      cancellationConfirmable: true,
+      kind: 'generation_job', ownerId: readOnlyRoute.streamId, cancellationConfirmable: true,
     });
     if (directTask?.owner?.kind === 'generation_job') {
       tasks.registerVoiceTaskOwnerAdapter(readOnlyRoute.taskId, { kind: 'generation_job' });
@@ -846,10 +738,7 @@ function bindHarnessCancellation({
       req._viventiumHarnessIdempotencyKeys.size > 0) ||
     (Array.isArray(req?._viventiumHarnessIdempotencyKeys) &&
       req._viventiumHarnessIdempotencyKeys.length > 0);
-  if (
-    (!readOnlyRoute && req?._viventiumHarnessExecutionEnabled !== true && !hasGraphHarnessKeys) ||
-    !signal
-  ) {
+  if ((!readOnlyRoute && req?._viventiumHarnessExecutionEnabled !== true && !hasGraphHarnessKeys) || !signal) {
     return false;
   }
   const cancelBaseURL = extractEnvVariable(endpointConfig?.baseURL || '').replace(/\/$/, '');
@@ -878,32 +767,17 @@ function bindHarnessCancellation({
         workAuthorityOwn: Object.prototype.hasOwnProperty.call(req, 'viventiumVoiceWorkAuthority'),
         cortexAttempt: Boolean(req._viventiumCortexToolEvidence),
         signalAborted: signal.aborted,
-        signalAbortReason: !signal.aborted
-          ? null
-          : HARNESS_CANCELLATION_ABORT_REASONS.has(signal.reason) ||
-              HARNESS_RELEASE_REASONS.has(signal.reason)
-            ? signal.reason
-            : 'other',
+        signalAbortReason: !signal.aborted ? null :
+          HARNESS_CANCELLATION_ABORT_REASONS.has(signal.reason) ||
+          HARNESS_RELEASE_REASONS.has(signal.reason) ? signal.reason : 'other',
         activeBinding: req._viventiumHarnessCancellationActiveBaseURL === cancelBaseURL,
-        boundListener:
-          req._viventiumHarnessCancellationBoundBaseURLs instanceof Set &&
-          req._viventiumHarnessCancellationBoundBaseURLs.has(
-            readOnlyRoute?.bindingKey || cancelBaseURL,
-          ),
+        boundListener: req._viventiumHarnessCancellationBoundBaseURLs instanceof Set &&
+          req._viventiumHarnessCancellationBoundBaseURLs.has(readOnlyRoute?.bindingKey || cancelBaseURL),
         ...checks,
       };
       logger.debug('[GlassHiveProvider] Voice Stop confirmation', decision);
-      if (
-        checks.failedCheck ||
-        [
-          'abort_started',
-          'confirmation_checks',
-          'confirmation_saved',
-          'already_completed',
-          'delivery_settled',
-          'failed_attention_confirmed',
-        ].includes(stage)
-      ) {
+      if (checks.failedCheck || ['abort_started', 'confirmation_checks', 'confirmation_saved',
+        'already_completed', 'delivery_settled', 'failed_attention_confirmed'].includes(stage)) {
         logger.info(`[GlassHiveProvider] Voice Stop decision ${JSON.stringify(decision)}`);
       }
     } catch (_) {
@@ -914,9 +788,7 @@ function bindHarnessCancellation({
     req[restrictedVoiceCancellationRoutes].active = readOnlyRoute;
     if (!readOnlyRoute.chat) {
       require('./VoiceTaskService').setVoiceTaskOwnerCapabilities(readOnlyRoute.taskId, {
-        kind: 'remote_generation',
-        ownerId: readOnlyRoute.streamId,
-        cancellationConfirmable: false,
+        kind: 'remote_generation', ownerId: readOnlyRoute.streamId, cancellationConfirmable: false,
       });
     }
   }
@@ -956,14 +828,10 @@ function bindHarnessCancellation({
         callSessionId: authority.callSessionId,
       }).find((item) => item.taskId === taskId);
       const owner = boundTask.owner;
-      stopDiagnosticOwner = Object.freeze({
-        scopeSha256: crypto
-          .createHash('sha256')
-          .update(JSON.stringify([boundTask.taskId, boundTask.streamId, boundTask.callSessionId]))
-          .digest('hex'),
-      });
-      const failedAttentionKey =
-        String(req._viventiumHarnessIdempotencyKey || '').trim() ||
+      stopDiagnosticOwner = Object.freeze({ scopeSha256: crypto.createHash('sha256')
+        .update(JSON.stringify([boundTask.taskId, boundTask.streamId, boundTask.callSessionId]))
+        .digest('hex') });
+      const failedAttentionKey = String(req._viventiumHarnessIdempotencyKey || '').trim() ||
         buildHarnessAttemptIdempotencyKey(req, req.body?.responseMessageId);
       const currentOwnerTask = () => {
         const current = getVoiceTask(taskId);
@@ -972,9 +840,7 @@ function bindHarnessCancellation({
           taskCreatedAtMatches: current?.createdAt === boundTask.createdAt,
           taskCallMatches: current?.callSessionId === boundTask.callSessionId,
           authorityCallMatches: authority.callSessionId === boundTask.callSessionId,
-          foregroundOwnerKind: ['generation_job', 'remote_generation'].includes(
-            current?.owner?.kind,
-          ),
+          foregroundOwnerKind: ['generation_job', 'remote_generation'].includes(current?.owner?.kind),
           ownerIdMatches: current?.owner?.id === owner.id,
           streamIdMatches: current?.streamId === owner.id,
           taskStateEligible: Boolean(current) && !['completed', 'failed'].includes(current.state),
@@ -1004,34 +870,27 @@ function bindHarnessCancellation({
               stage = 'failed_attention_release';
               const scope = readOnlyRoute ? await readOnlyRoute.currentScope() : null;
               const key = readOnlyRoute ? scope?.responseId : failedAttentionKey;
-              if (
-                !key ||
-                (!readOnlyRoute && req._viventiumHarnessCancellationActiveBaseURL !== cancelBaseURL)
-              ) {
+              if (!key || (!readOnlyRoute &&
+                  req._viventiumHarnessCancellationActiveBaseURL !== cancelBaseURL)) {
                 observeVoiceStop(stage, { failedCheck: 'exact_request' });
                 return { accepted: false };
               }
               const outcome = await deliverHarnessCancellation({
                 url: `${cancelBaseURL}/requests/by-idempotency/${encodeURIComponent(key)}/cancel`,
-                headers: {
-                  Authorization: `Bearer ${cancelApiKey}`,
-                  'X-Viventium-User-Id': cancelOwnerId,
-                },
-                fetchImpl,
-                requireCapacityRelease: true,
-                includeRequestState: true,
+                headers: { Authorization: `Bearer ${cancelApiKey}`,
+                  'X-Viventium-User-Id': cancelOwnerId },
+                fetchImpl, requireCapacityRelease: true, includeRequestState: true,
                 attemptTimeoutMs: MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
                 retryDelaysMs: MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
                 totalTimeoutMs: MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
               });
-              if (!currentOwnerTask() || (readOnlyRoute && !(await readOnlyRoute.currentScope())))
-                return { accepted: false };
+              if (!currentOwnerTask() || (readOnlyRoute &&
+                  !(await readOnlyRoute.currentScope()))) return { accepted: false };
               if (outcome.state === 'completed') return { alreadyCompleted: true };
               if (outcome.acknowledged !== true || outcome.capacityReleased !== true)
                 return { accepted: false };
               const confirmation = await confirmVoiceTaskOwnerCancellation(
-                taskId,
-                'The native owner confirmed Stop.',
+                taskId, 'The native owner confirmed Stop.',
               );
               observeVoiceStop('failed_attention_confirmed', { accepted: Boolean(confirmation) });
               return { accepted: Boolean(confirmation) };
@@ -1053,22 +912,13 @@ function bindHarnessCancellation({
             }
             stage = 'owner_after_abort';
             if (!currentOwnerTask()) {
-              observeVoiceStop(stage, {
-                failedCheck: 'owner_current',
-                localStopSucceeded: stopped?.success === true,
-              });
+              observeVoiceStop(stage, { failedCheck: 'owner_current', localStopSucceeded: stopped?.success === true });
               return { accepted: false };
             }
             stage = 'scope_after_abort';
-            if (
-              readOnlyRoute &&
-              !['committed', 'pending'].includes(stopped?.nativeResponse) &&
-              !(await readOnlyRoute.currentScope())
-            ) {
-              observeVoiceStop(stage, {
-                failedCheck: 'scope_current',
-                localStopSucceeded: stopped?.success === true,
-              });
+            if (readOnlyRoute && !['committed', 'pending'].includes(stopped?.nativeResponse) &&
+                !(await readOnlyRoute.currentScope())) {
+              observeVoiceStop(stage, { failedCheck: 'scope_current', localStopSucceeded: stopped?.success === true });
               return { accepted: false };
             }
             if (['committed', 'pending'].includes(stopped?.nativeResponse)) {
@@ -1078,8 +928,7 @@ function bindHarnessCancellation({
             stage = 'delivery';
             const delivery = await req._viventiumHarnessCancellationDeliveryPromise;
             stage = 'scope_after_delivery';
-            const readOnlyScopeCurrent =
-              !readOnlyRoute || Boolean(await readOnlyRoute.currentScope());
+            const readOnlyScopeCurrent = !readOnlyRoute || Boolean(await readOnlyRoute.currentScope());
             let ownerCurrent = null;
             const confirmed =
               stopped?.success === true &&
@@ -1088,49 +937,34 @@ function bindHarnessCancellation({
               Array.isArray(delivery.outcomes) &&
               delivery.outcomes.length > 0 &&
               delivery.outcomes.every((outcome) => outcome?.capacityReleased === true) &&
-              (ownerCurrent = Boolean(currentOwnerTask())) &&
-              readOnlyScopeCurrent;
+              (ownerCurrent = Boolean(currentOwnerTask())) && readOnlyScopeCurrent;
             const checks = {
               localStopSucceeded: stopped?.success === true,
-              nativeResponseState: ['committed', 'pending', 'unavailable'].includes(
-                stopped?.nativeResponse,
-              )
-                ? stopped.nativeResponse
-                : null,
+              nativeResponseState: ['committed', 'pending', 'unavailable'].includes(stopped?.nativeResponse)
+                ? stopped.nativeResponse : null,
               freshDelivery: req._viventiumHarnessCancellationDeliveryPromise !== priorDelivery,
               deliveryAcknowledged: delivery?.acknowledged === true,
               outcomesPresent: Array.isArray(delivery?.outcomes),
               familyCount: Array.isArray(delivery?.outcomes) ? delivery.outcomes.length : 0,
               releasedFamilyCount: Array.isArray(delivery?.outcomes)
-                ? delivery.outcomes.filter((outcome) => outcome?.capacityReleased === true).length
-                : 0,
+                ? delivery.outcomes.filter((outcome) => outcome?.capacityReleased === true).length : 0,
               ownerCurrent,
               scopeCurrent: readOnlyScopeCurrent,
               confirmed,
             };
-            const failedCheck = !checks.localStopSucceeded
-              ? 'local_stop'
-              : !checks.freshDelivery
-                ? 'fresh_delivery'
-                : !checks.deliveryAcknowledged
-                  ? 'delivery_acknowledged'
-                  : !checks.outcomesPresent
-                    ? 'outcomes_present'
-                    : checks.familyCount === 0
-                      ? 'family_nonempty'
-                      : checks.releasedFamilyCount !== checks.familyCount
-                        ? 'families_released'
-                        : ownerCurrent !== true
-                          ? 'owner_current'
-                          : !readOnlyScopeCurrent
-                            ? 'scope_current'
-                            : null;
+            const failedCheck = !checks.localStopSucceeded ? 'local_stop' :
+              !checks.freshDelivery ? 'fresh_delivery' :
+              !checks.deliveryAcknowledged ? 'delivery_acknowledged' :
+              !checks.outcomesPresent ? 'outcomes_present' :
+              checks.familyCount === 0 ? 'family_nonempty' :
+              checks.releasedFamilyCount !== checks.familyCount ? 'families_released' :
+              ownerCurrent !== true ? 'owner_current' :
+              !readOnlyScopeCurrent ? 'scope_current' : null;
             observeVoiceStop('confirmation_checks', { ...checks, failedCheck });
             if (!confirmed) return { accepted: false };
             stage = 'confirm_owner';
             const confirmation = await confirmVoiceTaskOwnerCancellation(
-              taskId,
-              'The native owner confirmed Stop.',
+              taskId, 'The native owner confirmed Stop.',
             );
             observeVoiceStop('confirmation_saved', { accepted: Boolean(confirmation) });
             return { accepted: Boolean(confirmation) };
@@ -1142,10 +976,7 @@ function bindHarnessCancellation({
       });
     }
     if (!readOnlyRoute && ownsTask() && !req._viventiumNativeVoiceInputPolling) {
-      const {
-        createNativeVoiceInputClient,
-        nativeQuestionFormFromSchema,
-      } = require('@librechat/api');
+      const { createNativeVoiceInputClient, nativeQuestionFormFromSchema } = require('@librechat/api');
       const client = createNativeVoiceInputClient({
         baseURL: cancelBaseURL,
         apiKey: cancelApiKey,
@@ -1171,20 +1002,11 @@ function bindHarnessCancellation({
               preserveExisting: true,
               inputExpiresAtMs: Date.parse(request.expiresAt),
               isNativeInputCurrent: async (metadata) => {
-                const current = listVoiceTasks({
-                  userId: cancelOwnerId,
-                  callSessionId: authority.callSessionId,
-                }).find((item) => item.taskId === taskId);
-                if (
-                  !ownsTask() ||
-                  current?.owner?.kind !== owner.kind ||
-                  current?.owner?.id !== owner.id ||
-                  !['requestId', 'requestFingerprint', 'runId', 'attemptId', 'expiresAt'].every(
-                    (field) => metadata?.[field] === request[field],
-                  ) ||
-                  metadata.kind !== (request.kind || 'permission')
-                )
-                  return false;
+                const current = listVoiceTasks({ userId:cancelOwnerId,
+                  callSessionId:authority.callSessionId }).find((item) => item.taskId === taskId);
+                if (!ownsTask() || current?.owner?.kind !== owner.kind || current?.owner?.id !== owner.id ||
+                    !['requestId','requestFingerprint','runId','attemptId','expiresAt'].every((field) => metadata?.[field] === request[field]) ||
+                    metadata.kind !== (request.kind || 'permission')) return false;
                 return client.isCurrent(key, request);
               },
               provideInput: async ({ input }) => {
@@ -1219,17 +1041,9 @@ function bindHarnessCancellation({
                   expiresAt: request.expiresAt,
                 },
                 ...(request.kind === 'question'
-                  ? {
-                      inputType: 'native_question',
-                      questionForm: nativeQuestionFormFromSchema(request.requestedSchema),
-                    }
-                  : {
-                      inputType: 'choice',
-                      choices: request.choices,
-                      ...(request.operationTitle !== undefined
-                        ? { operationTitle: request.operationTitle }
-                        : {}),
-                    }),
+                  ? { inputType: 'native_question', questionForm: nativeQuestionFormFromSchema(request.requestedSchema) }
+                  : { inputType: 'choice', choices: request.choices,
+                      ...(request.operationTitle !== undefined ? {operationTitle: request.operationTitle} : {}) }),
               },
             });
           },
@@ -1254,11 +1068,7 @@ function bindHarnessCancellation({
   let restrictedChatDeliveryFailed = false;
   const deliverCancellation = (reason) => {
     if (readOnlyRoute) {
-      if (
-        reason !== 'user_cancelled' ||
-        req[restrictedVoiceCancellationRoutes]?.active !== readOnlyRoute
-      )
-        return;
+      if (reason !== 'user_cancelled' || req[restrictedVoiceCancellationRoutes]?.active !== readOnlyRoute) return;
       req._viventiumHarnessCancellationDeliveryPromise = (async () => {
         const scope = await readOnlyRoute.currentScope();
         if (!scope?.responseId || req[restrictedVoiceCancellationRoutes]?.active !== readOnlyRoute)
@@ -1266,21 +1076,13 @@ function bindHarnessCancellation({
         observeVoiceStop('delivery_started', { familyCount: 1, capacityRequired: true });
         const outcome = await deliverHarnessCancellation({
           url: `${cancelBaseURL}/requests/by-idempotency/${encodeURIComponent(scope.responseId)}/cancel`,
-          headers: {
-            Authorization: `Bearer ${cancelApiKey}`,
-            'X-Viventium-User-Id': cancelOwnerId,
-          },
-          fetchImpl,
-          requireCapacityRelease: true,
+          headers: { Authorization: `Bearer ${cancelApiKey}`, 'X-Viventium-User-Id': cancelOwnerId },
+          fetchImpl, requireCapacityRelease: true,
           attemptTimeoutMs: MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
           retryDelaysMs: MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
           totalTimeoutMs: MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
         });
-        observeVoiceStop('delivery_settled', {
-          familyCount: 1,
-          releasedFamilyCount: Number(outcome?.capacityReleased === true),
-          deliveryAcknowledged: outcome?.acknowledged === true,
-        });
+        observeVoiceStop('delivery_settled', { familyCount: 1, releasedFamilyCount: Number(outcome?.capacityReleased === true), deliveryAcknowledged: outcome?.acknowledged === true });
         return { acknowledged: outcome?.acknowledged === true, outcomes: [outcome] };
       })().catch((error) => {
         reportHarnessCancellationDeliveryError(onDeliveryError, error);
@@ -1292,18 +1094,14 @@ function bindHarnessCancellation({
         restrictedChatDeliveryFailed = false;
         restrictedChatDelivery = req._viventiumHarnessCancellationDeliveryPromise
           .then((delivery) => {
-            if (
-              delivery?.acknowledged !== true ||
-              delivery.outcomes?.length !== 1 ||
-              delivery.outcomes[0]?.capacityReleased !== true
-            ) {
+            if (delivery?.acknowledged !== true || delivery.outcomes?.length !== 1 ||
+                delivery.outcomes[0]?.capacityReleased !== true) {
               throw Object.assign(new Error('Native cancellation could not be confirmed.'), {
                 code: 'HARNESS_CANCELLATION_DELIVERY_FAILED',
               });
             }
             return { delivered: false };
-          })
-          .catch((error) => {
+          }).catch((error) => {
             restrictedChatDeliveryFailed = true;
             throw error;
           });
@@ -1343,10 +1141,7 @@ function bindHarnessCancellation({
       (reason === 'user_cancelled' &&
         req.body?.voiceMode === true &&
         Boolean(req.viventiumVoiceWorkAuthority));
-    observeVoiceStop('delivery_started', {
-      familyCount: cancelIdempotencyKeys.length,
-      capacityRequired: requireRelease,
-    });
+    observeVoiceStop('delivery_started', { familyCount: cancelIdempotencyKeys.length, capacityRequired: requireRelease });
     const deliveries = cancelIdempotencyKeys.map(async (cancelIdempotencyKey) => {
       try {
         return await deliverHarnessCancellation({
@@ -1378,8 +1173,7 @@ function bindHarnessCancellation({
       const acknowledged = outcomes.every((outcome) => outcome?.acknowledged === true);
       observeVoiceStop('delivery_settled', {
         familyCount: outcomes.length,
-        releasedFamilyCount: outcomes.filter((outcome) => outcome?.capacityReleased === true)
-          .length,
+        releasedFamilyCount: outcomes.filter((outcome) => outcome?.capacityReleased === true).length,
         deliveryAcknowledged: acknowledged,
       });
       return { acknowledged, outcomes };
@@ -1394,11 +1188,8 @@ function bindHarnessCancellation({
       get() {
         // A failed native ACK leaves the exact job retained. A fresh owner Stop may retry
         // its same sealed transport even though the local AbortSignal is already stopped.
-        if (
-          signal.aborted &&
-          signal.reason === 'user_cancelled' &&
-          (!restrictedChatDelivery || restrictedChatDeliveryFailed)
-        ) {
+        if (signal.aborted && signal.reason === 'user_cancelled' &&
+            (!restrictedChatDelivery || restrictedChatDeliveryFailed)) {
           deliverCancellation('user_cancelled');
         }
         return restrictedChatDelivery;
@@ -1672,22 +1463,40 @@ function installConversationProviderCapabilityRefresher({
     const previousInstructionAppend = String(
       targetAgent?.[CONVERSATION_PROVIDER_INSTRUCTION_APPEND] || '',
     ).trim();
-    const attached = await attachConversationProviderCapabilityBundle({
-      targetAgent,
-      declaredAgent,
-      capabilitySourceAgent,
-      mcpCapabilitySourceAgent,
-      req,
-      capability: resolvedCapability,
-      requestBody: effectiveRequestBody,
-      nativeTools,
-      ...(privateStructuredResponse ? { privateStructuredResponse: true } : {}),
-    });
-    if (!attached) {
-      // Never leave a previously valid but now expired bundle on the next provider attempt.
-      removeBootstrapBundleHeaders(targetAgent);
+    const startedAt = req?.viventiumVoiceLogLatency === true ? voiceLatencyNow() : null;
+    let outcome = 'failed';
+    try {
+      const attached = await attachConversationProviderCapabilityBundle({
+        targetAgent,
+        declaredAgent,
+        capabilitySourceAgent,
+        mcpCapabilitySourceAgent,
+        req,
+        capability: resolvedCapability,
+        requestBody: effectiveRequestBody,
+        nativeTools,
+        ...(privateStructuredResponse ? { privateStructuredResponse: true } : {}),
+      });
+      if (!attached) {
+        // Never leave a previously valid but now expired bundle on the next provider attempt.
+        removeBootstrapBundleHeaders(targetAgent);
+      }
+      outcome = 'completed';
+      return capabilityRefreshResult(targetAgent, attached, previousInstructionAppend);
+    } finally {
+      if (startedAt != null) {
+        try {
+          const requestHash = crypto.createHash('sha256')
+            .update(String(req.viventiumVoiceRequestId || 'unknown')).digest('hex');
+          const participantHash = crypto.createHash('sha256')
+            .update(String(targetAgent.id || 'unknown')).digest('hex');
+          logVoiceLatencyNumericStage(logger, req, `conversation_provider:${participantHash}`,
+            `capability_refresh_${outcome}`, startedAt, requestHash);
+        } catch {
+          // Passive timing must never alter authorization or model execution.
+        }
+      }
     }
-    return capabilityRefreshResult(targetAgent, attached, previousInstructionAppend);
   };
   Object.defineProperty(targetAgent, CONVERSATION_PROVIDER_CAPABILITY_REFRESH, {
     value: refresh,
@@ -1834,6 +1643,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
   req,
   requestBody = req?.body || {},
   resolveAgentById,
+  deferUntilInvocation = false,
 } = {}) {
   const declaredProvider = resolveConversationProviderId(declaredAgent);
   const capability = req?.config?.endpoints?.agents?.providerCapabilities?.[declaredProvider];
@@ -1846,6 +1656,7 @@ async function attachDeclaredConversationProviderCapabilityBundle({
     capability,
     requestBody,
     resolveAgentById,
+    deferUntilInvocation,
   });
 }
 
@@ -1859,11 +1670,10 @@ async function attachConversationProviderCapabilityBundle({
   requestBody = req?.body || {},
   nativeTools,
   privateStructuredResponse = false,
+  deferUntilInvocation = false,
 } = {}) {
-  if (
-    typeof privateStructuredResponse !== 'boolean' ||
-    (privateStructuredResponse && nativeTools !== false)
-  ) {
+  if (typeof privateStructuredResponse !== 'boolean' ||
+    (privateStructuredResponse && nativeTools !== false)) {
     throw new TypeError('Private structured response requires an explicit zero-tool capability');
   }
   if (nativeTools !== undefined && typeof nativeTools !== 'boolean') {
@@ -1878,16 +1688,12 @@ async function attachConversationProviderCapabilityBundle({
   }
   if (nativeTools === false) {
     // A signed capability narrows an explicitly tool-less owner. Never silently drop tools.
-    for (const participant of new Set(
-      [targetAgent, declaredAgent, capabilitySourceAgent, mcpCapabilitySourceAgent].filter(Boolean),
-    )) {
-      if (
-        resolvedAgentToolNameSet(participant).size > 0 ||
+    for (const participant of new Set([targetAgent, declaredAgent, capabilitySourceAgent,
+      mcpCapabilitySourceAgent].filter(Boolean))) {
+      if (resolvedAgentToolNameSet(participant).size > 0 ||
         (participant.declaredToolNames || []).length > 0 ||
         (participant.mcp || []).length > 0 ||
-        (participant.agent_ids || []).length > 0 ||
-        (participant.edges || []).length > 0
-      ) {
+        (participant.agent_ids || []).length > 0 || (participant.edges || []).length > 0) {
         throw new Error('Native zero-tool capability requires a tool-less participant');
       }
     }
@@ -1898,13 +1704,11 @@ async function attachConversationProviderCapabilityBundle({
     configuration.defaultHeaders = {
       ...projectTrustedNativeInteractionHeaders(req, configuration.defaultHeaders),
       ...headers,
-      ...(privateStructuredResponse
-        ? {
-            'X-Viventium-Actor-Kind': 'system',
-            'X-Viventium-Origin': 'system',
-            'X-Viventium-Audio-Eligible': 'false',
-          }
-        : {}),
+      ...(privateStructuredResponse ? {
+        'X-Viventium-Actor-Kind': 'system',
+        'X-Viventium-Origin': 'system',
+        'X-Viventium-Audio-Eligible': 'false',
+      } : {}),
     };
     targetAgent.model_parameters = { ...modelParameters, configuration };
     return true;
@@ -1921,6 +1725,16 @@ async function attachConversationProviderCapabilityBundle({
   ) {
     targetAgent.model_parameters = { ...modelParameters, configuration };
   }
+  /* === VIVENTIUM START === Defer duplicate minting to the existing invocation owner. === */
+  // Graph-owned attempts rebuild this exact capability after durable turn IDs exist.
+  // Keep structural headers above; zero-tool/private contracts remain eager. A runtime
+  // refresher is required, so direct attach callers cannot lose their signed authority.
+  if (deferUntilInvocation === true &&
+      typeof targetAgent[CONVERSATION_PROVIDER_CAPABILITY_REFRESH] === 'function') {
+    removeBootstrapBundleHeaders(targetAgent);
+    return false;
+  }
+  /* === VIVENTIUM END === */
   /* === VIVENTIUM START ===
    * Feature: Participant-owned capability parity across provider fallback routes.
    * Purpose: The fallback route declares provider identity, while the owning participant declares
@@ -1938,25 +1752,17 @@ async function attachConversationProviderCapabilityBundle({
   const currentUploads = trustedUploadedFilesFromRequestBody(trustedRequestBody);
   const historyUploads =
     capability.workspace_binding === true
-      ? await resolveSelectedHistoryAttachments(
-          {
-            userId: String(req?.user?.id || req?.user?._id || ''),
-            conversationId: trustedRequestBody.conversationId,
-            parentMessageId: trustedRequestBody.parentMessageId,
-          },
-          { getMessages, getFiles },
-        )
+      ? await resolveConversationProviderHistoryAttachments(req, trustedRequestBody)
       : [];
   // Current source records retain their text and order when persisted ancestry repeats their IDs.
   const currentUploadKeys = new Set(currentUploads.map((file) => file.file_id || file.filename));
   const uploadedFiles = Array.from(
     new Map(
-      trustedUploadedFilesFromRequestBody({
-        files: [
-          ...currentUploads,
-          ...historyUploads.filter((file) => !currentUploadKeys.has(file.file_id || file.filename)),
-        ],
-      }).map((file) => [file.file_id || file.filename, file]),
+      trustedUploadedFilesFromRequestBody({ files: [...currentUploads,
+        ...historyUploads.filter((file) => !currentUploadKeys.has(file.file_id || file.filename)),
+      ] }).map(
+        (file) => [file.file_id || file.filename, file],
+      ),
     ).values(),
   );
   const hostToolCapabilityState = await resolveHostToolCapabilityState({
@@ -2138,6 +1944,7 @@ function attachConversationProviderBootstrapBundle({
 }
 
 module.exports = {
+  resolveConversationProviderHistoryAttachments,
   restrictedConversationProviderBootstrapHeaders,
   attachConversationProviderBootstrapBundle,
   applyHostEvidenceBoundaryInstructions,

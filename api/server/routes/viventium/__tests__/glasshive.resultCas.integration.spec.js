@@ -42,11 +42,16 @@ jest.mock('@librechat/api', () => {
     ...actual,
     receiveGlassHiveTerminalCallbackResult: async (...args) => {
       const result = await actual.receiveGlassHiveTerminalCallbackResult(...args);
-      const notify = () => mockAfterTerminalCas(args[0]?.body, result);
       const { deferGlassHiveTerminalCallbackAfterCommit } = jest.requireActual(
         '~/server/services/viventium/GlassHiveTerminalCallbackTransaction',
       );
-      if (!deferGlassHiveTerminalCallbackAfterCommit(notify)) await notify();
+      if (
+        !deferGlassHiveTerminalCallbackAfterCommit(() =>
+          mockAfterTerminalCas(args[0]?.body, result),
+        )
+      ) {
+        await mockAfterTerminalCas(args[0]?.body, result);
+      }
       return result;
     },
   };
@@ -271,18 +276,6 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
     await mongoose.connection.db.collection(CALLBACK_RESULTS_COLLECTION).deleteMany({});
     await mongoose.connection.db.collection(CALLBACK_BINDINGS_COLLECTION).deleteMany({});
     await mongoose.connection.db.collection(EXTERNAL_WORK_COLLECTION).deleteMany({});
-    const binding = trustedContext();
-    const dispatched = {
-      _id: binding.originRef,
-      ownerId: binding.ownerId,
-      conversationId: binding.conversationId,
-      anchorMessageId: binding.anchorMessageId,
-      requestedParentMessageId: binding.requestedParentMessageId,
-      workRef: '',
-      launchState: 'dispatch_ready',
-    };
-    await mongoose.connection.db.collection(CALLBACK_BINDINGS_COLLECTION).insertOne(dispatched);
-    await mongoose.connection.db.collection(EXTERNAL_WORK_COLLECTION).insertOne(dispatched);
     mockGetConvo = jest.fn().mockResolvedValue({
       conversationId: 'conv-receiver-cas',
       user: 'owner-receiver-cas',
@@ -322,6 +315,18 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
     mockCreateVoiceTask = jest.fn().mockReturnValue(null);
     mockCompleteVoiceTask = jest.fn().mockResolvedValue(null);
     mockRegisterGlassHiveVoiceTaskActionCapabilities = jest.fn();
+    const binding = trustedContext();
+    const origin = {
+      _id: binding.originRef,
+      ownerId: binding.ownerId,
+      conversationId: binding.conversationId,
+      anchorMessageId: binding.anchorMessageId,
+      requestedParentMessageId: binding.requestedParentMessageId,
+      workRef: '',
+      launchState: 'dispatch_ready',
+    };
+    await mongoose.connection.db.collection(CALLBACK_BINDINGS_COLLECTION).insertOne(origin);
+    await mongoose.connection.db.collection(EXTERNAL_WORK_COLLECTION).insertOne(origin);
   }, 10000);
 
   afterEach(() => {
@@ -343,6 +348,52 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
       process.env.VIVENTIUM_GLASSHIVE_CALLBACK_SECRET = originalCallbackSecret;
     }
   }, 15000);
+
+  test.each(['missing-task', 'mismatched-task'])(
+    'keeps persisted terminal replay fenced with a %s', async (mode) => {
+      const task = mode === 'mismatched-task' ? {
+        taskId: 'foreign-task', callSessionId: 'foreign-call', userId: 'owner-receiver-cas',
+        conversationId: 'conv-receiver-cas',
+      } : null;
+      mockGetCallSession.mockResolvedValue({
+        callSessionId: 'call-receiver-cas', userId: 'owner-receiver-cas',
+        conversationId: 'conv-receiver-cas', status: 'ended',
+      });
+      mockGetVoiceTaskByStreamId.mockReturnValue(task);
+      mockResolveGlassHiveCallbackContext.mockResolvedValue({
+        ...trustedContext(), destinations: [{ surface: 'voice',
+          voiceCallSessionId: 'call-receiver-cas', voiceRequestId: '' }],
+      });
+      const body = terminalBody(1, 'a', 'Synthetic completed result.', {
+        surface: 'voice', voice_call_session_id: 'call-receiver-cas',
+      });
+      mockMessages.push({ messageId: 'persisted-callback', parentMessageId: 'anchor-receiver-cas',
+        text: '', metadata: { viventium: { type: 'glasshive_worker_callback',
+          callbackId: body.callback_id, callbackKey: body.callback_id,
+        } } });
+      const response = await callbackRequest(app, body);
+      expect(mockCreateVoiceTask).not.toHaveBeenCalled();
+      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockCompleteVoiceTask).not.toHaveBeenCalled();
+      if (mode === 'mismatched-task') {
+        expect(response.status).toBe(409);
+        expect(response.body.error).toBe('voice_task_session_mismatch');
+        // The pre-existing binding guard runs before loading messages or repairing delivery.
+        expect(mockGetMessages).not.toHaveBeenCalled();
+        expect(mockEnqueueGlassHiveCallbackDelivery).not.toHaveBeenCalled();
+        expect(mockRecordGlassHiveCallbackExternalState).not.toHaveBeenCalled();
+      } else {
+        expect(response.status).toBe(200);
+        expect(response.body).toMatchObject({ status: 'http_accepted', duplicate: true });
+        expect(mockEnqueueGlassHiveCallbackDelivery).toHaveBeenCalledTimes(1);
+        expect(mockEnqueueGlassHiveCallbackDelivery.mock.calls[0][0]).toMatchObject({
+          message: { messageId: 'persisted-callback' },
+          effectFence: expect.any(Object),
+        });
+        expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenCalledTimes(1);
+      }
+    }, 15000,
+  );
 
   test('stops A before its first effect when B wins after A has accepted the real CAS', async () => {
     let releaseA;

@@ -140,7 +140,6 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
   const {
     file_id = '',
     filename = '',
-    filepath,
   } = useMemo(() => {
     /* === VIVENTIUM START === Present only the exact verified grant through the owner File API. === */
     const imported = importedFileForGrant(
@@ -153,7 +152,6 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
       return {
         file_id: imported.file_id,
         filename: imported.filename,
-        filepath: `files/${encodeURIComponent(user?.id ?? '')}/${imported.file_id}/${encodeURIComponent(imported.filename ?? '')}`,
       };
     }
     /* === VIVENTIUM END === */
@@ -188,7 +186,7 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
     );
   }
 
-  const handleDownload = async (event: React.MouseEvent<HTMLAnchorElement>) => {
+  const handleDownload = async (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     try {
       const stream = await downloadFile();
@@ -212,23 +210,13 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
     }
   };
 
-  props.onClick = handleDownload;
-  props.target = '_blank';
-
-  const domainServerBaseUrl = `${apiBaseUrl()}/api`;
-
+  /* === VIVENTIUM START === Authorized downloads are actions, not unauthenticated URLs. === */
   return (
-    <a
-      href={
-        filepath?.startsWith('files/')
-          ? `${domainServerBaseUrl}/${filepath}`
-          : `${domainServerBaseUrl}/files/${filepath}`
-      }
-      {...props}
-    >
+    <button type="button" className="cursor-pointer text-left underline" onClick={handleDownload}>
       {children}
-    </a>
+    </button>
   );
+  /* === VIVENTIUM END === */
 });
 a.displayName = 'MarkdownAnchor';
 

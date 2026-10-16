@@ -370,41 +370,28 @@ describe('agentLlmFallback', () => {
   test.each([
     { code: 'provider_progress_stalled', status: 502 },
     { viventiumCompletionPhase: 'provider_response', cause: { code: 'provider_progress_stalled' } },
-  ])(
-    'preserves native attention instead of initializing or selecting a fallback: %j',
-    async (detail) => {
-      const primaryError = Object.assign(new Error('Synthetic private attention detail'), detail);
-      const initializeFallback = jest.fn();
-      expect(isRecoverableProviderFallbackError(primaryError)).toBe(false);
-      expect(
-        shouldRetryWithFallback([
-          {
-            type: ContentTypes.ERROR,
-            error_class: 'provider_progress_stalled',
-            error: 'provider temporarily unavailable',
-          },
-        ]),
-      ).toBe(false);
-      await expect(
-        initializePrimaryAgentWithFallback({
-          primaryAgent: { id: 'main', provider: 'openAI', model: 'synthetic-primary' },
-          fallbackAgent: { id: 'main', provider: 'xai', model: 'synthetic-fallback' },
-          fallbackAssignment: { provider: 'xai', model: 'synthetic-fallback' },
-          initializePrimary: async () => {
-            throw primaryError;
-          },
-          initializeFallback,
-        }),
-      ).rejects.toBe(primaryError);
-      expect(initializeFallback).not.toHaveBeenCalled();
-    },
-  );
+  ])('preserves native attention instead of initializing or selecting a fallback: %j', async (detail) => {
+    const primaryError = Object.assign(new Error('Synthetic private attention detail'), detail);
+    const initializeFallback = jest.fn();
+    expect(isRecoverableProviderFallbackError(primaryError)).toBe(false);
+    expect(shouldRetryWithFallback([{
+      type: ContentTypes.ERROR,
+      error_class: 'provider_progress_stalled',
+      error: 'provider temporarily unavailable',
+    }])).toBe(false);
+    await expect(initializePrimaryAgentWithFallback({
+      primaryAgent: { id: 'main', provider: 'openAI', model: 'synthetic-primary' },
+      fallbackAgent: { id: 'main', provider: 'xai', model: 'synthetic-fallback' },
+      fallbackAssignment: { provider: 'xai', model: 'synthetic-fallback' },
+      initializePrimary: async () => { throw primaryError; },
+      initializeFallback,
+    })).rejects.toBe(primaryError);
+    expect(initializeFallback).not.toHaveBeenCalled();
+  });
 
   test('retains ordinary provider recovery without a blanket needs_input exemption', () => {
     expect(isRecoverableProviderFallbackError({ status: 500 })).toBe(true);
-    expect(
-      isRecoverableProviderFallbackError({ code: 'provider_auth_missing', state: 'needs_input' }),
-    ).toBe(true);
+    expect(isRecoverableProviderFallbackError({ code: 'provider_auth_missing', state: 'needs_input' })).toBe(true);
   });
 
   test('allows graph fallback only for structured recoverable provider failures', () => {
@@ -757,26 +744,45 @@ test('host capacity rejection does not start another provider before any harness
   ).toBe(false);
 });
 
+
 test('native MCP startup failure is recoverable but a failed MCP tool is not', () => {
-  const part = {
-    type: ContentTypes.ERROR,
-    error: 'Synthetic private detail',
-    error_class: 'native_mcp_unavailable',
-  };
+  const part = { type: ContentTypes.ERROR, error: 'Synthetic private detail', error_class: 'native_mcp_unavailable' };
   expect(shouldRetryWithFallback([part])).toBe(true);
   expect(isRecoverableProviderFallbackError({ code: 'native_mcp_unavailable' })).toBe(true);
-  expect(
-    shouldRetryBackgroundCortexWithFallback({
-      insight: null,
-      errorClass: 'native_mcp_unavailable',
-    }),
-  ).toBe(true);
+  expect(shouldRetryBackgroundCortexWithFallback({ insight: null, errorClass: 'native_mcp_unavailable' })).toBe(true);
   expect(shouldRetryWithFallback([{ ...part, error_class: 'mcp_tool_failure' }])).toBe(false);
   expect(isRecoverableProviderFallbackError({ code: 'mcp_tool_failure', status: 503 })).toBe(false);
-  expect(
-    isRecoverableProviderFallbackError({ name: 'AbortError', code: 'native_mcp_unavailable' }),
-  ).toBe(false);
-  expect(
-    shouldRetryWithFallback([part, { type: ContentTypes.TEXT, text: 'Already visible.' }]),
-  ).toBe(false);
+  expect(isRecoverableProviderFallbackError({ name: 'AbortError', code: 'native_mcp_unavailable' })).toBe(false);
+  expect(shouldRetryWithFallback([part, { type: ContentTypes.TEXT, text: 'Already visible.' }])).toBe(false);
 });
+
+/* === VIVENTIUM START === A failed consult must not turn HTTP400 into a retryable Main call. */
+test('a final model request-rejection phase preserves outer HTTP400 no-retry semantics', () => {
+  const original = Object.assign(new Error('Synthetic API request rejection'), { status: 400 });
+  const rejected = Object.assign(new Error('Synthetic API request rejection'), {
+    status: 400, viventiumCompletionPhase: 'provider_request_rejected',
+  });
+  expect(isRecoverableProviderFallbackError(original)).toBe(false);
+  expect(isRecoverableProviderFallbackError(rejected)).toBe(false);
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Direct refusal keeps the existing typed no-fallback policy. === */
+test('typed Direct HTTP403 request refusal does not retry through another provider', () => {
+  const refused = { status: 403, code: 'provider_request_rejected' };
+  expect(isRecoverableProviderFallbackError(refused)).toBe(false);
+  expect(isRecoverableProviderFallbackError({
+    status: 502, error: { type: 'glasshive_runtime_error', code: refused.code },
+  })).toBe(false);
+  expect(shouldRetryWithFallback([{
+    type: ContentTypes.ERROR,
+    error: 'The selected API declined this request or its model access.',
+    error_class: refused.code,
+  }])).toBe(false);
+  expect(shouldRetryBackgroundCortexWithFallback({
+    insight: null, errorStatus: refused.status, errorCode: refused.code,
+    errorClass: refused.code, harnessInvocationStarted: true,
+  })).toBe(false);
+  expect(isRecoverableProviderFallbackError({ status: 401, code: 'provider_auth_missing' })).toBe(true);
+});
+/* === VIVENTIUM END === */

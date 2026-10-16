@@ -15,6 +15,9 @@ const harnessLabels: Record<string, string> = {
   'claude-code': 'Anthropic',
   'grok-build': 'Grok',
   'openclaw-general': 'OpenClaw',
+  'direct-openai': 'Direct OpenAI (API)',
+  'direct-anthropic': 'Direct Anthropic (API)',
+  'direct-xai': 'Direct xAI (API)',
 };
 
 export default function AgentModelPicker({

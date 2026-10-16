@@ -21,17 +21,15 @@ const mockRecordGlassHiveSurfaceDeliveryOutcome = jest.fn().mockResolvedValue({ 
 const mockRecordVoiceOrchestrationTrace = jest.fn().mockResolvedValue(null);
 
 jest.mock('../GlassHiveCallbackBindingService', () => ({
-  ...jest.requireActual('../GlassHiveCallbackBindingService'),
-  isGlassHiveNonterminalAttentionCallback:
-    require('@librechat/api').createGlassHiveCallbackBindingService({})
-      .isGlassHiveNonterminalAttentionCallback,
+  isGlassHiveNonterminalAttentionCallback: require('@librechat/api')
+    .createGlassHiveCallbackBindingService({}).isGlassHiveNonterminalAttentionCallback,
   recordGlassHiveSurfaceDeliveryOutcome: (...args) =>
     mockRecordGlassHiveSurfaceDeliveryOutcome(...args),
 }));
 
 jest.mock('../VoiceOrchestrationTraceService', () => ({
-  recordVoiceOrchestrationTrace: (...args) => mockRecordVoiceOrchestrationTrace(...args),
   recordVoiceOrchestrationTraceBestEffort: (...args) => mockRecordVoiceOrchestrationTrace(...args),
+  recordVoiceOrchestrationTrace: (...args) => mockRecordVoiceOrchestrationTrace(...args),
 }));
 
 const {

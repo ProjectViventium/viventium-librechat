@@ -14,48 +14,31 @@ const mockSubmit = jest.fn();
 const mockSetFilesLoading = jest.fn();
 
 jest.mock('recoil', () => ({
-  useRecoilValue: (key: string) => (key === 'latest' ? mockLatest : true),
+  useRecoilValue: (key: string) => key === 'latest' ? mockLatest : true,
   useRecoilState: () => [undefined, jest.fn()],
 }));
 jest.mock('~/store', () => ({
   __esModule: true,
-  default: {
-    enterToSend: 'enter',
-    latestMessageFamily: () => 'latest',
-    activePromptByIndex: () => 'prompt',
-  },
+  default: { enterToSend: 'enter', latestMessageFamily: () => 'latest', activePromptByIndex: () => 'prompt' },
 }));
 jest.mock('~/Providers/ChatContext', () => ({
   useChatContext: () => ({
-    index: 0,
-    conversation: { endpoint: mockEndpoint, agent_id: 'agent', assistant_id: 'assistant' },
-    isSubmitting: mockIsSubmitting,
-    filesLoading: mockFilesLoading,
-    setFilesLoading: mockSetFilesLoading,
+    index: 0, conversation: { endpoint: mockEndpoint, agent_id: 'agent', assistant_id: 'assistant' },
+    isSubmitting: mockIsSubmitting, filesLoading: mockFilesLoading, setFilesLoading: mockSetFilesLoading,
   }),
 }));
-jest.mock('~/Providers/AgentsMapContext', () => ({
-  useAgentsMapContext: () => ({ agent: { name: 'Agent' } }),
-}));
+jest.mock('~/Providers/AgentsMapContext', () => ({ useAgentsMapContext: () => ({ agent: { name: 'Agent' } }) }));
 jest.mock('~/Providers/AssistantsMapContext', () => ({
   useAssistantsMapContext: () => ({ assistants: { assistant: { name: 'Assistant' } } }),
 }));
-jest.mock('~/hooks/Conversations/useGetSender', () => ({
-  __esModule: true,
-  default: () => () => 'AI',
-}));
-jest.mock('~/hooks/Files/useFileHandling', () => ({
-  __esModule: true,
-  default: () => ({ handleFiles: jest.fn() }),
-}));
+jest.mock('~/hooks/Conversations/useGetSender', () => ({ __esModule: true, default: () => () => 'AI' }));
+jest.mock('~/hooks/Files/useFileHandling', () => ({ __esModule: true, default: () => ({ handleFiles: jest.fn() }) }));
 jest.mock('~/data-provider', () => ({ useInteractionHealthCheck: () => jest.fn() }));
 jest.mock('~/hooks', () => ({ useLocalize: () => (key: string) => key }));
 jest.mock('~/utils', () => ({
   getEntity: jest.requireActual('~/utils/endpoints').getEntity,
   getEntityName: jest.requireActual('~/utils/endpoints').getEntityName,
-  forceResize: jest.fn(),
-  insertTextAtCursor: jest.fn(),
-  checkIfScrollable: () => false,
+  forceResize: jest.fn(), insertTextAtCursor: jest.fn(), checkIfScrollable: () => false,
   cn: (value: string) => value,
 }));
 jest.mock('@librechat/client', () => ({
@@ -63,56 +46,26 @@ jest.mock('@librechat/client', () => ({
   TooltipAnchor: ({ render }: { render: React.ReactNode }) => render,
 }));
 
-function Composer({
-  disabled = false,
-  text = 'Next ordinary request.',
-}: {
-  disabled?: boolean;
-  text?: string;
-}) {
+function Composer({ disabled = false, text = 'Next ordinary request.' }: { disabled?: boolean; text?: string }) {
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
   const submitButtonRef = useRef<HTMLButtonElement | null>(null);
   const methods = useForm<{ text: string }>({ defaultValues: { text } });
   const field = methods.register('text');
   const { isNotAppendable, handleKeyDown } = useTextarea({
-    textAreaRef,
-    submitButtonRef,
-    setIsScrollable: jest.fn(),
-    disabled,
+    textAreaRef, submitButtonRef, setIsScrollable: jest.fn(), disabled,
   });
   // These are the confirmed ChatForm consumer expressions; the production hook and SendButton run here.
-  return (
-    <form onSubmit={methods.handleSubmit(mockSubmit)}>
-      <textarea
-        {...field}
-        ref={(element) => {
-          field.ref(element);
-          textAreaRef.current = element;
-        }}
-        aria-label="New message"
-        disabled={disabled || isNotAppendable}
-        onKeyDown={handleKeyDown}
-      />
-      <SendButton
-        ref={submitButtonRef}
-        control={methods.control}
-        disabled={mockFilesLoading || disabled || isNotAppendable}
-      />
-    </form>
-  );
+  return <form onSubmit={methods.handleSubmit(mockSubmit)}>
+    <textarea {...field} ref={(element) => { field.ref(element); textAreaRef.current = element; }}
+      aria-label="New message" disabled={disabled || isNotAppendable} onKeyDown={handleKeyDown} />
+    <SendButton ref={submitButtonRef} control={methods.control}
+      disabled={mockFilesLoading || disabled || isNotAppendable} />
+  </form>;
 }
 
 beforeEach(() => {
-  mockLatest = {
-    messageId: 'failed-answer',
-    parentMessageId: 'original-request',
-    error: true,
-    unfinished: false,
-  };
-  mockEndpoint = 'agents';
-  mockFilesLoading = false;
-  mockIsSubmitting = false;
-  mockSubmit.mockClear();
+  mockLatest = { messageId: 'failed-answer', parentMessageId: 'original-request', error: true, unfinished: false };
+  mockEndpoint = 'agents'; mockFilesLoading = false; mockIsSubmitting = false; mockSubmit.mockClear();
 });
 
 test('settled Agents failure permits a new message and keeps the original failure intact', async () => {
@@ -122,23 +75,18 @@ test('settled Agents failure permits a new message and keeps the original failur
   expect(screen.getByTestId('send-button')).toBeEnabled();
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Try a new request.' } });
   fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', code: 'Enter' });
-  await waitFor(() =>
-    expect(mockSubmit).toHaveBeenCalledWith({ text: 'Try a new request.' }, expect.anything()),
-  );
+  await waitFor(() => expect(mockSubmit).toHaveBeenCalledWith({ text: 'Try a new request.' }, expect.anything()));
   expect(mockLatest).toEqual(saved);
 });
 
-test.each([true, undefined])(
-  'unfinished or unknown Agents failure stays locked: %s',
-  (unfinished) => {
-    mockLatest.unfinished = unfinished;
-    render(<Composer />);
-    expect(screen.getByRole('textbox')).toBeDisabled();
-    expect(screen.getByTestId('send-button')).toBeDisabled();
-    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
-    expect(mockSubmit).not.toHaveBeenCalled();
-  },
-);
+test.each([true, undefined])('unfinished or unknown Agents failure stays locked: %s', (unfinished) => {
+  mockLatest.unfinished = unfinished;
+  render(<Composer />);
+  expect(screen.getByRole('textbox')).toBeDisabled();
+  expect(screen.getByTestId('send-button')).toBeDisabled();
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+  expect(mockSubmit).not.toHaveBeenCalled();
+});
 
 test('non-Agents legacy failure keeps its input lock even after settlement', () => {
   mockEndpoint = 'openAI';
@@ -148,16 +96,14 @@ test('non-Agents legacy failure keeps its input lock even after settlement', () 
 });
 
 test('Assistants keeps its existing append behavior', () => {
-  mockEndpoint = 'assistants';
-  mockLatest.unfinished = undefined;
+  mockEndpoint = 'assistants'; mockLatest.unfinished = undefined;
   render(<Composer />);
   expect(screen.getByRole('textbox')).toBeEnabled();
   expect(screen.getByTestId('send-button')).toBeEnabled();
 });
 
 test('healthy ongoing Agents output keeps the existing superseding-input behavior', () => {
-  mockLatest = { error: false, unfinished: true };
-  mockIsSubmitting = true;
+  mockLatest = { error: false, unfinished: true }; mockIsSubmitting = true;
   render(<Composer />);
   expect(screen.getByRole('textbox')).toBeEnabled();
   expect(screen.getByTestId('send-button')).toBeEnabled();

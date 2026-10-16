@@ -86,6 +86,7 @@ export interface IAgent extends Omit<Document, 'model'> {
       worker_profile?: 'codex-cli' | 'claude-code' | 'grok-build' | 'openclaw-general';
       fallback_worker_profile?: 'codex-cli' | 'claude-code' | 'grok-build' | 'openclaw-general';
       worker_model?: string;
+      worker_access?: 'ask' | 'full';
       worker_reasoning_effort?: string;
       fallback_worker_model?: string;
       fallback_worker_reasoning_effort?: string;
@@ -112,6 +113,10 @@ export interface IAgent extends Omit<Document, 'model'> {
   tool_resources?: unknown;
   projectIds?: Types.ObjectId[];
   versions?: Omit<IAgent, 'versions'>[];
+  /* === VIVENTIUM START === Separate durable Agent history. === */
+  /** Accepted history count after transactional migration to AgentVersion documents. */
+  version_count?: number;
+  /* === VIVENTIUM END === */
   category: string;
   support_contact?: ISupportContact;
   is_promoted?: boolean;

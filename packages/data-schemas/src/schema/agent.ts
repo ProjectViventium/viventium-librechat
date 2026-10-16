@@ -114,6 +114,9 @@ const agentSchema = new Schema<IAgent>(
       type: [Schema.Types.Mixed],
       default: [],
     },
+    /* === VIVENTIUM START === External history keeps the active Agent within BSON capacity. === */
+    version_count: { type: Number, min: 0, default: undefined },
+    /* === VIVENTIUM END === */
     category: {
       type: String,
       trim: true,

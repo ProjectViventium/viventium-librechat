@@ -77,6 +77,20 @@ export interface IMainCompactionOutputContract {
   maxToolIdentityCharacters: number;
 }
 
+/** Unaccepted fidelity repair retained by the existing epoch/lease owner, never delivered context. */
+export interface IMainContinuityCompactionRepair {
+  version: 1;
+  sourceDigest: string;
+  contractKey: string;
+  semanticAttempts: number;
+  transportRetries: number;
+  sourceGeneration: number;
+  sourceTurnKeys: string[];
+  legacySourceRange?: IMainContinuityLegacySourceRange;
+  outputContract?: IMainCompactionOutputContract;
+  correction: { code: 'semantic_fidelity'; candidate: string; reason?: string };
+}
+
 export interface IMainContinuityCompactionLease {
   leaseId: string;
   sourceDigest: string;
@@ -126,6 +140,7 @@ export interface IViventiumMainContinuityState {
   semanticCompactionContract?: IMainCompactionOutputContract;
   compactionStatus: MainContinuityCompactionStatus;
   compactionLease: IMainContinuityCompactionLease | null;
+  pendingCompactionRepair?: IMainContinuityCompactionRepair | null;
   lastCompactionError: string;
   createdAt: Date;
   updatedAt: Date;

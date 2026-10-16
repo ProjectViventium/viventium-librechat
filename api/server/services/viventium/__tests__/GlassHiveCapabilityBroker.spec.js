@@ -35,6 +35,7 @@ const mockInspectStoredOAuthCredentialState = jest.fn();
 const mockGetUserById = jest.fn();
 const mockGetFiles = jest.fn();
 const mockGetMessages = jest.fn();
+const mockGetMCPServerTools = jest.fn();
 const mockGetDownloadStream = jest.fn();
 const mockGetStrategyFunctions = jest.fn(() => ({ getDownloadStream: mockGetDownloadStream }));
 const mockConfiguredTranscribe = jest.fn(async () => ({
@@ -115,6 +116,10 @@ jest.mock('~/server/services/GraphTokenService', () => ({
   getGraphApiToken: jest.fn(),
 }));
 
+jest.mock('~/server/services/Config/getCachedTools', () => ({
+  getMCPServerTools: (...args) => mockGetMCPServerTools(...args),
+}));
+
 jest.mock('~/server/services/Tools/mcp', () => ({
   buildMcpOAuthRecovery: (server) => ({
     action: 'connect_mcp_account',
@@ -128,6 +133,12 @@ jest.mock('~/server/services/Tools/mcp', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  nativeToolDefinitionsFromCache: (...args) =>
+    jest.requireActual('@librechat/api').nativeToolDefinitionsFromCache(...args),
+  nativeToolCatalogFitsBootstrap: (...args) =>
+    jest.requireActual('@librechat/api').nativeToolCatalogFitsBootstrap(...args),
+  createNativeToolCatalog: (...args) =>
+    jest.requireActual('@librechat/api').createNativeToolCatalog(...args),
   checkAccess: (...args) => mockCitationAccess(...args),
   assertCurrentGlassHiveSourceAuthor: (...args) => mockAssertCurrentGlassHiveSourceAuthor(...args),
   GenerationJobManager: {
@@ -293,6 +304,7 @@ describe('GlassHive capability broker', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetMCPServerTools.mockReset().mockResolvedValue(null);
     mockGetMessages.mockReset().mockResolvedValue([]);
     mockPrepareDurableEffect
       .mockReset()
@@ -591,6 +603,132 @@ describe('GlassHive capability broker', () => {
     });
   });
 
+  test('catalog projection uses only current eager authorization and cached metadata without seeding discovery', async () => {
+    const {
+      buildConversationProviderBootstrapBundle,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    const {
+      verifyBrokerGrant,
+      hydrateBrokerGrantResources,
+    } = require('../GlassHiveCapabilityBrokerAuth');
+    const { buildCapabilityCatalog } = require('../GlassHiveCapabilityBrokerService');
+    const policy = {
+      source: 'config',
+      viventiumGlassHive: {
+        version: 1,
+        permitsAutonomousWorker: true,
+        hostAllowed: true,
+        defaultToolAccess: 'content_read',
+        reexportNativeTools: true,
+        toolPolicies: { eager_tools_read: { access: 'content_read' } },
+      },
+    };
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({
+        eager_tools: policy,
+        deferred_tools: policy,
+        ungranted_tools: policy,
+      }),
+      getServerConfig: jest.fn().mockResolvedValue(policy),
+    });
+    mockReinitMCPServer.mockImplementation(async ({ serverName }) => ({
+      success: true,
+      oauthRequired: false,
+      tools: [
+        {
+          name: serverName + '_read',
+          description: 'Literal {{keep}} data.',
+          inputSchema: {
+            type: 'object',
+            properties: { value: { type: 'string', const: '{{literal}}' } },
+          },
+        },
+      ],
+    }));
+    mockGetMCPServerTools.mockResolvedValue({
+      eager_tools_read_mcp_eager_tools: {
+        type: 'function',
+        function: {
+          name: 'eager_tools_read_mcp_eager_tools',
+          description: 'Literal {{keep}} data.',
+          parameters: {
+            type: 'object',
+            properties: { value: { type: 'string', const: '{{literal}}' } },
+          },
+        },
+      },
+    });
+    const bundle = await buildConversationProviderBootstrapBundle({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: { conversationId: 'catalog-conversation', messageId: 'catalog-message' },
+      allowedServerNames: ['eager_tools'],
+      deferredServerNames: ['deferred_tools'],
+    });
+    const metadata = bundle.glasshive_capability_broker.tool_catalog;
+    expect(metadata).toBeDefined();
+    expect(metadata.tools.some((tool) => tool.name.includes('eager_tools_read'))).toBe(true);
+    expect(JSON.stringify(metadata)).not.toContain('deferred_tools_read');
+    expect(JSON.stringify(metadata)).not.toContain('ungranted_tools');
+    expect(JSON.stringify(metadata)).toContain('{{literal}}');
+    expect(mockReinitMCPServer).not.toHaveBeenCalled();
+    expect(mockGetMCPServerTools).toHaveBeenCalledTimes(1);
+    expect(mockGetMCPServerTools).toHaveBeenCalledWith('user-1', 'eager_tools');
+    const grant = await hydrateBrokerGrantResources(
+      verifyBrokerGrant(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN),
+    );
+    await buildCapabilityCatalog({ grant });
+    expect(mockReinitMCPServer).toHaveBeenCalledTimes(1);
+    for (const key of ['agents_md', 'claude_md', 'codex_md', 'conversation_provider_instructions'])
+      expect(bundle[key] || '').not.toContain('{{literal}}');
+  });
+
+  test.each(['cold', 'malformed', 'removed_policy', 'second_cold', 'credentials'])(
+    'optional cached catalog omits all on %s without starting slow discovery',
+    async (failure) => {
+      const {
+        buildConversationProviderBootstrapBundle,
+      } = require('../GlassHiveCapabilityBootstrapService');
+      const policy = {
+        source: 'config',
+        ...(failure === 'credentials' ? { requiresOAuth: true } : {}),
+        viventiumGlassHive: {
+          version: 1,
+          permitsAutonomousWorker: true,
+          hostAllowed: true,
+          defaultToolAccess: 'read',
+          toolPolicies: failure === 'removed_policy' ? {} : { read: { access: 'write' } },
+        },
+      };
+      mockGetMCPServersRegistry.mockReturnValue({
+        getAllServerConfigs: jest.fn().mockResolvedValue({ eager: policy, second: policy }),
+        getServerConfig: jest.fn().mockResolvedValue(policy),
+      });
+      mockGetMCPServerTools.mockImplementation(async (_user, server) =>
+        failure === 'cold' || server === 'second'
+          ? null
+          : failure === 'malformed'
+            ? { invalid: {} }
+            : {
+                read_mcp_eager: {
+                  type: 'function',
+                  function: { name: 'read_mcp_eager', parameters: { type: 'object' } },
+                },
+              },
+      );
+      mockInspectStoredOAuthCredentialState.mockResolvedValue({ status: 'missing_auth' });
+      mockReinitMCPServer.mockImplementation(() => new Promise(() => {}));
+      const bundle = await buildConversationProviderBootstrapBundle({
+        user: { id: 'user-1', role: 'USER' },
+        requestBody: { conversationId: 'c', messageId: 'm' },
+        allowedServerNames: failure === 'second_cold' ? ['eager', 'second'] : ['eager'],
+      });
+      expect(bundle.glasshive_capability_broker.grant_id).toBeTruthy();
+      expect(bundle.glasshive_capability_broker.tool_catalog).toBeUndefined();
+      expect(bundle.env.GLASSHIVE_CAPABILITY_BROKER_TOKEN).toBeTruthy();
+      expect(mockReinitMCPServer).not.toHaveBeenCalled();
+    },
+  );
+
   test('projects Main orchestration into one signed provider grant with server-side resources', async () => {
     const {
       buildConversationProviderBootstrapBundle,
@@ -641,6 +779,21 @@ describe('GlassHive capability broker', () => {
       },
     });
     expect(bundle.glasshive_capability_broker.allowed_host_tools).toEqual(grant.allowed_host_tools);
+    const catalog = bundle.glasshive_capability_broker.tool_catalog;
+    expect(catalog).toMatchObject({
+      version: 1,
+      grant_id: grant.grant_id,
+      expires_at: grant.exp,
+      server_name: bundle.glasshive_capability_broker.name,
+      broker_url: bundle.glasshive_capability_broker.url,
+    });
+    const delegate = catalog.tools.find(
+      (tool) => tool.name === 'worker_delegate_once_mcp_glasshive-workers-projects',
+    );
+    expect(delegate.inputSchema.properties.invocation_id).toBeUndefined();
+    expect(catalog.tools.some((tool) => tool.name === 'active_work_list')).toBe(true);
+    expect(catalog.tools.some((tool) => tool.name === 'active_work_action')).toBe(true);
+    expect(catalog.tools.some((tool) => tool.name === 'file_search')).toBe(false);
     for (const brief of [bundle.agents_md, bundle.claude_md, bundle.codex_md]) {
       expect(brief).toContain('This list is the scope of this invocation only');
       expect(brief).toContain(
@@ -5253,4 +5406,22 @@ describe('Claude exact granted host read permissions', () => {
       ]);
     });
   });
+});
+
+test('a fresh or inherited broker scope never retains a prior grant catalog', () => {
+  const { mergeBrokerBundle } = require('../GlassHiveCapabilityBootstrapService');
+  const bundle = mergeBrokerBundle({
+    existingBundle: {
+      glasshive_capability_broker: {
+        tool_catalog: { version: 1, grant_id: 'prior-grant', tools: [{ name: 'prior_tool' }] },
+      },
+    },
+    brokerUrl: 'https://example.test/mcp',
+    grantToken: 'synthetic',
+    grantPayload: { grant_id: 'fresh-worker-grant', exp: 4102444800 },
+    allowedServers: [],
+    allowedHostTools: [],
+  });
+  expect(bundle.glasshive_capability_broker.grant_id).toBe('fresh-worker-grant');
+  expect(bundle.glasshive_capability_broker.tool_catalog).toBeUndefined();
 });

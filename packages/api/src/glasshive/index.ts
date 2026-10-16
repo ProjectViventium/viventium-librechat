@@ -26,6 +26,7 @@ export * from './terminalCallbackTransaction';
 export * from './nativeResponse';
 export * from './nativeOutputFiles';
 export * from './nativeToolEvidence';
+export * from './nativeToolCatalog';
 export * from './terminalCallbackOutbox';
 export * from './callbackBinding';
 export * from './callbackDeliveryDispatch';

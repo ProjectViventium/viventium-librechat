@@ -5,6 +5,7 @@ const {
 } = require('./VoiceTaskManagementTool');
 const {
   backgroundWorkerResources,
+  nativeToolDefinitionsFromCache,
   resolveBackgroundWorkerRoute,
   mainDelegationJsonSchema,
   resolveSelectedDelegationAttachments,
@@ -38,6 +39,7 @@ const { CacheKeys, PermissionTypes, Permissions } = require('librechat-data-prov
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
 const { findToken, createToken, updateToken, deleteToken, getUserById } = require('~/models');
 const { getLogStores } = require('~/cache');
+const { getMCPServerTools } = require('~/server/services/Config/getCachedTools');
 const { getGraphApiToken } = require('~/server/services/GraphTokenService');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
 const {
@@ -483,6 +485,7 @@ async function buildCapabilityCatalog({
   requestedServerNames,
   requestedHostToolName,
   appConfig,
+  metadataOnly = false,
 } = {}) {
   const user = await userForGrant(grant);
   const registry = getMCPServersRegistry();
@@ -610,11 +613,29 @@ async function buildCapabilityCatalog({
     const serverConfig = await registry.getServerConfig(serverName, user.id).catch(() => null);
     const policy = getPolicy(serverConfig);
     if (!serverConfig || !policy || !isTrustedServerConfig(serverConfig)) {
+      if (metadataOnly) throw new Error('native_tool_catalog_policy_unavailable');
       omissions.push(logOmission('policy_not_authorized', serverName));
       continue;
     }
-    let discovered = cachedServerDiscovery(grant, serverName);
-    if (discovered) {
+    let discovered;
+    if (metadataOnly) {
+      // No MCP initialization, listTools, retry or grant-cache population on this advisory path.
+      if (await oauthDiscoveryBlocker({ user, serverName, serverConfig })) {
+        throw new Error('native_tool_catalog_credentials_unavailable');
+      }
+      const tools = nativeToolDefinitionsFromCache({
+        serverName,
+        cachedTools: await getMCPServerTools(user.id, serverName),
+        toolPolicies: policy.toolPolicies,
+      });
+      if (!tools) throw new Error('native_tool_catalog_metadata_unavailable');
+      discovered = { tools, success: true, oauthRequired: false };
+    } else {
+      discovered = cachedServerDiscovery(grant, serverName);
+    }
+    if (metadataOnly) {
+      // Continue through the same policy-qualified definition projection below.
+    } else if (discovered) {
       const blocker = await oauthDiscoveryBlocker({ user, serverName, serverConfig });
       if (blocker) {
         discovered = blocker;

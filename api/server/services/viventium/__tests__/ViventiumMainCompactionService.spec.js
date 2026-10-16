@@ -50,14 +50,12 @@ const {
   setMainContinuityPersistenceForTests,
 } = require('../ViventiumMainContinuityService');
 const {
-  acquireInteractiveMainAdmissionFence,
   buildCompactionPrompt,
   compactorAgent,
   ensureAcceptedMainCompaction,
   flushEndedCallMainCompactions,
   loadAcceptedMainContextForAdmission,
   parseSemanticCompactionOutput,
-  yieldAcceptedMainCompaction,
 } = require('../ViventiumMainCompactionService');
 
 function inMemoryPersistence() {
@@ -911,6 +909,253 @@ describe('ViventiumMainCompactionService', () => {
     expect(ensureCompaction).not.toHaveBeenCalled();
     expect(context).not.toHaveProperty('capsule');
   });
+
+  test('parallel recovery follows the real idle batch into its next claim without duplicate work', async () => {
+    let completed = 0;
+    const gates = [0, 1].map(() => {
+      let release, started;
+      return {
+        ready: new Promise((resolve) => {
+          started = resolve;
+        }),
+        wait: new Promise((resolve) => {
+          release = resolve;
+        }),
+        start: () => started(),
+        release: () => release(),
+      };
+    });
+    const candidate = JSON.stringify({
+      version: 1,
+      summary: 'Keep the exact approval boundary.',
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    });
+    const claim = jest.fn(async () => ({
+      status: 'claimed',
+      leaseId: `parallel-${completed}`,
+      domainEpochKey: 'parallel-domain',
+      sourceDigest: String(completed + 1).repeat(64),
+      sourceBytes: 100,
+      sourceTurns: [],
+      leaseExpiresAt: new Date(Date.now() + 300000),
+    }));
+    const batch = ensureAcceptedMainCompaction({
+      ...identity,
+      trigger: 'accepted_turn',
+      claimCompaction: claim,
+      rejectCompaction: jest.fn(),
+      completeCompaction: async () => ({
+        status: 'compacted',
+        continuationPending: ++completed < 2,
+      }),
+      executeCompactor: async (call) => {
+        if (call.stage !== 'review') {
+          gates[completed].start();
+          await gates[completed].wait;
+        }
+        expect(call.signal.aborted).toBe(false);
+        call.reportCapacityRelease(true);
+        return call.stage === 'review' ? reviewApproved : candidate;
+      },
+    });
+    await gates[0].ready;
+    const ensureCompaction = jest.fn(async () => ({ status: 'busy' }));
+    const waiting = loadAcceptedMainContextForAdmission({
+      ...identity,
+      req: {},
+      ensureCompaction,
+      loadContext: async () => ({ status: completed === 2 ? 'available' : 'context_budget' }),
+    });
+    void waiting.catch(() => {});
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(ensureCompaction).not.toHaveBeenCalled();
+      gates[0].release();
+      await gates[1].ready;
+      expect(ensureCompaction).not.toHaveBeenCalled();
+      gates[1].release();
+      await expect(waiting).resolves.toMatchObject({ status: 'available' });
+      expect(claim).toHaveBeenCalledTimes(2);
+      expect(ensureCompaction).not.toHaveBeenCalled();
+    } finally {
+      gates.forEach((gate) => gate.release());
+      await batch;
+    }
+  });
+
+  test('parallel reviewed memory survives fitting Main reads and newly accepted turns', async () => {
+    const outputCarrier = { carrierMaxUtf8Bytes: 131072, reservedContextUtf8Bytes: 0 };
+    const store = inMemoryPersistence();
+    setMainContinuityPersistenceForTests(store);
+    const append = (index) =>
+      commitAcceptedMainTurn({
+        ...identity,
+        logicalTurnId: `parallel-turn-${index}`,
+        revision: 1,
+        conversationId: 'parallel-source',
+        userMessageId: `user-${index}`,
+        assistantMessageId: `answer-${index}`,
+        userText: `Original question ${index}.`,
+        assistantText: `Original answer ${index}.`,
+        origin: 'interactive',
+      });
+    for (let i = 0; i < 7; i++) await append(i);
+    let release, started, signal;
+    const ready = new Promise((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const executeCompactor = jest.fn(async (call) => {
+      signal = call.signal;
+      if (call.stage !== 'review') {
+        started();
+        await gate;
+      }
+      expect(call.signal.aborted).toBe(false);
+      call.reportCapacityRelease(true);
+      return call.stage === 'review'
+        ? reviewApproved
+        : JSON.stringify({
+            version: 1,
+            summary: 'Original question 0 and its original answer remain covered.',
+            pendingAsks: [],
+            commitments: [],
+            corrections: [],
+            decisions: [],
+            durableIdentifiers: [],
+            recurrenceOutcomes: [],
+            toolPairs: [],
+          });
+    });
+    const running = ensureAcceptedMainCompaction({
+      ...identity,
+      trigger: 'accepted_turn',
+      executeCompactor,
+    });
+    await Promise.race([
+      ready,
+      running.then((result) => {
+        throw new Error(`Expected a background claim: ${result.status}`);
+      }),
+    ]);
+    try {
+      await append(7);
+      for (let i = 0; i < 3; i++) {
+        const context = await loadAcceptedMainContextForAdmission({
+          ...identity,
+          outputCarrier,
+          req: {},
+        });
+        expect(context.status).toBe('available');
+        expect(signal.aborted).toBe(false);
+        expect(context.capsule).toContain('Original question 7.');
+      }
+      expect(executeCompactor).toHaveBeenCalledTimes(1);
+      release();
+      expect(await running).toMatchObject({ status: 'compacted' });
+      expect(executeCompactor.mock.calls.map(([call]) => call.stage || 'compaction')).toEqual([
+        'compaction',
+        'review',
+      ]);
+      const context = await loadAcceptedMainContext(identity);
+      expect(context.semanticCompaction.summary).toContain('Original question 0');
+      expect(context.capsule).toContain('Original question 7.');
+      expect(store.accepted.size).toBe(8);
+    } finally {
+      release();
+      await running;
+    }
+  });
+
+  test.each(['same', 'other-owner', 'other-agent', 'other-authority'])(
+    'parallel dependency waits only on its exact continuity domain (%s)',
+    async (mode) => {
+      let release, started, producerSignal;
+      const ready = new Promise((resolve) => {
+        started = resolve;
+      });
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      const candidate = JSON.stringify({
+        version: 1,
+        summary: 'Keep the approval boundary.',
+        pendingAsks: [],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: [],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      });
+      const running = ensureAcceptedMainCompaction({
+        ...identity,
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: 'scoped-memory',
+          sourceDigest: 'a'.repeat(64),
+          domainEpochKey: 'scoped-domain',
+          sourceBytes: 100,
+          sourceTurns: [],
+          leaseExpiresAt: new Date(Date.now() + 300000),
+        }),
+        executeCompactor: async (call) => {
+          producerSignal = call.signal;
+          if (call.stage !== 'review') {
+            started();
+            await gate;
+          }
+          call.reportCapacityRelease(true);
+          return call.stage === 'review' ? reviewApproved : candidate;
+        },
+        completeCompaction: async () => ({ status: 'compacted' }),
+        rejectCompaction: jest.fn(),
+      });
+      await ready;
+      const waitingIdentity = {
+        ...identity,
+        ...(mode === 'other-owner' ? { ownerId: 'another-owner' } : {}),
+        ...(mode === 'other-agent' ? { agentId: 'another-agent' } : {}),
+        ...(mode === 'other-authority' ? { stableAuthoritySha256: 'f'.repeat(64) } : {}),
+      };
+      const stop = new AbortController();
+      const ensureCompaction = jest.fn(async () => ({ status: 'empty' }));
+      const waiting = loadAcceptedMainContextForAdmission({
+        ...waitingIdentity,
+        req: {},
+        signal: stop.signal,
+        loadContext: async () => ({ status: 'context_budget' }),
+        ensureCompaction,
+      });
+      void waiting.catch(() => {});
+      try {
+        await new Promise((resolve) => setImmediate(resolve));
+        if (mode === 'same') {
+          expect(ensureCompaction).not.toHaveBeenCalled();
+          stop.abort('user_cancelled');
+          await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+        } else {
+          await expect(waiting).rejects.toMatchObject({
+            code: 'source_context_unavailable',
+            status: 413,
+          });
+          expect(ensureCompaction).toHaveBeenCalledTimes(1);
+        }
+        expect(producerSignal.aborted).toBe(false);
+      } finally {
+        release();
+        expect(await running).toMatchObject({ status: 'compacted' });
+      }
+    },
+  );
 
   test('accepted compaction claim inherits the actual request-selected aggregate carrier', async () => {
     const outputCarrier = { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: 25000 };
@@ -2263,10 +2508,118 @@ describe('ViventiumMainCompactionService', () => {
       },
     );
 
-    test('a long detached native producer reaches review with a renewed live claim and its own deadline', async () => {
-      jest.useFakeTimers();
-      jest.setSystemTime(1000);
+    test.each(['background', 'foreground'])(
+      'a long %s native producer reaches review with a renewed live claim and its own deadline',
+      async (mode) => {
+        jest.useFakeTimers();
+        jest.setSystemTime(1000);
+        const args = input(voiceRequest());
+        args.foreground = mode === 'foreground';
+        args.req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-native': { workspace_binding: true, conversation_session: true },
+            },
+          },
+        };
+        args.renewCompaction = jest.fn(async ({ leaseExpiresAt, expiresAt }) => {
+          expect(new Date(leaseExpiresAt).getTime()).toBeGreaterThan(Date.now());
+          return { status: 'renewed', leaseExpiresAt: expiresAt.toISOString() };
+        });
+        let started;
+        const admitted = new Promise((resolve) => {
+          started = resolve;
+        });
+        const execute = jest
+          .spyOn(background, 'executeCortex')
+          .mockImplementation(async (params) => {
+            expect(typeof params.onNativeAdmission).toBe('function');
+            expect(
+              await params.onNativeAdmission({
+                requestId: params.agent.id,
+                responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+              }),
+            ).toBe(true);
+            if (!params.agent.id.endsWith('-review')) {
+              started();
+              await new Promise((resolve) => setTimeout(resolve, 660000));
+              return { insight: structured, nativeOwnership: 'ended' };
+            }
+            // Fresh stage admission replenishes the short lease left by the long producer.
+            expect(params.executionTimeoutMs).toBe(240000);
+            return { insight: reviewApproved, nativeOwnership: 'ended' };
+          });
+        try {
+          const result = ensureAcceptedMainCompaction(args);
+          await Promise.race([
+            admitted,
+            result.then(() => {
+              throw new Error('Producer not admitted');
+            }),
+          ]);
+          await jest.advanceTimersByTimeAsync(660000);
+          expect(await result).toMatchObject({ status: 'compacted' });
+          expect(execute).toHaveBeenCalledTimes(2);
+          expect(args.renewCompaction.mock.calls.length).toBeGreaterThanOrEqual(4);
+          expect(jest.getTimerCount()).toBe(0);
+        } finally {
+          execute.mockRestore();
+          jest.useRealTimers();
+        }
+      },
+    );
+
+    test.each([1200000, 800000])(
+      'foreground receipt respects its finite %s enclosing budget without changing Native timeout metadata',
+      async (remainingMs) => {
+        jest.useFakeTimers();
+        jest.setSystemTime(1000);
+        const args = input(voiceRequest());
+        args.foreground = true;
+        args.deadlineAt = new Date(Date.now() + remainingMs).toISOString();
+        args.executionBudget = { completionReserveMs: 0 };
+        args.req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              'synthetic-native': { workspace_binding: true, conversation_session: true },
+            },
+          },
+        };
+        args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+          status: 'renewed',
+          leaseExpiresAt: expiresAt.toISOString(),
+        }));
+        const execute = jest
+          .spyOn(background, 'executeCortex')
+          .mockImplementation(async (params) => {
+            expect(params.nativeResponseDeadlineAt).toBeUndefined();
+            expect(params.executionTimeoutMs).toBeLessThanOrEqual(240000);
+            const approved = await params.onNativeAdmission({
+              requestId: params.agent.id,
+              responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
+            });
+            expect(approved).toBe(remainingMs === 1200000 || params.agent.id.endsWith('-review'));
+            return {
+              insight: params.agent.id.endsWith('-review') ? reviewApproved : structured,
+              nativeOwnership: 'ended',
+            };
+          });
+        try {
+          expect(await ensureAcceptedMainCompaction(args)).toMatchObject({ status: 'compacted' });
+          expect(execute).toHaveBeenCalledTimes(2);
+          expect(jest.getTimerCount()).toBe(0);
+        } finally {
+          execute.mockRestore();
+          jest.useRealTimers();
+        }
+      },
+    );
+
+    test('foreground native carrier recovery still cancels with its waiting request', async () => {
+      const controller = new AbortController();
       const args = input(voiceRequest());
+      args.foreground = true;
+      args.signal = controller.signal;
       args.req.config.endpoints = {
         agents: {
           providerCapabilities: {
@@ -2274,47 +2627,47 @@ describe('ViventiumMainCompactionService', () => {
           },
         },
       };
-      args.renewCompaction = jest.fn(async ({ leaseExpiresAt, expiresAt }) => {
-        expect(new Date(leaseExpiresAt).getTime()).toBeGreaterThan(Date.now());
-        return { status: 'renewed', leaseExpiresAt: expiresAt.toISOString() };
-      });
-      let started;
+      args.renewCompaction = jest.fn(async ({ expiresAt }) => ({
+        status: 'renewed',
+        leaseExpiresAt: expiresAt.toISOString(),
+      }));
+      let admit;
       const admitted = new Promise((resolve) => {
-        started = resolve;
+        admit = resolve;
       });
       const execute = jest.spyOn(background, 'executeCortex').mockImplementation(async (params) => {
-        expect(typeof params.onNativeAdmission).toBe('function');
         expect(
           await params.onNativeAdmission({
             requestId: params.agent.id,
             responseDeadlineAt: new Date(Date.now() + 660000).toISOString(),
           }),
         ).toBe(true);
-        if (!params.agent.id.endsWith('-review')) {
-          started();
-          await new Promise((resolve) => setTimeout(resolve, 660000));
-          return { insight: structured, nativeOwnership: 'ended' };
-        }
-        // Fresh stage admission replenishes the short lease left by the long producer.
-        expect(params.executionTimeoutMs).toBe(240000);
-        return { insight: reviewApproved, nativeOwnership: 'ended' };
+        admit();
+        await new Promise((resolve) =>
+          params.signal.addEventListener('abort', resolve, { once: true }),
+        );
+        params.onHarnessCancellationOutcome({ acknowledged: true });
+        return { error: 'cancelled', nativeOwnership: 'ended' };
       });
       try {
         const result = ensureAcceptedMainCompaction(args);
         await Promise.race([
           admitted,
           result.then(() => {
-            throw new Error('Producer not admitted');
+            throw Error('Foreground producer not admitted');
           }),
         ]);
-        await jest.advanceTimersByTimeAsync(660000);
-        expect(await result).toMatchObject({ status: 'compacted' });
-        expect(execute).toHaveBeenCalledTimes(2);
-        expect(args.renewCompaction.mock.calls.length).toBeGreaterThanOrEqual(4);
-        expect(jest.getTimerCount()).toBe(0);
+        controller.abort('user_cancelled');
+        const delivery = controller.signal._viventiumHarnessCancellationDelivery;
+        await expect(result).resolves.toMatchObject({
+          status: 'degraded',
+          reason: 'compaction_cancelled',
+        });
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(args.completeCompaction).not.toHaveBeenCalled();
+        await expect(delivery).resolves.toEqual({ delivered: true });
       } finally {
         execute.mockRestore();
-        jest.useRealTimers();
       }
     });
 
@@ -2769,7 +3122,7 @@ describe('ViventiumMainCompactionService', () => {
       },
     );
 
-    test('foreground admission still cancels an admitted finite native compaction', async () => {
+    test('an explicit caller Stop still cancels an admitted finite native compaction', async () => {
       const args = input(voiceRequest());
       args.deadlineAt = new Date(Date.now() + 1200000).toISOString();
       args.executionBudget = { completionReserveMs: 0 };
@@ -2804,7 +3157,8 @@ describe('ViventiumMainCompactionService', () => {
         params.reportCapacityRelease(true);
         return { error: 'cancelled', nativeOwnership: 'ended' };
       });
-      let release;
+      const stop = new AbortController();
+      args.signal = stop.signal;
       try {
         const result = ensureAcceptedMainCompaction(args);
         await Promise.race([
@@ -2813,13 +3167,11 @@ describe('ViventiumMainCompactionService', () => {
             throw new Error('Finite producer not admitted');
           }),
         ]);
-        release = acquireInteractiveMainAdmissionFence(identity.ownerId);
-        await yieldAcceptedMainCompaction(identity.ownerId);
+        stop.abort('user_cancelled');
         expect(observedSignal.aborted).toBe(true);
-        expect(await result).toMatchObject({ status: 'degraded', reason: 'interactive_priority' });
+        expect(await result).toMatchObject({ status: 'degraded', reason: 'compaction_cancelled' });
         expect(args.completeCompaction).not.toHaveBeenCalled();
       } finally {
-        release?.();
         execute.mockRestore();
       }
     });
@@ -2857,9 +3209,14 @@ describe('ViventiumMainCompactionService', () => {
       }
     });
 
-    test.each(['foreground', 'non-native', 'no-renewal'])(
-      'keeps the legacy native deadline policy for %s',
-      async (mode) => {
+    test.each([
+      ['non-native', false],
+      ['non-native', true],
+      ['no-renewal', false],
+      ['no-renewal', true],
+    ])(
+      'keeps the legacy native deadline policy for %s with foreground=%s',
+      async (mode, foreground) => {
         const args = input(voiceRequest());
         args.req.config.endpoints = {
           agents: {
@@ -2870,7 +3227,7 @@ describe('ViventiumMainCompactionService', () => {
         };
         if (mode !== 'no-renewal')
           args.renewCompaction = jest.fn(async () => ({ status: 'stale_lease' }));
-        if (mode === 'foreground') args.foreground = true;
+        args.foreground = foreground;
         if (mode === 'non-native') args.req.config.endpoints.agents.providerCapabilities = {};
         const execute = jest
           .spyOn(background, 'executeCortex')
@@ -3020,7 +3377,7 @@ describe('ViventiumMainCompactionService', () => {
       }
     });
 
-    test('maintenance yield releases only the default voice compactor exact native attempt', async () => {
+    test('explicit Stop releases only the default voice compactor exact native attempt', async () => {
       const outer = voiceRequest();
       const originalBody = structuredClone(outer.body);
       const fetchImpl = jest.fn(async () => ({
@@ -3047,14 +3404,14 @@ describe('ViventiumMainCompactionService', () => {
           nativeOwnership: outcome?.acknowledged === true ? 'released' : 'unresolved',
         };
       });
-      const args = input(outer);
+      const stop = new AbortController();
+      const args = { ...input(outer), signal: stop.signal };
       const running = ensureAcceptedMainCompaction(args);
       try {
         await ready;
-        const yielded = await yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 1000 });
-        expect(await running).toMatchObject({ status: 'degraded', reason: 'interactive_priority' });
+        stop.abort('user_cancelled');
+        expect(await running).toMatchObject({ status: 'degraded', reason: 'compaction_cancelled' });
         expect(binding.bound).toBe(true);
-        expect(yielded).toMatchObject({ status: 'yielded', capacityReleaseAcknowledged: true });
         expect(fetchImpl).toHaveBeenCalledTimes(1);
         expect(fetchImpl.mock.calls[0][0]).toBe(
           `${endpoint.baseURL}/requests/by-idempotency/${encodeURIComponent(
@@ -3070,7 +3427,7 @@ describe('ViventiumMainCompactionService', () => {
         });
         expect(args.completeCompaction).not.toHaveBeenCalled();
         expect(args.rejectCompaction).toHaveBeenCalledWith(
-          expect.objectContaining({ reason: 'interactive_priority' }),
+          expect.objectContaining({ reason: 'compaction_cancelled' }),
         );
         expect(outer.body).toEqual(originalBody);
         expect(outer.viventiumCallSession.callSessionId).toBe('synthetic-outer-call');
@@ -3391,7 +3748,7 @@ describe('ViventiumMainCompactionService', () => {
     expect(sleep).toHaveBeenCalledTimes(1);
   });
 
-  test('yields optional compaction to an interactive Main turn without losing source evidence', async () => {
+  test('explicitly cancels optional compaction without losing source evidence', async () => {
     for (let index = 1; index <= 4; index += 1) {
       await commitAcceptedMainTurn({
         ...identity,
@@ -3424,28 +3781,28 @@ describe('ViventiumMainCompactionService', () => {
         }),
     );
 
+    const stop = new AbortController();
     const compaction = ensureAcceptedMainCompaction({
+      signal: stop.signal,
       ...identity,
       executeCompactor,
     });
     const signal = await compactorStarted;
 
-    await expect(
-      yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 100 }),
-    ).resolves.toMatchObject({ status: 'yielded' });
+    stop.abort('user_cancelled');
     await expect(compaction).resolves.toMatchObject({
       status: 'degraded',
       attempts: 0,
-      reason: 'interactive_priority',
+      reason: 'compaction_cancelled',
     });
     expect(signal.aborted).toBe(true);
-    expect(signal.reason).toBe('maintenance_yield');
+    expect(signal.reason).toBe('user_cancelled');
     const loaded = await loadAcceptedMainContext(identity);
     expect(loaded.pendingCompactionTurns).toHaveLength(1);
     expect(loaded.compactionStatus).toBe('degraded');
   });
 
-  test('reserves interactive priority before the asynchronous compaction claim settles', async () => {
+  test('honors explicit Stop before the asynchronous compaction claim settles', async () => {
     const store = inMemoryPersistence();
     setMainContinuityPersistenceForTests(store);
     for (let index = 1; index <= 4; index += 1) {
@@ -3476,75 +3833,22 @@ describe('ViventiumMainCompactionService', () => {
       return originalRead(...args);
     });
     const executeCompactor = jest.fn();
-    const compaction = ensureAcceptedMainCompaction({ ...identity, executeCompactor });
+    const stop = new AbortController();
+    const compaction = ensureAcceptedMainCompaction({
+      ...identity,
+      signal: stop.signal,
+      executeCompactor,
+    });
     await claimStarted;
 
-    const yielded = yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 100 });
+    stop.abort('user_cancelled');
     releaseClaim();
 
-    await expect(yielded).resolves.toMatchObject({ status: 'yielded' });
     await expect(compaction).resolves.toMatchObject({
       status: 'degraded',
-      reason: 'interactive_priority',
+      reason: 'compaction_cancelled',
     });
     expect(executeCompactor).not.toHaveBeenCalled();
-  });
-
-  test('yields every active compaction domain owned by the interactive user', async () => {
-    const secondIdentity = {
-      ownerId: identity.ownerId,
-      agentId: 'second-main-agent',
-      stableAuthoritySha256: 'f'.repeat(64),
-    };
-    for (const activeIdentity of [identity, secondIdentity]) {
-      for (let index = 1; index <= 4; index += 1) {
-        await commitAcceptedMainTurn({
-          ...activeIdentity,
-          logicalTurnId: `${activeIdentity.agentId}-turn-${index}`,
-          revision: 1,
-          conversationId: `${activeIdentity.agentId}-conversation`,
-          userMessageId: `${activeIdentity.agentId}-user-${index}`,
-          assistantMessageId: `${activeIdentity.agentId}-assistant-${index}`,
-          userText: `${activeIdentity.agentId} ask ${index}.`,
-          assistantText: `${activeIdentity.agentId} answer ${index}.`,
-          origin: 'interactive',
-        });
-      }
-    }
-    const startedSignals = [];
-    let reportBothStarted;
-    const bothStarted = new Promise((resolve) => {
-      reportBothStarted = resolve;
-    });
-    const executeCompactor = jest.fn(
-      ({ signal, reportCapacityRelease }) =>
-        new Promise((_resolve, reject) => {
-          startedSignals.push(signal);
-          if (startedSignals.length === 2) reportBothStarted();
-          signal.addEventListener(
-            'abort',
-            () => {
-              reportCapacityRelease(true);
-              reject(Object.assign(new Error('maintenance yielded'), { name: 'AbortError' }));
-            },
-            { once: true },
-          );
-        }),
-    );
-    const compactions = [identity, secondIdentity].map((activeIdentity) =>
-      ensureAcceptedMainCompaction({ ...activeIdentity, executeCompactor }),
-    );
-    await bothStarted;
-
-    await expect(
-      yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 100 }),
-    ).resolves.toMatchObject({ status: 'yielded', count: 2 });
-    await expect(Promise.all(compactions)).resolves.toEqual([
-      expect.objectContaining({ status: 'degraded', reason: 'interactive_priority' }),
-      expect.objectContaining({ status: 'degraded', reason: 'interactive_priority' }),
-    ]);
-    expect(startedSignals).toHaveLength(2);
-    expect(startedSignals.every((signal) => signal.reason === 'maintenance_yield')).toBe(true);
   });
 
   test('keeps source evidence when the real default internal compactor degrades', async () => {
@@ -3624,23 +3928,31 @@ describe('ViventiumMainCompactionService', () => {
             reportStarted();
           }),
       );
+    const stop = new AbortController();
     try {
       const compaction = ensureAcceptedMainCompaction({
         ...identity,
+        signal: stop.signal,
         req: { user: { id: identity.ownerId }, config: {} },
         agent: { id: identity.agentId, provider: 'openai', model: 'synthetic-model' },
       });
       await started;
 
-      await expect(
-        yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 100 }),
-      ).resolves.toMatchObject({
-        status: 'yield_unconfirmed',
-        capacityReleaseAcknowledged: false,
+      const waiting = loadAcceptedMainContextForAdmission({
+        ...identity,
+        req: {},
+        loadContext: async () => ({ status: 'context_budget' }),
+        ensureCompaction: jest.fn(),
+      });
+      void waiting.catch(() => {});
+      await Promise.resolve();
+      stop.abort('user_cancelled');
+      await expect(waiting).rejects.toMatchObject({
+        code: 'main_compaction_native_release_unconfirmed',
       });
       await expect(compaction).resolves.toMatchObject({
         status: 'degraded',
-        reason: 'interactive_priority',
+        reason: 'compaction_cancelled',
       });
     } finally {
       executeCortexSpy.mockRestore();
@@ -3676,113 +3988,30 @@ describe('ViventiumMainCompactionService', () => {
           reportStarted();
         }),
     );
-    const compaction = ensureAcceptedMainCompaction({ ...identity, executeCompactor });
+    const stop = new AbortController();
+    const compaction = ensureAcceptedMainCompaction({
+      ...identity,
+      signal: stop.signal,
+      executeCompactor,
+    });
     await started;
 
-    await expect(
-      yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 100 }),
-    ).resolves.toMatchObject({
-      status: 'yield_unconfirmed',
-      capacityReleaseAcknowledged: false,
+    const waiting = loadAcceptedMainContextForAdmission({
+      ...identity,
+      req: {},
+      loadContext: async () => ({ status: 'context_budget' }),
+      ensureCompaction: jest.fn(),
+    });
+    void waiting.catch(() => {});
+    await Promise.resolve();
+    stop.abort('user_cancelled');
+    await expect(waiting).rejects.toMatchObject({
+      code: 'main_compaction_native_release_unconfirmed',
     });
     await expect(compaction).resolves.toMatchObject({
       status: 'degraded',
-      reason: 'interactive_priority',
+      reason: 'compaction_cancelled',
     });
-  });
-
-  test('returns yield_pending at the configured bounded wait when cancellation does not settle', async () => {
-    for (let index = 1; index <= 4; index += 1) {
-      await commitAcceptedMainTurn({
-        ...identity,
-        logicalTurnId: `pending-yield-turn-${index}`,
-        revision: 1,
-        conversationId: 'pending-yield-conversation',
-        userMessageId: `pending-yield-user-${index}`,
-        assistantMessageId: `pending-yield-assistant-${index}`,
-        userText: `Pending yield ask ${index}.`,
-        assistantText: `Pending yield answer ${index}.`,
-        origin: 'interactive',
-      });
-    }
-    let reportStarted;
-    const started = new Promise((resolve) => {
-      reportStarted = resolve;
-    });
-    let rejectExecution;
-    const executeCompactor = jest.fn(
-      () =>
-        new Promise((_resolve, reject) => {
-          rejectExecution = reject;
-          reportStarted();
-        }),
-    );
-    const compaction = ensureAcceptedMainCompaction({ ...identity, executeCompactor });
-    await started;
-
-    const timeoutSpy = jest.spyOn(global, 'setTimeout');
-    try {
-      await expect(
-        yieldAcceptedMainCompaction(identity.ownerId, { timeoutMs: 5 }),
-      ).resolves.toMatchObject({
-        status: 'yield_pending',
-        capacityReleaseAcknowledged: false,
-      });
-      expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), 5);
-    } finally {
-      timeoutSpy.mockRestore();
-    }
-
-    rejectExecution(
-      Object.assign(new Error('late cancellation settlement'), { name: 'AbortError' }),
-    );
-    await expect(compaction).resolves.toMatchObject({
-      status: 'degraded',
-      reason: 'interactive_priority',
-    });
-  });
-
-  test('fences a compactor that enters after the interactive yield snapshot', async () => {
-    for (let index = 1; index <= 4; index += 1) {
-      await commitAcceptedMainTurn({
-        ...identity,
-        logicalTurnId: `post-snapshot-fence-turn-${index}`,
-        revision: 1,
-        conversationId: 'post-snapshot-fence-conversation',
-        userMessageId: `post-snapshot-fence-user-${index}`,
-        assistantMessageId: `post-snapshot-fence-assistant-${index}`,
-        userText: `Post-snapshot fence ask ${index}.`,
-        assistantText: `Post-snapshot fence answer ${index}.`,
-        origin: 'interactive',
-      });
-    }
-    const releaseAdmission = acquireInteractiveMainAdmissionFence(identity.ownerId);
-    const executeCompactor = jest.fn();
-    try {
-      await expect(yieldAcceptedMainCompaction(identity.ownerId)).resolves.toMatchObject({
-        status: 'idle',
-        count: 0,
-      });
-      await expect(
-        ensureAcceptedMainCompaction({
-          ownerId: 'owner-2',
-          agentId: identity.agentId,
-          stableAuthoritySha256: identity.stableAuthoritySha256,
-          executeCompactor,
-        }),
-      ).resolves.toMatchObject({ status: 'empty' });
-
-      await expect(
-        ensureAcceptedMainCompaction({ ...identity, executeCompactor }),
-      ).resolves.toMatchObject({
-        status: 'degraded',
-        attempts: 0,
-        reason: 'interactive_priority',
-      });
-      expect(executeCompactor).not.toHaveBeenCalled();
-    } finally {
-      releaseAdmission();
-    }
   });
 });
 
@@ -3968,27 +4197,7 @@ describe('active Call compaction scheduling owner', () => {
       }
     },
   );
-  test('an actual foreground fence still wins during an active Call before a memory claim', async () => {
-    const claim = jest.fn(),
-      execute = jest.fn();
-    const release = acquireInteractiveMainAdmissionFence(identity.ownerId);
-    try {
-      expect(
-        await ensureAcceptedMainCompaction({
-          ...identity,
-          trigger: 'accepted_turn',
-          foreground: false,
-          req: { viventiumCallSession: call() },
-          claimCompaction: claim,
-          executeCompactor: execute,
-        }),
-      ).toMatchObject({ status: 'deferred', reason: 'interactive_priority' });
-      expect(claim).not.toHaveBeenCalled();
-      expect(execute).not.toHaveBeenCalled();
-    } finally {
-      release();
-    }
-  });
+
   test('required foreground recovery during a call remains immediate with no deferred duplicate', async () => {
     const session = call(),
       claim = jest.fn(async () => ({ status: 'empty' }));
@@ -4072,8 +4281,8 @@ describe('accepted-turn idle continuation binding', () => {
     },
   );
 
-  test('a foreground fence between reviewed claims stops idle continuation', async () => {
-    let release;
+  test('explicit caller Stop between reviewed claims stops idle continuation', async () => {
+    const stop = new AbortController();
     const claimCompaction = jest.fn(async () => ({
       status: 'claimed',
       leaseId: 'yield-idle',
@@ -4086,11 +4295,12 @@ describe('accepted-turn idle continuation binding', () => {
     try {
       const result = await ensureAcceptedMainCompaction({
         ...identity,
+        signal: stop.signal,
         trigger: 'accepted_turn',
         claimCompaction,
         executeCompactor: async (call) => (call.stage === 'review' ? reviewApproved : candidate),
         completeCompaction: async () => {
-          release = acquireInteractiveMainAdmissionFence(identity.ownerId);
+          stop.abort('user_cancelled');
           return { status: 'compacted', continuationPending: true };
         },
         rejectCompaction: jest.fn(),
@@ -4098,7 +4308,7 @@ describe('accepted-turn idle continuation binding', () => {
       expect(result).toMatchObject({ status: 'compacted', continuationPending: true });
       expect(claimCompaction).toHaveBeenCalledTimes(1);
     } finally {
-      release?.();
+      stop.abort();
     }
   });
 });
@@ -4263,10 +4473,9 @@ describe('historical idle claims during a live Call', () => {
 
 describe('legacy conversation maintenance uses the existing idle and call owners', () => {
   beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
-  test('the idle binding waits for the foreground fence without invoking a provider', async () => {
+  test('the idle binding runs independently of foreground preparation', async () => {
     jest.useFakeTimers();
     const run = jest.fn(async () => {});
-    const release = acquireInteractiveMainAdmissionFence('legacy-idle-owner');
     try {
       const { scheduleMainContinuityMaintenance } = require('../ViventiumMainCompactionService');
       expect(
@@ -4278,13 +4487,9 @@ describe('legacy conversation maintenance uses the existing idle and call owners
         }),
       ).toBe(true);
       await jest.advanceTimersByTimeAsync(60000);
-      expect(run).not.toHaveBeenCalled();
-      release();
-      await jest.advanceTimersByTimeAsync(30000);
       expect(run).toHaveBeenCalledTimes(1);
       expect(jest.getTimerCount()).toBe(0);
     } finally {
-      release();
       require('@librechat/api').resetMainCompactionSchedulingForTests();
       jest.useRealTimers();
     }
@@ -4737,7 +4942,7 @@ describe('durable fidelity continuation through the existing idle owner', () => 
   });
 });
 
-describe('resumed fidelity checkpoint during foreground cancellation', () => {
+describe('resumed fidelity checkpoint during explicit caller cancellation', () => {
   test.each([
     [true, 1],
     [false, 1],
@@ -4816,7 +5021,8 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
         const started = new Promise((resolve) => {
           start = resolve;
         });
-        const input = { ...identity, agent, trigger: 'accepted_turn' };
+        const stop = new AbortController();
+        const input = { ...identity, agent, signal: stop.signal, trigger: 'accepted_turn' };
         const running = ensureAcceptedMainCompaction({
           ...input,
           executeCompactor: (call) => {
@@ -4835,13 +5041,10 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
           },
         });
         await started;
-        expect(await yieldAcceptedMainCompaction(identity.ownerId)).toMatchObject({
-          status: released ? 'yielded' : 'yield_unconfirmed',
-          capacityReleaseAcknowledged: released,
-        });
+        stop.abort('user_cancelled');
         expect(await running).toMatchObject({
           status: 'degraded',
-          reason: 'interactive_priority',
+          reason: 'compaction_cancelled',
           attempts: completed,
         });
         expect((await running).repairPending).toBeUndefined();
@@ -4853,6 +5056,7 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
         const calls = [];
         const next = await ensureAcceptedMainCompaction({
           ...input,
+          signal: new AbortController().signal,
           executeCompactor: async (call) => {
             calls.push(call);
             call.reportCapacityRelease(true);

@@ -120,9 +120,7 @@ const {
   commitAcceptedMainTurnFromPresentation,
 } = require('~/server/services/viventium/ViventiumMainContinuityService');
 const {
-  acquireInteractiveMainAdmissionFence,
   ensureAcceptedMainCompaction,
-  yieldAcceptedMainCompaction,
 } = require('~/server/services/viventium/ViventiumMainCompactionService');
 const {
   attachEffectiveDeliveryDisposition,
@@ -1446,35 +1444,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         .json({ code: error.code, retryable: true, error: error.message, conversationId });
     throw error;
   }
-  let interactiveCompactionYield = null;
-  let releaseInteractiveAdmissionFence = null;
-  const completeInteractiveMainAdmission = () => {
-    const release = releaseInteractiveAdmissionFence;
-    releaseInteractiveAdmissionFence = null;
-    release?.();
-  };
-  if (
-    interactionContext?.actor_kind === 'external_user' &&
-    interactionContext?.origin === 'interactive'
-  ) {
-    releaseInteractiveAdmissionFence = acquireInteractiveMainAdmissionFence(userId);
-    try {
-      // Request abort now; overlap cancellation cleanup with job/client preparation.
-      interactiveCompactionYield = observeVoiceLatencyOperation(
-        logger,
-        req,
-        'request',
-        'request_compaction_yield',
-        () => yieldAcceptedMainCompaction(userId),
-      );
-      // The same Promise is joined before generation; handle an early rejection meanwhile.
-      interactiveCompactionYield.catch(() => {});
-    } catch (error) {
-      completeInteractiveMainAdmission();
-      await maybeDecrement();
-      throw error;
-    }
-  }
   /* === VIVENTIUM NOTE END === */
   const voiceLatencyEnabled = isVoiceLatencyEnabled(req);
   let client = null;
@@ -1507,7 +1476,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       ...(clientPresentation ? { clientPresentation } : {}),
     });
     if (job.duplicateOfStreamId) {
-      completeInteractiveMainAdmission();
       await maybeDecrement();
       const duplicateReceipt = duplicateGenerationReceipt(req, job, conversationId);
       await req._viventiumBeforeGenerationReceipt?.(duplicateReceipt);
@@ -1751,7 +1719,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     }
 
     if (job.abortController.signal.aborted) {
-      completeInteractiveMainAdmission();
       /* === VIVENTIUM START ===
        * Fix: exact source supersession is a benign generation settlement.
        */
@@ -2060,7 +2027,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         recordPassiveTextTurnBoundary(req, 'main_pipeline_start');
         startPartialCheckpointing();
         const response = await client.sendMessage(text, messageOptions);
-        completeInteractiveMainAdmission();
         recordPassiveTextTurnBoundary(req, 'main_pipeline_complete');
         if (
           req.body?.voiceMode === true &&
@@ -2725,7 +2691,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
         }
       } catch (error) {
-        completeInteractiveMainAdmission();
         stopPartialCheckpointing();
         // Check if this was an abort (not a real error)
         const wasAborted = job.abortController.signal.aborted || error.message?.includes('abort');
@@ -2840,15 +2805,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       }
     };
 
-    /* === VIVENTIUM START ===
-     * Join the original compaction yield before model work. The foreground fence has remained
-     * held throughout preparation; provider admission still owns actual capacity release.
-     */
-    await interactiveCompactionYield;
-    /* === VIVENTIUM END === */
     // Start generation and handle any unhandled errors
     startGeneration().catch(async (err) => {
-      completeInteractiveMainAdmission();
       stopPartialCheckpointing();
       logger.error(
         `[ResumableAgentController] Unhandled error in background generation: ${err.message}`,
@@ -2899,7 +2857,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       await maybeDecrement();
     });
   } catch (error) {
-    completeInteractiveMainAdmission();
     /* === VIVENTIUM START ===
      * Fix: typed source-order admission supersession uses the existing benign task outcome.
      */

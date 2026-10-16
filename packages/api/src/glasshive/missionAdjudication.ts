@@ -188,7 +188,6 @@ export interface GlassHiveMissionReconciliationSummary {
 }
 
 export interface GlassHiveMissionAdjudicationService {
-  COALESCE_MS: number;
   wakeGlassHiveMissionAdjudications: (input: GlassHiveMissionLimitInput) => void;
   clearAdjudicationTimersForTests: () => void;
   enqueueGlassHiveMissionAdjudication: (
@@ -380,12 +379,10 @@ export function createGlassHiveMissionAdjudicationService(
   } = dependencies;
 
 const COLLECTION = 'viventium_glasshive_mission_evidence';
-const COALESCE_MS = 2000;
 const MAX_EVIDENCE_CHARS = 64_000;
 const MAX_ADJUDICATION_ATTEMPTS = 10;
 const LEGACY_DELIVERY_PARENT_REDRIVE_VERSION = 1;
 const NO_PARENT_MESSAGE_ID = '00000000-0000-0000-0000-000000000000';
-const conversationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const conversationFlushes = new Map<string, Promise<RuntimeRecord>>();
 const conversationReschedules = new Map<string, boolean>();
 
@@ -718,7 +715,7 @@ function flushConversationAdjudication(
 ): void {
   const key = JSON.stringify([owner, conversation]);
   if (conversationFlushes.has(key)) {
-    // A matured collection window includes new rows; a ready wake cannot narrow that pass.
+    // A pending full pass includes new rows; a ready wake cannot narrow that pass.
     conversationReschedules.set(key, (conversationReschedules.get(key) ?? true) && pinnedOnly);
     return;
   }
@@ -745,15 +742,7 @@ function scheduleConversationAdjudication(ownerId: unknown, conversationId: unkn
   const owner = safeText(ownerId, 160);
   if (!owner) return;
   const conversation = safeText(conversationId, 160);
-  // Initial collection keeps its own timer, including while a ready group uses the same lane.
-  const key = JSON.stringify([owner, conversation]);
-  if (conversationTimers.has(key)) return;
-  const timer = setTimeout(() => {
-    conversationTimers.delete(key);
-    flushConversationAdjudication(owner, conversation, false);
-  }, COALESCE_MS);
-  timer.unref?.();
-  conversationTimers.set(key, timer);
+  flushConversationAdjudication(owner, conversation, false);
 }
 
 function wakeGlassHiveMissionAdjudications({ ownerId, conversationId }: GlassHiveMissionLimitInput): void {
@@ -2378,14 +2367,11 @@ async function reconcilePendingGlassHiveMissionAdjudications({
 }
 
 function clearAdjudicationTimersForTests(): void {
-  for (const timer of conversationTimers.values()) clearTimeout(timer);
-  conversationTimers.clear();
   conversationFlushes.clear();
   conversationReschedules.clear();
 }
 
 return {
-  COALESCE_MS,
   wakeGlassHiveMissionAdjudications,
   clearAdjudicationTimersForTests,
   enqueueGlassHiveMissionAdjudication,

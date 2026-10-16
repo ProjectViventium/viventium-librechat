@@ -628,14 +628,12 @@ async function authoredDeliveryProof(
     });
   }
   const evidence = evidenceRows[0];
-  // Advance only the isolated retry clock; the existing reconciliation owner performs admission.
+  // Control the direct-flush retry fixture; automatic reconciliation has separate scheduling tests.
   const due = async () => {
     await collection.updateOne(
       { _id: evidence._id },
-      { $set: { nextAttemptAt: new Date(0), updatedAt: new Date(0) } },
+      { $set: { state: 'pending', nextAttemptAt: new Date(0), updatedAt: new Date(0) } },
     );
-    await service.reconcilePendingGlassHiveMissionAdjudications();
-    service.clearAdjudicationTimersForTests();
   };
   return {
     result,

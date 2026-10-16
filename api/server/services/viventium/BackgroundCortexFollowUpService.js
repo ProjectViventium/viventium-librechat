@@ -1885,6 +1885,7 @@ async function resolveFollowUpLLMConfig({
   runId = '',
   conversationId = '',
   parentMessageId = '',
+  responseMessageId = '',
 }) {
   const capabilityRequiredProviders =
     req?.config?.endpoints?.agents?.capabilityRequiredProviders || [];
@@ -2086,7 +2087,7 @@ async function resolveFollowUpLLMConfig({
         ...(req.body || {}),
         conversationId: conversationId || req.body?.conversationId || '',
         parentMessageId: parentMessageId || req.body?.parentMessageId || '',
-        messageId: parentMessageId || req.body?.messageId || '',
+        messageId: responseMessageId || parentMessageId || req.body?.messageId || '',
         viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
         viventiumStreamId: followUpIdempotencyKey,
       },
@@ -2144,7 +2145,7 @@ async function resolveFollowUpLLMConfig({
           body: {
             ...(req.body || {}),
             conversationId: conversationId || req.body?.conversationId || '',
-            messageId: parentMessageId || req.body?.messageId || '',
+            messageId: responseMessageId || parentMessageId || req.body?.messageId || '',
             viventiumGlassHiveIdempotencyKey: followUpIdempotencyKey,
             viventiumStreamId: followUpIdempotencyKey,
           },
@@ -3031,6 +3032,7 @@ async function generateFollowUpText({
   onNativeMediaSelection,
   onNativeDeliveryOutput,
   onNativeSilentDecision,
+  nativeAuthor,
 }) {
   if (!agent) {
     return '';
@@ -3107,6 +3109,7 @@ async function generateFollowUpText({
     runId,
     conversationId,
     parentMessageId,
+    responseMessageId: nativeAuthor?.messageId,
   });
   if (!llmConfig?.provider) {
     throw new Error(
@@ -3149,7 +3152,7 @@ async function generateFollowUpText({
     headers: llmConfig.configuration?.defaultHeaders || {},
     userId: String(req?.user?.id || ''),
     conversationId,
-    sourceMessageId: parentMessageId,
+    sourceMessageId: nativeAuthor?.messageId || parentMessageId,
     agentId: `${runtimeAgent.id}:${PHASE_B_PROVIDER_SESSION_LANE}`,
     presentationAgentId: String(agent.id || ''),
     providerId: providerName,
@@ -3256,6 +3259,8 @@ async function generateFollowUpText({
         role: 'cortex',
       });
     }
+    if (nativeAuthor && nativeFileSource)
+      nativeFetch = nativeAuthor.wrapFetch(nativeFetch, providerName);
     llmConfig.configuration.fetch = createNativeBootstrapFetch(nativeFetch);
   }
   /* === VIVENTIUM END === */
@@ -3294,6 +3299,7 @@ async function generateFollowUpText({
                   nativeFinalOutput = undefined;
                   return;
                 }
+                nativeAuthor?.finish();
                 if (nativeFileSource) nativeFinalOutput = data?.output;
                 if (!nativeFileStreamed) captureNativeFiles(data?.output);
                 if (audioEligible)
@@ -3438,6 +3444,7 @@ async function prepareCortexFollowUpMessage({
   insightsData,
   recentResponse,
   forceVisibleFollowUp = false,
+  nativeAuthor,
 }) {
   const recoverySuppression = req?.[ownedVoiceCortexRecovery]
     ? await refreshOwnedVoiceCortexRecovery(req)
@@ -3538,6 +3545,7 @@ async function prepareCortexFollowUpMessage({
       text = await generateFollowUpText({
         req,
         agent,
+        nativeAuthor,
         insightsData,
         recentResponse: followUpRecentResponse,
         userRequest,
@@ -3719,6 +3727,12 @@ async function prepareCortexFollowUpMessage({
 
   return {
     suppressed: false,
+    ...(nativeAuthor
+      ? {
+          plannedMessageId: nativeAuthor.messageId,
+          nativeSourceMessageId: nativeAuthor.identity ? nativeAuthor.messageId : undefined,
+        }
+      : {}),
     voiceTaskId,
     text,
     telegramDeliveryControls,
@@ -3855,7 +3869,11 @@ async function persistPreparedCortexFollowUpMessage(
     decisionRecord: followUpDecisionRecord,
   });
 
-  if (!text || text.trim().length === 0) {
+  const attachmentOnly =
+    (!text || text.trim().length === 0) &&
+    prepared.attachmentsRequired === true &&
+    typeof dependencies.prepareAttachments === 'function';
+  if ((!text || text.trim().length === 0) && !attachmentOnly) {
     if (deliveryBatch?.claimed?.length) {
       await dropCortexInsightDeliveryBatch({
         req,
@@ -3952,9 +3970,10 @@ async function persistPreparedCortexFollowUpMessage(
     .update([String(parentMessageId || ''), ...deliveryIds].join('\u0000'))
     .digest('hex');
   const messageId =
-    deliveryIds.length > 0
+    prepared.plannedMessageId ||
+    (deliveryIds.length > 0
       ? `${stableMessageHash.slice(0, 8)}-${stableMessageHash.slice(8, 12)}-5${stableMessageHash.slice(13, 16)}-a${stableMessageHash.slice(17, 20)}-${stableMessageHash.slice(20, 32)}`
-      : crypto.randomUUID();
+      : crypto.randomUUID());
   const sender = 'AI';
 
   const endpoint = EModelEndpoint.agents;
@@ -3962,8 +3981,22 @@ async function persistPreparedCortexFollowUpMessage(
   const metadata = {
     viventium: {
       type: 'cortex_followup',
-      ...(prepared.deliveryControls ? { deliveryControls: prepared.deliveryControls } : {}),
-      ...(deliveryDisposition ? { deliveryDisposition } : {}),
+      ...(!attachmentOnly && prepared.deliveryControls
+        ? { deliveryControls: prepared.deliveryControls }
+        : {}),
+      ...(attachmentOnly
+        ? {
+            deliveryDisposition: {
+              version: 1,
+              audio: 'skip',
+              required: false,
+              valid: true,
+              source: 'legacy',
+            },
+          }
+        : deliveryDisposition
+          ? { deliveryDisposition }
+          : {}),
       ...(durableMissionEvidence === true
         ? {
             followUpSource: insightsData.insights.every(
@@ -4003,7 +4036,9 @@ async function persistPreparedCortexFollowUpMessage(
     model,
     agent_id: agent?.id,
     text,
-    ...(prepared.nativeDeliveryContent ? { content: prepared.nativeDeliveryContent } : {}),
+    ...(!attachmentOnly && prepared.nativeDeliveryContent
+      ? { content: prepared.nativeDeliveryContent }
+      : {}),
     isCreatedByUser: false,
     metadata,
   };
@@ -4020,6 +4055,8 @@ async function persistPreparedCortexFollowUpMessage(
       };
     }
   }
+
+  if (attachmentOnly && !followUpMessage.attachments?.length) return null;
 
   if (deliveryBatch?.claimed?.length) {
     const persisted = await persistCortexFollowUpMessageWithLedger({

@@ -1668,6 +1668,236 @@ describe('GlassHiveMissionAdjudicationService', () => {
       });
     }
 
+    test.each([
+      'queued',
+      'lost_ack',
+      'slow_ack',
+      'final',
+      'abort',
+      'stale_claim',
+      'surface',
+      'feelings',
+    ])(
+      'offers committed sibling evidence to the exact active PhaseB author: %s',
+      async (boundary) => {
+        jest.useFakeTimers();
+        const first = row();
+        const fresh = row({
+          _id: 'cb-2',
+          evidenceId: 'cb-2',
+          originRef: 'ghi-origin-2',
+          workRef: 'gh-work-2',
+          runId: 'run-2',
+        });
+        const rows = [first];
+        schedulingRows(rows);
+        mockFindOne.mockImplementation(
+          async (filter) =>
+            rows.find((item) =>
+              Object.entries(filter).every(([key, value]) => item[key] === value),
+            ) || null,
+        );
+        const update = mockUpdateOne.getMockImplementation();
+        mockUpdateOne.mockImplementation(async (filter, change, options) => {
+          if (change.$setOnInsert && !rows.some((item) => item._id === filter._id)) {
+            rows.push({ ...change.$setOnInsert });
+          }
+          const item = rows.find((entry) => entry._id === filter._id);
+          if (filter.state && item?.state !== filter.state) return { matchedCount: 0 };
+          for (const [key, value] of Object.entries(filter)) {
+            if (
+              key.startsWith('currentAuthorInput.') &&
+              item?.currentAuthorInput?.[key.split('.')[1]] !== value
+            )
+              return { matchedCount: 0 };
+          }
+          return update(filter, change, options);
+        });
+        let release;
+        const blocked = new Promise((resolve) => {
+          release = resolve;
+        });
+        const controller = new AbortController();
+        const offers = [];
+        let author;
+        let releaseAck;
+        const ackWait = new Promise((resolve) => {
+          releaseAck = resolve;
+        });
+        mockPrepareCortexFollowUpMessage.mockImplementationOnce(async (input) => {
+          author = input.nativeAuthor;
+          expect(author).toBeDefined();
+          const send = async (url, init) => {
+            if (String(url).endsWith('/interject')) {
+              const body = JSON.parse(init.body);
+              offers.push(body);
+              if (boundary === 'lost_ack') throw new Error('synthetic_ack_lost');
+              if (boundary === 'slow_ack') await ackWait;
+              return new Response(
+                JSON.stringify({
+                  version: 1,
+                  status: 'queued',
+                  invocation_id: author.identity.invocationId,
+                  delivery_id: body.delivery_id,
+                  text_sha256: body.text_sha256,
+                  run_id: 'native-run',
+                  attempt_id: 'native-attempt',
+                  message_id: 'native-mailbox',
+                }),
+              );
+            }
+            return new Response('{}');
+          };
+          const bound = author.wrapFetch(send, 'native');
+          await bound('http://native.test/v1/chat/completions', {
+            method: 'POST',
+            signal: controller.signal,
+            body: JSON.stringify({ model: 'native-high', messages: [] }),
+            headers: {
+              Authorization: 'Bearer synthetic',
+              'X-Viventium-User-Id': first.ownerId,
+              'X-Viventium-Conversation-Id': first.conversationId,
+              'X-Viventium-Message-Id': author.messageId,
+              'X-GlassHive-Agent-Id': `${first.mainAgentId}:phase_b:followup`,
+              'X-Viventium-Stream-Id': 'phase-b-stream',
+              'X-GlassHive-Idempotency-Key': 'phase-b-stream',
+            },
+          });
+          return blocked;
+        });
+        await enqueueScheduled(first);
+        await jest.advanceTimersByTimeAsync(0);
+        expect(author.identity.bodySha256).toMatch(/^[a-f0-9]{64}$/);
+        const projected = mockPrepareCortexFollowUpMessage.mock.calls[0][0].insightsData.insights;
+        const { normalizeMainBackgroundInputs } = require('@librechat/data-schemas');
+        expect(
+          normalizeMainBackgroundInputs([
+            {
+              version: 1,
+              invocationId: author.identity.invocationId,
+              deliveryId: 'a'.repeat(64),
+              text: JSON.stringify(projected),
+              textSha256: require('crypto')
+                .createHash('sha256')
+                .update(JSON.stringify(projected))
+                .digest('hex'),
+              sources: projected.map((item) => ({
+                cortexId: item.cortexId,
+                insightSha256: require('crypto')
+                  .createHash('sha256')
+                  .update(item.insight)
+                  .digest('hex'),
+              })),
+            },
+          ]),
+        ).toHaveLength(1);
+
+        if (boundary === 'queued') {
+          const identity = {
+            ...author.identity,
+            streamId: 'foreground-stream',
+            responseMessageId: 'foreground-answer',
+            logicalTurnId: 'foreground-turn',
+            source: { id: 'user-source', messageId: 'user-source', digest: 'c'.repeat(64) },
+          };
+          const job = {
+            userId: identity.userId,
+            conversationId: identity.conversationId,
+            responseMessageId: identity.responseMessageId,
+            streamId: identity.streamId,
+            createdAt: identity.jobCreatedAt,
+            status: 'running',
+            nativeResponse: identity,
+            userMessage: { messageId: identity.source.messageId },
+            interactionContext: {
+              logical_turn_id: identity.logicalTurnId,
+              revision: identity.revision,
+            },
+          };
+          const sent = jest.fn(async (_url, options) => {
+            const body = JSON.parse(options.body);
+            return new Response(
+              JSON.stringify({
+                version: 1,
+                status: 'queued',
+                invocation_id: identity.invocationId,
+                delivery_id: body.delivery_id,
+                text_sha256: body.text_sha256,
+                run_id: 'foreground-run',
+                attempt_id: 'attempt',
+                message_id: 'mailbox',
+              }),
+            );
+          });
+          const outcome = await require('@librechat/api').deliverCortexBatchToRunningMain(
+            {
+              ownerId: identity.userId,
+              conversationId: identity.conversationId,
+              parentMessageId: identity.responseMessageId,
+              streamId: identity.streamId,
+              insights: projected,
+              context: JSON.stringify(projected),
+            },
+            {
+              liveContextEnabled: true,
+              getJob: async () => job,
+              readAdmission: async () => ({ ...identity, status: 'pending' }),
+              resolveRoute: async () => ({ baseURL: 'http://native.test/v1', headers: {} }),
+              isEligible: async () => true,
+              isCurrentLogicalTurn: async () => true,
+              observeSourceOrder: async () => ({ stale: false }),
+              prepareInput: async () => true,
+              recordInputReceipt: async () => true,
+              fetch: sent,
+            },
+          );
+          expect(outcome.status).toBe('queued');
+          expect(sent).toHaveBeenCalledTimes(1);
+        }
+        if (boundary === 'final') author.finish();
+        if (boundary === 'abort') controller.abort();
+        if (boundary === 'stale_claim') first.attempts += 1;
+        if (boundary === 'surface') fresh.destinations = [{ surface: 'web' }];
+        if (boundary === 'feelings') fresh.feelingsIsolated = true;
+        await enqueueGlassHiveMissionAdjudication({
+          binding: { ...fresh, ...(boundary === 'feelings' ? { feelingsIsolated: true } : {}) },
+          body: {
+            callback_id: fresh._id,
+            event: fresh.event,
+            work_state: fresh.workState,
+            work_terminal: true,
+            worker_id: fresh.workerId,
+            run_id: fresh.runId,
+            message: fresh.evidence,
+          },
+        });
+        await jest.advanceTimersByTimeAsync(0);
+        expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+        if (['queued', 'lost_ack', 'slow_ack'].includes(boundary)) {
+          expect(offers).toHaveLength(1);
+          expect(offers[0]).toEqual(
+            expect.objectContaining({
+              stream_id: 'phase-b-stream',
+              message_id: author.messageId,
+              body_sha256: author.identity.bodySha256,
+            }),
+          );
+          const sibling = rows.find((item) => item.runId === fresh.runId);
+          expect(sibling.state).toBe('pending');
+          expect(sibling.currentAuthorInput.status).toBe(
+            boundary === 'queued' ? 'queued' : boundary === 'slow_ack' ? 'offered' : 'unavailable',
+          );
+          expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+        } else expect(offers).toHaveLength(0);
+        release({ prepared: true, plannedMessageId: author.messageId });
+        await jest.advanceTimersByTimeAsync(0);
+        expect(mockPrepareCortexFollowUpMessage).toHaveBeenCalledTimes(2);
+        expect(rows.find((item) => item.runId === fresh.runId).state).toBe('completed');
+        releaseAck();
+        await jest.advanceTimersByTimeAsync(0);
+      },
+    );
+
     test('Main-ready wake immediately claims an already-pinned group without another coalescing wait', async () => {
       jest.useFakeTimers();
       const pending = row({
@@ -2148,6 +2378,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         insightsData: expect.objectContaining({
           insights: [
             {
+              cortexId: 'cb-1',
               cortexName: 'Mission evidence',
               insight: 'Verified synthetic result.',
               nativeMedia: media,
@@ -2161,6 +2392,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
               },
             },
             {
+              cortexId: 'cb-2',
               cortexName: 'Mission evidence',
               insight: 'Second result.',
               maxPromptChars: 12_000,
@@ -3190,6 +3422,41 @@ describe('GlassHiveMissionAdjudicationService', () => {
       failed: 1,
     });
     expect(mockMessageUpdateOne).not.toHaveBeenCalled();
+  });
+
+  test('replays a committed attachment-only callback without reauthoring or losing its file', async () => {
+    const retained = row({
+      followUpMessageId: 'file-only-message',
+      followUpText: '',
+      authoredAt: new Date(),
+      outputFiles: { files: [{ filename: 'result.txt' }] },
+    });
+    storeAuthoredMessage(
+      { req: { user: { id: retained.ownerId } }, conversationId: retained.conversationId },
+      {
+        messageId: retained.followUpMessageId,
+        text: '',
+        attachments: [{ file_id: 'owned-file', filename: 'result.txt', bytes: 11 }],
+      },
+    );
+    mockFind.mockReturnValueOnce(cursor([retained]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...retained, state: 'processing' });
+    await expect(
+      flushGlassHiveMissionAdjudications({ ownerId: retained.ownerId }),
+    ).resolves.toMatchObject({
+      visible: 1,
+      failed: 0,
+    });
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: '',
+        message: expect.objectContaining({
+          messageId: 'file-only-message',
+          attachments: [{ file_id: 'owned-file', filename: 'result.txt', bytes: 11 }],
+        }),
+      }),
+    );
   });
 
   test('prepares Main synthesis outside Mongo and persists it inside a fresh terminal fence', async () => {

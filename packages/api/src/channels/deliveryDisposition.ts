@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { logger } from '@librechat/data-schemas';
 import { ChatModelStreamHandler } from '@librechat/agents';
 import { getTrustedInteractionContext } from '../agents/interactionContext';
 import { nativeIdentityJson } from '../stream/implementations/nativeResponse';
@@ -436,6 +438,96 @@ export function projectDeliveryDispositionRanges(
     projected = prefix.length;
   }
   return cursor === source.length && projected === publicText.length ? result : [];
+}
+
+export interface AudioDeliveryControls {
+  sourceTextSha256: string;
+  audioContent: Array<{
+    type: 'text';
+    text: string;
+    deliveryDispositionRanges: DeliveryDispositionRange[];
+  }>;
+}
+
+/** Bind retained speech markup and its choices to the exact canonical display projection. */
+export function projectAudioDeliveryControls(
+  value: unknown,
+  displayText: string,
+  displayContent: unknown,
+  projectText: (text: string) => string,
+): AudioDeliveryControls | undefined {
+  const sourceTextSha256 = createHash('sha256').update(displayText).digest('hex');
+  const silent: AudioDeliveryControls = { sourceTextSha256, audioContent: [] };
+  const finish = (
+    state: 'bound' | 'canonical_fallback' | 'binding_silenced' | 'legacy',
+    controls: AudioDeliveryControls | undefined,
+  ): AudioDeliveryControls | undefined => {
+    logger.info('[VoiceAudioBinding][core] state=%s', state);
+    return controls;
+  };
+  const collect = (
+    parts: unknown[],
+  ): { text: string; ranges: DeliveryDispositionRange[] } | null => {
+    let text = '';
+    const ranges: DeliveryDispositionRange[] = [];
+    for (const part of parts) {
+      if (!isRecord(part) || part.type !== 'text' || typeof part.text !== 'string') return null;
+      const accepted = projectDeliveryDispositionRanges(part.deliveryDispositionRanges, part.text);
+      if (!accepted.length) return null;
+      for (const range of accepted)
+        ranges.push({
+          ...range,
+          start: range.start + text.length,
+          end: range.end + text.length,
+        });
+      text += part.text;
+    }
+    return { text, ranges };
+  };
+  const canonicalParts = Array.isArray(displayContent)
+    ? displayContent.filter((item) => isRecord(item) && item.type === 'text')
+    : [];
+  const canonical = collect(canonicalParts);
+  if (!canonical || !canonical.text || canonical.text !== displayText) {
+    const hasRanges = canonicalParts.some(
+      (item) =>
+        isRecord(item) && Object.prototype.hasOwnProperty.call(item, 'deliveryDispositionRanges'),
+    );
+    return value === undefined && !hasRanges
+      ? finish('legacy', undefined)
+      : finish('binding_silenced', silent);
+  }
+  const fallback: AudioDeliveryControls = {
+    sourceTextSha256,
+    audioContent: [
+      {
+        type: 'text',
+        text: canonical.text,
+        deliveryDispositionRanges: canonical.ranges,
+      },
+    ],
+  };
+  if (
+    !isRecord(value) ||
+    value.sourceTextSha256 !== sourceTextSha256 ||
+    !Array.isArray(value.audioContent) ||
+    !value.audioContent.length
+  )
+    return finish('canonical_fallback', fallback);
+  const source = collect(value.audioContent);
+  if (!source) return finish('canonical_fallback', fallback);
+  const projected = projectDeliveryDispositionRanges(
+    source.ranges,
+    source.text,
+    displayText,
+    projectText,
+  );
+  if (!projected.length || JSON.stringify(projected) !== JSON.stringify(canonical.ranges))
+    return finish('canonical_fallback', fallback);
+  return finish('bound', {
+    sourceTextSha256,
+    audioContent: [{ type: 'text', text: source.text, deliveryDispositionRanges: source.ranges }],
+  });
 }
 
 /** Accept Core's fail-closed outcomes as well as validated model choices. */

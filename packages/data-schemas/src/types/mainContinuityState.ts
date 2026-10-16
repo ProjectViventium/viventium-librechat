@@ -104,7 +104,7 @@ export interface IMainContinuityCompactionRepair {
   sizeRepair?: { proposalBytes: number; previousProposalBytes: number; converging: true };
   correction:
     | { code: 'semantic_fidelity'; candidate: string; reason?: string }
-    | { code: 'schema_invalid'; issue: IMainContinuitySizeFeedback; candidate?: never; reason?: never };
+    | { code: 'schema_invalid'; issue: IMainContinuitySizeFeedback; candidate?: string; reason?: never };
 }
 
 export interface IMainContinuityCompactionLease {

@@ -407,12 +407,11 @@ function compatibleMainCompactionSizeAllocation(before: MainCompactionOutputCont
     after.maxSummaryUtf8Bytes <= before.maxSummaryUtf8Bytes;
 }
 
-/** Validate bounded size feedback without persisting or replaying an oversized draft. */
+/** Keep a structurally valid, JSON-bounded draft as repair input; oversized drafts stay numeric. */
 export function normalizeMainCompactionSizeRepair(value: unknown, previousContract: unknown,
   currentContract: unknown = previousContract): Pick<IMainContinuityCompactionRepair, 'correction' | 'sizeRepair'> | null {
   if (!isRecord(value) || !isRecord(value.correction) || value.correction.code !== 'schema_invalid' ||
-      value.correction.candidate !== undefined || !isRecord(value.correction.issue) ||
-      !isRecord(value.sizeRepair)) return null;
+      !isRecord(value.correction.issue) || !isRecord(value.sizeRepair)) return null;
   const before = normalizeMainCompactionOutputContract(previousContract);
   const after = normalizeMainCompactionOutputContract(currentContract);
   if (!before || !after || !compatibleMainCompactionSizeAllocation(before, after)) return null;
@@ -442,14 +441,33 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
       Buffer.byteLength(JSON.stringify(key)) + 1, 2 + MAIN_COMPACTION_FIELDS.length - 1);
     if (calculated !== state.proposalBytes) return null;
   }
+  let candidate: string | undefined;
+  if (value.correction.candidate !== undefined) {
+    try {
+      const draft = typeof value.correction.candidate === 'string'
+        ? JSON.parse(value.correction.candidate) : value.correction.candidate;
+      const serialized = JSON.stringify(draft);
+      if (!serialized || Buffer.byteLength(serialized, 'utf8') !== state.proposalBytes ||
+          (typeof value.correction.candidate === 'string' && value.correction.candidate !== serialized)) return null;
+      const prepared = inspectMainCompactionCandidate(draft, before);
+      if (!prepared.ok && (prepared.issue.constraint !== 'max_bytes' ||
+          !['', 'summary'].includes(prepared.issue.path))) return null;
+      if (path === '$carrier' && (!prepared.ok ||
+          mainCompactionRenderedBytes(prepared.candidate, before) !== issue.actual)) return null;
+      if (path !== '' && prepared.ok && Buffer.byteLength(serialized, 'utf8') <= after.maxJsonUtf8Bytes &&
+          inspectMainCompactionCandidate(draft, after).ok) candidate = serialized;
+    } catch { return null; }
+  }
   const limit = path === '' ? after.maxJsonUtf8Bytes :
     path === 'summary' ? after.maxSummaryUtf8Bytes : after.carrierMaxUtf8Bytes;
-  const feedback: IMainContinuitySizeFeedback = { path, constraint: 'max_bytes', actual: issue.actual,
+  const actual = path === '$carrier'
+    ? issue.actual + after.reservedUtf8Bytes - before.reservedUtf8Bytes : issue.actual;
+  const feedback: IMainContinuitySizeFeedback = { path, constraint: 'max_bytes', actual,
     limit, unit: 'utf8_bytes', proposalBytes: state.proposalBytes,
     excessBytes: path === 'summary' && state.proposalBytes > after.maxJsonUtf8Bytes
-      ? state.proposalBytes - after.maxJsonUtf8Bytes : issue.actual - limit,
+      ? state.proposalBytes - after.maxJsonUtf8Bytes : actual - limit,
     ...(fieldBytes ? { fieldBytes } : {}) };
-  return { correction: { code: 'schema_invalid', issue: feedback },
+  return { correction: { code: 'schema_invalid', issue: feedback, ...(candidate ? { candidate } : {}) },
     sizeRepair: { proposalBytes: state.proposalBytes, previousProposalBytes: state.previousProposalBytes,
       converging: true } };
 }

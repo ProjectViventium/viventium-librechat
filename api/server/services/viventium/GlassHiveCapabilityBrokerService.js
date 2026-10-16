@@ -18,7 +18,8 @@ const {
  * === VIVENTIUM END === */
 
 const { logger } = require('@librechat/data-schemas');
-const { loadWebSearchAuth, reportCortexHostToolResult } = require('@librechat/api');
+const { loadWebSearchAuth, reportCortexHostToolResult, checkAccess } = require('@librechat/api');
+const { getRoleByName } = require('~/models/Role');
 const {
   assertCurrentGlassHiveSourceAuthor,
   GenerationJobManager,
@@ -33,7 +34,7 @@ const {
 } = require('@librechat/api');
 const { getFiles, getMessages } = require('~/models');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
-const { CacheKeys } = require('librechat-data-provider');
+const { CacheKeys, PermissionTypes, Permissions } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
 const { findToken, createToken, updateToken, deleteToken, getUserById } = require('~/models');
 const { getLogStores } = require('~/cache');
@@ -1441,6 +1442,21 @@ async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationI
         fileCitations: false,
       });
       [content, artifact] = await fileSearchTool.func({ query });
+      // Native formatting omits model anchor instructions; source display still obeys role access.
+      if (artifact?.file_search) {
+        let fileCitations = false;
+        try {
+          fileCitations = await checkAccess({
+            user: catalog.user,
+            permissionType: PermissionTypes.FILE_CITATIONS,
+            permissions: [Permissions.USE],
+            getRoleByName,
+          });
+        } catch (error) {
+          logger.warn('[VIVENTIUM][glasshive-capability-broker] Citation access unavailable');
+        }
+        artifact = { ...artifact, file_search: { ...artifact.file_search, fileCitations } };
+      }
       resourceCount = hostTool.resources.files.length;
     } else if (hostTool.toolName === 'web_search') {
       const auth = await loadWebSearchAuth({

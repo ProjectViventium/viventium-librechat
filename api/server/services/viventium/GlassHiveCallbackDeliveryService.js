@@ -16,6 +16,7 @@ const {
   nativeWorkInputPresentation,
   createNativeWorkInputPresentationService,
   notifyTelegramDeliveryReady,
+  projectAudioDeliveryControls,
 } = require('@librechat/api');
 const {
   acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease,
@@ -30,6 +31,7 @@ const {
   ViventiumGlassHiveCallbackDelivery,
 } = require('~/db/models');
 const { getCallSession } = require('./CallSessionService');
+const { stripVoiceControlTagsForDisplay } = require('./surfacePrompts');
 const {
   fenceGlassHiveCallbackRunState,
   isGlassHiveNonterminalAttentionCallback,
@@ -667,7 +669,7 @@ async function recordFencedDeliveryTrace(row, status, at, transactionOptions) {
   try {
     await transactionallyFencePersistedDelivery(
       async (session) => {
-        if (status === 'claimed' && row.surface === 'telegram') {
+        if (status === 'claimed' && ['telegram', 'voice'].includes(row.surface)) {
           const message = await queryLean(
             Message.findOne({
               user: row.userId,
@@ -682,7 +684,11 @@ async function recordFencedDeliveryTrace(row, status, at, transactionOptions) {
             session,
           );
           if (message) {
-            const deliveredText = String(row.fullText || row.text || '').trim();
+            const deliveredText = String(
+              row.surface === 'voice' && row.workerCompletionPresentation
+                ? row.text || ''
+                : row.fullText || row.text || '',
+            ).trim();
             const sourceText = String(message.text || '').trim();
             const content = (Array.isArray(message.content) ? message.content : []).filter(
               (part) => part?.type === 'text',
@@ -691,7 +697,16 @@ async function recordFencedDeliveryTrace(row, status, at, transactionOptions) {
               Object.prototype.hasOwnProperty.call(part, 'deliveryDispositionRanges'),
             );
             const disposition = message.metadata?.viventium?.deliveryDisposition;
-            if (ranged || disposition)
+            if (row.surface === 'voice') {
+              if (row.workerCompletionPresentation) payload.text = deliveredText;
+              else payload.fullText = deliveredText;
+              payload.deliveryControls = projectAudioDeliveryControls(
+                message.metadata?.viventium?.deliveryControls,
+                deliveredText,
+                content,
+                stripVoiceControlTagsForDisplay,
+              );
+            } else if (ranged || disposition)
               payload.deliveryControls = {
                 ...(disposition ? { deliveryDisposition: disposition } : {}),
                 ...(ranged || sourceText !== deliveredText

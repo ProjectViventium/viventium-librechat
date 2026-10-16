@@ -3546,3 +3546,91 @@ describe('native structured cortex failures', () => {
   });
 });
 // VIVENTIUM END
+
+test.each([
+  ['visible', 'Verified source.', true, 1],
+  ['silent', '{NTA}', true, 0],
+  ['denied', 'Verified source.', false, 0],
+])(
+  'native cortex %s keeps authorized source artifacts on the canonical response',
+  async (_case, content, fileCitations, expected) => {
+    const api = require('@librechat/api');
+    const { Files } = require('~/models');
+    const lookup = jest.spyOn(Files, 'find').mockResolvedValue([]);
+    const params = {
+      agent: { id: 'native-source-check', provider: 'native-test', tools: [] },
+      messages: [],
+      runId: 'native-source-answer',
+      conversationId: 'native-source-conversation',
+      contextMode: 'minimal',
+      mainContextBinding: 'isolated',
+      completedResultPolicy: 'internal',
+      req: {
+        user: { id: 'native-source-owner', role: 'USER' },
+        body: {},
+        config: {
+          endpoints: {
+            agents: { providerCapabilities: { 'native-test': { workspace_binding: true } } },
+          },
+        },
+      },
+    };
+    try {
+      const result = await executeCortexOnce(params, {
+        initializeAgentFn: jest.fn(async ({ agent }) => ({
+          ...agent,
+          instructions: '',
+          tools: [],
+        })),
+        prepareCapabilityFn: jest.fn(async ({ req }) =>
+          req._viventiumCortexToolEvidence.observeGrant('native-source-grant'),
+        ),
+        createRunFn: jest.fn(async () => ({
+          processStream: jest.fn(async () => {
+            api.reportCortexHostToolResult('foreign-source-grant', {
+              status: 'ok',
+              tool: 'file_search',
+              artifact: {
+                file_search: {
+                  fileCitations: true,
+                  sources: [{ fileId: 'foreign', fileName: 'Other.txt', relevance: 1 }],
+                },
+              },
+            });
+            api.reportCortexHostToolResult('native-source-grant', {
+              status: 'ok',
+              tool: 'file_search',
+              artifact: {
+                file_search: {
+                  fileCitations,
+                  sources: [
+                    {
+                      fileId: 'owned-file',
+                      fileName: 'Meeting.txt',
+                      relevance: 1,
+                      content: 'Original source evidence.',
+                    },
+                  ],
+                },
+              },
+            });
+            return content;
+          }),
+        })),
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.attachments || []).toHaveLength(expected);
+      if (expected) {
+        expect(result.attachments[0]).toMatchObject({
+          type: 'file_search',
+          messageId: params.runId,
+          conversationId: params.conversationId,
+          file_search: { sources: [{ fileId: 'owned-file', fileName: 'Meeting.txt' }] },
+        });
+        expect(JSON.stringify(result.attachments)).not.toContain('Other.txt');
+      }
+    } finally {
+      lookup.mockRestore();
+    }
+  },
+);

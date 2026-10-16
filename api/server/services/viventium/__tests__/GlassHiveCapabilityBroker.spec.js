@@ -1,3 +1,5 @@
+const mockCitationAccess = jest.fn(async () => true);
+jest.mock('~/models/Role', () => ({ getRoleByName: jest.fn() }));
 const mockPrepareDurableEffect = jest.fn();
 const mockCommitDurableEffect = jest.fn();
 const mockSettleDurableEffectFailure = jest.fn();
@@ -126,6 +128,7 @@ jest.mock('~/server/services/Tools/mcp', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  checkAccess: (...args) => mockCitationAccess(...args),
   assertCurrentGlassHiveSourceAuthor: (...args) => mockAssertCurrentGlassHiveSourceAuthor(...args),
   GenerationJobManager: {
     getJobStore: jest.fn(),
@@ -2727,14 +2730,16 @@ describe('GlassHive capability broker', () => {
       status: 'ok',
       tool: 'file_search',
       content: 'Synthetic source-backed recall result.',
-      artifact: { file_search: { sources: [{ fileId: recallFile.file_id }] } },
+      artifact: { file_search: { sources: [{ fileId: recallFile.file_id }], fileCitations: true } },
     });
     expect(require('@librechat/api').reportCortexHostToolResult).toHaveBeenCalledWith(
       grant.grant_id,
       expect.objectContaining({
         status: 'ok',
         tool: 'file_search',
-        artifact: { file_search: { sources: [{ fileId: recallFile.file_id }] } },
+        artifact: {
+          file_search: { sources: [{ fileId: recallFile.file_id }], fileCitations: true },
+        },
       }),
     );
     expect(mockCreateFileSearchTool).toHaveBeenCalledWith({
@@ -2745,6 +2750,20 @@ describe('GlassHive capability broker', () => {
       activeMessageId: 'msg-1',
       fileCitations: false,
     });
+
+    for (const displayAccess of [false, 'unavailable']) {
+      if (displayAccess === 'unavailable')
+        mockCitationAccess.mockRejectedValueOnce(new Error('access unavailable'));
+      else mockCitationAccess.mockResolvedValueOnce(false);
+      const denied = await handleToolCall({
+        grant,
+        toolName: 'file_search',
+        args: { query: 'synthetic fact' },
+      });
+      expect(denied.status).toBe('ok');
+      expect(denied.artifact.file_search.fileCitations).toBe(false);
+      expect(denied.content).toBe('Synthetic source-backed recall result.');
+    }
   });
 
   test('exposes and invokes canonical web_search through the signed host-tool broker', async () => {

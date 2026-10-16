@@ -646,3 +646,81 @@ test.each([false, true])(
     }
   },
 );
+
+test('late native citations persist once on their authenticated canonical message, never inside cortex text', async () => {
+  const db = require('~/models');
+  const { persistCortexPartsToCanonicalMessage } = require('../BackgroundCortexFollowUpService');
+  const req = { user: { id: 'citation-owner' } };
+  const attachment = {
+    type: 'file_search',
+    messageId: 'citation-answer',
+    conversationId: 'citation-conversation',
+    toolCallId: 'tool-owned',
+    file_search: {
+      sources: [
+        {
+          fileId: 'owned-file',
+          fileName: 'Meeting.txt',
+          content: 'Original evidence.',
+          relevance: 1,
+        },
+      ],
+    },
+  };
+  const existing = {
+    messageId: 'citation-answer',
+    conversationId: 'citation-conversation',
+    text: 'Parent answer.',
+    content: [],
+    attachments: [],
+  };
+  const get = jest
+    .spyOn(db, 'getMessage')
+    .mockImplementation(async (filter) => (filter.user === req.user.id ? existing : null));
+  const update = jest.spyOn(db, 'updateMessage').mockImplementation(async (_req, payload) => {
+    if (payload.content) existing.content = payload.content;
+    for (const item of payload.$addToSet?.attachments?.$each || []) {
+      if (!existing.attachments.some((saved) => JSON.stringify(saved) === JSON.stringify(item)))
+        existing.attachments.push(item);
+    }
+  });
+  try {
+    const part = {
+      type: 'cortex_insight',
+      cortex_id: 'retrieval',
+      status: 'complete',
+      insight: 'Verified evidence.',
+      attachments: [
+        attachment,
+        { ...attachment, conversationId: 'foreign-conversation' },
+        { ...attachment, messageId: 'foreign-answer' },
+      ],
+    };
+    for (let replay = 0; replay < 2; replay++)
+      await persistCortexPartsToCanonicalMessage({
+        req,
+        responseMessageId: existing.messageId,
+        cortexParts: [part],
+        maxAttempts: 1,
+      });
+    expect(existing.attachments).toEqual([attachment]);
+    expect(existing.content[0]).not.toHaveProperty('attachments');
+    expect(get).toHaveBeenCalledWith({ user: req.user.id, messageId: existing.messageId });
+    expect(update.mock.calls[0][1]).not.toHaveProperty('$addToSet');
+    expect(update.mock.calls[1][1]).not.toHaveProperty('content');
+    expect(update.mock.calls[1][1].$addToSet.attachments.$each).toEqual([attachment]);
+    update.mockClear();
+    await expect(
+      persistCortexPartsToCanonicalMessage({
+        req: { user: { id: 'foreign-owner' } },
+        responseMessageId: existing.messageId,
+        cortexParts: [part],
+        maxAttempts: 1,
+      }),
+    ).rejects.toThrow('message_not_found');
+    expect(update).not.toHaveBeenCalled();
+  } finally {
+    get.mockRestore();
+    update.mockRestore();
+  }
+});

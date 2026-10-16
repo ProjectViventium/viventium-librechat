@@ -291,6 +291,33 @@ function compactorAgent(agent, domainEpochKey, stage = 'compaction') {
   };
 }
 
+// Both an in-claim draft and a resumed bounded draft use ordinary native admission sizing.
+// The full source, isolation instructions and all configured fallback routes remain included.
+async function sizeCorrectionWithinNativeAdmission(input, claim, correction) {
+  const { candidate, ...numeric } = correction;
+  if (candidate === undefined) return numeric;
+  const isolated = compactorAgent(input.agent, claim.domainEpochKey);
+  const routes = [
+    { ...isolated, model: isolated.model_parameters?.model || isolated.model },
+    isolated.viventiumFallbackLlm || isolated.viventiumFallbackLlmAssignment,
+    ...(isolated.viventiumGraphLlmFallbacks || []),
+    ...require('./agentLlmFallback').resolveFallbackCandidates(isolated),
+  ].filter(Boolean);
+  const floor = await require('@librechat/api')
+    .getNativeConversationReplayBudgetForRoutes(routes, input.req?.config?.endpoints?.custom)
+    .catch(() => null);
+  return Number.isSafeInteger(floor) &&
+    floor > 0 &&
+    require('./ViventiumMainContextService').mainHistoryFitsNativeBody(
+      [new HumanMessage(buildCompactionPrompt(claim, correction))],
+      isolated,
+      0,
+      floor,
+    )
+    ? correction
+    : numeric;
+}
+
 async function defaultExecuteCompactor({
   claim,
   prompt,
@@ -658,7 +685,14 @@ async function runAcceptedMainCompaction(input = {}) {
       fidelityRepairAttempts = pendingRepair.fidelityRepairAttempts ?? 0;
       transportRetries = pendingRepair.transportRetries;
       correctionReason = pendingSize?.correction || pendingRepair.correction;
-      if (pendingSize) sizeRepair = pendingSize.sizeRepair;
+      if (pendingSize) {
+        sizeRepair = pendingSize.sizeRepair;
+        correctionReason = await sizeCorrectionWithinNativeAdmission(
+          input,
+          claim,
+          correctionReason,
+        );
+      }
     }
     const effectiveLeaseExpiry = () =>
       Number.isFinite(deadlineMs)
@@ -986,33 +1020,10 @@ async function runAcceptedMainCompaction(input = {}) {
           break;
         }
         if (proposalSizeRejected) {
-          const isolated = compactorAgent(input.agent, claim.domainEpochKey);
-          const routes = [
-            { ...isolated, model: isolated.model_parameters?.model || isolated.model },
-            isolated.viventiumFallbackLlm || isolated.viventiumFallbackLlmAssignment,
-            ...(isolated.viventiumGraphLlmFallbacks || []),
-            ...require('./agentLlmFallback').resolveFallbackCandidates(isolated),
-          ].filter(Boolean);
-          const floor = await require('@librechat/api')
-            .getNativeConversationReplayBudgetForRoutes(
-              routes,
-              input.req?.config?.endpoints?.custom,
-            )
-            .catch(() => null);
-          const withCandidate = { ...correctionReason, candidate: proposal };
-          // Reuse ordinary native admission sizing for the complete isolated request. Unknown
-          // or insufficient discovery keeps numeric feedback; native admission remains final.
-          if (
-            Number.isSafeInteger(floor) &&
-            floor > 0 &&
-            require('./ViventiumMainContextService').mainHistoryFitsNativeBody(
-              [new HumanMessage(buildCompactionPrompt(claim, withCandidate))],
-              isolated,
-              0,
-              floor,
-            )
-          )
-            correctionReason = withCandidate;
+          correctionReason = await sizeCorrectionWithinNativeAdmission(input, claim, {
+            ...correctionReason,
+            candidate: proposal,
+          });
         }
         continue;
       }
@@ -1163,10 +1174,9 @@ async function runAcceptedMainCompaction(input = {}) {
     }
     const pendingSizeFeedback = normalizeMainCompactionSizeRepair(
       {
-        // A draft is useful only inside this claim. Durable size continuation remains numeric.
-        correction: sizeRepair
-          ? { code: correctionReason.code, issue: correctionReason.issue }
-          : correctionReason,
+        // The shared owner retains only structurally valid, JSON-bounded drafts. Whole-JSON
+        // overflow stays numeric; resumed drafts still pass current native admission sizing.
+        correction: correctionReason,
         sizeRepair,
       },
       claim.outputContract,

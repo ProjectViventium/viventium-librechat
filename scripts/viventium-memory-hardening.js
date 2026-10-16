@@ -74,6 +74,7 @@ const DEFAULT_TRANSCRIPT_IGNORE_GLOBS = [
   '**/*.part',
   '**/*.download',
   '**/*.log',
+  '**/*.log.*',
 ];
 const TRANSCRIPT_RAG_MODES = new Set(['detailed_summary_only', 'raw_and_summary', 'raw_only']);
 const TRANSCRIPT_MAX_BYTES_PER_CHAR = 16;

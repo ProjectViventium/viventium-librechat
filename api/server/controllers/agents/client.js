@@ -1,3 +1,4 @@
+const { collectCortexCitationAttachments } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * File: api/server/controllers/agents/client.js
  *
@@ -8766,10 +8767,17 @@ class AgentClient extends BaseClient {
               cortex_name: sanitizeCortexDisplayName(cortexData.cortex_name),
             };
           }
+          const citationAttachments = collectCortexCitationAttachments([cortexData], {
+            messageId: canonicalResponseMessageId,
+            conversationId,
+          });
+          if (Array.isArray(this.artifactPromises))
+            this.artifactPromises.push(...citationAttachments);
           // Persist cortex parts onto the main message so they survive refresh/reload.
           // We upsert by cortex_id to keep a single row per cortex.
+          const { attachments: _citationArtifacts, ...displayCortexData } = cortexData;
           upsertCortexContentPart(pendingCortexParts, cortexData);
-          upsertCortexContentPart(this.contentParts, cortexData);
+          upsertCortexContentPart(this.contentParts, displayCortexData);
           void cortexPersistenceCoordinator.enqueue(pendingCortexParts);
 
           const streamId = req?._resumableStreamId;
@@ -8800,10 +8808,21 @@ class AgentClient extends BaseClient {
               runId: uiMessageId,
               canonicalMessageId: canonicalResponseMessageId,
               userMessageId: canonicalUserMessageId,
-              ...cortexData,
+              ...displayCortexData,
             },
           };
 
+          // Reuse ordinary attachment events; late persistence below owns reload and replay.
+          for (const attachment of citationAttachments) {
+            if (streamId) {
+              void GenerationJobManager.emitChunk(streamId, {
+                event: 'attachment',
+                data: attachment,
+              });
+            } else if (streamOpen) {
+              stream.write(`event: attachment\ndata: ${JSON.stringify(attachment)}\n\n`);
+            }
+          }
           // Use GenerationJobManager for reliable event delivery (works even after stream closes)
           if (streamId) {
             const emitPromise = GenerationJobManager.emitChunk(streamId, eventPayload);

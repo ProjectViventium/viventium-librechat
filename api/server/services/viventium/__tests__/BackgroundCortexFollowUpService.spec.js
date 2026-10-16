@@ -673,10 +673,11 @@ describe('Phase B prepare/persist boundary', () => {
           return source;
         },
       }));
+      const saveMessage = jest.spyOn(db, 'saveMessage').mockResolvedValue({});
       const previous = process.env.XAI_API_KEY;
       try {
         process.env.XAI_API_KEY = 'synthetic-xai-key';
-        const prepared = await prepareCortexFollowUpMessage({
+        const input = {
           req: {
             id: 'synthetic-voice-ranges',
             viventiumCallSession: { callSessionId: 'synthetic-owned-call' },
@@ -703,9 +704,16 @@ describe('Phase B prepare/persist boundary', () => {
             insights: [{ cortexName: 'Synthetic specialist', insight: 'A useful result.' }],
           },
           recentResponse: 'The initial answer is visible.',
-        });
+        };
+        const prepared = await prepareCortexFollowUpMessage(input);
         expect(prepared.text).toBe(visible || source.replace('[laugh] ', ''));
         expect(prepared.nativeDeliveryContent[0].text).toBe(prepared.text);
+        expect(prepared.deliveryControls.sourceTextSha256).toBe(
+          require('node:crypto').createHash('sha256').update(prepared.text).digest('hex'),
+        );
+        expect(prepared.deliveryControls.audioContent).toEqual(
+          invalid ? [] : [expect.objectContaining({ type: 'text', text: source.trim() })],
+        );
         expect(prepared.deliveryDisposition).toEqual({
           ...disposition,
           audio: invalid ? 'skip' : audio,
@@ -722,11 +730,15 @@ describe('Phase B prepare/persist boundary', () => {
                 ]
               : [{ start: 0, end: prepared.text.length, disposition }],
         );
+        const persisted = await persistPreparedCortexFollowUpMessage(input, prepared);
+        expect(persisted.metadata.viventium.deliveryControls).toEqual(prepared.deliveryControls);
+        expect(persisted.text).toBe(prepared.text);
         expect(createRun).toHaveBeenCalledTimes(1);
       } finally {
         if (previous === undefined) delete process.env.XAI_API_KEY;
         else process.env.XAI_API_KEY = previous;
         createRun.mockRestore();
+        saveMessage.mockRestore();
       }
     },
   );

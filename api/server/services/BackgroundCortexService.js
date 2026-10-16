@@ -1995,6 +1995,7 @@ function buildCortexCompletionPayload(result) {
   return {
     ...basePayload,
     status: 'complete',
+    ...(hasVisibleInsight && result.attachments?.length ? { attachments: result.attachments } : {}),
     insight: hasVisibleInsight ? result.insight : '',
     silent: !hasVisibleInsight,
     no_response: !hasVisibleInsight,
@@ -2021,6 +2022,9 @@ function buildCompletionInputFromActivation({
       activationResult.cortexName ||
       activationResult.agentId,
     insight: cancellationApplies ? null : (result?.insight ?? null),
+    ...(!cancellationApplies && !result?.error && result?.attachments?.length
+      ? { attachments: result.attachments }
+      : {}),
     cancelled: cancellationApplies && !cancellationUnconfirmed,
     error: cancellationUnconfirmed
       ? 'Native request release is unconfirmed.'
@@ -4285,16 +4289,26 @@ async function runCortexAttempt(
       names: new Set(),
     };
     const declaredResultEvidence = resultEvidence ?? resultEvidencePolicy;
-    toolEvidence = createCortexToolEvidence(declaredResultEvidence, (output) => {
-      toolExecutionState.completed += 1;
-      completedToolCalls = toolExecutionState.completed;
-      if (output.name) toolExecutionState.names.add(output.name);
-    });
     const baseToolEndCallback = createToolEndCallback({
       req: safeReq,
       res: safeRes,
       artifactPromises,
       streamId,
+    });
+    // Native broker artifacts use the same authorized citation processor as direct tools.
+    toolEvidence = createCortexToolEvidence(declaredResultEvidence, (output) => {
+      toolExecutionState.completed += 1;
+      completedToolCalls = toolExecutionState.completed;
+      if (output.name) toolExecutionState.names.add(output.name);
+      if (output.artifact?.[Tools.file_search]) {
+        void baseToolEndCallback(
+          { output },
+          {
+            run_id: runId,
+            thread_id: resolvedConversationId,
+          },
+        );
+      }
     });
     const toolEndCallback = async (data, metadata) => {
       const output = data?.output;
@@ -4838,7 +4852,11 @@ async function runCortexAttempt(
       };
     }
 
+    const citationAttachments = insight.trim()
+      ? (await Promise.all(artifactPromises)).filter(Boolean)
+      : [];
     const cortexResult = {
+      ...(citationAttachments.length ? { attachments: citationAttachments } : {}),
       agentId: agent.id,
       agentName: agent.name || agent.id,
       insight,

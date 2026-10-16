@@ -16,6 +16,7 @@ import {
   compareMainCompactionToolIdentities,
   mainCompactionOutputConstraints,
   mainCompactionCandidateDigest,
+  mainCompactionRenderedBytes,
   mainCompactionOutputContractDigest,
   createMainCompactionOutputContract,
   inspectMainCompactionCarrier,
@@ -2428,6 +2429,53 @@ describe('durable numeric size feedback', () => {
       .toMatchObject({ status: 'compacted' });
     expect(states.get(String(claim.domainEpochKey))?.pendingCompactionRepair).toBeNull();
   });
+  test.each(['same', 'tighter', 'no-longer-bounded'])(
+    'retains exact bounded carrier repair across the existing checkpoint (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const claim = await seed(), contract = claim.outputContract as Record<string, number>;
+      const candidate = { ...faithful, summary: '&'.repeat(Math.floor(contract.maxJsonUtf8Bytes / 2)) };
+      expect(inspectMainCompactionCandidate(candidate, contract).ok).toBe(true);
+      const result = inspectMainCompactionCarrier(candidate, contract);
+      if (result.ok) throw new Error('Expected escaped carrier rejection');
+      const serialized = JSON.stringify(candidate), bytes = Buffer.byteLength(serialized);
+      const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: routeKey(contract),
+        semanticAttempts: 2, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'schema_invalid', issue: result.issue, candidate: serialized },
+        sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 3000, converging: true } };
+      expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+      const saved = states.get(String(claim.domainEpochKey))!.pendingCompactionRepair!;
+      expect(saved.correction.candidate).toBe(serialized);
+      const extra = mode === 'same' ? 0 : mode === 'tighter' ? 100 : contract.maxJsonUtf8Bytes - bytes + 1;
+      const next = await service.claimAcceptedMainCompaction({ ...identity,
+        outputCarrier: { carrierMaxUtf8Bytes: contract.carrierMaxUtf8Bytes,
+          reservedContextUtf8Bytes: contract.reservedUtf8Bytes + extra } });
+      expect(next.sourceDigest).toBe(claim.sourceDigest);
+      expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2,
+        fidelityRepairAttempts: 0, transportRetries: 0 });
+      const feedback = normalizeMainCompactionSizeRepair(saved, saved.outputContract, next.outputContract)!;
+      expect(feedback).not.toBeNull();
+      expect(feedback.correction.candidate).toBe(mode === 'no-longer-bounded' ? undefined : serialized);
+      expect(feedback.correction.issue).toMatchObject({ path: '$carrier',
+        actual: mainCompactionRenderedBytes(candidate, next.outputContract as never),
+        excessBytes: mainCompactionRenderedBytes(candidate, next.outputContract as never) - contract.carrierMaxUtf8Bytes });
+      expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair!.correction.candidate)
+        .toBe(serialized);
+    });
+
+  test('does not retain whole-JSON overflow even when supplied as an in-claim candidate', () => {
+    const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 55221 })!;
+    const candidate = { ...faithful, summary: 's'.repeat(contract.maxJsonUtf8Bytes + 1000) };
+    const value = sizeFeedback(contract as unknown as Record<string, unknown>);
+    Object.assign(value.correction, { candidate });
+    const normalized = normalizeMainCompactionSizeRepair(value, contract)!;
+    expect(normalized).not.toBeNull();
+    expect(normalized.correction.candidate).toBeUndefined();
+    expect(normalized.sizeRepair).toEqual(value.sizeRepair);
+  });
+
   test.each(['source', 'attempts', 'release', 'not-shrinking', 'candidate', 'field-total', 'actual',
     'limit', 'item', 'transport', 'lease'])(
     'rejects unsafe numeric size feedback (%s)', async mode => {

@@ -184,3 +184,20 @@ test.each([-1, 0.5, 2])('rejects invalid completed fidelity repair count %s', as
   } });
   await expect(document.validate()).rejects.toThrow('fidelityRepairAttempts');
 });
+
+
+test('round-trips an owner-validated bounded size draft without promoting it', async () => {
+  const candidate = JSON.stringify({ version: 1, summary: 'Keep approval required.', pendingAsks: [],
+    commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] });
+  const bytes = Buffer.byteLength(candidate);
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 2, fidelityRepairAttempts: 0, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 100, converging: true },
+    correction: { code: 'schema_invalid', candidate, issue: { path: '$carrier', constraint: 'max_bytes',
+      actual: 131080, limit: 131072, proposalBytes: bytes, excessBytes: 8, unit: 'utf8_bytes' } } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
+});

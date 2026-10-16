@@ -1,4 +1,10 @@
-import { createCortexToolEvidence, reportCortexHostToolResult } from './cortexToolEvidence';
+import {
+  collectCortexCitationAttachments,
+  createCortexToolEvidence,
+  reportCortexHostToolResult,
+} from './cortexToolEvidence';
+import { Tools } from 'librechat-data-provider';
+import type { TAttachment } from 'librechat-data-provider';
 
 const policy = {
   visible_insight_requires: [{ tool: 'file_search', receipt: 'non_empty_sources' as const }],
@@ -55,4 +61,54 @@ test('direct execution uses the same receipt rules and ordinary tool-free specia
   expect(ordinary.isSatisfied()).toBe(true);
   evidence.close();
   ordinary.close();
+});
+
+test('ordinary native tool artifacts remain isolated without a mandatory-evidence policy', () => {
+  const receive = jest.fn();
+  const evidence = createCortexToolEvidence(null, receive);
+  evidence.observeGrant('ordinary-grant');
+  reportCortexHostToolResult('foreign-grant', found);
+  reportCortexHostToolResult('ordinary-grant', { ...found, status: 'blocked' });
+  expect(receive).not.toHaveBeenCalled();
+  reportCortexHostToolResult('ordinary-grant', found);
+  expect(receive).toHaveBeenCalledWith({ name: 'file_search', artifact: found.artifact });
+  evidence.close();
+  reportCortexHostToolResult('ordinary-grant', found);
+  expect(receive).toHaveBeenCalledTimes(1);
+});
+
+test('citation artifacts require canonical message and conversation and deduplicate replay', () => {
+  const binding = { messageId: 'answer-owned', conversationId: 'conversation-owned' };
+  const attachment = {
+    ...binding,
+    type: Tools.file_search,
+    file_search: {
+      sources: [
+        {
+          fileId: 'file-owned',
+          fileName: 'Meeting.txt',
+          content: 'Source evidence.',
+          relevance: 1,
+        },
+      ],
+    },
+  } as TAttachment;
+  expect(
+    collectCortexCitationAttachments([{ attachments: [attachment, attachment] }], binding),
+  ).toEqual([attachment]);
+  for (const invalid of [
+    { ...attachment, messageId: 'answer-other' },
+    { ...attachment, conversationId: 'conversation-other' },
+    { ...attachment, type: Tools.memory },
+    { ...attachment, file_search: { sources: [] } },
+  ])
+    expect(
+      collectCortexCitationAttachments([{ attachments: [invalid as TAttachment] }], binding),
+    ).toEqual([]);
+  expect(
+    collectCortexCitationAttachments([{ attachments: [attachment] }], {
+      ...binding,
+      conversationId: '',
+    }),
+  ).toEqual([]);
 });

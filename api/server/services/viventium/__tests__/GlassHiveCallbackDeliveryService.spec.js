@@ -2799,6 +2799,83 @@ describe('GlassHiveCallbackDeliveryService', () => {
     },
   );
 
+  test.each([
+    [false, ''],
+    [true, ''],
+    [false, '\ufeff'],
+    [false, '\u00a0'],
+    [false, '\u0085'],
+  ])(
+    'Voice claim returns verified raw speech without changing presentation identity, mismatch=%s edge=%s',
+    async (changed, edge) => {
+      const transportText = edge + 'A useful result.' + edge;
+      const text = transportText.trim();
+      const raw = '[chuckle] ' + text;
+      const disposition = {
+        version: 1,
+        audio: 'eligible',
+        required: true,
+        valid: true,
+        source: 'model',
+      };
+      const part = (value) => ({
+        type: 'text',
+        text: value,
+        deliveryDispositionRanges: [{ start: 0, end: value.length, disposition }],
+      });
+      const controls = {
+        sourceTextSha256: require('node:crypto').createHash('sha256').update(text).digest('hex'),
+        audioContent: [part(raw)],
+      };
+      const row = {
+        deliveryId: 'voice-delivery',
+        callbackId: 'voice-callback',
+        callbackMessageId: 'voice-message',
+        userId: 'voice-owner',
+        conversationId: 'voice-conversation',
+        voiceCallSessionId: 'voice-call',
+        event: 'run.completed',
+        surface: 'voice',
+        status: 'pending',
+        text: changed ? 'Changed presentation.' : transportText,
+        claimId: 'voice-claim',
+        fullText: 'Raw worker body is not the Main-authored presentation.',
+      };
+      row.workerCompletionPresentation =
+        require('@librechat/api').buildVoiceWorkerCompletionPresentation({
+          ownerId: row.userId,
+          conversationId: row.conversationId,
+          callSessionId: row.voiceCallSessionId,
+          responseMessageId: row.callbackMessageId,
+          responseText: row.text,
+          bindings: workerCompletionFixture().presentation.bindings,
+        });
+      mockFindOne.mockReturnValueOnce(leanResult(row));
+      mockFindOneAndUpdate.mockReturnValueOnce(leanResult({ ...row, status: 'claimed' }));
+      mockMessageFindOne.mockReturnValueOnce(
+        leanResult({
+          text,
+          content: [part(text)],
+          metadata: { viventium: { deliveryDisposition: disposition, deliveryControls: controls } },
+        }),
+      );
+      const claimed = await claimPendingGlassHiveCallbackDeliveries({ surface: 'voice', limit: 1 });
+      expect(claimed[0].text).toBe(row.text.trim());
+      expect(claimed[0].deliveryControls.sourceTextSha256).toBe(
+        require('node:crypto').createHash('sha256').update(claimed[0].text).digest('hex'),
+      );
+      expect(claimed[0].deliveryControls.audioContent).toEqual(changed ? [] : [part(raw)]);
+      expect(mockMessageFindOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: row.userId,
+          conversationId: row.conversationId,
+          messageId: row.callbackMessageId,
+          isCreatedByUser: false,
+        }),
+      );
+    },
+  );
+
   test('claim projects the exact retained native attention identity and signed topic without private form data', async () => {
     const binding = {
       version: 1,

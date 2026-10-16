@@ -1,3 +1,4 @@
+const { collectCortexCitationAttachments } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: Background Cortices - Follow-up + Persistence Helpers
  * Purpose:
@@ -25,6 +26,7 @@ const {
   initializeOpenAI,
   inspectProviderDeliveryDisposition,
   inspectProviderDeliveryRanges,
+  projectAudioDeliveryControls,
   isAudioDeliveryRequested,
   nativeFollowUpOutputSource,
   renderGlassHiveNativeMediaLinks,
@@ -2219,7 +2221,15 @@ async function persistCortexPartsToCanonicalMessage({
       );
       /* VIVENTIUM NOTE */
 
-      const merged = upsertCortexParts(existing.content, cortexParts, {
+      const citationAttachments = collectCortexCitationAttachments(cortexParts || [], {
+        messageId: responseMessageId,
+        conversationId: existing.conversationId,
+      });
+      const displayParts = (cortexParts || []).map((entry) => {
+        const { attachments, ...part } = entry || {};
+        return part;
+      });
+      const merged = upsertCortexParts(existing.content, displayParts, {
         visibleText: existingVisibleText,
       });
 
@@ -2246,6 +2256,18 @@ async function persistCortexPartsToCanonicalMessage({
             'viventium/services/BackgroundCortexFollowUpService.persistCortexPartsToCanonicalMessage',
         },
       );
+
+      // Keep the canonical content guard and atomic late-artifact receipt as separate owners.
+      if (citationAttachments.length) {
+        await db.updateMessage(
+          req,
+          {
+            messageId: responseMessageId,
+            $addToSet: { attachments: { $each: citationAttachments } },
+          },
+          { operationKind: 'system' },
+        );
+      }
 
       /* VIVENTIUM NOTE
        * Purpose: Confirm persisted content size after update.
@@ -2810,6 +2832,7 @@ async function promoteForcedFollowUpToEmptyParent({
   telegramDeliveryControls,
   deliveryDisposition,
   nativeDeliveryContent,
+  deliveryControls,
   insightsData,
   forceVisibleFollowUp,
   scheduleId,
@@ -2901,6 +2924,7 @@ async function promoteForcedFollowUpToEmptyParent({
             }
           : {}),
         telegramDeliveryControls: telegramDeliveryControls || undefined,
+        deliveryControls,
         ...(deliveryDisposition ? { deliveryDisposition } : {}),
         recoveredPrimaryErrorClasses:
           recoveredPrimaryErrorClasses.length > 0 ? recoveredPrimaryErrorClasses : undefined,
@@ -3604,13 +3628,15 @@ async function prepareCortexFollowUpMessage({
     };
   }
   /* === VIVENTIUM START === Native audio choices survive Phase B text projection. === */
+  const projectNativeDeliveryText = (source) =>
+    normalizeNoResponseText(
+      sanitizeFollowUpDisplayText(
+        renderGlassHiveNativeMediaLinks(source, insightsData?.insights || []),
+      ),
+    ).trim();
   const nativeDeliveryRanges = nativeDeliveryOutput
     ? inspectProviderDeliveryRanges(nativeDeliveryOutput, text, (source) => {
-        const projected = normalizeNoResponseText(
-          sanitizeFollowUpDisplayText(
-            renderGlassHiveNativeMediaLinks(source, insightsData?.insights || []),
-          ),
-        ).trim();
+        const projected = projectNativeDeliveryText(source);
         if (voiceMode) return stripVoiceControlTagsForDisplay(projected);
         return surface === 'telegram' ? parseDeliveryControls(projected).cleanText : projected;
       })
@@ -3619,6 +3645,30 @@ async function prepareCortexFollowUpMessage({
     nativeDeliveryRanges === null
       ? undefined
       : [{ type: 'text', text, deliveryDispositionRanges: nativeDeliveryRanges }];
+  const speechText =
+    voiceMode && nativeDeliveryOutput ? projectNativeDeliveryText(generatedText) : '';
+  const deliveryControls =
+    voiceMode && nativeDeliveryContent
+      ? projectAudioDeliveryControls(
+          {
+            sourceTextSha256: crypto.createHash('sha256').update(text).digest('hex'),
+            audioContent: [
+              {
+                type: 'text',
+                text: speechText,
+                deliveryDispositionRanges: inspectProviderDeliveryRanges(
+                  nativeDeliveryOutput,
+                  speechText,
+                  projectNativeDeliveryText,
+                ),
+              },
+            ],
+          },
+          text,
+          nativeDeliveryContent,
+          stripVoiceControlTagsForDisplay,
+        )
+      : undefined;
   if (nativeDeliveryContent) {
     deliveryDisposition = {
       version: 1,
@@ -3670,6 +3720,7 @@ async function prepareCortexFollowUpMessage({
     telegramDeliveryControls,
     deliveryDisposition,
     ...(nativeDeliveryContent ? { nativeDeliveryContent } : {}),
+    ...(deliveryControls ? { deliveryControls } : {}),
     followUpDecisionRecord,
     conversationMessages,
     finalContinuationContext,
@@ -3831,6 +3882,7 @@ async function persistPreparedCortexFollowUpMessage(
     telegramDeliveryControls,
     deliveryDisposition,
     nativeDeliveryContent: prepared.nativeDeliveryContent,
+    deliveryControls: prepared.deliveryControls,
     insightsData,
     forceVisibleFollowUp: shouldForceVisibleFollowUp,
     scheduleId,
@@ -3906,6 +3958,7 @@ async function persistPreparedCortexFollowUpMessage(
   const metadata = {
     viventium: {
       type: 'cortex_followup',
+      ...(prepared.deliveryControls ? { deliveryControls: prepared.deliveryControls } : {}),
       ...(deliveryDisposition ? { deliveryDisposition } : {}),
       ...(durableMissionEvidence === true
         ? {

@@ -2368,13 +2368,16 @@ describe('/api/viventium/telegram', () => {
           origin: 'scheduler',
           surface: 'workbench',
           source_event_id: 'forged-event',
+          source_received_at: 1,
         },
         adapterCapabilities: { segment_stability: 'provisional', supersede_scope: 'response_only' },
       },
     });
     const res = createMockRes();
 
+    const beforeDispatch = Date.now();
     await dispatch(app, req, res);
+    const afterDispatch = Date.now();
 
     expect(mockLastInteractionContext).toEqual({
       actor_kind: 'external_user',
@@ -2388,7 +2391,11 @@ describe('/api/viventium/telegram', () => {
       }),
       source_order_scope: expect.stringMatching(/^[a-f0-9]{64}$/),
       source_sequence: 12347,
+      source_received_at: expect.any(Number),
     });
+    expect(Number.isSafeInteger(mockLastInteractionContext.source_received_at)).toBe(true);
+    expect(mockLastInteractionContext.source_received_at).toBeGreaterThanOrEqual(beforeDispatch);
+    expect(mockLastInteractionContext.source_received_at).toBeLessThanOrEqual(afterDispatch);
     expect(mockLastAdapterCapabilities).toEqual({
       segment_stability: 'immediate',
       /* === VIVENTIUM START === Additive Telegram turn authoring. */

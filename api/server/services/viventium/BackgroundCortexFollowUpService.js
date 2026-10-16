@@ -22,6 +22,7 @@ const {
   createNativeCapacityFetch,
   captureNativeFollowUpOutputFiles,
   collectGlassHiveNativeMediaReferences,
+  getCurrentCallContext,
   initializeAnthropic,
   initializeOpenAI,
   inspectProviderDeliveryDisposition,
@@ -2452,6 +2453,7 @@ function formatFollowUpPrompt({
   surface = '',
   telegramAudioRequested = false,
   voiceProvider = '',
+  currentCallContext = '',
   primaryResponseMode = false,
 }) {
   if (!Array.isArray(insights) || insights.length === 0) {
@@ -2536,6 +2538,7 @@ function formatFollowUpPrompt({
       : '';
   const surfaceRules = [
     voiceRules,
+    voiceMode ? currentCallContext : '',
     telegramRules,
     telegramAudioRules,
     webRules,
@@ -3060,6 +3063,7 @@ async function generateFollowUpText({
     surface,
     telegramAudioRequested,
     voiceProvider,
+    currentCallContext: getCurrentCallContext(req),
     primaryResponseMode,
   });
   if (!prompt) {

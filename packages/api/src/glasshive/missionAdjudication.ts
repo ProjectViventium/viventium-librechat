@@ -25,12 +25,13 @@ import { evidenceId, legacyEvidenceId } from './missionEvidenceIdentity';
 import { normalizeNativeCallbackOutputFiles } from './nativeOutputFiles';
 import type { NativeCallbackOutputFiles, NativeOutputDeliveryAttachment, NativeFollowUpOutputFiles } from './nativeOutputFiles';
 import { loadFeelingsReadContext } from '../feelings/service';
+import { bindCurrentCallContext } from '../voice/callContext';
 
 import type { TerminalCallbackTransactionOptions } from './terminalCallbackTransaction';
 import type { Logger } from 'winston';
 import type { ClientSession, Model } from 'mongoose';
 import type { Document } from 'mongodb';
-import type { IGlassHiveTerminalCallbackResult } from '@librechat/data-schemas';
+import type { IGlassHiveTerminalCallbackResult, ViventiumVoiceRouteState } from '@librechat/data-schemas';
 import type {
   VoiceWorkerCompletionPresentationV1,
   BuildVoiceWorkerCompletionPresentationInput,
@@ -289,7 +290,13 @@ export interface GlassHiveMissionAdjudicationDependencies {
   getActiveCallSessionForConversation: (input: {
     userId: string;
     conversationId: string;
-  }) => Promise<{ callSessionId?: string } | null>;
+  }) => Promise<{
+    callSessionId?: string;
+    userId?: string;
+    agentId?: string;
+    mode?: string;
+    requestedVoiceRoute?: ViventiumVoiceRouteState | null;
+  } | null>;
   sanitizeGlassHiveCallbackText: (value: string | undefined, options: { maxLength: number; ownerResult?: boolean }) => string;
   deferGlassHiveTerminalCallbackAfterCommit: (operation: () => void) => boolean;
   runGlassHiveTerminalCallbackTransaction: <T>(
@@ -1183,11 +1190,23 @@ async function loadMainAuthorContext(
         : {}),
     },
     ...(activeCall?.callSessionId
-      ? { viventiumCallSession: { callSessionId: activeCall.callSessionId } }
+      ? { viventiumCallSession: {
+            callSessionId: activeCall.callSessionId,
+            ...(activeCall.userId ? { userId: activeCall.userId } : {}),
+            ...(activeCall.agentId ? { agentId: activeCall.agentId } : {}),
+            ...(activeCall.mode ? { mode: activeCall.mode } : {}),
+            ...(activeCall.requestedVoiceRoute
+              ? { requestedVoiceRoute: activeCall.requestedVoiceRoute } : {}),
+          } }
       : {}),
     headers: { 'x-viventium-surface': first.surface },
     config: await getAppConfig({ role: user.role }),
   };
+  // The authorized Call supplies selected capabilities, not proof of actual fallback playback.
+  if (bindCurrentCallContext(req)) {
+    const selectedProvider = safeText(activeCall?.requestedVoiceRoute?.tts?.provider, 160);
+    if (selectedProvider) req.body.voiceProvider = selectedProvider;
+  }
   const startedAt = Date.now();
   if (feelingsIsolated) {
     req._viventiumFeelingSnapshot = null;

@@ -3330,6 +3330,74 @@ describe('GlassHiveMissionAdjudicationService', () => {
       });
     });
 
+    test('preserves selected voice capabilities without inventing the actual playback route', async () => {
+      pendingCompletion();
+      const selectedRoute = {
+        stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
+        tts: { provider: 'xai', variant: 'synthetic-voice' },
+      };
+      mockGetActiveCallSessionForConversation.mockResolvedValue({
+        callSessionId: 'live-call',
+        userId: 'user-1',
+        agentId: 'main-agent',
+        mode: 'call',
+        requestedVoiceRoute: selectedRoute,
+      });
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+      expect(input.req.body.voiceProvider).toBe('xai');
+      expect(input.req.viventiumCallSession.requestedVoiceRoute).toEqual(selectedRoute);
+      const context = require('@librechat/api').getCurrentCallContext(input.req);
+      const facts = JSON.parse(
+        context.replace(/^<viventium_current_call_v1>|<\/viventium_current_call_v1>$/g, ''),
+      );
+      expect(facts.requestedRoute).toEqual(selectedRoute);
+      expect(facts.actualPlaybackRoute).toBeNull();
+      expect(facts.gatewayReadyRoute).toBeNull();
+      const instructions = require('../surfacePrompts').buildVoiceModeInstructions(
+        input.req.body.voiceProvider,
+      );
+      expect(instructions).toContain('[chuckle]');
+      expect(mockGetActiveCallSessionForConversation).toHaveBeenCalledTimes(2);
+    });
+
+    test.each([null, { tts: { provider: null, variant: null } }])(
+      'keeps an unknown selected voice route generic: %j',
+      async (requestedVoiceRoute) => {
+        pendingCompletion();
+        mockGetActiveCallSessionForConversation.mockResolvedValue({
+          callSessionId: 'live-call',
+          userId: 'user-1',
+          agentId: 'main-agent',
+          mode: 'call',
+          requestedVoiceRoute,
+        });
+        await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+        const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+        expect(input.req.body).not.toHaveProperty('voiceProvider');
+        const instructions = require('../surfacePrompts').buildVoiceModeInstructions(
+          input.req.body.voiceProvider,
+        );
+        expect(instructions).not.toContain('[chuckle]');
+        const context = require('@librechat/api').getCurrentCallContext(input.req);
+        expect(context).toContain('"actualPlaybackRoute":null');
+      },
+    );
+
+    test('does not project selected capabilities from an unbound Call owner', async () => {
+      pendingCompletion();
+      mockGetActiveCallSessionForConversation.mockResolvedValue({
+        callSessionId: 'live-call',
+        userId: 'different-owner',
+        agentId: 'main-agent',
+        requestedVoiceRoute: { tts: { provider: 'xai', variant: 'synthetic-voice' } },
+      });
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      const input = mockPrepareCortexFollowUpMessage.mock.calls[0][0];
+      expect(input.req.body).not.toHaveProperty('voiceProvider');
+      expect(require('@librechat/api').getCurrentCallContext(input.req)).toBe('');
+    });
+
     test('overlaps the canonical Call lookup with validated user and agent reads', async () => {
       pendingCompletion();
       let userRequested;

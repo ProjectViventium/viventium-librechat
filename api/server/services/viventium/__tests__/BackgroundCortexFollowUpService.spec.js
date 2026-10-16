@@ -3116,6 +3116,75 @@ describe('canonical written details in Voice follow-up', () => {
     expect(rendered).not.toContain('say you can send the details');
     expect(rendered).toContain('{NTA}');
   });
+  test('renders exact admitted Call facts as data beside the selected provider rules', () => {
+    const req = {
+      user: { id: 'owner-1' },
+      body: { voiceMode: true },
+      viventiumCallSession: {
+        callSessionId: 'call-1',
+        userId: 'owner-1',
+        agentId: 'main-1',
+        requestedVoiceRoute: { tts: { provider: 'xai', variant: 'synthetic-voice' } },
+      },
+    };
+    const { bindCurrentCallContext, getCurrentCallContext } = require('@librechat/api');
+    expect(bindCurrentCallContext(req)).toBe(true);
+    const currentCallContext = getCurrentCallContext(req);
+    const rendered = formatFollowUpPrompt({ ...input, currentCallContext });
+    expect(rendered.split(currentCallContext)).toHaveLength(2);
+    expect(rendered).toContain('"requestedRoute"');
+    expect(rendered).toContain('"actualPlaybackRoute":null');
+    expect(rendered).toContain('[chuckle]');
+    expect(formatFollowUpPrompt({ ...input, voiceMode: false, currentCallContext })).not.toContain(
+      currentCallContext,
+    );
+  });
+  test('passes the bound Call data through the actual Phase-B generation consumer', async () => {
+    const req = {
+      user: { id: 'owner-1' },
+      body: { voiceMode: true, voiceProvider: 'xai' },
+      viventiumCallSession: {
+        callSessionId: 'call-1',
+        userId: 'owner-1',
+        agentId: 'main-1',
+        requestedVoiceRoute: { tts: { provider: 'xai', variant: 'synthetic-voice' } },
+      },
+    };
+    const { bindCurrentCallContext, getCurrentCallContext } = require('@librechat/api');
+    expect(bindCurrentCallContext(req)).toBe(true);
+    const capsule = getCurrentCallContext(req);
+    const processStream = jest.fn().mockResolvedValue('The verified result is ready.');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const native = require('../nativeResponseService');
+    const service = jest.spyOn(native, 'getService').mockReturnValue({
+      readToolEvidenceForPresentation: jest.fn().mockResolvedValue([]),
+    });
+    const priorKey = process.env.XAI_API_KEY;
+    try {
+      process.env.XAI_API_KEY = 'synthetic-key';
+      const args = {
+        req,
+        agent: { provider: 'xai', model: 'synthetic', model_parameters: {} },
+        conversationId: 'conversation-1',
+        parentMessageId: 'answer-1',
+        insightsData: { insights: input.insights },
+      };
+      await generateFollowUpText(args);
+      const transmitted = JSON.stringify(processStream.mock.calls[0][0]);
+      expect(transmitted).toContain(JSON.stringify(capsule).slice(1, -1));
+      expect(transmitted).toContain('[chuckle]');
+      req.body.voiceMode = false;
+      await generateFollowUpText(args);
+      expect(JSON.stringify(processStream.mock.calls[1][0])).not.toContain(
+        'viventium_current_call_v1',
+      );
+    } finally {
+      if (priorKey === undefined) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = priorKey;
+      service.mockRestore();
+      createRun.mockRestore();
+    }
+  });
   test('retains the explicit follow-up override as its sole voice rule owner', () => {
     const previous = process.env.VIVENTIUM_VOICE_FOLLOWUP_RULES;
     try {

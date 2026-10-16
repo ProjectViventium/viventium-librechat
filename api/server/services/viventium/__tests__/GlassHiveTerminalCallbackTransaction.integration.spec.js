@@ -1197,6 +1197,94 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
     }
   });
 
+  test('due delivery retry reconciles through the real pending claim lane without duplicate publication', async () => {
+    const h = await authoredDeliveryProof('due-reconcile-lane');
+    let releaseClaim;
+    let claim;
+    try {
+      await expect(
+        h.service.flushGlassHiveMissionAdjudications({
+          ownerId: h.result.ownerId,
+        }),
+      ).resolves.toMatchObject({ failed: 1 });
+      expect(await h.collection.findOne({ _id: h.evidence._id })).toMatchObject({
+        state: 'delivery_pending',
+        attempts: 1,
+        followUpMessageId: h.authoredId,
+      });
+      await h.collection.updateOne(
+        { _id: h.evidence._id },
+        {
+          $set: { nextAttemptAt: new Date(0), updatedAt: new Date(0) },
+        },
+      );
+      const blocked = new Promise((resolve) => {
+        releaseClaim = resolve;
+      });
+      let enteredClaim;
+      const pendingClaim = new Promise((resolve) => {
+        enteredClaim = resolve;
+      });
+      const originalClaim = h.collection.findOneAndUpdate.bind(h.collection);
+      claim = jest.spyOn(h.collection, 'findOneAndUpdate').mockImplementation(async (...args) => {
+        const [filter, , options] = args;
+        if (filter._id === h.evidence._id && filter.state === 'pending') {
+          const pending = await h.collection.findOne(
+            { _id: filter._id },
+            { session: options.session },
+          );
+          enteredClaim(pending);
+          await blocked;
+        }
+        return originalClaim(...args);
+      });
+      let delivered;
+      const committed = new Promise((resolve) => {
+        delivered = resolve;
+      });
+      const originalDelivery = h.delivery.getMockImplementation();
+      h.delivery.mockImplementation(async (...args) => {
+        const result = await originalDelivery(...args);
+        expect(deferGlassHiveTerminalCallbackAfterCommit(delivered)).toBe(true);
+        return result;
+      });
+      h.allowDelivery();
+      await expect(h.service.reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({
+        rows: 1,
+        owners: 1,
+      });
+      await expect(pendingClaim).resolves.toMatchObject({ state: 'pending', attempts: 1 });
+      await expect(h.service.reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({
+        rows: 1,
+        owners: 1,
+      });
+      expect(claim).toHaveBeenCalledTimes(1);
+      releaseClaim();
+      await committed;
+      expect(await h.collection.findOne({ _id: h.evidence._id })).toMatchObject({
+        state: 'completed',
+        attempts: 2,
+        followUpMessageId: h.authoredId,
+      });
+      await expect(h.service.reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({
+        rows: 0,
+        owners: 0,
+      });
+      expect(h.prepare).toHaveBeenCalledTimes(1);
+      expect(h.persist).toHaveBeenCalledTimes(1);
+      expect(h.delivery).toHaveBeenCalledTimes(2);
+      expect(claim).toHaveBeenCalledTimes(1);
+      expect(
+        await Message.countDocuments({ user: h.result.ownerId, messageId: h.authoredId }),
+      ).toBe(1);
+      expect(await h.receipts.countDocuments({ deliveryRef: `main-web:${h.authoredId}` })).toBe(1);
+    } finally {
+      releaseClaim?.();
+      claim?.mockRestore();
+      h.service.clearAdjudicationTimersForTests();
+    }
+  }, 15000);
+
   test.each(['trace', 'after_enqueue'])(
     'a two-row Main delivery retries real Mongo conflict without resynthesis or lost presentation rows (%s)',
     async (phase) => {

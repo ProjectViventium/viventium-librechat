@@ -2,6 +2,7 @@ import axios from 'axios';
 import { EModelEndpoint, defaultModels } from 'librechat-data-provider';
 import {
   fetchModels,
+  ensureNativeConversationModelCatalog,
   getNativeConversationReplayBudget,
   getNativeConversationReplayBudgetForRoutes,
   nativeConversationHistoryFits,
@@ -830,6 +831,88 @@ describe('native context allocation from retained source cost', () => {
       image_url: { url: 'data:image/png;base64,AAAA' } }] }], 196608)).toBeNull();
     expect(nativeConversationContextBudget(messages, 1)).toBeLessThan(0);
     expect(nativeConversationHistoryFits(messages, 1, 0)).toBe(false);
+  });
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Failed native discovery cannot poison a cached menu. === */
+describe('native catalog recovery', () => {
+  const params = {
+    name: 'native',
+    baseURL: 'https://native.example/v1',
+    apiKey: 'synthetic-key',
+    user: 'synthetic-owner',
+  };
+  const catalogCache = jest.requireMock('~/cache').standardCache.mock.results[0].value;
+  beforeEach(() => {
+    catalogCache.get.mockReset().mockResolvedValue(undefined);
+    catalogCache.set.mockReset().mockResolvedValue(true);
+    mockedAxios.get.mockReset();
+  });
+  test('a timeout remains retryable, then a declared floor is reused without another request', async () => {
+    mockedAxios.get.mockRejectedValueOnce(new Error('synthetic timeout'));
+    await ensureNativeConversationModelCatalog(params);
+    expect(catalogCache.set).not.toHaveBeenCalled();
+    mockedAxios.get.mockResolvedValueOnce({
+      data: {
+        data: [
+          { id: 'primary', native_history_admission_v1: { replay_budget_floor_bytes: 250000 } },
+        ],
+      },
+    });
+    await ensureNativeConversationModelCatalog(params);
+    expect(catalogCache.set).toHaveBeenCalledWith(expect.any(String), { primary: 250000 });
+    catalogCache.get.mockResolvedValue({ primary: 250000 });
+    await ensureNativeConversationModelCatalog(params);
+    expect(await getNativeConversationReplayBudget('native', params.baseURL, 'primary')).toBe(
+      250000,
+    );
+    expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+  });
+  test('a malformed successful response does not certify discovery', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { error: 'synthetic malformed response' } });
+    await ensureNativeConversationModelCatalog(params);
+    expect(catalogCache.set).not.toHaveBeenCalled();
+    mockedAxios.get.mockResolvedValueOnce({ data: { data: [] } });
+    await ensureNativeConversationModelCatalog(params);
+    expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+    expect(catalogCache.set).toHaveBeenCalledWith(expect.any(String), {});
+  });
+  test('a successful catalog without a floor remains unknown and does not fetch forever', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { data: [{ id: 'primary' }] } });
+    await ensureNativeConversationModelCatalog(params);
+    expect(catalogCache.set).toHaveBeenCalledWith(expect.any(String), {});
+    catalogCache.get.mockResolvedValue({});
+    await ensureNativeConversationModelCatalog(params);
+    expect(await getNativeConversationReplayBudget('native', params.baseURL, 'primary')).toBeNull();
+    expect(mockedAxios.get).toHaveBeenCalledTimes(1);
+  });
+  test('different authenticated requests do not share pending discovery', async () => {
+    mockedAxios.get.mockResolvedValue({ data: { data: [] } });
+    await Promise.all([
+      ensureNativeConversationModelCatalog(params),
+      ensureNativeConversationModelCatalog({ ...params, apiKey: 'other-synthetic-key' }),
+    ]);
+    expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+  });
+  test('concurrent missing discovery shares one exact authenticated request and clears after failure', async () => {
+    let release!: (value: { data: { data: Array<{ id: string }> } }) => void;
+    mockedAxios.get.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const first = ensureNativeConversationModelCatalog(params);
+    const second = ensureNativeConversationModelCatalog({ ...params });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockedAxios.get).toHaveBeenCalledTimes(1);
+    release({ data: { data: [] } });
+    await Promise.all([first, second]);
+    catalogCache.get.mockResolvedValue(undefined);
+    mockedAxios.get.mockRejectedValueOnce(new Error('synthetic timeout'));
+    await ensureNativeConversationModelCatalog(params);
+    expect(mockedAxios.get).toHaveBeenCalledTimes(2);
   });
 });
 /* === VIVENTIUM END === */

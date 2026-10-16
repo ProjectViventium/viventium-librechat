@@ -614,6 +614,66 @@ describe('GenerationJobManager Integration Tests', () => {
   });
 
   describe('In-Memory Mode', () => {
+    /* === VIVENTIUM START === Keep the real local request owner through slow preparation. */
+    test('retains a running request beyond 1200 seconds and delivers its error after reconnect', async () => {
+      const { GenerationJobManagerClass } = await import('../GenerationJobManager');
+      const { InMemoryJobStore } = await import('../implementations/InMemoryJobStore');
+      const { InMemoryEventTransport } = await import('../implementations/InMemoryEventTransport');
+      const store = Object.assign(new InMemoryJobStore({ ttlAfterComplete: 300_000 }), {
+        renewRunningJob: jest.fn(
+          async (_streamId: string, _createdAt: number, _owner?: string) => true,
+        ),
+      });
+      const manager = new GenerationJobManagerClass({
+        jobStore: store,
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      jest.useFakeTimers();
+      try {
+        await manager.initialize();
+        const job = await manager.createJob('preparing-stream', 'preparing-owner');
+        const first = await manager.subscribe('preparing-stream', () => {});
+        await store.createJob('remote-stream', 'preparing-owner');
+        await manager.subscribe('remote-stream', () => {});
+        await jest.advanceTimersByTimeAsync(720_000);
+        first!.unsubscribe();
+        const error = jest.fn();
+        await manager.subscribe('preparing-stream', () => {}, undefined, error);
+        await jest.advanceTimersByTimeAsync(600_000);
+        expect(store.renewRunningJob).toHaveBeenCalledTimes(22);
+        expect(store.renewRunningJob.mock.calls.every(([id]) => id === 'preparing-stream')).toBe(
+          true,
+        );
+        expect(store.renewRunningJob).toHaveBeenLastCalledWith(
+          'preparing-stream',
+          job.createdAt,
+          undefined,
+        );
+        await manager.emitError(
+          'preparing-stream',
+          'Context unavailable.',
+          'source_context_unavailable',
+        );
+        await manager.completeJob('preparing-stream', 'Context unavailable.');
+        expect(error).toHaveBeenCalledWith('Context unavailable.', 'source_context_unavailable');
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(store.renewRunningJob).toHaveBeenCalledTimes(22);
+        const stopped = await manager.createJob('stopped-stream', 'preparing-owner');
+        await manager.abortJob('stopped-stream', 'user_cancelled', 'preparing-owner');
+        expect(stopped.abortController.signal.aborted).toBe(true);
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(store.renewRunningJob).toHaveBeenCalledTimes(22);
+        await manager.destroy();
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(store.renewRunningJob).toHaveBeenCalledTimes(22);
+      } finally {
+        await manager.destroy();
+        jest.useRealTimers();
+      }
+    });
+    /* === VIVENTIUM END === */
+
     test('newer input withdraws a late Cortex addition before its receipt commits', async () => {
       const { createStreamServices } = await import('../createStreamServices');
       await expectNewerInputWithdrawsLateAddition(createStreamServices({ useRedis: false }));

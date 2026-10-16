@@ -4990,7 +4990,6 @@ class AgentClient extends BaseClient {
           })
         )
           return null;
-        const carrier = await resolveLegacyOutputCarrier();
         const nativeHistoryUploads =
           nativeReplayBudget === null
             ? undefined
@@ -5000,7 +4999,7 @@ class AgentClient extends BaseClient {
         const turnContextReserveBytes =
           nativeReplayBudget !== null
             ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
-            : carrier.reservedContextUtf8Bytes +
+            : (await resolveLegacyOutputCarrier()).reservedContextUtf8Bytes +
               (capsule
                 ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
                 : 0);

@@ -1312,25 +1312,50 @@ export class RedisJobStore implements IJobStore {
 
   async isNativeResponseUnboundCancelled(expected: SerializableJobData): Promise<boolean> {
     const job = await this.getJob(expected.streamId);
-    if (!job || job.createdAt !== expected.createdAt || job.userId !== expected.userId ||
-      job.responseMessageId !== expected.responseMessageId || job.conversationId !== expected.conversationId ||
-      job.status !== 'superseded' || job.nativeResponseCancelled !== true ||
+    if (
+      !job ||
+      job.createdAt !== expected.createdAt ||
+      job.userId !== expected.userId ||
+      job.responseMessageId !== expected.responseMessageId ||
+      job.conversationId !== expected.conversationId ||
+      job.status !== 'superseded' ||
+      job.nativeResponseCancelled !== true ||
       job.interactionContext?.logical_turn_id !== expected.interactionContext?.logical_turn_id ||
-      job.interactionContext?.revision !== expected.interactionContext?.revision) return false;
+      job.interactionContext?.revision !== expected.interactionContext?.revision
+    )
+      return false;
     return (await this.nativePublication('read-unbound', job)).status === 'revoked';
   }
 
   async getLogicalTurnSourcePredecessors(
-    streamId: string, userId: string, interactionContext: InteractionContext,
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
   ): Promise<SerializableJobData[]> {
     const current = await this.getJob(streamId);
-    if (!interactionContext.logical_turn_id || !current || current.userId !== userId ||
-      current.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id || current.interactionContext?.revision !== interactionContext.revision) throw streamIdConflictError();
+    if (
+      !interactionContext.logical_turn_id ||
+      !current ||
+      current.userId !== userId ||
+      current.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id ||
+      current.interactionContext?.revision !== interactionContext.revision
+    )
+      throw streamIdConflictError();
     const scope = logicalTurnScopeDigest(userId, interactionContext);
     const ledger = KEYS.authorLedger(scope, interactionContext.logical_turn_id);
-    const revisions = [interactionContext.revision, ...earlierAuthoringRevisions(interactionContext)];
-    const reservations = await this.redis.hmget(ledger, ...revisions.map((revision) => `reservation:${revision}`));
-    if (reservations[0] !== `${streamId}\n${streamClaimIdentity(scope, interactionContext.source_event_id)}`) throw streamIdConflictError();
+    const revisions = [
+      interactionContext.revision,
+      ...earlierAuthoringRevisions(interactionContext),
+    ];
+    const reservations = await this.redis.hmget(
+      ledger,
+      ...revisions.map((revision) => `reservation:${revision}`),
+    );
+    if (
+      reservations[0] !==
+      `${streamId}\n${streamClaimIdentity(scope, interactionContext.source_event_id)}`
+    )
+      throw streamIdConflictError();
     const jobs: SerializableJobData[] = [];
     for (let index = 1; index < revisions.length; index++) {
       const reserved = reservations[index];
@@ -1338,10 +1363,19 @@ export class RedisJobStore implements IJobStore {
       const predecessorStream = reserved.split('\n')[0];
       const job = await this.getJob(predecessorStream);
       const source = job?.interactionContext?.source_event_id;
-      if (!job || !source || job.userId !== userId || job.conversationId !== current.conversationId ||
-        job.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id || job.interactionContext?.revision !== revisions[index] ||
+      if (
+        !job ||
+        !source ||
+        job.userId !== userId ||
+        job.conversationId !== current.conversationId ||
+        job.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id ||
+        job.interactionContext?.revision !== revisions[index] ||
         reserved !== `${predecessorStream}\n${streamClaimIdentity(scope, source)}` ||
-        !interactionContext.source_segments?.some((segment) => segment.source_event_id === source && segment.authoring_revision === revisions[index])) {
+        !interactionContext.source_segments?.some(
+          (segment) =>
+            segment.source_event_id === source && segment.authoring_revision === revisions[index],
+        )
+      ) {
         throw nativeSourceRecoveryUnconfirmed('author_lookup', current, job);
       }
       jobs.push(job);
@@ -1373,7 +1407,8 @@ export class RedisJobStore implements IJobStore {
       current?.source_event_id !== interactionContext.source_event_id ||
       current?.conversation_id !== interactionContext.conversation_id ||
       current?.source_order_scope !== interactionContext.source_order_scope
-    ) return;
+    )
+      return;
     /* === VIVENTIUM END === */
     const scopeDigest = logicalTurnScopeDigest(userId, interactionContext);
     await this.redis.eval(
@@ -1804,6 +1839,80 @@ export class RedisJobStore implements IJobStore {
       String(claim.leaseMs),
     );
     return claimed === 1;
+  }
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START ===
+   * Renew existing authority while its exact local request prepares. Each script checks its
+   * own hash slot; neither recreates a missing key or extends a native response deadline.
+   */
+  async renewRunningJob(
+    streamId: string,
+    createdAt: number,
+    dispatchOwner?: string,
+  ): Promise<boolean> {
+    const job = await this.getJob(streamId);
+    if (!job || job.createdAt !== createdAt || job.status !== 'running' || job.nativeResponse) {
+      return false;
+    }
+    if (job.nativeDispatchOwner && job.nativeDispatchOwner !== dispatchOwner) return false;
+    const context = job.interactionContext;
+    let claimIdentity = '';
+    if (context?.logical_turn_id) {
+      const scope = logicalTurnScopeDigest(job.userId, context);
+      claimIdentity = streamClaimIdentity(scope, context.source_event_id);
+      const retained = await this.redis.eval(
+        `if redis.call('HGET', KEYS[1], 'currentStreamId') ~= ARGV[1] or
+           redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[2] or
+           redis.call('HGET', KEYS[1], 'revision') ~= ARGV[3] or
+           redis.call('HGET', KEYS[1], 'active') ~= '1' or
+           redis.call('HGET', KEYS[3], 'reservation:' .. ARGV[3]) ~= ARGV[4] then return 0 end
+         local source_sequence = tonumber(redis.call('HGET', KEYS[1], 'sourceSequenceForRevision:' .. ARGV[3]) or '')
+         local latest_source_sequence = tonumber(redis.call('HGET', KEYS[2], 'latestSourceSequence') or '')
+         if source_sequence and latest_source_sequence and latest_source_sequence > source_sequence then return 0 end
+         for index = 1, #KEYS do
+           if redis.call('EXISTS', KEYS[index]) == 1 then
+             redis.call('EXPIRE', KEYS[index], math.max(tonumber(ARGV[5]), redis.call('TTL', KEYS[index])))
+           end
+         end
+         return 1`,
+        3,
+        KEYS.logicalTurn(job.userId, context),
+        KEYS.sourceOrderFromScopeDigest(scope),
+        KEYS.authorLedger(scope, context.logical_turn_id),
+        streamId,
+        context.logical_turn_id,
+        String(context.revision),
+        `${streamId}\n${claimIdentity}`,
+        this.ttl.running,
+      );
+      if (retained !== 1) return false;
+    }
+    return (
+      (await this.redis.eval(
+        `if redis.call('HGET', KEYS[1], 'createdAt') ~= ARGV[1] or
+         redis.call('HGET', KEYS[1], 'userId') ~= ARGV[2] or
+         redis.call('HGET', KEYS[1], 'status') ~= 'running' or
+         redis.call('HEXISTS', KEYS[1], 'nativeResponse') == 1 then return 0 end
+       if ARGV[3] ~= '' and redis.call('GET', KEYS[2]) ~= ARGV[3] then return 0 end
+       local dispatch_owner = redis.call('HGET', KEYS[1], 'nativeDispatchOwner')
+       if dispatch_owner and dispatch_owner ~= ARGV[5] then return 0 end
+       for index = 1, #KEYS do
+         if redis.call('EXISTS', KEYS[index]) == 1 then
+           redis.call('EXPIRE', KEYS[index], math.max(tonumber(ARGV[4]), redis.call('TTL', KEYS[index])))
+         end
+       end
+       return 1`,
+        2,
+        KEYS.job(streamId),
+        KEYS.streamOwner(streamId),
+        String(createdAt),
+        job.userId,
+        claimIdentity,
+        this.ttl.running,
+        dispatchOwner || '',
+      )) === 1
+    );
   }
   /* === VIVENTIUM END === */
 

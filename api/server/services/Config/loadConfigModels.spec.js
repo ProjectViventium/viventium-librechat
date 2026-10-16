@@ -1,10 +1,11 @@
-const { fetchModels } = require('@librechat/api');
+const { fetchModels, ensureNativeConversationModelCatalog } = require('@librechat/api');
 const loadConfigModels = require('./loadConfigModels');
 const { getAppConfig } = require('./app');
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   fetchModels: jest.fn(),
+  ensureNativeConversationModelCatalog: jest.fn(),
 }));
 jest.mock('./app');
 
@@ -431,3 +432,43 @@ describe('native capability discovery with a fixed model menu', () => {
     );
   });
 });
+
+/* === VIVENTIUM START === Cached menus recover only declared native discovery. === */
+test('native-only discovery keeps fixed choices and does not fetch ordinary endpoints', async () => {
+  ensureNativeConversationModelCatalog.mockResolvedValue([]);
+  fetchModels.mockClear();
+  getAppConfig.mockResolvedValue({
+    endpoints: {
+      agents: { providerCapabilities: { native: { context_protocol: 'main_context_v1' } } },
+      custom: [
+        {
+          name: 'native',
+          baseURL: 'https://native.example/v1',
+          apiKey: 'synthetic-key',
+          models: { fetch: false, default: ['primary', { name: 'fallback' }] },
+        },
+        {
+          name: 'ordinary',
+          baseURL: 'https://ordinary.example/v1',
+          apiKey: 'synthetic-key',
+          models: { fetch: true, default: ['ordinary'] },
+        },
+      ],
+    },
+  });
+  const result = await loadConfigModels(
+    { user: { id: 'synthetic-owner' } },
+    { nativeDiscoveryOnly: true },
+  );
+  expect(result.native).toEqual(['primary', 'fallback']);
+  expect(ensureNativeConversationModelCatalog).toHaveBeenCalledTimes(1);
+  expect(ensureNativeConversationModelCatalog).toHaveBeenCalledWith(
+    expect.objectContaining({
+      name: 'native',
+      baseURL: 'https://native.example/v1',
+      apiKey: 'synthetic-key',
+    }),
+  );
+  expect(fetchModels).not.toHaveBeenCalled();
+});
+/* === VIVENTIUM END === */

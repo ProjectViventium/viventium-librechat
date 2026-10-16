@@ -154,6 +154,29 @@ export interface FetchModelsParams {
   userObject?: Partial<IUser>;
 }
 
+/* === VIVENTIUM START === Recover only missing native discovery, without changing model menus. === */
+const nativeCatalogDiscovery = new Map<string, Promise<string[]>>();
+
+export async function ensureNativeConversationModelCatalog(
+  params: FetchModelsParams,
+): Promise<string[]> {
+  const baseURL = params.direct ? extractBaseURL(params.baseURL ?? '') : params.baseURL;
+  if (!baseURL || !params.apiKey || isUserProvided(baseURL) || isUserProvided(params.apiKey))
+    return [];
+  // A successful catalog with no replay-floor declarations is still discovered. Its routes stay
+  // unknown for admission, but it must not cause a fetch on every healthy conversation turn.
+  if ((await nativeHistoryModelCache.get(nativeHistoryKey(baseURL))) !== undefined) return [];
+  // Scope concurrent discovery to the exact authenticated request. Only a digest is retained,
+  // and the in-flight entry is removed after either outcome; failures remain retryable.
+  const key = createHash('sha256').update(JSON.stringify(params)).digest('hex');
+  const existing = nativeCatalogDiscovery.get(key);
+  if (existing) return existing;
+  const pending = fetchModels(params).finally(() => nativeCatalogDiscovery.delete(key));
+  nativeCatalogDiscovery.set(key, pending);
+  return pending;
+}
+/* === VIVENTIUM END === */
+
 /**
  * Fetches Ollama models from the specified base API path.
  * @param baseURL - The Ollama server URL
@@ -277,6 +300,7 @@ export async function fetchModels({
     const res = await axios.get(url.toString(), options);
 
     const input = res.data;
+    if (!Array.isArray(input?.data)) throw new Error('Invalid model catalog');
     const nativeBudgets: Record<string, number> = {};
     for (const item of Array.isArray(input?.data) ? input.data : []) {
       const floor = item?.native_history_admission_v1?.replay_budget_floor_bytes;

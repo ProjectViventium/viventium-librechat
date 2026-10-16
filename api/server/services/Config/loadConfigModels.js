@@ -1,4 +1,8 @@
-const { isUserProvided, fetchModels } = require('@librechat/api');
+const {
+  isUserProvided,
+  fetchModels,
+  ensureNativeConversationModelCatalog,
+} = require('@librechat/api');
 const {
   EModelEndpoint,
   extractEnvVariable,
@@ -11,7 +15,7 @@ const { getAppConfig } = require('./app');
  * @function loadConfigModels
  * @param {ServerRequest} req - The Express request object.
  */
-async function loadConfigModels(req) {
+async function loadConfigModels(req, { nativeDiscoveryOnly = false } = {}) {
   const appConfig = await getAppConfig({ role: req.user?.role });
   if (!appConfig) {
     return {};
@@ -75,6 +79,7 @@ async function loadConfigModels(req) {
     const nativeDiscovery =
       appConfig.endpoints?.agents?.providerCapabilities?.[name]?.context_protocol ===
       'main_context_v1';
+    if (nativeDiscoveryOnly && !nativeDiscovery) continue;
     // Existing cached model loading also warms native admission capabilities. A fixed model
     // menu does not disable provider capability discovery or alter its configured choices.
     if (
@@ -84,7 +89,7 @@ async function loadConfigModels(req) {
     ) {
       fetchPromisesMap[uniqueKey] =
         fetchPromisesMap[uniqueKey] ||
-        fetchModels({
+        (nativeDiscoveryOnly ? ensureNativeConversationModelCatalog : fetchModels)({
           name,
           apiKey: API_KEY,
           baseURL: BASE_URL,

@@ -4800,7 +4800,12 @@ describe('native whole-source courier admission', () => {
       module: { exports: {} },
       req: request(),
       conversationProviderUsesNativeBody: () => true,
-      resolveLegacyOutputCarrier: async () => ({ reservedContextUtf8Bytes: 1 }),
+      resolveLegacyOutputCarrier: jest.fn(async () => {
+        throw Object.assign(new Error('Reviewed Core needs the larger final body allocation'), {
+          code: 'source_context_unavailable',
+          status: 413,
+        });
+      }),
       resolveConversationProviderHistoryAttachments: async () => uploads,
       nativeWholeHistoryFits: fits,
       nativeReplayBudget: 196608,
@@ -4815,6 +4820,7 @@ describe('native whole-source courier admission', () => {
     const check = scope.module.exports.call({ options: { agent, endpoint: 'agents' } });
     const source = rows();
     expect(await check(source, 'Earlier small summary')).toBe(true);
+    expect(scope.resolveLegacyOutputCarrier).not.toHaveBeenCalled();
     expect(fits.mock.calls[0][3]).toBe(131072);
     expect(fits.mock.calls[0][4].nativeHistoryUploads).toBe(uploads);
     expect(fits.mock.calls[0][5]).toBe(196608);
@@ -4830,7 +4836,84 @@ describe('native whole-source courier admission', () => {
       authorizedAttachmentBoundBytes: 123,
       turnContextReserveBytes: 131072,
     });
+    const completeSource = rows(260);
+    const record = recordFor(completeSource);
+    const compaction = {
+      ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })),
+      scheduleMainContinuityMaintenance: jest.fn(),
+    };
+    const outcome = await resolve(completeSource, record, check, compaction, true);
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.result.messages).toEqual(completeSource.slice(100));
+    expect(outcome.result.coveredIds).toEqual(
+      completeSource.slice(0, 100).map((row) => row.messageId),
+    );
+    expect(outcome.result.capsule).toContain('Reviewed history.');
+    expect(outcome.compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+    expect(outcome.compaction.scheduleMainContinuityMaintenance).toHaveBeenCalledTimes(1);
   });
+
+  test.each([
+    { budget: null, fit: true },
+    { budget: 196608, fit: false },
+    { budget: 196608, fit: null },
+  ])(
+    'actual history callback preserves unknown and overflow recovery (%j)',
+    async ({ budget, fit }) => {
+      const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+      const ast = ts.createSourceFile(
+        file,
+        fs.readFileSync(file, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true,
+      );
+      let callback;
+      const visit = (node) => {
+        if (ts.isPropertyAssignment(node) && node.name.getText(ast) === 'canCarryWholeHistory')
+          callback = node.initializer;
+        ts.forEachChild(node, visit);
+      };
+      visit(ast);
+      const reserve = jest.fn(async () => ({ reservedContextUtf8Bytes: 1000 }));
+      const uploads = jest.fn(async () => []);
+      const fits = jest.fn(() => fit);
+      const scope = {
+        module: { exports: {} },
+        req: request(),
+        Buffer,
+        conversationProviderUsesNativeBody: () => true,
+        resolveLegacyOutputCarrier: reserve,
+        resolveConversationProviderHistoryAttachments: uploads,
+        nativeWholeHistoryFits: fits,
+        nativeReplayBudget: budget,
+        NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES: 131072,
+        TURN_CONTEXT_SEPARATOR_BYTES: 2,
+        logger: { info: jest.fn() },
+        isAgentsEndpoint: () => true,
+      };
+      vm.runInNewContext(
+        'module.exports=function(){return (' + callback.getText(ast) + ');};',
+        scope,
+      );
+      const check = scope.module.exports.call({ options: { agent, endpoint: 'agents' } });
+      const capsule = 'Reviewed history.';
+      expect(await check(rows(), capsule)).toBe(fit);
+      expect(reserve).toHaveBeenCalledTimes(budget === null ? 1 : 0);
+      expect(uploads).toHaveBeenCalledTimes(budget === null ? 0 : 1);
+      expect(fits.mock.calls[0][3]).toBe(
+        budget === null ? 1000 + Buffer.byteLength(JSON.stringify(capsule)) + 2 : 131072,
+      );
+      if (budget !== null) {
+        const compaction = {
+          ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })),
+          scheduleMainContinuityMaintenance: jest.fn(),
+        };
+        const outcome = await resolve(rows(260), recordFor(rows(260)), check, compaction, true);
+        expect(outcome.compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
+        expect(outcome.compaction.scheduleMainContinuityMaintenance).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   test.each([true, false, null])(
     'current stamped history retains Native admission for conservative estimate %j',

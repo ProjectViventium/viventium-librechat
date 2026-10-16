@@ -950,8 +950,6 @@ async function runAcceptedMainCompaction(input = {}) {
         const proposalSizeRejected =
           prepared.issue?.constraint === 'max_bytes' &&
           ['', 'summary', '$carrier'].includes(prepared.issue.path);
-        // Regenerate size repairs from the complete source and typed feedback. Echoing the
-        // oversized unaccepted draft can itself overflow the next request's input budget.
         correctionReason = {
           code: 'schema_invalid',
           issue: prepared.issue,
@@ -962,6 +960,43 @@ async function runAcceptedMainCompaction(input = {}) {
         if (proposalSizeRejected && claim.canReduceSource === true) {
           canReduceRejectedSizeSource = true;
           break;
+        }
+        if (proposalSizeRejected) {
+          const isolated = compactorAgent(input.agent, claim.domainEpochKey);
+          const routes = [
+            { ...isolated, model: isolated.model_parameters?.model || isolated.model },
+            isolated.viventiumFallbackLlm || isolated.viventiumFallbackLlmAssignment,
+            ...(isolated.viventiumGraphLlmFallbacks || []),
+            ...(isolated.fallback_llm_provider
+              ? [
+                  {
+                    provider: isolated.fallback_llm_provider,
+                    model:
+                      isolated.fallback_llm_model_parameters?.model || isolated.fallback_llm_model,
+                  },
+                ]
+              : []),
+          ].filter(Boolean);
+          const floor = await require('@librechat/api')
+            .getNativeConversationReplayBudgetForRoutes(
+              routes,
+              input.req?.config?.endpoints?.custom,
+            )
+            .catch(() => null);
+          const withCandidate = { ...correctionReason, candidate: proposal };
+          // Reuse ordinary native admission sizing for the complete isolated request. Unknown
+          // or insufficient discovery keeps numeric feedback; native admission remains final.
+          if (
+            Number.isSafeInteger(floor) &&
+            floor > 0 &&
+            require('./ViventiumMainContextService').mainHistoryFitsNativeBody(
+              [new HumanMessage(buildCompactionPrompt(claim, withCandidate))],
+              isolated,
+              0,
+              floor,
+            )
+          )
+            correctionReason = withCandidate;
         }
         continue;
       }
@@ -1112,7 +1147,10 @@ async function runAcceptedMainCompaction(input = {}) {
     }
     const pendingSizeFeedback = normalizeMainCompactionSizeRepair(
       {
-        correction: correctionReason,
+        // A draft is useful only inside this claim. Durable size continuation remains numeric.
+        correction: sizeRepair
+          ? { code: correctionReason.code, issue: correctionReason.issue }
+          : correctionReason,
         sizeRepair,
       },
       claim.outputContract,

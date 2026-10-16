@@ -1,4 +1,8 @@
 'use strict';
+jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  getNativeConversationReplayBudgetForRoutes: jest.fn(async () => null),
+}));
 jest.mock('../ViventiumMainContinuityService', () => require('./fixtures/mainContinuity')());
 jest.mock('../CallSessionService', () => ({
   getActiveCallSessionForMainMaintenance: jest.fn(async () => null),
@@ -4579,6 +4583,7 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
 
 describe('durable shrinking size continuation through the existing idle owner', () => {
   test('retains two completed size corrections across a bounded batch before review and promotion', async () => {
+    require('@librechat/api').getNativeConversationReplayBudgetForRoutes.mockResolvedValue(524288);
     jest.useFakeTimers({ doNotFake: ['setImmediate'] });
     jest.setSystemTime(1000000);
     const scheduling = require('@librechat/api');
@@ -4714,6 +4719,13 @@ describe('durable shrinking size continuation through the existing idle owner', 
         repairPending: true,
       });
       expect(calls).toHaveLength(2);
+      expect(
+        JSON.parse(
+          calls[1].prompt
+            .split('<untrusted_conversation_data_v1>')[1]
+            .split('</untrusted_conversation_data_v1>')[0],
+        ).priorRejection.candidate.summary,
+      ).toHaveLength(96000);
       expect(completeCompaction).not.toHaveBeenCalled();
       expect(pending).toMatchObject({
         semanticAttempts: 2,
@@ -4749,6 +4761,7 @@ describe('durable shrinking size continuation through the existing idle owner', 
       expect(pending).toBeNull();
       expect(jest.getTimerCount()).toBe(0);
     } finally {
+      require('@librechat/api').getNativeConversationReplayBudgetForRoutes.mockResolvedValue(null);
       scheduling.resetMainCompactionSchedulingForTests();
       jest.useRealTimers();
     }
@@ -4835,4 +4848,209 @@ describe('terminal size failure consumer', () => {
       }
     },
   );
+});
+
+describe('in-claim size repair uses the existing native admission floor', () => {
+  const api = require('@librechat/api');
+  const fitting = {
+    version: 1,
+    summary: 'Approval is still required.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  const contract = {
+    version: 1,
+    consumer: 'accepted_core',
+    carrierMaxUtf8Bytes: 131072,
+    reservedUtf8Bytes: 130372,
+    maxJsonUtf8Bytes: 700,
+    maxSummaryUtf8Bytes: 700,
+    maxItemsPerArray: 32,
+    maxStringItemUtf8Bytes: 1024,
+    maxToolIdentityCharacters: 256,
+  };
+  const claim = {
+    status: 'claimed',
+    leaseId: 'size-candidate-lease',
+    domainEpochKey: 'size-candidate-domain',
+    sourceDigest: 'c'.repeat(64),
+    sourceBytes: 1000,
+    canReduceSource: false,
+    previousSemanticCompaction: { ...fitting, summary: 'Keep the signed approval boundary.' },
+    sourceTurns: [{ logicalTurnId: 'source-1', revision: 1, userText: 'Wait for approval.' }],
+    legacyInputs: [
+      { kind: 'legacy_state', id: 'source-legacy', sourceRange: { start: 1, end: 2, total: 3 } },
+    ],
+  };
+  const agent = {
+    endpoint: 'Native',
+    provider: 'openAI',
+    model: 'stale-model',
+    model_parameters: { model: 'native-model', reasoning_effort: 'high' },
+    fallback_llm_provider: 'Backup',
+    fallback_llm_model: 'stale-fallback',
+    fallback_llm_model_parameters: { model: 'backup-model' },
+  };
+  const req = {
+    config: {
+      endpoints: {
+        custom: [
+          { name: 'Native', baseURL: 'https://native.example.invalid/v1' },
+          { name: 'Backup', baseURL: 'https://backup.example.invalid/v1' },
+        ],
+      },
+    },
+  };
+  const payload = (prompt) =>
+    JSON.parse(
+      prompt
+        .split('<untrusted_conversation_data_v1>')[1]
+        .split('</untrusted_conversation_data_v1>')[0],
+    );
+  beforeEach(() => {
+    api.resetMainCompactionSchedulingForTests();
+    api.getNativeConversationReplayBudgetForRoutes.mockReset().mockResolvedValue(524288);
+  });
+  afterEach(() =>
+    api.getNativeConversationReplayBudgetForRoutes.mockReset().mockResolvedValue(null),
+  );
+
+  async function run(rejected, options = {}) {
+    const calls = [];
+    const result = await ensureAcceptedMainCompaction({
+      ownerId: 'size-candidate-owner',
+      agentId: 'main',
+      stableAuthoritySha256: 'a'.repeat(64),
+      agent,
+      req,
+      foreground: true,
+      claimCompaction: async () => ({
+        ...claim,
+        outputContract: contract,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }),
+      completeCompaction: async () => ({ status: 'compacted' }),
+      rejectCompaction: async () => ({ status: 'rejected' }),
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') return reviewApproved;
+        return calls.length === 1 ? JSON.stringify(rejected) : JSON.stringify(fitting);
+      },
+      ...options,
+    });
+    return { calls, result };
+  }
+
+  test.each(['', 'summary', '$carrier'])(
+    'retains the parsed draft for %s max_bytes with full source',
+    async (path) => {
+      const rejected = {
+        ...fitting,
+        summary: path === 'summary' ? 's'.repeat(800) : 'é"'.repeat(200),
+      };
+      const options =
+        path === '$carrier'
+          ? {
+              claimCompaction: async () => ({
+                ...claim,
+                outputContract: {
+                  ...contract,
+                  reservedUtf8Bytes: 126072,
+                  maxJsonUtf8Bytes: 5000,
+                  maxSummaryUtf8Bytes: 5000,
+                },
+                leaseExpiresAt: new Date(Date.now() + 300000),
+              }),
+              inspectCandidateCarrier: async ({ candidate }) =>
+                candidate.summary === fitting.summary
+                  ? { ok: true, candidate }
+                  : {
+                      ok: false,
+                      issue: {
+                        path: '$carrier',
+                        constraint: 'max_bytes',
+                        unit: 'utf8_bytes',
+                        actual: 131073,
+                        limit: 131072,
+                        proposalBytes: Buffer.byteLength(JSON.stringify(candidate)),
+                      },
+                    },
+            }
+          : {};
+      const { calls, result } = await run(rejected, options);
+      expect(result).toMatchObject({ status: 'compacted', attempts: 2 });
+      const sent = payload(calls[1].prompt);
+      expect(sent.priorRejection).toMatchObject({
+        code: 'schema_invalid',
+        issue: { path, constraint: 'max_bytes' },
+        candidate: rejected,
+      });
+      expect(sent.acceptedOlderTurns).toEqual(claim.sourceTurns);
+      expect(sent.previousSemanticCompaction).toEqual(claim.previousSemanticCompaction);
+      expect(sent.legacyInputs).toEqual(claim.legacyInputs);
+      const [routes, endpoints] = api.getNativeConversationReplayBudgetForRoutes.mock.calls[0];
+      expect(routes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ endpoint: 'Native', model: 'native-model' }),
+          { provider: 'Backup', model: 'backup-model' },
+        ]),
+      );
+      expect(endpoints).toBe(req.config.endpoints.custom);
+    },
+  );
+
+  test.each([null, 0, -1, 1, 1.5, '524288', NaN])(
+    'keeps numeric feedback for unknown/insufficient floor %s',
+    async (floor) => {
+      api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(floor);
+      const { calls, result } = await run({ ...fitting, summary: 's'.repeat(800) });
+      expect(result.status).toBe('compacted');
+      expect(payload(calls[1].prompt).priorRejection.candidate).toBeUndefined();
+    },
+  );
+
+  test('uses the entire serialized repair request at the exact conservative byte boundary', async () => {
+    const rejected = { ...fitting, summary: 'é"'.repeat(200) };
+    const first = await run(rejected);
+    const repairPrompt = first.calls[1].prompt;
+    const path = require('node:path');
+    const { _convertMessagesToOpenAIParams } = require(
+      path.join(path.dirname(require.resolve('@librechat/agents')), 'llm/openai/utils/index.cjs'),
+    );
+    const messages = _convertMessagesToOpenAIParams(
+      [new (require('@langchain/core/messages').HumanMessage)(repairPrompt)],
+      'native-model',
+    );
+    const projectedBytes = -api.nativeConversationContextBudget(messages, 1) + 1;
+    expect(projectedBytes).toBeGreaterThan(Buffer.byteLength(repairPrompt, 'utf8'));
+    api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(projectedBytes);
+    expect(payload((await run(rejected)).calls[1].prompt).priorRejection.candidate).toEqual(
+      rejected,
+    );
+    api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(projectedBytes - 1);
+    expect(payload((await run(rejected)).calls[1].prompt).priorRejection.candidate).toBeUndefined();
+  });
+
+  test('cache failure retains numeric feedback without a provider discovery call', async () => {
+    api.getNativeConversationReplayBudgetForRoutes.mockRejectedValue(
+      new Error('cache unavailable'),
+    );
+    const { calls, result } = await run({ ...fitting, summary: 's'.repeat(800) });
+    expect(result.status).toBe('compacted');
+    expect(payload(calls[1].prompt).priorRejection.candidate).toBeUndefined();
+  });
+
+  test('non-size shape repair retains its exact raw candidate without consulting admission', async () => {
+    const rejected = { ...fitting, pendingAsks: ['x'.repeat(1100)] };
+    const { calls, result } = await run(rejected);
+    expect(result.status).toBe('compacted');
+    expect(payload(calls[1].prompt).priorRejection.candidate).toBe(JSON.stringify(rejected));
+    expect(api.getNativeConversationReplayBudgetForRoutes).not.toHaveBeenCalled();
+  });
 });

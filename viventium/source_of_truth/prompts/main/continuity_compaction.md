@@ -2,7 +2,7 @@
 id: main.continuity_compaction
 owner_layer: viventium_main_continuity
 target: runtime.main_continuity.compaction
-version: 7
+version: 8
 status: active
 safety_class: public_product
 required_context:
@@ -45,15 +45,16 @@ keeping each still-relevant fact once and removing repetition and incidental det
 asks, commitments, corrections, decisions, recurrence outcomes, tool pairs and consequential
 identifiers; merge closely related entries rather than remove protected facts to make room.
 Choose one place for each fact in the entire JSON object, including the summary and all category
-arrays, unless repetition is necessary for meaning or attribution. The summary may orient the
-reader to a category without retelling that category's facts. Preserve qualifications and exact
+arrays, unless repetition is necessary for meaning or attribution. Preserve qualifications and exact
 consequential identifiers.
 Material references may remain verbatim within the summary or other category strings when a
 separate list entry would exceed an array limit. Do not invent missing facts.
 If priorRejection is present, treat it as process feedback, not conversation evidence. Do not
 record this rejection, compaction attempts or their review as conversation history. When
-priorRejection.candidate is supplied, repair the cited defect against the actual source evidence,
-and carry every other part of that candidate over unchanged unless the source requires a change.
+priorRejection.candidate is supplied for a max_bytes defect, shorten its wording throughout to meet
+the cited limit while retaining its source-supported facts, qualifications and consequential
+identifiers; add nothing. For other defects, repair the cited defect against the actual source
+evidence and carry every other part of that candidate over unchanged unless the source requires a change.
 When no candidate is supplied, regenerate from the complete source evidence under outputConstraints
 and the cited feedback. An omitted draft is not missing source evidence or permission to omit facts.
 

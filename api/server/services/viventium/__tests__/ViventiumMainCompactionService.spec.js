@@ -4446,9 +4446,14 @@ describe('durable fidelity continuation through the existing idle owner', () => 
 });
 
 describe('resumed fidelity checkpoint during foreground cancellation', () => {
-  test.each([true, false])(
-    'keeps the earlier completed review only after native release=%s',
-    async (released) => {
+  test.each([
+    [true, 1],
+    [false, 1],
+    [true, 4],
+    [false, 4],
+  ])(
+    'keeps the earlier completed review only after native release=%s (completed=%i)',
+    async (released, completed) => {
       jest.useFakeTimers({ doNotFake: ['setImmediate'] });
       const persistence = inMemoryPersistence();
       setMainContinuityPersistenceForTests(persistence);
@@ -4504,7 +4509,8 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
             version: 1,
             sourceDigest: first.sourceDigest,
             contractKey,
-            semanticAttempts: 1,
+            semanticAttempts: completed,
+            ...(completed === 4 ? { fidelityRepairAttempts: 0 } : {}),
             transportRetries: 0,
             correction: {
               code: 'semantic_fidelity',
@@ -4522,7 +4528,7 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
         const running = ensureAcceptedMainCompaction({
           ...input,
           executeCompactor: (call) => {
-            expect(call.attempt).toBe(2);
+            expect(call.attempt).toBe(completed + 1);
             start();
             return new Promise((resolve, reject) =>
               call.signal.addEventListener(
@@ -4544,7 +4550,7 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
         expect(await running).toMatchObject({
           status: 'degraded',
           reason: 'interactive_priority',
-          attempts: 1,
+          attempts: completed,
         });
         expect((await running).repairPending).toBeUndefined();
         expect(jest.getTimerCount()).toBe(0);
@@ -4561,7 +4567,7 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
             return call.stage === 'review' ? reviewApproved : candidate;
           },
         });
-        expect(next).toMatchObject({ status: 'compacted', attempts: 2 });
+        expect(next).toMatchObject({ status: 'compacted', attempts: completed + 1 });
         expect(calls).toHaveLength(2);
         const payload = JSON.parse(
           calls[0].prompt.match(
@@ -4893,8 +4899,8 @@ describe('in-claim size repair uses the existing native admission floor', () => 
     model: 'stale-model',
     model_parameters: { model: 'native-model', reasoning_effort: 'high' },
     fallback_llm_provider: 'Backup',
-    fallback_llm_model: 'stale-fallback',
-    fallback_llm_model_parameters: { model: 'backup-model' },
+    fallback_llm_model: 'explicit-backup-model',
+    fallback_llm_model_parameters: { model: 'parameter-backup-model' },
   };
   const req = {
     config: {
@@ -4998,7 +5004,7 @@ describe('in-claim size repair uses the existing native admission floor', () => 
       expect(routes).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ endpoint: 'Native', model: 'native-model' }),
-          { provider: 'Backup', model: 'backup-model' },
+          expect.objectContaining({ provider: 'Backup', model: 'explicit-backup-model' }),
         ]),
       );
       expect(endpoints).toBe(req.config.endpoints.custom);
@@ -5012,6 +5018,31 @@ describe('in-claim size repair uses the existing native admission floor', () => 
       const { calls, result } = await run({ ...fitting, summary: 's'.repeat(800) });
       expect(result.status).toBe('compacted');
       expect(payload(calls[1].prompt).priorRejection.candidate).toBeUndefined();
+    },
+  );
+
+  test.each([
+    ['explicit-backup-model', 'parameter-backup-model', 'explicit-backup-model'],
+    ['', 'parameter-backup-model', 'parameter-backup-model'],
+  ])(
+    'sizes the same fallback selected by its existing owner (%s)',
+    async (explicit, parameter, expected) => {
+      const selected = {
+        ...agent,
+        fallback_llm_model: explicit,
+        fallback_llm_model_parameters: { model: parameter },
+        voice_fallback_llm_provider: 'VoiceOnly',
+        voice_fallback_llm_model: 'voice-model',
+      };
+      await run({ ...fitting, summary: 's'.repeat(800) }, { agent: selected });
+      const [routes] = api.getNativeConversationReplayBudgetForRoutes.mock.calls[0];
+      const actualFallback = require('../agentLlmFallback').resolveFallbackCandidates(selected);
+      expect(actualFallback).toEqual([
+        expect.objectContaining({ provider: 'Backup', model: expected }),
+      ]);
+      expect(routes.slice(1).map(({ provider, model }) => ({ provider, model }))).toEqual(
+        actualFallback.map(({ provider, model }) => ({ provider, model })),
+      );
     },
   );
 
@@ -5052,5 +5083,200 @@ describe('in-claim size repair uses the existing native admission floor', () => 
     expect(result.status).toBe('compacted');
     expect(payload(calls[1].prompt).priorRejection.candidate).toBe(JSON.stringify(rejected));
     expect(api.getNativeConversationReplayBudgetForRoutes).not.toHaveBeenCalled();
+  });
+});
+
+describe('one fidelity repair after bounded structural size work', () => {
+  const fitting = {
+    version: 1,
+    summary: 'Exact pending reference remains unverified.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: ['EVIDENCE-EXACT-41'],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  const reason = 'Retain EVIDENCE-EXACT-41 and its unverified status.';
+  beforeEach(() => require('@librechat/api').resetMainCompactionSchedulingForTests());
+
+  test.each([
+    [2, true],
+    [2, false],
+    [4, true],
+    [4, false],
+  ])('size call %i fitting leaves one fidelity repair (approved=%s)', async (fitsAt, approved) => {
+    const calls = [];
+    let producers = 0,
+      reviews = 0;
+    const complete = jest.fn(async () => ({ status: 'compacted' }));
+    const result = await ensureAcceptedMainCompaction({
+      ownerId: `size-fidelity-${fitsAt}-${approved}`,
+      agentId: 'main',
+      stableAuthoritySha256: 'f'.repeat(64),
+      claimCompaction: async () => ({
+        status: 'claimed',
+        leaseId: 'lease',
+        domainEpochKey: 'size-fidelity-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 500,
+        sourceTurns: [],
+        canReduceSource: false,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }),
+      completeCompaction: complete,
+      rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review')
+          return JSON.stringify({ approved: ++reviews === 2 && approved, reason });
+        return JSON.stringify(
+          ++producers < fitsAt
+            ? { ...fitting, summary: 'x'.repeat(10000 - producers * 1000) }
+            : fitting,
+        );
+      },
+    });
+    expect(producers).toBe(fitsAt + 1);
+    expect(reviews).toBe(2);
+    expect(result).toMatchObject({
+      status: approved ? 'compacted' : 'degraded',
+      attempts: fitsAt + 1,
+    });
+    expect(complete).toHaveBeenCalledTimes(approved ? 1 : 0);
+    const repair = calls.filter((call) => call.stage !== 'review').at(-1);
+    const payload = JSON.parse(
+      repair.prompt.match(
+        /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+      )[1],
+    );
+    expect(payload.priorRejection).toEqual({
+      code: 'semantic_fidelity',
+      candidate: JSON.stringify(fitting),
+      reason,
+    });
+    expect(payload.sourceDigest).toBe('d'.repeat(64));
+  });
+
+  test('transport retry reuses the fifth-call fidelity prompt without spending another repair', async () => {
+    let producers = 0,
+      reviews = 0,
+      transportFailed = false;
+    const calls = [],
+      sleep = jest.fn().mockResolvedValue(undefined);
+    const result = await ensureAcceptedMainCompaction({
+      ownerId: 'size-fidelity-transport',
+      agentId: 'main',
+      stableAuthoritySha256: 'f'.repeat(64),
+      claimCompaction: async () => ({
+        status: 'claimed',
+        leaseId: 'lease',
+        domainEpochKey: 'transport-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 500,
+        sourceTurns: [],
+        canReduceSource: false,
+        leaseExpiresAt: new Date(Date.now() + 300000),
+      }),
+      completeCompaction: async () => ({ status: 'compacted' }),
+      rejectCompaction: jest.fn(async () => ({ status: 'rejected' })),
+      sleep,
+      retryDelayMs: 1,
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') return JSON.stringify({ approved: ++reviews === 2, reason });
+        if (producers === 4 && !transportFailed) {
+          transportFailed = true;
+          const error = new Error('temporary capacity');
+          Object.assign(error, {
+            code: 'main_compaction_provider_failed',
+            errorCode: 'host_capacity',
+            errorStatus: 503,
+          });
+          throw error;
+        }
+        return JSON.stringify(
+          ++producers < 4 ? { ...fitting, summary: 'x'.repeat(10000 - producers * 1000) } : fitting,
+        );
+      },
+    });
+    expect(result).toMatchObject({ status: 'compacted', attempts: 5, transportRetries: 1 });
+    const repairCalls = calls.filter((call) => call.stage !== 'review').slice(-2);
+    expect(repairCalls.map((call) => call.attempt)).toEqual([5, 5]);
+    expect(repairCalls[1].prompt).toBe(repairCalls[0].prompt);
+    expect(producers).toBe(5);
+    expect(reviews).toBe(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  test('deadline checkpoint keeps fourth-size-call fidelity feedback and consumes it once after resume', async () => {
+    let clock = Date.now(),
+      pending,
+      producers = 0,
+      reviews = 0;
+    const calls = [],
+      reject = jest.fn(async (input) => {
+        pending = input.pendingCompactionRepair;
+        return { status: 'rejected', repairPending: !!pending };
+      });
+    const complete = jest.fn(async () => ({ status: 'compacted' }));
+    const args = {
+      ownerId: 'size-fidelity-paused',
+      agentId: 'main',
+      stableAuthoritySha256: 'f'.repeat(64),
+      now: () => clock,
+      executionBudget: { completionReserveMs: 0 },
+      claimCompaction: async () => ({
+        status: 'claimed',
+        leaseId: 'lease',
+        domainEpochKey: 'paused-domain',
+        sourceDigest: 'd'.repeat(64),
+        sourceBytes: 500,
+        sourceTurns: [],
+        canReduceSource: false,
+        leaseExpiresAt: new Date(clock + 300000),
+        ...(pending ? { pendingCompactionRepair: pending } : {}),
+      }),
+      completeCompaction: complete,
+      rejectCompaction: reject,
+      executeCompactor: async (call) => {
+        calls.push(call);
+        call.reportCapacityRelease(true);
+        if (call.stage === 'review') {
+          clock += ++reviews === 1 ? 14000 : 1000;
+          return JSON.stringify({ approved: reviews === 2, reason });
+        }
+        clock += 1000;
+        return JSON.stringify(
+          ++producers < 4 ? { ...fitting, summary: 'x'.repeat(10000 - producers * 1000) } : fitting,
+        );
+      },
+    };
+    const first = await ensureAcceptedMainCompaction({
+      ...args,
+      deadlineAt: new Date(clock + 20000).toISOString(),
+    });
+    expect(first).toMatchObject({
+      status: 'degraded',
+      attempts: 4,
+      reason: 'compaction_enclosing_deadline',
+      repairPending: true,
+    });
+    expect(pending).toMatchObject({
+      semanticAttempts: 4,
+      fidelityRepairAttempts: 0,
+      correction: { code: 'semantic_fidelity', candidate: JSON.stringify(fitting), reason },
+    });
+    const second = await ensureAcceptedMainCompaction({
+      ...args,
+      deadlineAt: new Date(clock + 40000).toISOString(),
+    });
+    expect(second).toMatchObject({ status: 'compacted', attempts: 5 });
+    expect(producers).toBe(5);
+    expect(reviews).toBe(2);
+    expect(complete).toHaveBeenCalledTimes(1);
   });
 });

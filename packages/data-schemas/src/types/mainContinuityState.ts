@@ -94,6 +94,8 @@ export interface IMainContinuityCompactionRepair {
   sourceDigest: string;
   contractKey: string;
   semanticAttempts: number;
+  /** Completed producer calls that repaired typed fidelity feedback; never reset on resume. */
+  fidelityRepairAttempts?: 0 | 1;
   transportRetries: number;
   sourceGeneration: number;
   sourceTurnKeys: string[];

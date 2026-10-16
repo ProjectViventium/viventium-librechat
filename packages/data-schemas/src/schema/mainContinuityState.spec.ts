@@ -163,3 +163,24 @@ test('retains numeric size feedback without an oversized candidate or accepted s
   expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
   expect(document.toObject().semanticCompaction).toBeNull();
 });
+
+
+test.each([0, 1])('round-trips completed fidelity repair count %s', async fidelityRepairAttempts => {
+  const pendingCompactionRepair = { version: 1, sourceDigest: 'd'.repeat(64),
+    contractKey: 'exact-route-contract', semanticAttempts: 3, fidelityRepairAttempts, transportRetries: 0,
+    sourceGeneration: 2, sourceTurnKeys: ['source:1'],
+    correction: { code: 'semantic_fidelity', candidate: '{"summary":"unaccepted"}', reason: 'Keep approval required.' } };
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair });
+  await expect(document.validate()).resolves.toBeUndefined();
+  expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
+  expect(document.toObject().semanticCompaction).toBeNull();
+});
+
+test.each([-1, 0.5, 2])('rejects invalid completed fidelity repair count %s', async fidelityRepairAttempts => {
+  const document = new ContinuityState({ ...validState, pendingCompactionRepair: {
+    version: 1, sourceDigest: 'd'.repeat(64), contractKey: 'exact-route-contract',
+    semanticAttempts: 3, fidelityRepairAttempts, transportRetries: 0, sourceGeneration: 2,
+    sourceTurnKeys: ['source:1'], correction: { code: 'semantic_fidelity', candidate: '{}' },
+  } });
+  await expect(document.validate()).rejects.toThrow('fidelityRepairAttempts');
+});

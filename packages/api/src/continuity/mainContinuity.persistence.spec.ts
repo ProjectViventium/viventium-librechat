@@ -276,7 +276,7 @@ describe('native Main acceptance projection', () => {
     const proposalBytes = Buffer.byteLength(JSON.stringify(candidate));
     const repair = { version: 1, sourceDigest: claim.sourceDigest,
       contractKey: JSON.stringify({ provider: 'native', model: 'synthetic', effort: 'high', constraints: contract }),
-      semanticAttempts: 2, transportRetries: 0,
+      semanticAttempts: 2, fidelityRepairAttempts: 1, transportRetries: 0,
       correction: { code: 'schema_invalid', issue: inspected.issue },
       sizeRepair: { proposalBytes, previousProposalBytes: proposalBytes + 3000, converging: true } };
     expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
@@ -289,8 +289,43 @@ describe('native Main acceptance projection', () => {
     expect((await history()).count).toBe(4);
     const next = await runtime.claimAcceptedMainCompaction(identity);
     expect(next.sourceDigest).toBe(claim.sourceDigest);
-    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2 });
+    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2, fidelityRepairAttempts: 1 });
     expect((await runtime.loadAcceptedMainContext(identity)).capsule).toContain('Valid request size-0.');
+  });
+
+  it('round-trips fourth-call fidelity feedback and its one repair allowance through Mongo', async () => {
+    const runtime = service();
+    for (let n = 0; n < 4; n++) await runtime.commitAcceptedMainTurn(await presentation(`fidelity-${n}`));
+    const claim = await runtime.claimAcceptedMainCompaction(identity);
+    const candidate = { version: 1, summary: 'Valid requests remain pending.', pendingAsks: [],
+      commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
+    const repair = { version: 1, sourceDigest: claim.sourceDigest, contractKey: 'same-contract',
+      semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+      correction: { code: 'semantic_fidelity', candidate: JSON.stringify(candidate), reason: 'Retain exact source references.' } };
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const saved = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(saved?.semanticCompaction).toBeNull();
+    expect(saved?.pendingCompactionRepair).toMatchObject(repair);
+    const next = await runtime.claimAcceptedMainCompaction(identity);
+    expect(next.pendingCompactionRepair).toMatchObject(repair);
+    expect(next.sourceDigest).toBe(claim.sourceDigest);
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: next.leaseId,
+      reason: 'compaction_cancelled', capacityReleaseAcknowledged: true,
+      sourceDigest: next.sourceDigest, contractKey: repair.contractKey,
+      semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0 })).toMatchObject({ repairPending: true });
+    expect((await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean())?.pendingCompactionRepair)
+      .toEqual(saved?.pendingCompactionRepair);
+    const last = await runtime.claimAcceptedMainCompaction(identity);
+    expect(await runtime.rejectAcceptedMainCompaction({ ...identity, leaseId: last.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: { ...repair, semanticAttempts: 5, fidelityRepairAttempts: 1 } }))
+      .not.toMatchObject({ repairPending: true });
+    const final = await states().findOne({ domainEpochKey: claim.domainEpochKey }).lean();
+    expect(final?.pendingCompactionRepair).toBeNull();
+    expect(final?.semanticCompaction).toBeNull();
+    expect((await history()).count).toBe(4);
   });
 
   it('hydrates retained scheduled results from exact typed parent provenance without user authority', async () => {

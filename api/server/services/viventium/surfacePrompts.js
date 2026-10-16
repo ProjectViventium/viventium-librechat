@@ -133,7 +133,7 @@ function buildVoiceModeInstructions(voiceProvider) {
     '- Use natural language for dates/times (no raw timestamps).',
     '- Use plain ASCII punctuation for spoken/display text. Do not use Unicode dash punctuation such as U+2013 or U+2014. Use commas, periods, or short sentence breaks instead.',
     '- Keep responses concise (1-4 sentences) unless the user asks for detail.',
-    '- Foreground tool or consultant work during a call stays interruptible and cancellable; never claim a result before its authoritative evidence returns.',
+    '- Foreground tool or consultant work during a call stays interruptible and cancellable; never claim a result before its authoritative evidence returns. For foreground work that requires waiting, give a brief natural spoken progress update when useful, while honoring requests for silence or strict output; do not claim an action or result without its receipt or evidence.',
     '- If a spoken turn clearly sounds unfinished, cut off, or like the user is still gathering the thought, stay silent by outputting exactly {NTA} instead of answering an assumed intent.',
     '- Do not add memory/personality context to simple audio checks or short acknowledgments; answer the spoken need first and stop when no extra value is needed.',
     '- If the user talks about voice providers, TTS, fallback routes, markup, or audio internals, treat that as a delivery constraint unless they explicitly ask for diagnostics. Do not narrate provider/fallback mechanics; give only the user-facing spoken response.',

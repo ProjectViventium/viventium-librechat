@@ -284,6 +284,23 @@ export const MAIN_COMPACTION_MAX_ATTEMPTS = 2;
 export const MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS = 4;
 export const MAIN_COMPACTION_MAX_TRANSPORT_RETRIES = 1;
 
+/** One fidelity repair is independent of size work, under the same claim deadline and lease. */
+export function canContinueMainCompactionRepair(
+  input: { semanticAttempts?: unknown; fidelityRepairAttempts?: unknown },
+  kind: 'size' | 'fidelity',
+): boolean {
+  const total = input.semanticAttempts;
+  const fidelity = input.fidelityRepairAttempts === undefined ? 0 : input.fidelityRepairAttempts;
+  if (!Number.isSafeInteger(total) || Number(total) < 1 ||
+      !Number.isSafeInteger(fidelity) || Number(fidelity) < 0 || Number(fidelity) > 1 ||
+      Number(fidelity) > Number(total)) return false;
+  if (kind === 'size') return Number(total) >= 2 && Number(total) < MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS;
+  // Old checkpoints never stored fidelity feedback after two producers. Do not infer a new
+  // unused allowance from an impossible legacy record; new records carry the explicit counter.
+  return fidelity === 0 && Number(total) <= MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS &&
+    (input.fidelityRepairAttempts !== undefined || Number(total) < MAIN_COMPACTION_MAX_ATTEMPTS);
+}
+
 /**
  * A claim may take less source than the default target; it always takes at least one whole turn,
  * and never more than the default target. Unreviewed source is only deferred, never dropped.
@@ -2479,9 +2496,10 @@ export function createMainContinuityService(
         (mainCompactionOutputContractDigest(previousRepair.outputContract) ===
           mainCompactionOutputContractDigest(current.compactionLease.outputContract) || sizeContractMatches) &&
         input.semanticAttempts === previousRepair.semanticAttempts &&
+        (input.fidelityRepairAttempts === undefined ? 0 : input.fidelityRepairAttempts) ===
+          (previousRepair.fidelityRepairAttempts ?? 0) &&
         input.transportRetries === previousRepair.transportRetries &&
-        previousRepair.semanticAttempts > 0 && previousRepair.semanticAttempts <
-          (preservedSize ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAIN_COMPACTION_MAX_ATTEMPTS);
+        canContinueMainCompactionRepair(previousRepair, preservedSize ? 'size' : 'fidelity');
       // Foreground pre-emption can stop a resumed attempt before it produces another candidate.
       // Keep the earlier completed review unchanged; this does not schedule cancelled work again.
       let pendingCompactionRepair: IMainContinuityCompactionRepair | null =
@@ -2498,14 +2516,15 @@ export function createMainContinuityService(
           repair.version === 1 && repair.sourceDigest === current.compactionLease.sourceDigest &&
           typeof repair.contractKey === 'string' && repair.contractKey.length > 0 &&
           repair.contractKey.length <= 4096 &&
-          Number.isSafeInteger(repair.semanticAttempts) && Number(repair.semanticAttempts) >= (sizeFeedback ? 2 : 1) &&
-          Number(repair.semanticAttempts) < (sizeFeedback ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAIN_COMPACTION_MAX_ATTEMPTS) &&
+          canContinueMainCompactionRepair(repair, sizeFeedback ? 'size' : 'fidelity') &&
           Number.isSafeInteger(repair.transportRetries) && Number(repair.transportRetries) >= 0 &&
           Number(repair.transportRetries) <= MAIN_COMPACTION_MAX_TRANSPORT_RETRIES &&
           (sizeFeedback || fidelityFeedback)) {
         const retained = {
           version: 1 as const, sourceDigest: String(repair.sourceDigest), contractKey: repair.contractKey,
           semanticAttempts: Number(repair.semanticAttempts), transportRetries: Number(repair.transportRetries),
+          ...(repair.fidelityRepairAttempts !== undefined
+            ? { fidelityRepairAttempts: Number(repair.fidelityRepairAttempts) as 0 | 1 } : {}),
           sourceGeneration: current.compactionLease.sourceGeneration || 0,
           sourceTurnKeys: [...current.compactionLease.sourceTurnKeys],
           ...(current.compactionLease.legacySourceRange

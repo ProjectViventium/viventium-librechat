@@ -58,6 +58,22 @@ describe('promptRegistry', () => {
     expect(prompt).toContain('Do not default to `slight`');
   });
 
+  test('canonical Main retains background ownership across result channels and direct-work exceptions', () => {
+    const {
+      buildPromptBundleFixture,
+    } = require('../../../../../scripts/test-support/promptBundle.cjs');
+    const sourceRoot = path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts');
+    writeBundle(buildPromptBundleFixture(sourceRoot));
+    const main = getRequiredPromptText('main.conscious_agent');
+    const rule =
+      'When the user wants execution to continue independently, use that durable handoff even if its result must return here or the conversation is a live call.';
+    expect(main.split(rule)).toHaveLength(2);
+    expect(main).toContain('If the user asks you to act yourself or excludes handoffs');
+    expect(main).toContain('Do not defer immediate current-state checks to background cortices');
+    expect(main).toContain('An explicit focused preference limits new automatic delegation');
+    expect(main).toContain('Report a launch only after its receipt');
+  });
+
   test('renders compiled prompt with includes and variables from memory only', () => {
     writeBundle({
       schema_version: 1,

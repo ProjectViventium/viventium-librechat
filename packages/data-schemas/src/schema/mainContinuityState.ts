@@ -158,6 +158,7 @@ const compactionRepairSchema = new Schema<IMainContinuityCompactionRepair>(
     sourceDigest: { type: String, required: true, maxlength: 64 },
     contractKey: { type: String, required: true, maxlength: 4096 },
     semanticAttempts: { type: Number, required: true, min: 1 },
+    fidelityRepairAttempts: { type: Number, enum: [0, 1], default: undefined },
     transportRetries: { type: Number, required: true, min: 0 },
     sourceGeneration: { type: Number, required: true, min: 0 },
     sourceTurnKeys: { type: [String], required: true },

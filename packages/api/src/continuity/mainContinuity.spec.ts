@@ -11,6 +11,7 @@ import {
   prepareMainCompactionCandidate,
   inspectMainCompactionCandidate,
   normalizeMainCompactionSizeRepair,
+  canContinueMainCompactionRepair,
   compatibleMainCompactionSizeContract,
   compareMainCompactionToolIdentities,
   mainCompactionOutputConstraints,
@@ -2476,5 +2477,88 @@ describe('durable numeric size feedback', () => {
     expect(normalizeMainCompactionSizeRepair(value, { ...contract, consumer: 'conversation_legacy' }, contract)).toBeNull();
     expect(normalizeMainCompactionSizeRepair(value, contract, { ...contract,
       maxJsonUtf8Bytes: contract.maxJsonUtf8Bytes + 1 })).toBeNull();
+  });
+});
+
+
+describe('independent bounded fidelity repair accounting', () => {
+  test.each([
+    [1, undefined, 'fidelity', true], [2, undefined, 'fidelity', false],
+    [1, 0, 'fidelity', true], [2, 0, 'fidelity', true], [4, 0, 'fidelity', true],
+    [5, 0, 'fidelity', false], [1, 1, 'fidelity', false], [4, 1, 'fidelity', false],
+    [2, undefined, 'size', true], [3, 1, 'size', true], [4, 0, 'size', false],
+    [1, 0, 'size', false], [0, 0, 'fidelity', false], [2.5, 0, 'fidelity', false],
+    [2, null, 'fidelity', false], [2, '0', 'fidelity', false], [2, false, 'fidelity', false],
+    [2, -1, 'fidelity', false], [2, 0.5, 'fidelity', false], [2, 2, 'fidelity', false],
+    [2, null, 'size', false], [2, '0', 'size', false], [2, 2, 'size', false],
+  ])('total=%s fidelity=%s kind=%s eligible=%s', (total, fidelity, kind, expected) => {
+    expect(canContinueMainCompactionRepair({ semanticAttempts: total, fidelityRepairAttempts: fidelity },
+      kind as 'size' | 'fidelity')).toBe(expected);
+  });
+
+  test.each(['yield', 'cancel', 'used', 'missing', 'null', 'no-release', 'source', 'contract'])(
+    'four completed size calls preserve exactly one fidelity allowance (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const first = await seed();
+      const repair = { version: 1, sourceDigest: first.sourceDigest, contractKey: 'same-contract',
+        semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } };
+      expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+      const checkpoint = states.get(String(first.domainEpochKey))!.pendingCompactionRepair!;
+      const resumed = await service.claimAcceptedMainCompaction(identity);
+      expect(resumed.pendingCompactionRepair).toEqual(checkpoint);
+      const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: resumed.leaseId,
+        reason: mode === 'cancel' ? 'compaction_cancelled' : 'interactive_priority',
+        capacityReleaseAcknowledged: mode !== 'no-release',
+        sourceDigest: mode === 'source' ? 'e'.repeat(64) : resumed.sourceDigest,
+        contractKey: mode === 'contract' ? 'changed-contract' : 'same-contract',
+        semanticAttempts: 4,
+        ...(mode === 'missing' ? {} : { fidelityRepairAttempts: mode === 'used' ? 1 : mode === 'null' ? null : 0 }),
+        transportRetries: 0 });
+      const preserves = ['yield', 'cancel', 'missing'].includes(mode);
+      expect(result.repairPending).toBe(preserves ? true : undefined);
+      expect(states.get(String(first.domainEpochKey))!.pendingCompactionRepair).toEqual(preserves ? checkpoint : null);
+      if (preserves) expect((await service.claimAcceptedMainCompaction(identity)).pendingCompactionRepair)
+        .toMatchObject({ semanticAttempts: 4, fidelityRepairAttempts: 0, correction: repair.correction });
+    });
+
+  test.each([undefined, null, '0', -1, 0.5, 1, 2])(
+    'does not create a fourth-call fidelity checkpoint with an absent, spent or invalid counter %s', async fidelity => {
+      const { service, identity, seed, states } = fixture();
+      const claim = await seed();
+      const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: { version: 1, sourceDigest: claim.sourceDigest, contractKey: 'same-contract',
+          semanticAttempts: 4, fidelityRepairAttempts: fidelity, transportRetries: 0,
+          correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } } });
+      expect(result.repairPending).toBeUndefined();
+      expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair).toBeNull();
+    });
+
+  test('numeric size checkpoint retains a used fidelity allowance and cannot reset it on cancellation', async () => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed(), contract = claim.outputContract as Record<string, unknown>;
+    const candidate = { ...faithful, summary: 's'.repeat(Number(contract.maxJsonUtf8Bytes) + 1000) };
+    const inspected = inspectMainCompactionCandidate(candidate, contract);
+    if (inspected.ok) throw new Error('Expected synthetic size rejection');
+    const bytes = Buffer.byteLength(JSON.stringify(candidate));
+    const repair = { version: 1, sourceDigest: claim.sourceDigest,
+      contractKey: JSON.stringify({ provider: 'native', model: 'synthetic', effort: 'high', constraints: contract }),
+      semanticAttempts: 2, fidelityRepairAttempts: 1, transportRetries: 0,
+      correction: { code: 'schema_invalid', issue: inspected.issue },
+      sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 3000, converging: true } };
+    expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: repair })).toMatchObject({ repairPending: true });
+    const next = await service.claimAcceptedMainCompaction(identity);
+    expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 2, fidelityRepairAttempts: 1 });
+    expect(await service.rejectAcceptedMainCompaction({ ...identity, leaseId: next.leaseId,
+      reason: 'compaction_cancelled', capacityReleaseAcknowledged: true,
+      sourceDigest: next.sourceDigest, contractKey: repair.contractKey,
+      semanticAttempts: 2, fidelityRepairAttempts: 0, transportRetries: 0 }))
+      .not.toMatchObject({ repairPending: true });
+    expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair).toBeNull();
   });
 });

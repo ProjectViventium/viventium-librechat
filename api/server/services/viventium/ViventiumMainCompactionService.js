@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { HumanMessage } = require('@langchain/core/messages');
 const {
   inspectMainCompactionCandidate,
+  canContinueMainCompactionRepair,
   normalizeMainCompactionSizeRepair,
   compatibleMainCompactionSizeContract,
   compareMainCompactionToolIdentities,
@@ -518,6 +519,7 @@ async function runAcceptedMainCompaction(input = {}) {
     ? Math.min(MAX_TRANSIENT_RETRY_DELAY_MS, Math.max(0, configuredRetryDelayMs))
     : TRANSIENT_RETRY_DELAY_MS;
   let semanticAttempts = 0;
+  let fidelityRepairAttempts = 0;
   let transportRetries = 0;
   let correctionReason = '';
   let terminalReason = '';
@@ -630,16 +632,14 @@ async function runAcceptedMainCompaction(input = {}) {
       (pendingRepair.contractKey === contractKey ||
         (pendingSize &&
           compatibleMainCompactionSizeContract(pendingRepair.contractKey, contractKey))) &&
-      Number.isSafeInteger(pendingRepair.semanticAttempts) &&
-      pendingRepair.semanticAttempts > 0 &&
-      pendingRepair.semanticAttempts <
-        (pendingSize ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAX_ATTEMPTS) &&
+      canContinueMainCompactionRepair(pendingRepair, pendingSize ? 'size' : 'fidelity') &&
       Number.isSafeInteger(pendingRepair.transportRetries) &&
       pendingRepair.transportRetries >= 0 &&
       pendingRepair.transportRetries <= MAX_TRANSPORT_RETRIES &&
       (pendingRepair.correction?.code === 'semantic_fidelity' || pendingSize)
     ) {
       semanticAttempts = pendingRepair.semanticAttempts;
+      fidelityRepairAttempts = pendingRepair.fidelityRepairAttempts ?? 0;
       transportRetries = pendingRepair.transportRetries;
       correctionReason = pendingSize?.correction || pendingRepair.correction;
       if (pendingSize) sizeRepair = pendingSize.sizeRepair;
@@ -670,7 +670,10 @@ async function runAcceptedMainCompaction(input = {}) {
     // renewal run once inside the stage's error owner, after prompt preparation.
     const mayRepairSize = () =>
       sizeRepair?.converging === true &&
-      semanticAttempts < MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS;
+      canContinueMainCompactionRepair({ semanticAttempts, fidelityRepairAttempts }, 'size');
+    const mayRepairFidelity = () =>
+      correctionReason?.code === 'semantic_fidelity' &&
+      canContinueMainCompactionRepair({ semanticAttempts, fidelityRepairAttempts }, 'fidelity');
     // Every native call and retry wait ends within the store-owned claim lease.
     const leaseRemainingMs = () => mainCompactionLeaseRemainingMs(effectiveLeaseExpiry(), now());
     let pendingLeaseRenewalDisposition = 'not_required';
@@ -820,7 +823,10 @@ async function runAcceptedMainCompaction(input = {}) {
     if (yieldToInteractive()) {
       terminalReason = 'interactive_priority';
     }
-    while (!terminalReason && (semanticAttempts < MAX_ATTEMPTS || mayRepairSize())) {
+    while (
+      !terminalReason &&
+      (semanticAttempts < MAX_ATTEMPTS || mayRepairSize() || mayRepairFidelity())
+    ) {
       if (controller.signal.aborted) {
         terminalReason =
           controller.signal.reason === 'maintenance_yield'
@@ -829,6 +835,7 @@ async function runAcceptedMainCompaction(input = {}) {
         break;
       }
       const attempt = semanticAttempts + 1;
+      const repairingFidelity = correctionReason?.code === 'semantic_fidelity';
       let raw;
       let callStartedMs;
       try {
@@ -848,7 +855,7 @@ async function runAcceptedMainCompaction(input = {}) {
         // Use the current lease after the final admission/renewal await. A timeout saved
         // before prompt preparation can otherwise cap a newly admitted whole-source repair.
         const sizeBudget =
-          attempt > MAX_ATTEMPTS && !nativeStageDeadline
+          attempt > MAX_ATTEMPTS && !nativeStageDeadline && !repairingFidelity
             ? mainCompactionSizeRepairBudget({
                 state: sizeRepair,
                 attempts: semanticAttempts,
@@ -927,6 +934,7 @@ async function runAcceptedMainCompaction(input = {}) {
         break;
       }
       semanticAttempts += 1;
+      if (repairingFidelity) fidelityRepairAttempts += 1;
       const proposal = parseSemanticCompactionOutput(raw);
       let prepared = inspectMainCompactionCandidate(proposal, claim.outputContract, {
         previousSemanticCompaction: claim.previousSemanticCompaction || null,
@@ -967,15 +975,7 @@ async function runAcceptedMainCompaction(input = {}) {
             { ...isolated, model: isolated.model_parameters?.model || isolated.model },
             isolated.viventiumFallbackLlm || isolated.viventiumFallbackLlmAssignment,
             ...(isolated.viventiumGraphLlmFallbacks || []),
-            ...(isolated.fallback_llm_provider
-              ? [
-                  {
-                    provider: isolated.fallback_llm_provider,
-                    model:
-                      isolated.fallback_llm_model_parameters?.model || isolated.fallback_llm_model,
-                  },
-                ]
-              : []),
+            ...require('./agentLlmFallback').resolveFallbackCandidates(isolated),
           ].filter(Boolean);
           const floor = await require('@librechat/api')
             .getNativeConversationReplayBudgetForRoutes(
@@ -1159,9 +1159,10 @@ async function runAcceptedMainCompaction(input = {}) {
       terminalReason === 'compaction_enclosing_deadline' &&
       active.capacityReleaseAcknowledged === true &&
       !controller.signal.aborted &&
-      semanticAttempts >= (pendingSizeFeedback ? 2 : 1) &&
-      semanticAttempts <
-        (pendingSizeFeedback ? MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS : MAX_ATTEMPTS) &&
+      canContinueMainCompactionRepair(
+        { semanticAttempts, fidelityRepairAttempts },
+        pendingSizeFeedback ? 'size' : 'fidelity',
+      ) &&
       (correctionReason?.code === 'semantic_fidelity' || pendingSizeFeedback);
     const rejected = await rejectCompaction({
       ...input,
@@ -1170,6 +1171,7 @@ async function runAcceptedMainCompaction(input = {}) {
       sourceDigest: claim.sourceDigest,
       contractKey,
       semanticAttempts,
+      fidelityRepairAttempts,
       transportRetries,
       capacityReleaseAcknowledged: active.capacityReleaseAcknowledged === true,
       ...(canContinueRepair
@@ -1179,6 +1181,7 @@ async function runAcceptedMainCompaction(input = {}) {
               sourceDigest: claim.sourceDigest,
               contractKey,
               semanticAttempts,
+              fidelityRepairAttempts,
               transportRetries,
               ...(pendingSizeFeedback || {
                 correction: {

@@ -4885,16 +4885,31 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
 });
 
 describe('first numeric size feedback through the existing idle owner', () => {
-  test.each(['promote', 'equal', 'larger', 'unknown-floor', 'small-floor', 'changed-floor'])(
+  test.each([
+    'promote',
+    'equal',
+    'larger',
+    'unknown-floor',
+    'small-floor',
+    'changed-floor',
+    'carrier-echo',
+    'carrier-unknown-floor',
+    'stored-envelope-boundary',
+  ])(
     'first size rejection pauses, resumes attempt two, and requires shrinking (%s)',
     async (outcome) => {
       jest.useFakeTimers({ doNotFake: ['setImmediate'] });
       jest.setSystemTime(1000000);
       const api = require('@librechat/api');
       api.resetMainCompactionSchedulingForTests();
-      const hasEcho = !['unknown-floor', 'small-floor'].includes(outcome);
+      const hasEcho = ![
+        'unknown-floor',
+        'small-floor',
+        'carrier-unknown-floor',
+        'stored-envelope-boundary',
+      ].includes(outcome);
       let floor = 524288;
-      if (outcome === 'unknown-floor') floor = null;
+      if (['unknown-floor', 'carrier-unknown-floor'].includes(outcome)) floor = null;
       else if (outcome === 'small-floor') floor = 1;
       api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(floor);
       const valid = {
@@ -4913,11 +4928,13 @@ describe('first numeric size feedback through the existing idle owner', () => {
         carrierMaxUtf8Bytes: 131072,
         reservedUtf8Bytes: 29577,
       });
-      const oversized = {
-        ...valid,
-        summary: 's'.repeat(contract.maxJsonUtf8Bytes - 1000),
-        pendingAsks: Array.from({ length: 4 }, () => 'p'.repeat(900)),
-      };
+      const oversized = outcome.startsWith('carrier-')
+        ? { ...valid, summary: '&'.repeat(22000) }
+        : {
+            ...valid,
+            summary: 's'.repeat(contract.maxJsonUtf8Bytes - 1000),
+            pendingAsks: Array.from({ length: 4 }, () => 'p'.repeat(900)),
+          };
       const source = {
         previousSemanticCompaction: valid,
         sourceTurns: [],
@@ -4991,6 +5008,31 @@ describe('first numeric size feedback through the existing idle owner', () => {
           await new Promise((resolve) => setTimeout(resolve, calls.length === 1 ? 373471 : 1000));
           call.reportCapacityRelease(true);
           if (call.stage === 'review') return reviewApproved;
+          if (calls.length === 1 && outcome === 'stored-envelope-boundary') {
+            const { HumanMessage } = require('@langchain/core/messages');
+            const { mainHistoryFitsNativeBody: fits } = require('../ViventiumMainContextService');
+            const issue = api.inspectMainCompactionCandidate(oversized, contract).issue;
+            const feedback = { code: 'schema_invalid', issue };
+            const isolated = compactorAgent(input.agent, 'first-size-domain');
+            const objectPrompt = buildCompactionPrompt(call.claim, {
+              ...feedback,
+              candidate: oversized,
+            });
+            const stringPrompt = buildCompactionPrompt(call.claim, {
+              ...feedback,
+              candidate: JSON.stringify(oversized),
+            });
+            let low = 0,
+              high = 524288;
+            while (low < high) {
+              const mid = Math.floor((low + high) / 2);
+              if (fits([new HumanMessage(objectPrompt)], isolated, 0, mid)) high = mid;
+              else low = mid + 1;
+            }
+            expect(fits([new HumanMessage(objectPrompt)], isolated, 0, low)).toBe(true);
+            expect(fits([new HumanMessage(stringPrompt)], isolated, 0, low)).toBe(false);
+            api.getNativeConversationReplayBudgetForRoutes.mockResolvedValue(low);
+          }
           let draft = valid;
           if (calls.length === 1 || outcome === 'equal') draft = oversized;
           else if (outcome === 'larger') draft = { ...oversized, summary: oversized.summary + 'x' };

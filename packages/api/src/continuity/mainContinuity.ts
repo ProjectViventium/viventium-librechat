@@ -460,7 +460,7 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
       const boundedWholeJsonDraft = path === '' && !prepared.ok &&
         prepared.issue.constraint === 'max_bytes' && prepared.issue.path === '' &&
         Buffer.byteLength(serialized, 'utf8') <= Math.min(before.carrierMaxUtf8Bytes, after.carrierMaxUtf8Bytes);
-      if (boundedWholeJsonDraft || (!firstRejection && path !== '' && prepared.ok &&
+      if (boundedWholeJsonDraft || (path !== '' && prepared.ok &&
           Buffer.byteLength(serialized, 'utf8') <= after.maxJsonUtf8Bytes &&
           inspectMainCompactionCandidate(draft, after).ok)) candidate = serialized;
     } catch { return null; }

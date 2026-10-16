@@ -1181,6 +1181,12 @@ async function runAcceptedMainCompaction(input = {}) {
       },
       claim.outputContract,
     );
+    if (pendingSizeFeedback?.correction?.candidate !== undefined)
+      pendingSizeFeedback.correction = await sizeCorrectionWithinNativeAdmission(
+        input,
+        claim,
+        pendingSizeFeedback.correction,
+      );
     const canContinueRepair =
       terminalReason === 'compaction_enclosing_deadline' &&
       active.capacityReleaseAcknowledged === true &&

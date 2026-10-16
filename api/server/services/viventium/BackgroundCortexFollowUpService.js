@@ -3606,12 +3606,13 @@ async function prepareCortexFollowUpMessage({
   /* === VIVENTIUM START === Native audio choices survive Phase B text projection. === */
   const nativeDeliveryRanges = nativeDeliveryOutput
     ? inspectProviderDeliveryRanges(nativeDeliveryOutput, text, (source) => {
-        const projected = sanitizeFollowUpDisplayText(
-          renderGlassHiveNativeMediaLinks(source, insightsData?.insights || []),
+        const projected = normalizeNoResponseText(
+          sanitizeFollowUpDisplayText(
+            renderGlassHiveNativeMediaLinks(source, insightsData?.insights || []),
+          ),
         ).trim();
-        return surface === 'telegram' && !voiceMode
-          ? parseDeliveryControls(projected).cleanText
-          : projected;
+        if (voiceMode) return stripVoiceControlTagsForDisplay(projected);
+        return surface === 'telegram' ? parseDeliveryControls(projected).cleanText : projected;
       })
     : null;
   const nativeDeliveryContent =

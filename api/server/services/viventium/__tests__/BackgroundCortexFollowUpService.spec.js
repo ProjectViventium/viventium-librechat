@@ -629,6 +629,108 @@ describe('Phase B prepare/persist boundary', () => {
     },
   );
 
+  test.each([
+    ['eligible', false, undefined, undefined, undefined, undefined],
+    ['skip', false, undefined, undefined, undefined, undefined],
+    ['eligible', true, undefined, undefined, undefined, undefined],
+    ['eligible', false, '[laugh] Spoken result.', 'Spoken result.', undefined, undefined],
+    ['eligible', false, 'Written only. [laugh] Spoken.', 'Written only. Spoken.', 14, 13],
+    ['eligible', false, 'Written only.[laugh] Spoken.', 'Written only. Spoken.', 20, 13],
+    ['eligible', false, '  [laugh] Spoken result.  ', 'Spoken result.', undefined, undefined],
+  ])(
+    'projects voice display tags without losing native audio=%s, invalid=%s',
+    async (audio, invalid, customSource, visible, split, publicSplit) => {
+      const source =
+        customSource ||
+        'The page is ready. [laugh] https://www.example.org/; demo@example.org.\n\n![Page](https://files.example.org/image.jpg)';
+      const disposition = { version: 1, required: true, valid: true, source: 'model', audio };
+      const ranges = split
+        ? [
+            { start: 0, end: split, disposition: { ...disposition, audio: 'skip' } },
+            { start: split, end: source.length, disposition },
+          ]
+        : [{ start: 0, end: source.length - (invalid ? 1 : 0), disposition }];
+      const output = {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: source,
+              provider_specific_fields: {
+                viventium: {
+                  deliveryDispositionRanges: ranges,
+                  delivery_disposition: disposition,
+                },
+              },
+            },
+          },
+        ],
+      };
+      const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+        processStream: async () => {
+          options.customHandlers.on_chat_model_start.handle();
+          options.customHandlers.on_chat_model_end.handle('on_chat_model_end', { output });
+          return source;
+        },
+      }));
+      const previous = process.env.XAI_API_KEY;
+      try {
+        process.env.XAI_API_KEY = 'synthetic-xai-key';
+        const prepared = await prepareCortexFollowUpMessage({
+          req: {
+            id: 'synthetic-voice-ranges',
+            viventiumCallSession: { callSessionId: 'synthetic-owned-call' },
+            body: { voiceMode: true, viventiumSurface: 'voice' },
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    xai: {
+                      messaging_delivery_disposition: true,
+                      messaging_delivery_disposition_version: 1,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          runId: 'synthetic-run',
+          agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+          insightsData: {
+            cortexCount: 1,
+            insights: [{ cortexName: 'Synthetic specialist', insight: 'A useful result.' }],
+          },
+          recentResponse: 'The initial answer is visible.',
+        });
+        expect(prepared.text).toBe(visible || source.replace('[laugh] ', ''));
+        expect(prepared.nativeDeliveryContent[0].text).toBe(prepared.text);
+        expect(prepared.deliveryDisposition).toEqual({
+          ...disposition,
+          audio: invalid ? 'skip' : audio,
+          valid: !invalid,
+          source: invalid ? 'required_malformed' : 'model',
+        });
+        expect(prepared.nativeDeliveryContent[0].deliveryDispositionRanges).toEqual(
+          invalid
+            ? []
+            : split
+              ? [
+                  { start: 0, end: publicSplit, disposition: { ...disposition, audio: 'skip' } },
+                  { start: publicSplit, end: prepared.text.length, disposition },
+                ]
+              : [{ start: 0, end: prepared.text.length, disposition }],
+        );
+        expect(createRun).toHaveBeenCalledTimes(1);
+      } finally {
+        if (previous === undefined) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = previous;
+        createRun.mockRestore();
+      }
+    },
+  );
+
   test.each([false, true])(
     'prepares before persistence and retains declared audio=%s without calling the provider again',
     async (audioEligible) => {

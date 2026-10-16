@@ -2282,12 +2282,11 @@ export function createMainContinuityService(
       const currentOutputContract = acceptedMainCompactionOutputContract(acceptedTurns, input.outputCarrier);
       if (!currentOutputContract) return { status: 'degraded', reason: 'context_budget' };
       const repairContract = normalizeMainCompactionOutputContract(repairSource?.outputContract);
-      // Resume the same pinned contract within the same carrier class. Completion still checks
-      // the candidate against all current recent turns, exactly as for an uninterrupted lease.
+      // A fidelity repair uses the tighter current allocation, without widening its old ceiling
+      // when capacity becomes available. Completion still checks all current recent turns.
       const outputContract = repairSource?.sourceDigest === sourceDigest && repairContract &&
-        repairContract.consumer === currentOutputContract.consumer &&
-        repairContract.carrierMaxUtf8Bytes === currentOutputContract.carrierMaxUtf8Bytes
-        && repairSource?.correction.code !== 'schema_invalid'
+        compatibleMainCompactionSizeAllocation(currentOutputContract, repairContract)
+        && repairSource?.correction?.code === 'semantic_fidelity'
         ? repairContract : currentOutputContract;
       const smallerTarget = Math.max(1, Math.floor(bytes / 2));
       const smallerLegacy = await legacySource(identity, cache, undefined, smallerTarget);
@@ -2484,17 +2483,21 @@ export function createMainContinuityService(
         previousRepair.outputContract, current.compactionLease.outputContract);
       const sizeContractMatches = !!preservedSize &&
         compatibleMainCompactionSizeContract(previousRepair?.contractKey, input.contractKey);
-      const preserveRepair = ['interactive_priority', 'compaction_cancelled'].includes(String(input.reason)) &&
-        input.capacityReleaseAcknowledged === true && previousRepair?.version === 1 &&
-        input.sourceDigest === current.compactionLease.sourceDigest &&
+      const fidelityContractMatches = previousRepair?.correction?.code === 'semantic_fidelity' &&
+        compatibleMainCompactionSizeContract(previousRepair.contractKey, input.contractKey);
+      const repairContractMatches = sizeContractMatches || fidelityContractMatches;
+      const previousSourceMatches = previousRepair?.version === 1 &&
         previousRepair.sourceDigest === current.compactionLease.sourceDigest &&
-        (input.contractKey === previousRepair.contractKey || sizeContractMatches) &&
         previousRepair.sourceGeneration === current.compactionLease.sourceGeneration &&
         contentDigest(previousRepair.sourceTurnKeys) === contentDigest(current.compactionLease.sourceTurnKeys) &&
         contentDigest(previousRepair.legacySourceRange || null) ===
-          contentDigest(current.compactionLease.legacySourceRange || null) &&
+          contentDigest(current.compactionLease.legacySourceRange || null);
+      const preserveRepair = ['interactive_priority', 'compaction_cancelled'].includes(String(input.reason)) &&
+        input.capacityReleaseAcknowledged === true && previousSourceMatches &&
+        input.sourceDigest === current.compactionLease.sourceDigest &&
+        (input.contractKey === previousRepair.contractKey || repairContractMatches) &&
         (mainCompactionOutputContractDigest(previousRepair.outputContract) ===
-          mainCompactionOutputContractDigest(current.compactionLease.outputContract) || sizeContractMatches) &&
+          mainCompactionOutputContractDigest(current.compactionLease.outputContract) || repairContractMatches) &&
         input.semanticAttempts === previousRepair.semanticAttempts &&
         (input.fidelityRepairAttempts === undefined ? 0 : input.fidelityRepairAttempts) ===
           (previousRepair.fidelityRepairAttempts ?? 0) &&
@@ -2542,6 +2545,20 @@ export function createMainContinuityService(
               pendingCompactionRepair = { ...retained,
                 correction: { code: 'semantic_fidelity', candidate,
                   ...(typeof correction.reason === 'string' ? { reason: correction.reason } : {}) } };
+            else if (previousSourceMatches && previousRepair?.correction?.code === 'semantic_fidelity' &&
+                candidate === previousRepair.correction.candidate &&
+                correction.reason === previousRepair.correction.reason &&
+                compatibleMainCompactionSizeContract(previousRepair.contractKey, repair.contractKey) &&
+                repair.semanticAttempts === previousRepair.semanticAttempts &&
+                (repair.fidelityRepairAttempts ?? 0) === (previousRepair.fidelityRepairAttempts ?? 0) &&
+                repair.transportRetries === previousRepair.transportRetries &&
+                inspectMainCompactionCandidate(JSON.parse(candidate), previousRepair.outputContract).ok &&
+                Buffer.byteLength(candidate, 'utf8') <=
+                  (previousRepair.outputContract || mainCompactionOutputConstraints).maxJsonUtf8Bytes) {
+              // A tighter reserve cannot erase an already-owned review. Retain only the exact
+              // prior bounded draft as repair input; no new oversized output gains this exception.
+              pendingCompactionRepair = previousRepair;
+            }
           } catch { /* Malformed or oversized drafts are not retained for replay. */ }
         }
       }

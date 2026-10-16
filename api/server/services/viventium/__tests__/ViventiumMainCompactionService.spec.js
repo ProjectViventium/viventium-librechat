@@ -12,6 +12,7 @@ const os = require('os');
 const path = require('path');
 const yaml = require('js-yaml');
 const { resetPromptRegistryForTests } = require('../promptRegistry');
+const { mainCompactionRenderedBytes } = require('@librechat/api');
 const reviewApproved = JSON.stringify({ approved: true, reason: 'Faithful test fixture.' });
 let promptDirectory;
 let previousBundle;
@@ -1837,6 +1838,9 @@ describe('ViventiumMainCompactionService', () => {
         code: 'semantic_fidelity',
         candidate: rejected,
         reason,
+        carrierHeadroomUtf8Bytes:
+          payloads[2].outputConstraints.carrierMaxUtf8Bytes -
+          mainCompactionRenderedBytes(JSON.parse(rejected), payloads[2].outputConstraints),
       });
       for (const payload of payloads.slice(1)) {
         expect(payload.sourceDigest).toBe(payloads[0].sourceDigest);
@@ -4574,7 +4578,12 @@ describe('resumed fidelity checkpoint during foreground cancellation', () => {
             /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
           )[1],
         );
-        expect(payload.priorRejection).toEqual(checkpoint.correction);
+        expect(payload.priorRejection).toEqual({
+          ...checkpoint.correction,
+          carrierHeadroomUtf8Bytes:
+            payload.outputConstraints.carrierMaxUtf8Bytes -
+            mainCompactionRenderedBytes(JSON.parse(candidate), payload.outputConstraints),
+        });
         expect(payload.sourceDigest).toBe(first.sourceDigest);
         expect((await persistence.read(first.domainEpochKey)).pendingCompactionRepair).toBeNull();
         expect(jest.getTimerCount()).toBe(0);
@@ -5279,4 +5288,165 @@ describe('one fidelity repair after bounded structural size work', () => {
     expect(reviews).toBe(2);
     expect(complete).toHaveBeenCalledTimes(1);
   });
+});
+
+describe('fidelity repair carrier headroom', () => {
+  const {
+    buildCompactionPrompt,
+    ensureAcceptedMainCompaction,
+  } = require('../ViventiumMainCompactionService');
+  const {
+    createMainCompactionOutputContract,
+    mainCompactionRenderedBytes,
+  } = require('@librechat/api');
+  const candidate = {
+    version: 1,
+    summary: 'Keep "quoted" facts and approval required.',
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  const payload = (prompt) =>
+    JSON.parse(
+      prompt.match(
+        /<untrusted_conversation_data_v1>\s*([\s\S]*?)\s*<\/untrusted_conversation_data_v1>/,
+      )[1],
+    );
+  const contract = (reservedUtf8Bytes) =>
+    createMainCompactionOutputContract({
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 131072,
+      reservedUtf8Bytes,
+    });
+  test.each([52, 0, -106])(
+    'reports exact signed rendered carrier headroom %s, ignoring stale feedback',
+    (headroom) => {
+      const encoded = mainCompactionRenderedBytes(candidate, contract(0));
+      const selected = contract(131072 - encoded - headroom);
+      const feedback = {
+        code: 'semantic_fidelity',
+        candidate: JSON.stringify(candidate),
+        reason: 'Restore the missing reference.',
+        carrierHeadroomUtf8Bytes: 999999,
+      };
+      const result = payload(
+        buildCompactionPrompt(
+          { sourceDigest: 'd'.repeat(64), sourceTurns: [], outputContract: selected },
+          feedback,
+        ),
+      );
+      expect(result.priorRejection).toEqual({ ...feedback, carrierHeadroomUtf8Bytes: headroom });
+      expect(result.outputConstraints).toEqual(selected);
+      expect(feedback.carrierHeadroomUtf8Bytes).toBe(999999);
+    },
+  );
+  test.each(['bad-candidate', 'bad-contract', 'absent-contract'])(
+    'does not invent headroom for %s',
+    (mode) => {
+      const feedback = {
+        code: 'semantic_fidelity',
+        candidate: mode === 'bad-candidate' ? 'broken' : JSON.stringify(candidate),
+        reason: 'Restore the reference.',
+        carrierHeadroomUtf8Bytes: 999999,
+      };
+      const outputContract =
+        mode === 'absent-contract'
+          ? undefined
+          : mode === 'bad-contract'
+            ? { ...contract(0), maxJsonUtf8Bytes: 1 }
+            : contract(0);
+      expect(
+        payload(buildCompactionPrompt({ sourceTurns: [], outputContract }, feedback))
+          .priorRejection,
+      ).toEqual({ code: feedback.code, candidate: feedback.candidate, reason: feedback.reason });
+    },
+  );
+  test('leaves existing size feedback unchanged', () => {
+    const feedback = {
+      code: 'schema_invalid',
+      issue: {
+        path: '$carrier',
+        constraint: 'max_bytes',
+        actual: 131178,
+        limit: 131072,
+        unit: 'utf8_bytes',
+      },
+    };
+    expect(
+      payload(buildCompactionPrompt({ sourceTurns: [], outputContract: contract(0) }, feedback))
+        .priorRejection,
+    ).toEqual(feedback);
+  });
+  test.each([false, true])(
+    'resumes exactly one fidelity repair on a tighter same-route contract, route changed=%s',
+    (changed) => {
+      const before = contract(1000),
+        after = contract(1500);
+      const route = {
+        provider: 'native',
+        model: 'synthetic',
+        model_parameters: { reasoning_effort: 'high' },
+      };
+      const routeKey = (constraints) =>
+        JSON.stringify({
+          provider: route.provider,
+          model: route.model,
+          effort: changed ? 'low' : 'high',
+          constraints,
+        });
+      const feedback = {
+        code: 'semantic_fidelity',
+        candidate: JSON.stringify(candidate),
+        reason: 'Keep approval required.',
+      };
+      const calls = [];
+      return ensureAcceptedMainCompaction({
+        ownerId: 'headroom-resume-' + changed,
+        agentId: 'main',
+        stableAuthoritySha256: 'a'.repeat(64),
+        agent: route,
+        claimCompaction: async () => ({
+          status: 'claimed',
+          leaseId: 'lease',
+          domainEpochKey: 'headroom-domain-' + changed,
+          sourceDigest: 'd'.repeat(64),
+          sourceBytes: 500,
+          sourceTurns: [],
+          outputContract: after,
+          leaseExpiresAt: new Date(Date.now() + 300000),
+          pendingCompactionRepair: {
+            version: 1,
+            sourceDigest: 'd'.repeat(64),
+            outputContract: before,
+            contractKey: routeKey(before),
+            semanticAttempts: 4,
+            fidelityRepairAttempts: 0,
+            transportRetries: 0,
+            correction: feedback,
+          },
+        }),
+        executeCompactor: async (call) => {
+          calls.push(call);
+          call.reportCapacityRelease(true);
+          return call.stage === 'review' ? reviewApproved : JSON.stringify(candidate);
+        },
+        completeCompaction: async () => ({ status: 'compacted' }),
+        rejectCompaction: async () => ({ status: 'rejected' }),
+      }).then((result) => {
+        expect(result).toMatchObject({ status: 'compacted', attempts: changed ? 1 : 5 });
+        const first = payload(calls[0].prompt);
+        if (changed) expect(first.priorRejection).toBeUndefined();
+        else
+          expect(first.priorRejection).toEqual({
+            ...feedback,
+            carrierHeadroomUtf8Bytes:
+              after.carrierMaxUtf8Bytes - mainCompactionRenderedBytes(candidate, after),
+          });
+      });
+    },
+  );
 });

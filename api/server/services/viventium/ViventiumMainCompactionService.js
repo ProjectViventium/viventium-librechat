@@ -12,6 +12,8 @@ const {
   inspectMainCompactionCandidate,
   canContinueMainCompactionRepair,
   normalizeMainCompactionSizeRepair,
+  normalizeMainCompactionOutputContract,
+  mainCompactionRenderedBytes,
   compatibleMainCompactionSizeContract,
   compareMainCompactionToolIdentities,
   createMainCompactionStageLease,
@@ -192,6 +194,20 @@ function compactionContractKey(agent, contract) {
 }
 
 function buildCompactionPrompt(claim, correctionReason = '', candidate = null) {
+  if (correctionReason?.code === 'semantic_fidelity') {
+    const { carrierHeadroomUtf8Bytes: _staleHeadroom, ...feedback } = correctionReason;
+    const contract = normalizeMainCompactionOutputContract(claim.outputContract);
+    const priorCandidate = parseSemanticCompactionOutput(feedback.candidate);
+    correctionReason = {
+      ...feedback,
+      ...(contract && priorCandidate
+        ? {
+            carrierHeadroomUtf8Bytes:
+              contract.carrierMaxUtf8Bytes - mainCompactionRenderedBytes(priorCandidate, contract),
+          }
+        : {}),
+    };
+  }
   const payload = JSON.stringify({
     version: 1,
     sourceDigest: claim.sourceDigest,
@@ -630,7 +646,7 @@ async function runAcceptedMainCompaction(input = {}) {
       pendingRepair?.version === 1 &&
       pendingRepair.sourceDigest === claim.sourceDigest &&
       (pendingRepair.contractKey === contractKey ||
-        (pendingSize &&
+        ((pendingSize || pendingRepair.correction?.code === 'semantic_fidelity') &&
           compatibleMainCompactionSizeContract(pendingRepair.contractKey, contractKey))) &&
       canContinueMainCompactionRepair(pendingRepair, pendingSize ? 'size' : 'fidelity') &&
       Number.isSafeInteger(pendingRepair.transportRetries) &&

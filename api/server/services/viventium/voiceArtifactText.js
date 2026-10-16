@@ -156,7 +156,7 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function collectProtectedTextRanges(text) {
+function collectProtectedTextRanges(text, { codeOnly = false } = {}) {
   const value = String(text || '');
   const ranges = [];
   const addRegexRanges = (regex) => {
@@ -166,12 +166,13 @@ function collectProtectedTextRanges(text) {
     }
   };
 
-  addRegexRanges(/```[\s\S]*?```/g);
-  addRegexRanges(/`[^`\n]+`/g);
-  addRegexRanges(/"(?:\\.|[^"\\])*"/g);
-  addRegexRanges(/“[^”]*”/g);
-  addRegexRanges(/‘[^’]*’/g);
-  addRegexRanges(/(^|\n)[ \t]*>[^\n]*/g);
+  addRegexRanges(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`/g);
+  if (!codeOnly) {
+    addRegexRanges(/"(?:\\.|[^"\\])*"/g);
+    addRegexRanges(/“[^”]*”/g);
+    addRegexRanges(/‘[^’]*’/g);
+    addRegexRanges(/(^|\n)[ \t]*>[^\n]*/g);
+  }
 
   return ranges
     .filter(([start, end]) => end > start)
@@ -367,7 +368,19 @@ function stripMarkdownEmphasisSyntax(text) {
 }
 
 function stripVoiceControlTags(text) {
-  let cleaned = String(text || '');
+  const value = String(text || '');
+  let cleaned = '';
+  let offset = 0;
+  for (const [start, end] of collectProtectedTextRanges(value, { codeOnly: true })) {
+    cleaned += stripVoiceControlTagsFromProse(value.slice(offset, start));
+    cleaned += value.slice(start, end);
+    offset = end;
+  }
+  return cleaned + stripVoiceControlTagsFromProse(value.slice(offset));
+}
+
+function stripVoiceControlTagsFromProse(text) {
+  let cleaned = text;
   const angleNames = VOICE_CONTROL_NAMES.map(escapeRegExp).join('|');
   const angleTagRe = new RegExp(`</?(?:${angleNames})(?:\\s+[^<>]*)?\\/?>`, 'gi');
   const bracketTagRe = new RegExp(`\\[\\s*/?\\s*(?:${angleNames})\\s*\\]`, 'gi');

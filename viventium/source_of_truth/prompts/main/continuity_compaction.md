@@ -2,7 +2,7 @@
 id: main.continuity_compaction
 owner_layer: viventium_main_continuity
 target: runtime.main_continuity.compaction
-version: 8
+version: 9
 status: active
 safety_class: public_product
 required_context:
@@ -54,7 +54,12 @@ record this rejection, compaction attempts or their review as conversation histo
 priorRejection.candidate is supplied for a max_bytes defect, shorten its wording throughout to meet
 the cited limit while retaining its source-supported facts, qualifications and consequential
 identifiers; add nothing. For other defects, repair the cited defect against the actual source
-evidence and carry every other part of that candidate over unchanged unless the source requires a change.
+evidence and carry every other part of that candidate over unchanged unless the source or
+outputConstraints require a change. When restoring cited facts would exceed the limit, shorten
+other wording to make room while preserving its facts, qualifications and consequential identifiers.
+When supplied, priorRejection.carrierHeadroomUtf8Bytes is the measured remaining space in the
+rendered carrier, after escaping and reserved context, not raw JSON bytes. A negative value means
+the retained candidate already exceeds that carrier; reduce wording enough for the complete repair.
 When no candidate is supplied, regenerate from the complete source evidence under outputConstraints
 and the cited feedback. An omitted draft is not missing source evidence or permission to omit facts.
 

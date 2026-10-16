@@ -2322,7 +2322,8 @@ test('new acceptance preserves the released claim prefix and leaves new turns pe
   expect(next.status).toBe('claimed');
   expect(next.sourceTurns).toEqual(claim.sourceTurns);
   expect(next.sourceDigest).toBe(claim.sourceDigest);
-  expect(next.outputContract).toEqual(claim.outputContract);
+  expect((next.outputContract as Record<string, number>).maxJsonUtf8Bytes)
+    .toBeLessThan((claim.outputContract as Record<string, number>).maxJsonUtf8Bytes);
   expect(next.pendingCompactionRepair).toMatchObject({ semanticAttempts: 1 });
   expect(await service.completeAcceptedMainCompaction({ ...identity, ...next,
     semanticCompaction: faithful, semanticReview: reviewFor(next, faithful) }))
@@ -2331,7 +2332,7 @@ test('new acceptance preserves the released claim prefix and leaves new turns pe
   expect((await service.loadAcceptedMainContext(identity)).pendingCompactionTurns).toHaveLength(1);
 });
 
-test('a resumed pinned contract still checks the current full carrier before promotion', async () => {
+test('a resumed contract still checks newly accepted context before promotion', async () => {
   const { service, identity, seed } = fixture();
   const claim = await seed();
   await service.rejectAcceptedMainCompaction({ ...identity, leaseId: claim.leaseId,
@@ -2339,10 +2340,10 @@ test('a resumed pinned contract still checks the current full carrier before pro
     pendingCompactionRepair: { version: 1, sourceDigest: claim.sourceDigest,
       contractKey: 'original-contract', semanticAttempts: 1, transportRetries: 0,
       correction: { code: 'semantic_fidelity', candidate: JSON.stringify(inverse), reason: 'Keep approval required.' } } });
+  const next = await service.claimAcceptedMainCompaction(identity);
   await service.commitAcceptedMainTurn({ ...identity, logicalTurnId: 'long-new-turn', revision: 1,
     conversationId: 'synthetic-conversation', userMessageId: 'new-user', assistantMessageId: 'new-answer',
     userText: 'New accepted source. ' + 'x'.repeat(6000), assistantText: 'New answer.', origin: 'interactive' });
-  const next = await service.claimAcceptedMainCompaction(identity);
   expect(next.sourceDigest).toBe(claim.sourceDigest);
   expect(next.outputContract).toEqual(claim.outputContract);
   const candidate = { ...faithful, summary: 's'.repeat(6500) };
@@ -2560,5 +2561,66 @@ describe('independent bounded fidelity repair accounting', () => {
       semanticAttempts: 2, fidelityRepairAttempts: 0, transportRetries: 0 }))
       .not.toMatchObject({ repairPending: true });
     expect(states.get(String(claim.domainEpochKey))!.pendingCompactionRepair).toBeNull();
+  });
+});
+
+describe('fidelity continuation uses the current carrier without losing its owned draft', () => {
+  const routeKey = (constraints: unknown) => JSON.stringify({ provider: 'native', model: 'synthetic',
+    effort: 'high', constraints });
+  test.each(['deadline', 'cancel', 'yield', 'new-candidate', 'reason', 'source', 'generation', 'route',
+    'attempts', 'transport', 'used', 'release', 'expired'])(
+    'retains only the prior bounded byte-identical draft after a tighter allocation (%s)', async mode => {
+      const { service, identity, seed, states } = fixture();
+      const first = await seed(), before = first.outputContract as Record<string, number>;
+      const prior = { ...faithful, summary: 'x'.repeat(before.maxJsonUtf8Bytes - 1000) };
+      expect(inspectMainCompactionCandidate(prior, before).ok).toBe(true);
+      expect(inspectMainCompactionCarrier(prior, before).ok).toBe(true);
+      const repair = { version: 1, sourceDigest: first.sourceDigest, contractKey: routeKey(before),
+        semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'semantic_fidelity', candidate: JSON.stringify(prior), reason: 'Restore the exact reference.' } };
+      await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+        reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true, pendingCompactionRepair: repair });
+      const saved = states.get(String(first.domainEpochKey))!.pendingCompactionRepair!;
+      const resumed = await service.claimAcceptedMainCompaction({ ...identity,
+        outputCarrier: { carrierMaxUtf8Bytes: before.carrierMaxUtf8Bytes, reservedContextUtf8Bytes: 2000 } });
+      const after = resumed.outputContract as Record<string, number>;
+      expect(after.maxJsonUtf8Bytes).toBeLessThan(before.maxJsonUtf8Bytes);
+      expect(inspectMainCompactionCandidate(prior, after).ok).toBe(false);
+      expect(resumed.sourceDigest).toBe(first.sourceDigest);
+      const next = { ...repair, contractKey: routeKey(after), correction: { ...repair.correction } };
+      if (mode === 'new-candidate') next.correction.candidate = JSON.stringify({ ...prior, summary: prior.summary + 'x' });
+      if (mode === 'reason') next.correction.reason = 'A different review.';
+      if (mode === 'source') next.sourceDigest = 'e'.repeat(64);
+      if (mode === 'route') next.contractKey = routeKey({ ...after, consumer: 'conversation_legacy' });
+      if (mode === 'attempts') next.semanticAttempts = 3;
+      if (mode === 'transport') next.transportRetries = 1;
+      if (mode === 'used') next.fidelityRepairAttempts = 1;
+      if (mode === 'generation') saved.sourceGeneration++;
+      if (mode === 'expired') states.get(String(first.domainEpochKey))!.compactionLease!.expiresAt = new Date(0);
+      const result = await service.rejectAcceptedMainCompaction({ ...identity, leaseId: resumed.leaseId,
+        reason: mode === 'cancel' ? 'compaction_cancelled' : mode === 'yield' ? 'interactive_priority' : 'compaction_enclosing_deadline',
+        capacityReleaseAcknowledged: mode !== 'release', sourceDigest: resumed.sourceDigest,
+        contractKey: next.contractKey, semanticAttempts: next.semanticAttempts,
+        fidelityRepairAttempts: next.fidelityRepairAttempts, transportRetries: next.transportRetries,
+        pendingCompactionRepair: next });
+      const preserve = ['deadline', 'cancel', 'yield'].includes(mode);
+      expect(result.repairPending).toBe(preserve ? true : undefined);
+      expect(states.get(String(first.domainEpochKey))!.pendingCompactionRepair).toEqual(preserve ? saved : null);
+      expect((await service.loadAcceptedMainContext(identity)).semanticCompaction).toBeNull();
+    });
+  test('does not increase the retained fidelity ceiling when current capacity becomes larger', async () => {
+    const { service, identity, seed } = fixture();
+    const initial = await seed();
+    await service.rejectAcceptedMainCompaction({ ...identity, leaseId: initial.leaseId, reason: 'provider_unavailable' });
+    const first = await service.claimAcceptedMainCompaction({ ...identity,
+      outputCarrier: { carrierMaxUtf8Bytes: (initial.outputContract as Record<string, number>).carrierMaxUtf8Bytes,
+        reservedContextUtf8Bytes: 100 } });
+    await service.rejectAcceptedMainCompaction({ ...identity, leaseId: first.leaseId,
+      reason: 'compaction_enclosing_deadline', capacityReleaseAcknowledged: true,
+      pendingCompactionRepair: { version: 1, sourceDigest: first.sourceDigest, contractKey: routeKey(first.outputContract),
+        semanticAttempts: 4, fidelityRepairAttempts: 0, transportRetries: 0,
+        correction: { code: 'semantic_fidelity', candidate: JSON.stringify(faithful), reason: 'Keep approval required.' } } });
+    const resumed = await service.claimAcceptedMainCompaction(identity);
+    expect(resumed.outputContract).toEqual(first.outputContract);
   });
 });

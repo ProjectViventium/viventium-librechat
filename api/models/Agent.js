@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 const crypto = require('node:crypto');
-const { logger, agentVersionCount, isAgentBsonOverflow, createAgentVersionMethods } = require('@librechat/data-schemas');
+const {
+  logger,
+  agentVersionCount,
+  isAgentBsonOverflow,
+  createAgentVersionMethods,
+} = require('@librechat/data-schemas');
 const { getCustomEndpointConfig } = require('@librechat/api');
 const {
   Tools,
@@ -821,15 +826,25 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
     });
 
     if (shouldCreateVersion) {
-      const comparisonVersions = _version_count == null ? versions : [
-        await agentHistory.getVersion(currentAgent, _version_count - 1),
-      ].filter(Boolean);
-      const duplicateVersion = isDuplicateVersion(updateData, versionData, comparisonVersions, actionsHash);
+      const comparisonVersions =
+        _version_count == null
+          ? versions
+          : [await agentHistory.getVersion(currentAgent, _version_count - 1)].filter(Boolean);
+      const duplicateVersion = isDuplicateVersion(
+        updateData,
+        versionData,
+        comparisonVersions,
+        actionsHash,
+      );
       if (duplicateVersion && !forceVersion) {
         if (hasDirectUpdateDrift && !$push && !$pull && !$addToSet) {
           const repaired = normalizeAllAgentModelFields(
             currentAgent.version_count != null
-              ? await agentHistory.saveArchivedUpdate(currentAgent.toObject(), normalizeAtomicUpdateDocument(directUpdates), null)
+              ? await agentHistory.saveArchivedUpdate(
+                  currentAgent.toObject(),
+                  normalizeAtomicUpdateDocument(directUpdates),
+                  null,
+                )
               : await Agent.findOneAndUpdate(searchParameter, directUpdates, mongoOptions).lean(),
           );
           await _cacheAgent(repaired);
@@ -882,13 +897,21 @@ const updateAgent = async (searchParameter, updateData, options = {}) => {
   updateData = normalizeAtomicUpdateDocument(normalizeAllAgentModelFields(updateData));
   let saved;
   if (currentAgent?.version_count != null) {
-    saved = await agentHistory.saveArchivedUpdate(currentAgent.toObject(), updateData, pendingVersion);
+    saved = await agentHistory.saveArchivedUpdate(
+      currentAgent.toObject(),
+      updateData,
+      pendingVersion,
+    );
   } else {
     try {
       saved = await Agent.findOneAndUpdate(searchParameter, updateData, mongoOptions).lean();
     } catch (error) {
       if (!currentAgent || !isAgentBsonOverflow(error)) throw error;
-      saved = await agentHistory.saveArchivedUpdate(currentAgent.toObject(), updateData, pendingVersion);
+      saved = await agentHistory.saveArchivedUpdate(
+        currentAgent.toObject(),
+        updateData,
+        pendingVersion,
+      );
     }
   }
   const updated = normalizeAllAgentModelFields(saved);
@@ -1271,7 +1294,6 @@ const revertAgentVersion = async (searchParameter, versionIndex, validatedVersio
   if (!revertToVersion) {
     throw new Error(`Version ${versionIndex} not found`);
   }
-
 
   const updateData = {
     ...(validatedVersion || revertToVersion),

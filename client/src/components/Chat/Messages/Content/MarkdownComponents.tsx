@@ -137,10 +137,7 @@ export const a: React.ElementType = memo(function MarkdownAnchor({ href, childre
   const { showToast } = useToastContext();
   const localize = useLocalize();
 
-  const {
-    file_id = '',
-    filename = '',
-  } = useMemo(() => {
+  const { file_id = '', filename = '' } = useMemo(() => {
     /* === VIVENTIUM START === Present only the exact verified grant through the owner File API. === */
     const imported = importedFileForGrant(
       messageContext?.viventiumFileAttachments,

@@ -182,10 +182,18 @@ function resolveDeferredFallbackCanonicalTextState({
     };
   }
 
-  const disposition = validateDeliveryDisposition(message?.metadata?.viventium?.deliveryDisposition);
-  if (!canonicalText && message?.unfinished === false && message?.error !== true &&
-      message?.aborted !== true && message?.superseded !== true &&
-      message?.isCreatedByUser !== true && disposition?.audio === 'skip') {
+  const disposition = validateDeliveryDisposition(
+    message?.metadata?.viventium?.deliveryDisposition,
+  );
+  if (
+    !canonicalText &&
+    message?.unfinished === false &&
+    message?.error !== true &&
+    message?.aborted !== true &&
+    message?.superseded !== true &&
+    message?.isCreatedByUser !== true &&
+    disposition?.audio === 'skip'
+  ) {
     return { canonicalText: null, canonicalTextSource: '', canonicalTextFallbackReason: '' };
   }
 
@@ -297,10 +305,14 @@ async function getFollowUpMessageForParent({ userId, conversationId, parentMessa
     messageId: lastFollowUp.messageId,
     text,
     ...(lastFollowUp?.metadata?.viventium?.deliveryDisposition
-      ? { deliveryDisposition: lastFollowUp.metadata.viventium.deliveryDisposition } : {}),
-    ...(Array.isArray(lastFollowUp.content) && lastFollowUp.content.some(
-      (part) => Object.prototype.hasOwnProperty.call(part || {}, 'deliveryDispositionRanges'),
-    ) ? { content: lastFollowUp.content } : {}),
+      ? { deliveryDisposition: lastFollowUp.metadata.viventium.deliveryDisposition }
+      : {}),
+    ...(Array.isArray(lastFollowUp.content) &&
+    lastFollowUp.content.some((part) =>
+      Object.prototype.hasOwnProperty.call(part || {}, 'deliveryDispositionRanges'),
+    )
+      ? { content: lastFollowUp.content }
+      : {}),
     ...(typeof lastFollowUp?.metadata?.viventium?.followUpSource === 'string'
       ? { followUpSource: lastFollowUp.metadata.viventium.followUpSource }
       : {}),

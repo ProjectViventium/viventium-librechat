@@ -41,6 +41,9 @@ describe('glassHiveOrchestrationTools', () => {
       'claude-code',
       'grok-build',
       'openclaw-general',
+      'direct-openai',
+      'direct-anthropic',
+      'direct-xai',
     ]);
     expect(definitions[0].parameters.properties.resourceClass.enum).toEqual(['standard', 'light']);
     expect(definitions[0].parameters.required).toContain('resourceClass');
@@ -49,8 +52,10 @@ describe('glassHiveOrchestrationTools', () => {
     expect(definitions[0].description).toContain('active_work_action');
     expect(definitions[1].description).toContain('exact runId or workRef');
     expect(definitions[2].description).toContain('instead of starting a competing mission');
-    expect(definitions[2].description).toContain('Retry does not deliver new guidance');
-    expect(definitions[2].description).toContain('then Message or Steer');
+    expect(definitions[2].description).toContain(
+      'Retry can include updated recovery guidance in instruction',
+    );
+    expect(definitions[2].description).toContain('A separate Message or Steer is not required');
     expect(definitions[0].parameters.properties).not.toHaveProperty('executionMode');
   });
 

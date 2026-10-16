@@ -1,6 +1,10 @@
 'use strict';
 jest.mock('../ViventiumMainContinuityService', () => require('./fixtures/mainContinuity')());
-const { prepareMainCompactionCandidate, mainCompactionCandidateDigest, mainCompactionOutputContractDigest } = require('@librechat/api');
+const {
+  prepareMainCompactionCandidate,
+  mainCompactionCandidateDigest,
+  mainCompactionOutputContractDigest,
+} = require('@librechat/api');
 
 function approvedReview(claim, value) {
   const candidate = prepareMainCompactionCandidate(value, claim, claim.outputContract);

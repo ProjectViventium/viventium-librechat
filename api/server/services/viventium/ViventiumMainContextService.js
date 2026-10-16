@@ -24,7 +24,10 @@ const {
   MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER,
   visibleMessageChain: buildMainContinuityMessageChain,
 } = require('@librechat/api');
-const { getTrustedAdapterCapabilities, getTrustedInteractionContext } = require('./interactionContext');
+const {
+  getTrustedAdapterCapabilities,
+  getTrustedInteractionContext,
+} = require('./interactionContext');
 const {
   coerceTextToString,
   normalizeUserMessageContent,
@@ -293,20 +296,40 @@ function mainAttemptFactsAuthorityReserveBytes(req, agent) {
     snapshotSha256: '0'.repeat(64),
     logicalTurnId: String(interaction.logical_turn_id || ''),
     revision: Number(interaction.revision || 1),
-    routeFacts: { surface: interaction.surface || 'web',
-      primary: mainRouteTargetForAgent(agent), fallback: mainRouteTargetForAgent(fallback) },
+    routeFacts: {
+      surface: interaction.surface || 'web',
+      primary: mainRouteTargetForAgent(agent),
+      fallback: mainRouteTargetForAgent(fallback),
+    },
   };
   const receipts = [
-    { status: 'available', enabled: false, scope: 'conscious_agent',
-      version: Number.MAX_SAFE_INTEGER, snapshotSha256: '0'.repeat(64) },
+    {
+      status: 'available',
+      enabled: false,
+      scope: 'conscious_agent',
+      version: Number.MAX_SAFE_INTEGER,
+      snapshotSha256: '0'.repeat(64),
+    },
     { status: 'unavailable', reason: 'x'.repeat(ROUTE_TOKEN_MAX_LENGTH) },
   ];
-  return Math.max(...[agent, fallback || agent].flatMap((route) => receipts.map((feelingsReceipt) =>
-    Buffer.byteLength(renderMainAttemptFactsAuthorityBlock(buildMainAttemptFactsForAgent({
-      snapshot: { ...snapshot, feelingsReceipt }, agent: route,
-      attemptNumber: Number.MAX_SAFE_INTEGER, isFallback: true,
-      fallbackReason: 'x'.repeat(ROUTE_TOKEN_MAX_LENGTH),
-    })), 'utf8'))));
+  return Math.max(
+    ...[agent, fallback || agent].flatMap((route) =>
+      receipts.map((feelingsReceipt) =>
+        Buffer.byteLength(
+          renderMainAttemptFactsAuthorityBlock(
+            buildMainAttemptFactsForAgent({
+              snapshot: { ...snapshot, feelingsReceipt },
+              agent: route,
+              attemptNumber: Number.MAX_SAFE_INTEGER,
+              isFallback: true,
+              fallbackReason: 'x'.repeat(ROUTE_TOKEN_MAX_LENGTH),
+            }),
+          ),
+          'utf8',
+        ),
+      ),
+    ),
+  );
 }
 
 function contentText(content) {
@@ -323,8 +346,21 @@ function contentText(content) {
       if (text) return text;
       // Typed media payloads carry bytes, not authored prose. This text projection leaves those
       // payloads intact; an unknown content type still cannot silently disappear.
-      if (['image_url', 'image', 'input_image', 'file', 'input_file', 'document',
-        'media', 'audio', 'input_audio', 'video'].includes(part.type)) return '';
+      if (
+        [
+          'image_url',
+          'image',
+          'input_image',
+          'file',
+          'input_file',
+          'document',
+          'media',
+          'audio',
+          'input_audio',
+          'video',
+        ].includes(part.type)
+      )
+        return '';
       return String(part.type || '');
     })
     .filter(Boolean)
@@ -338,7 +374,11 @@ function prependMainHistoryFileContext(content, fileContext) {
   const next = content.slice();
   const index = next.findIndex((part) => part && typeof part === 'object' && part.type === 'text');
   if (index < 0) next.unshift({ type: 'text', text: fileContext });
-  else next[index] = { ...next[index], text: fileContext + '\n' + coerceTextToString(next[index].text) };
+  else
+    next[index] = {
+      ...next[index],
+      text: fileContext + '\n' + coerceTextToString(next[index].text),
+    };
   return next;
 }
 
@@ -349,27 +389,39 @@ function messageContentText(message, includeFileContext = false) {
   const visibleContent = Array.isArray(content)
     ? content.filter((part) => part != null && !INTERNAL_CONTENT_TYPES.has(part?.type))
     : content;
-  return contentText(includeFileContext
-    ? prependMainHistoryFileContext(visibleContent, message?.fileContext)
-    : visibleContent);
+  return contentText(
+    includeFileContext
+      ? prependMainHistoryFileContext(visibleContent, message?.fileContext)
+      : visibleContent,
+  );
 }
 
 // Reuse the provider formatter for typed tool history. Its output keeps tool results and
 // preserves undeclared calls as evidence text; literal content-type labels are not prose.
 function formattedToolHistoryCarriers(messages, agent) {
-  const sources = (messages || []).filter((message) =>
-    message?.isCreatedByUser === false && Array.isArray(message.content) &&
-    message.content.some((part) => part?.type === 'tool_call'),
+  const sources = (messages || []).filter(
+    (message) =>
+      message?.isCreatedByUser === false &&
+      Array.isArray(message.content) &&
+      message.content.some((part) => part?.type === 'tool_call'),
   );
   if (!sources.length) return new Map();
   for (const source of sources) {
     for (const part of source.content) {
       if (part?.type === 'tool_call') {
-        if (typeof part.tool_call?.id !== 'string' || !part.tool_call.id.trim() ||
-          typeof part.tool_call?.name !== 'string' || !part.tool_call.name.trim())
+        if (
+          typeof part.tool_call?.id !== 'string' ||
+          !part.tool_call.id.trim() ||
+          typeof part.tool_call?.name !== 'string' ||
+          !part.tool_call.name.trim()
+        )
           throw unreconciledSourceError();
-      } else if (part && !INTERNAL_CONTENT_TYPES.has(part.type) &&
-        !['text', 'input_text', 'output_text'].includes(part.type) && contentText([part])) {
+      } else if (
+        part &&
+        !INTERNAL_CONTENT_TYPES.has(part.type) &&
+        !['text', 'input_text', 'output_text'].includes(part.type) &&
+        contentText([part])
+      ) {
         throw unreconciledSourceError();
       }
     }
@@ -381,27 +433,44 @@ function formattedToolHistoryCarriers(messages, agent) {
     return {
       messageId: source.messageId,
       role: String(source.role || (source.isCreatedByUser === true ? 'user' : 'assistant')),
-      content: canonical(Array.isArray(content)
-        ? content.filter((part) => part != null && !INTERNAL_CONTENT_TYPES.has(part.type)) : content),
+      content: canonical(
+        Array.isArray(content)
+          ? content.filter((part) => part != null && !INTERNAL_CONTENT_TYPES.has(part.type))
+          : content,
+      ),
     };
   });
-  const formatted = formatAgentMessages(payload, undefined,
-    new Set((agent?.tools || []).map((tool) => tool && tool.name))).messages;
-  return new Map(sources.map((source) => {
-    const carrier = formatted.filter((message) => message.id === source.messageId);
-    const authored = carrier.filter((message) => message.role === 'assistant' && messageContentText(message));
-    // The digest-only Native chain binds one complete authored message per source row.
-    // A split authored answer must keep its existing fail-closed admission boundary.
-    if (!carrier.length || authored.length > 1) throw unreconciledSourceError();
-    return [source, { messages: carrier, text: authored.length ? messageContentText(authored[0]) : '' }];
-  }));
+  const formatted = formatAgentMessages(
+    payload,
+    undefined,
+    new Set((agent?.tools || []).map((tool) => tool && tool.name)),
+  ).messages;
+  return new Map(
+    sources.map((source) => {
+      const carrier = formatted.filter((message) => message.id === source.messageId);
+      const authored = carrier.filter(
+        (message) => message.role === 'assistant' && messageContentText(message),
+      );
+      // The digest-only Native chain binds one complete authored message per source row.
+      // A split authored answer must keep its existing fail-closed admission boundary.
+      if (!carrier.length || authored.length > 1) throw unreconciledSourceError();
+      return [
+        source,
+        { messages: carrier, text: authored.length ? messageContentText(authored[0]) : '' },
+      ];
+    }),
+  );
 }
 
 function toolHistoryMessageDigest(message) {
   const role = String(message?.role || message?._getType?.() || '').toLowerCase();
-  return digest({ role: role === 'ai' ? 'assistant' : role === 'human' ? 'user' : role,
-    text: messageContentText(message), toolCalls: message.tool_calls || [],
-    toolCallId: message.tool_call_id || '', name: message.name || '' });
+  return digest({
+    role: role === 'ai' ? 'assistant' : role === 'human' ? 'user' : role,
+    text: messageContentText(message),
+    toolCalls: message.tool_calls || [],
+    toolCallId: message.tool_call_id || '',
+    name: message.name || '',
+  });
 }
 
 function isInterruptedMainCarrier(message) {
@@ -437,7 +506,7 @@ function isBlankContextOnlyMainCarrier(message, text) {
 
 function isAttachmentOnlyMainTextCarrier(message, text) {
   const references = [message?.files, message?.attachments];
-  const attachments = references.flatMap((value) => Array.isArray(value) ? value : []);
+  const attachments = references.flatMap((value) => (Array.isArray(value) ? value : []));
   return (
     message?.isCreatedByUser === true &&
     message?.error !== true &&
@@ -447,14 +516,21 @@ function isAttachmentOnlyMainTextCarrier(message, text) {
     attachments.length > 0 &&
     attachments.every((attachment) => {
       const type = String(attachment?.type || '').toLowerCase();
-      return attachment && typeof attachment === 'object' &&
-        typeof attachment.file_id === 'string' && attachment.file_id.trim() &&
-        !['image/', 'audio/', 'video/'].some((prefix) => type.startsWith(prefix));
+      return (
+        attachment &&
+        typeof attachment === 'object' &&
+        typeof attachment.file_id === 'string' &&
+        attachment.file_id.trim() &&
+        !['image/', 'audio/', 'video/'].some((prefix) => type.startsWith(prefix))
+      );
     }) &&
-    [message.image_urls, message.documents, message.audios, message.videos]
-      .every((value) => value == null || (Array.isArray(value) && value.length === 0)) &&
-    (!Array.isArray(message.content) || message.content.every((part) =>
-      part == null || ['text', 'input_text', 'output_text'].includes(part.type)))
+    [message.image_urls, message.documents, message.audios, message.videos].every(
+      (value) => value == null || (Array.isArray(value) && value.length === 0),
+    ) &&
+    (!Array.isArray(message.content) ||
+      message.content.every(
+        (part) => part == null || ['text', 'input_text', 'output_text'].includes(part.type),
+      ))
   );
 }
 
@@ -728,7 +804,12 @@ function boundVisibleMessageChain(chain, protectUnreconciledHistory, nativeBodyC
   return chain;
 }
 
-function visibleMessageChain(messages = [], protectUnreconciledHistory = false, toolCarriers = new Map(), nativeBodyCarrier = false) {
+function visibleMessageChain(
+  messages = [],
+  protectUnreconciledHistory = false,
+  toolCarriers = new Map(),
+  nativeBodyCarrier = false,
+) {
   const source = (Array.isArray(messages) ? messages : [])
     .filter((message) => {
       const role = String(
@@ -737,8 +818,8 @@ function visibleMessageChain(messages = [], protectUnreconciledHistory = false, 
       return message?.messageId && role !== 'system' && role !== 'developer';
     })
     .map((message, index, visible) => {
-      const text = toolCarriers.get(message)?.text ??
-        messageContentText(message, index < visible.length - 1);
+      const text =
+        toolCarriers.get(message)?.text ?? messageContentText(message, index < visible.length - 1);
       return Object.freeze({
         id: String(message.messageId).slice(0, 160),
         parentId: String(message.parentMessageId || '').slice(0, 160),
@@ -748,7 +829,7 @@ function visibleMessageChain(messages = [], protectUnreconciledHistory = false, 
         bytes: Buffer.byteLength(text, 'utf8'),
         sha256: crypto.createHash('sha256').update(text, 'utf8').digest('hex'),
         ...((protectUnreconciledHistory || isInterruptedMainCarrier(message)) &&
-          index < visible.length - 1
+        index < visible.length - 1
           ? { accepted_source: !isContextOnlyMainCarrier(message) }
           : {}),
       });
@@ -772,8 +853,11 @@ function visibleMessageChain(messages = [], protectUnreconciledHistory = false, 
   ) {
     throw unreconciledSourceError();
   }
-  return boundVisibleMessageChain(nativeBodyCarrier ? source : source.slice(-128),
-    protectUnreconciledHistory, nativeBodyCarrier);
+  return boundVisibleMessageChain(
+    nativeBodyCarrier ? source : source.slice(-128),
+    protectUnreconciledHistory,
+    nativeBodyCarrier,
+  );
 }
 
 function assertUnreconciledHistoryCarrier(
@@ -811,15 +895,19 @@ function assertUnreconciledHistoryCarrier(
       (typeof source?.text === 'string' &&
         source.text.trim() &&
         !sourceText.includes(source.text.trim()) &&
-        !(source?.isCreatedByUser === false &&
+        !(
+          source?.isCreatedByUser === false &&
           source?.metadata?.viventium?.interactionContext?.surface === 'voice' &&
           source?.metadata?.viventium?.inputMode === 'voice_call' &&
           typeof source?.metadata?.viventium?.callSessionId === 'string' &&
           source.metadata.viventium.callSessionId.trim() &&
           // Only reconcile a supplemental display mismatch; preserve the exact carrier.
-          source.text === sanitizeVoiceAssistantMessageForPersistence(
-            { body: { voiceMode: true } }, { ...source, text: '' },
-          ).text)) ||
+          source.text ===
+            sanitizeVoiceAssistantMessageForPersistence(
+              { body: { voiceMode: true } },
+              { ...source, text: '' },
+            ).text
+        )) ||
       (expected.role === 'user' && source?.isCreatedByUser !== true) ||
       (expected.role === 'assistant' && source?.isCreatedByUser !== false) ||
       !['user', 'assistant'].includes(expected.role)
@@ -828,28 +916,49 @@ function assertUnreconciledHistoryCarrier(
     const toolCarrier = toolCarriers.get(source);
     if (toolCarrier) {
       const signatures = toolCarrier.messages.map(toolHistoryMessageDigest);
-      const callIds = new Set(toolCarrier.messages.flatMap((message) => [
-        ...(message.tool_calls || []).map((call) => call.id), message.tool_call_id,
-      ]).filter(Boolean));
-      const belongsToCarrier = (message) => callIds.has(message.tool_call_id) ||
+      const callIds = new Set(
+        toolCarrier.messages
+          .flatMap((message) => [
+            ...(message.tool_calls || []).map((call) => call.id),
+            message.tool_call_id,
+          ])
+          .filter(Boolean),
+      );
+      const belongsToCarrier = (message) =>
+        callIds.has(message.tool_call_id) ||
         (message.tool_calls || []).some((call) => callIds.has(call.id));
-      if (digest(final.filter(belongsToCarrier).map(toolHistoryMessageDigest)) !==
-        digest(toolCarrier.messages.filter(belongsToCarrier).map(toolHistoryMessageDigest)))
+      if (
+        digest(final.filter(belongsToCarrier).map(toolHistoryMessageDigest)) !==
+        digest(toolCarrier.messages.filter(belongsToCarrier).map(toolHistoryMessageDigest))
+      )
         throw unreconciledSourceError();
-      const matched = final.findIndex((_, candidate) => candidate >= position &&
-        signatures.every((signature, offset) => final[candidate + offset] &&
-          toolHistoryMessageDigest(final[candidate + offset]) === signature));
+      const matched = final.findIndex(
+        (_, candidate) =>
+          candidate >= position &&
+          signatures.every(
+            (signature, offset) =>
+              final[candidate + offset] &&
+              toolHistoryMessageDigest(final[candidate + offset]) === signature,
+          ),
+      );
       if (matched < 0) throw unreconciledSourceError();
-      matchedCarriers.push({ sourceMessage: source, source: toolCarrier,
-        messages: final.slice(matched, matched + signatures.length) });
+      matchedCarriers.push({
+        sourceMessage: source,
+        source: toolCarrier,
+        messages: final.slice(matched, matched + signatures.length),
+      });
       position = matched + signatures.length;
       continue;
     }
     // Blank answers and attachment-only user text remain in the owned ancestry. The existing
     // attachment lane carries the original file; media and authored words cannot disappear.
-    if (isBlankContextOnlyMainCarrier(source, sourceText) ||
-        isAttachmentOnlyMainTextCarrier(source, sourceText)) {
-      if (!final.some((message) => String(message?.messageId || message?.id || '') === expected.id)) {
+    if (
+      isBlankContextOnlyMainCarrier(source, sourceText) ||
+      isAttachmentOnlyMainTextCarrier(source, sourceText)
+    ) {
+      if (
+        !final.some((message) => String(message?.messageId || message?.id || '') === expected.id)
+      ) {
         omittedContextIds.add(expected.id);
       }
       continue;
@@ -898,27 +1007,54 @@ function stableAuthorityDigest(agent) {
 }
 
 /** Conservative positive-only shortcut; false is not a Native rejection or a whole-history size limit. */
-function mainHistoryFitsNativeBody(messages, agent, reservedContextUtf8Bytes = 0, nativeReplayBudget = null, sourceMetadataBytes = 0, sizingReceipt = null) {
-  if (!Array.isArray(messages) || !Number.isFinite(reservedContextUtf8Bytes) ||
-    reservedContextUtf8Bytes < 0) return false;
+function mainHistoryFitsNativeBody(
+  messages,
+  agent,
+  reservedContextUtf8Bytes = 0,
+  nativeReplayBudget = null,
+  sourceMetadataBytes = 0,
+  sizingReceipt = null,
+) {
+  if (
+    !Array.isArray(messages) ||
+    !Number.isFinite(reservedContextUtf8Bytes) ||
+    reservedContextUtf8Bytes < 0
+  )
+    return false;
   try {
     const path = require('node:path');
-    const { _convertMessagesToOpenAIParams } = require(path.join(
-      path.dirname(require.resolve('@librechat/agents')), 'llm/openai/utils/index.cjs'));
+    const { _convertMessagesToOpenAIParams } = require(
+      path.join(path.dirname(require.resolve('@librechat/agents')), 'llm/openai/utils/index.cjs'),
+    );
     if (typeof _convertMessagesToOpenAIParams !== 'function') return false;
     const selected = prepareMainContinuityCarrier(messages, agent?.useLegacyContent === true);
     const wire = _convertMessagesToOpenAIParams(selected, String(agent?.model || ''));
     if (nativeReplayBudget !== null) {
       const remaining = require('@librechat/api').nativeConversationContextBudget(
-        wire, nativeReplayBudget, sourceMetadataBytes);
+        wire,
+        nativeReplayBudget,
+        sourceMetadataBytes,
+      );
       if (sizingReceipt && remaining !== null) sizingReceipt.contextBudgetBytes = remaining;
       return require('@librechat/api').nativeConversationHistoryFits(
-        wire, nativeReplayBudget, reservedContextUtf8Bytes, sourceMetadataBytes);
+        wire,
+        nativeReplayBudget,
+        reservedContextUtf8Bytes,
+        sourceMetadataBytes,
+      );
     }
-    const instruction = { role: 'system', content: [agent?.instructions, agent?.additional_instructions]
-      .filter(Boolean).join('\n').trim() };
-    return Buffer.byteLength(JSON.stringify([instruction, ...wire]), 'utf8') +
-      reservedContextUtf8Bytes <= NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES;
+    const instruction = {
+      role: 'system',
+      content: [agent?.instructions, agent?.additional_instructions]
+        .filter(Boolean)
+        .join('\n')
+        .trim(),
+    };
+    return (
+      Buffer.byteLength(JSON.stringify([instruction, ...wire]), 'utf8') +
+        reservedContextUtf8Bytes <=
+      NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
+    );
   } catch {
     return false;
   }
@@ -941,7 +1077,8 @@ function captureMainContextSnapshot(
 ) {
   if (!req || typeof req !== 'object') return null;
   if (req[SNAPSHOT_SLOT]) return req[SNAPSHOT_SLOT];
-  nativeBodyCarrier = nativeBodyCarrier === true &&
+  nativeBodyCarrier =
+    nativeBodyCarrier === true &&
     Boolean(agent?.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']);
   const interaction = getTrustedInteractionContext(req) || {};
   const ownerId = String(req.user?.id || '');
@@ -969,20 +1106,39 @@ function captureMainContextSnapshot(
     ? formattedToolHistoryCarriers(visibleMessages || [], agent)
     : new Map();
   const conversationId = String(interaction.conversation_id || req.body?.conversationId || '');
-  let chain = visibleMessageChain(visibleMessages, protectUnreconciledHistory, toolCarriers, nativeBodyCarrier);
-  const omittedBlankIds = new Set((visibleMessages || []).filter((message) =>
-    message?.messageId && (isBlankContextOnlyMainCarrier(message, messageContentText(message)) ||
-      isAttachmentOnlyMainTextCarrier(message, messageContentText(message))) &&
-    !(messages || []).some((formatted) =>
-      String(formatted?.messageId || formatted?.id || '') === String(message.messageId)),
-  ).map((message) => String(message.messageId)));
+  let chain = visibleMessageChain(
+    visibleMessages,
+    protectUnreconciledHistory,
+    toolCarriers,
+    nativeBodyCarrier,
+  );
+  const omittedBlankIds = new Set(
+    (visibleMessages || [])
+      .filter(
+        (message) =>
+          message?.messageId &&
+          (isBlankContextOnlyMainCarrier(message, messageContentText(message)) ||
+            isAttachmentOnlyMainTextCarrier(message, messageContentText(message))) &&
+          !(messages || []).some(
+            (formatted) =>
+              String(formatted?.messageId || formatted?.id || '') === String(message.messageId),
+          ),
+      )
+      .map((message) => String(message.messageId)),
+  );
   const omittedContextIds = new Set();
   if (protectUnreconciledHistory || omittedBlankIds.size) {
     if (!protectUnreconciledHistory) {
       assertMainHistoryAncestry(ownerId, conversationId, visibleMessages, historyAncestry, true);
     }
     const matched = assertUnreconciledHistoryCarrier(
-      ownerId, conversationId, visibleMessages, messages, chain, toolCarriers, omittedContextIds,
+      ownerId,
+      conversationId,
+      visibleMessages,
+      messages,
+      chain,
+      toolCarriers,
+      omittedContextIds,
       protectUnreconciledHistory ? undefined : omittedBlankIds,
     );
     if (agent?.useLegacyContent === true && matched.length) {
@@ -992,8 +1148,10 @@ function captureMainContextSnapshot(
         const projected = prepareMainContinuityCarrier(carrier.messages, true);
         const text = carrier.source
           ? prepareMainContinuityCarrier(carrier.source.messages, true)
-            .filter((message) => message.role === 'assistant')
-            .map(messageContentText).filter(Boolean).join('\n')
+              .filter((message) => message.role === 'assistant')
+              .map(messageContentText)
+              .filter(Boolean)
+              .join('\n')
           : messageContentText(projected[0]);
         toolCarriers.set(carrier.sourceMessage, { ...carrier.source, text });
       }
@@ -1003,16 +1161,24 @@ function captureMainContextSnapshot(
     // manifest contains only rows carried by the selected provider formatter.
     chain = chain.filter((row) => !omittedContextIds.has(row.id));
   }
-  const selectedMessages = prepareMainContinuityCarrier(messages || [], agent?.useLegacyContent === true);
+  const selectedMessages = prepareMainContinuityCarrier(
+    messages || [],
+    agent?.useLegacyContent === true,
+  );
   const sourceMessageIds = chain.filter((row) => row.accepted_source).map((row) => row.id);
   let owned = [];
   let carried;
-  if (interaction.logical_turn_id && interaction.source_segments?.length &&
-      interaction.actor_kind === 'external_user' && interaction.origin === 'interactive') {
+  if (
+    interaction.logical_turn_id &&
+    interaction.source_segments?.length &&
+    interaction.actor_kind === 'external_user' &&
+    interaction.origin === 'interactive'
+  ) {
     // Keep the full trusted source/file ledger intact. Only the digest projection omits the
     // exact empty-text rows already reconciled above; genuinely missing sources still fail.
-    owned = ownedInteractionSources(interaction, getTrustedAdapterCapabilities(req))
-      .filter(({ segment }) => !omittedContextIds.has(String(segment.source_message_id || '')));
+    owned = ownedInteractionSources(interaction, getTrustedAdapterCapabilities(req)).filter(
+      ({ segment }) => !omittedContextIds.has(String(segment.source_message_id || '')),
+    );
     const headers = buildMainContinuityHeaders({
       context: { ownerId, agentId, stableAuthoritySha256 },
       messages: selectedMessages,
@@ -1021,23 +1187,31 @@ function captureMainContextSnapshot(
       revision: interaction.revision,
       interactionContext: { ...interaction, source_segments: owned.map(({ segment }) => segment) },
     });
-    carried = JSON.parse(Buffer.from(
-      headers['X-Viventium-Visible-Message-Chain-B64'], 'base64',
-    ).toString('utf8'));
+    carried = JSON.parse(
+      Buffer.from(headers['X-Viventium-Visible-Message-Chain-B64'], 'base64').toString('utf8'),
+    );
   } else {
     carried = buildMainContinuityMessageChain(selectedMessages, new Set(sourceMessageIds));
   }
   const carriedById = new Map(carried.map((row) => [row.id, row]));
   chain = chain.map((row) => {
     const input = carriedById.get(row.id);
-    const complete = input?.role === row.role && input.content_sha256
-      ? { ...row, content_sha256: input.content_sha256 } : row;
-    return input?.current_input ? Object.freeze({ ...complete, accepted_source: true, current_input: true,
-      // Subset input keeps its original S-labels in the selection capsule. Native optional
-      // ordinals require a complete contiguous ledger, so never renumber a subset here.
-      ...(owned.length === interaction.source_segments.length
-        ? { source_ordinals: Object.freeze([...input.source_ordinals]) } : {}),
-    }) : Object.freeze(complete);
+    const complete =
+      input?.role === row.role && input.content_sha256
+        ? { ...row, content_sha256: input.content_sha256 }
+        : row;
+    return input?.current_input
+      ? Object.freeze({
+          ...complete,
+          accepted_source: true,
+          current_input: true,
+          // Subset input keeps its original S-labels in the selection capsule. Native optional
+          // ordinals require a complete contiguous ledger, so never renumber a subset here.
+          ...(owned.length === interaction.source_segments.length
+            ? { source_ordinals: Object.freeze([...input.source_ordinals]) }
+            : {}),
+        })
+      : Object.freeze(complete);
   });
   // Current-input digests and flags are added after the first budget check. Bound that final
   // ordinary manifest again; the complete model payload and required source rows stay intact.
@@ -1146,7 +1320,11 @@ function turnContextComponents(value) {
   return components;
 }
 
-function describedTurnContextComponents(value, snapshot, requiredSections = TURN_CONTEXT_REQUIRED_SECTIONS) {
+function describedTurnContextComponents(
+  value,
+  snapshot,
+  requiredSections = TURN_CONTEXT_REQUIRED_SECTIONS,
+) {
   const sections = Object.entries(snapshot?.sections || {});
   return turnContextComponents(value).map((component, index) => {
     const bytes = Buffer.byteLength(component.text, 'utf8');
@@ -1164,17 +1342,26 @@ function describedTurnContextComponents(value, snapshot, requiredSections = TURN
 }
 
 function compactMainTurnContext(
-  value, maximumBytes, snapshot, requiredSections = TURN_CONTEXT_REQUIRED_SECTIONS,
+  value,
+  maximumBytes,
+  snapshot,
+  requiredSections = TURN_CONTEXT_REQUIRED_SECTIONS,
   retentionStage = 'encode',
 ) {
   if (Buffer.byteLength(value, 'utf8') <= maximumBytes) {
     if (promptFrameLoggingEnabled()) {
       logTurnContextRetention(logger, {
-        stage: retentionStage, budgetBytes: maximumBytes, outputText: value,
+        stage: retentionStage,
+        budgetBytes: maximumBytes,
+        outputText: value,
         snapshotSha256: snapshot?.snapshotSha256,
-        components: describedTurnContextComponents(value, snapshot, requiredSections).map((component) => ({
-          kind: component.section, beforeText: component.text, afterText: component.text,
-        })),
+        components: describedTurnContextComponents(value, snapshot, requiredSections).map(
+          (component) => ({
+            kind: component.section,
+            beforeText: component.text,
+            afterText: component.text,
+          }),
+        ),
       });
     }
     return value;
@@ -1218,17 +1405,19 @@ function compactMainTurnContext(
     .join(TURN_CONTEXT_SEPARATOR);
   if (promptFrameLoggingEnabled()) {
     logTurnContextRetention(logger, {
-      stage: retentionStage, budgetBytes: maximumBytes, outputText: context,
+      stage: retentionStage,
+      budgetBytes: maximumBytes,
+      outputText: context,
       snapshotSha256: snapshot?.snapshotSha256,
       components: components.map((component) => ({
-        kind: component.section, beforeText: component.text,
+        kind: component.section,
+        beforeText: component.text,
         afterText: selected.get(component.index) || '',
       })),
     });
   }
   return context;
 }
-
 
 /* === VIVENTIUM START ===
  * Reuse the request-pinned roster projection after the exact Main authority budget is known.
@@ -1239,12 +1428,17 @@ function projectMainActiveWorkTurnContext(turnContextText, maximumBytes, snapsho
   const components = local?.turnContextComponents;
   if (!projection || !Array.isArray(components)) return { text: turnContextText, rosterText: '' };
   const active = components.find((component) => component.kind === 'activeWork');
-  if (typeof active?.text !== 'string' || !active.text.trim()) return { text: turnContextText, rosterText: '' };
-  const present = components.filter((component) =>
-    typeof component.text === 'string' && component.text.trim());
-  const full = present.map((component) => component.text).join(TURN_CONTEXT_SEPARATOR).trim();
-  if (Buffer.byteLength(full, 'utf8') <= maximumBytes &&
-      turnContextText.includes(active.text)) return { text: turnContextText, rosterText: projection.rosterText || '' };
+  if (typeof active?.text !== 'string' || !active.text.trim())
+    return { text: turnContextText, rosterText: '' };
+  const present = components.filter(
+    (component) => typeof component.text === 'string' && component.text.trim(),
+  );
+  const full = present
+    .map((component) => component.text)
+    .join(TURN_CONTEXT_SEPARATOR)
+    .trim();
+  if (Buffer.byteLength(full, 'utf8') <= maximumBytes && turnContextText.includes(active.text))
+    return { text: turnContextText, rosterText: projection.rosterText || '' };
   const fixed = present.filter((component) => component.kind !== 'activeWork');
   const fixedText = fixed.map((component) => component.text).join(TURN_CONTEXT_SEPARATOR);
   const minimumRoster = buildActiveWorkCapsule({ ...projection, maxBytes: 1024 });
@@ -1252,22 +1446,40 @@ function projectMainActiveWorkTurnContext(turnContextText, maximumBytes, snapsho
   if (rosterBytes > maximumBytes) {
     throw mainContextTurnContextError('main_context_turn_context_required_section_too_large');
   }
-  const fixedBudget = Math.max(0, maximumBytes - rosterBytes -
-    (fixed.length ? Buffer.byteLength(TURN_CONTEXT_SEPARATOR, 'utf8') : 0));
+  const fixedBudget = Math.max(
+    0,
+    maximumBytes -
+      rosterBytes -
+      (fixed.length ? Buffer.byteLength(TURN_CONTEXT_SEPARATOR, 'utf8') : 0),
+  );
   const fixedContext = compactMainTurnContext(
-    fixedText, fixedBudget, snapshot, TURN_CONTEXT_REQUIRED_SECTIONS, 'fixed_compact');
-  const availableBytes = maximumBytes - Buffer.byteLength(fixedContext, 'utf8') -
+    fixedText,
+    fixedBudget,
+    snapshot,
+    TURN_CONTEXT_REQUIRED_SECTIONS,
+    'fixed_compact',
+  );
+  const availableBytes =
+    maximumBytes -
+    Buffer.byteLength(fixedContext, 'utf8') -
     (fixedContext ? Buffer.byteLength(TURN_CONTEXT_SEPARATOR, 'utf8') : 0);
   let rosterText = '';
-  const projected = buildActiveWorkCapsule({ ...projection, maxBytes: availableBytes,
-    onRenderedRoster: (value) => { rosterText = value; } });
+  const projected = buildActiveWorkCapsule({
+    ...projection,
+    maxBytes: availableBytes,
+    onRenderedRoster: (value) => {
+      rosterText = value;
+    },
+  });
   const bounded = [fixedContext, projected].filter(Boolean).join(TURN_CONTEXT_SEPARATOR);
   if (Buffer.byteLength(bounded, 'utf8') > maximumBytes) {
     throw mainContextTurnContextError('main_context_turn_context_required_section_too_large');
   }
   if (promptFrameLoggingEnabled()) {
     logTurnContextRetention(logger, {
-      stage: 'reproject', budgetBytes: maximumBytes, outputText: bounded,
+      stage: 'reproject',
+      budgetBytes: maximumBytes,
+      outputText: bounded,
       snapshotSha256: snapshot?.snapshotSha256,
       components: [
         { kind: 'fixedContext', beforeText: fixedText, afterText: fixedContext },
@@ -1278,23 +1490,28 @@ function projectMainActiveWorkTurnContext(turnContextText, maximumBytes, snapsho
   return { text: bounded, rosterText };
 }
 
-function encodeMainTurnContext({ turnContextText, trustedAttemptAuthority, snapshot,
-  maximumBytes = TURN_CONTEXT_MAX_DECODED_BYTES, onStateBlocks }) {
+function encodeMainTurnContext({
+  turnContextText,
+  trustedAttemptAuthority,
+  snapshot,
+  maximumBytes = TURN_CONTEXT_MAX_DECODED_BYTES,
+  onStateBlocks,
+}) {
   const authorityBytes = Buffer.byteLength(trustedAttemptAuthority, 'utf8');
   if (authorityBytes > maximumBytes) {
     throw mainContextTurnContextError('main_context_turn_context_authority_too_large');
   }
   const separatorBytes =
     (turnContextText || snapshot?.[LOCAL_ATTEMPT_STATE]?.activeWorkProjection) &&
-      trustedAttemptAuthority
+    trustedAttemptAuthority
       ? Buffer.byteLength(TURN_CONTEXT_SEPARATOR, 'utf8')
       : 0;
-  const contextBudget = Math.max(
-    0,
-    maximumBytes - authorityBytes - separatorBytes,
-  );
+  const contextBudget = Math.max(0, maximumBytes - authorityBytes - separatorBytes);
   const projectedContext = projectMainActiveWorkTurnContext(
-    turnContextText, contextBudget, snapshot);
+    turnContextText,
+    contextBudget,
+    snapshot,
+  );
   const context = compactMainTurnContext(projectedContext.text, contextBudget, snapshot);
   const decoded = [context, trustedAttemptAuthority].filter(Boolean).join(TURN_CONTEXT_SEPARATOR);
   if (Buffer.byteLength(decoded, 'utf8') > maximumBytes) {
@@ -1302,8 +1519,10 @@ function encodeMainTurnContext({ turnContextText, trustedAttemptAuthority, snaps
   }
   onStateBlocks?.(encodeMainContextStateBlock(decoded, projectedContext.rosterText));
   const encoded = Buffer.from(decoded, 'utf8').toString('base64');
-  const maximumEncodedBytes = maximumBytes === TURN_CONTEXT_MAX_DECODED_BYTES
-    ? TURN_CONTEXT_MAX_ENCODED_BYTES : Math.ceil(maximumBytes / 3) * 4;
+  const maximumEncodedBytes =
+    maximumBytes === TURN_CONTEXT_MAX_DECODED_BYTES
+      ? TURN_CONTEXT_MAX_ENCODED_BYTES
+      : Math.ceil(maximumBytes / 3) * 4;
   if (Buffer.byteLength(encoded, 'utf8') > maximumEncodedBytes) {
     throw mainContextTurnContextError('main_context_turn_context_too_large');
   }
@@ -1341,17 +1560,29 @@ function applyMainContextAttempt({
   const usesPerTurnHeader = Array.from(deliveries.values()).includes('per_turn_header');
   const primaryHeaders = admittedAgents[0]?.model_parameters?.configuration?.defaultHeaders;
   // This exact route has the existing final-dispatch body converter and source guard.
-  const usesNativeBody = Boolean(primaryHeaders?.['X-GlassHive-Agent-Id'] &&
-    primaryHeaders?.['X-Viventium-Visible-Message-Chain-B64']);
+  const usesNativeBody = Boolean(
+    primaryHeaders?.['X-GlassHive-Agent-Id'] &&
+    primaryHeaders?.['X-Viventium-Visible-Message-Chain-B64'],
+  );
   let stateBlocks = '';
   const encodedTurnContext = usesPerTurnHeader
-    ? encodeMainTurnContext({ turnContextText, trustedAttemptAuthority, snapshot,
+    ? encodeMainTurnContext({
+        turnContextText,
+        trustedAttemptAuthority,
+        snapshot,
         maximumBytes: usesNativeBody
-          ? Math.min(NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
-              Number.isSafeInteger(local.turnContextMaximumBytes) && local.turnContextMaximumBytes > 0
-                ? local.turnContextMaximumBytes : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES)
+          ? Math.min(
+              NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
+              Number.isSafeInteger(local.turnContextMaximumBytes) &&
+                local.turnContextMaximumBytes > 0
+                ? local.turnContextMaximumBytes
+                : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+            )
           : TURN_CONTEXT_MAX_DECODED_BYTES,
-        onStateBlocks: (value) => { stateBlocks = value; } })
+        onStateBlocks: (value) => {
+          stateBlocks = value;
+        },
+      })
     : '';
   for (const [index, agent] of admittedAgents.entries()) {
     const agentId = String(agent.id || '');
@@ -1399,9 +1630,15 @@ function bindMainContextSnapshot(targetAgent, snapshot, stateBlocks = '') {
       ? configuration.defaultHeaders
       : {};
   /* === VIVENTIUM START === Current compiler descriptor replaces any case variant. === */
-  const currentHeaders = Object.fromEntries(Object.entries(headers).filter(([key]) =>
-    !['x-viventium-main-context-state-blocks-b64',
-      MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER.toLowerCase()].includes(key.toLowerCase())));
+  const currentHeaders = Object.fromEntries(
+    Object.entries(headers).filter(
+      ([key]) =>
+        ![
+          'x-viventium-main-context-state-blocks-b64',
+          MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER.toLowerCase(),
+        ].includes(key.toLowerCase()),
+    ),
+  );
   /* === VIVENTIUM END === */
   targetAgent.model_parameters = {
     ...modelParameters,
@@ -1409,12 +1646,19 @@ function bindMainContextSnapshot(targetAgent, snapshot, stateBlocks = '') {
       ...configuration,
       defaultHeaders: {
         ...currentHeaders,
-        ...(headers['X-GlassHive-Agent-Id'] ? {
-          [MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER]: String(Math.min(NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
-            Number.isSafeInteger(snapshot[LOCAL_ATTEMPT_STATE]?.turnContextMaximumBytes) &&
-            snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes > 0
-              ? snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES)),
-        } : {}),
+        ...(headers['X-GlassHive-Agent-Id']
+          ? {
+              [MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER]: String(
+                Math.min(
+                  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
+                  Number.isSafeInteger(snapshot[LOCAL_ATTEMPT_STATE]?.turnContextMaximumBytes) &&
+                    snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes > 0
+                    ? snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes
+                    : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+                ),
+              ),
+            }
+          : {}),
         'X-Viventium-Main-Context-Protocol': 'main_context_v1',
         'X-Viventium-Main-Context-State-Blocks-B64': stateBlocks,
         'X-Viventium-Main-Context-Owner': 'core',

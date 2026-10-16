@@ -497,6 +497,18 @@ describe('normalizeUserMessageContent', () => {
       }),
     ).not.toThrow();
   });
+  test('restores saved assistant words beside internal cortex metadata without changing the source', () => {
+    const message = {
+      isCreatedByUser: false,
+      text: 'Assistant display summary',
+      content: [{ type: 'cortex_insight', text: '' }],
+    };
+    expect(normalizeUserMessageContent(message)).toEqual({
+      ...message,
+      content: [{ type: 'text', text: message.text }, ...message.content],
+    });
+    expect(message.content).toEqual([{ type: 'cortex_insight', text: '' }]);
+  });
   test.each([
     {
       isCreatedByUser: false,
@@ -507,11 +519,6 @@ describe('normalizeUserMessageContent', () => {
       isCreatedByUser: false,
       text: 'Assistant display summary',
       content: [{ type: 'tool_call', name: 'existing_tool', args: {} }],
-    },
-    {
-      isCreatedByUser: false,
-      text: 'Assistant display summary',
-      content: [{ type: 'cortex_insight', text: '' }],
     },
     {
       isCreatedByUser: false,

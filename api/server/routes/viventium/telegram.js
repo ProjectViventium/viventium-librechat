@@ -1177,7 +1177,8 @@ router.post('/source-order', telegramAuth, async (req, res) => {
       bindCanonicalInteractionConversation(req, conversationId);
       const sourceMessageId = acceptedInteractionSourceId(req);
       bindInteractionSourceSegments(req, input.text, [], {
-        messageId:sourceMessageId,parentMessageId:resolved.parentMessageId || Constants.NO_PARENT,
+        messageId: sourceMessageId,
+        parentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
       });
       if (!(await Message.exists({ user: req.user.id, messageId: sourceMessageId }))) {
         await saveMessage(
@@ -1198,7 +1199,7 @@ router.post('/source-order', telegramAuth, async (req, res) => {
                   originalParentMessageId: resolved.parentMessageId || Constants.NO_PARENT,
                 },
                 interactionContext: getTrustedInteractionContext(req),
-                originalInputReceipt: {sourceEventId,receivedAt:originalReceivedAt},
+                originalInputReceipt: { sourceEventId, receivedAt: originalReceivedAt },
               },
             },
           },
@@ -1540,7 +1541,8 @@ router.post(
         `status=${readiness.status} available=${readiness.available}`,
       );
       req._viventiumParallelWorkTurnReadiness = Object.freeze({
-        status: readiness.status, reason: readiness.reason || '',
+        status: readiness.status,
+        reason: readiness.reason || '',
       });
       const claimState = parallelWorkClaimState(String(req.user.id));
       req._viventiumParallelWorkTurnClaim = claimState;
@@ -2356,9 +2358,10 @@ router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, re
   const action = String(req.body?.action || '').trim();
   const instruction = String(req.body?.instruction || '').trim();
   const operationId = String(req.body?.operationId || '').trim();
-  const nativeResponse = req.body?.nativeInput == null
-    ? null
-    : nativeWorkInputResponseSchema.safeParse(req.body.nativeInput);
+  const nativeResponse =
+    req.body?.nativeInput == null
+      ? null
+      : nativeWorkInputResponseSchema.safeParse(req.body.nativeInput);
   if (
     !WORK_REF_PATTERN.test(workRef) ||
     (nativeResponse && (!nativeResponse.success || action !== 'resume')) ||
@@ -2384,9 +2387,7 @@ router.post('/orchestration/work/:workRef/actions', telegramAuth, async (req, re
       operationId,
       sourceSurface: 'telegram',
       ownerInputControl: true,
-      ...(nativeResponse?.success
-        ? { nativeInput: nativeResponse.data }
-        : {}),
+      ...(nativeResponse?.success ? { nativeInput: nativeResponse.data } : {}),
     });
     return res.status(202).json(result);
   } catch (error) {
@@ -2715,13 +2716,18 @@ router.post('/glasshive/deliveries/claim', telegramBridgeAuth, async (req, res) 
   res.once('close', disconnected);
   if (req.aborted) controller.abort();
   try {
-    const deliveries = await claimTelegramDeliveriesWhenReady(() => claimPendingGlassHiveCallbackDeliveries({
-      surface: 'telegram',
-      limit: req.body?.limit,
-      leaseMs: req.body?.leaseMs,
-      claimOwner: req.body?.dispatcherId || 'telegram-bridge',
-      callbackId: req.body?.callbackId || '',
-    }), Number(req.body?.waitMs) || 0, controller.signal);
+    const deliveries = await claimTelegramDeliveriesWhenReady(
+      () =>
+        claimPendingGlassHiveCallbackDeliveries({
+          surface: 'telegram',
+          limit: req.body?.limit,
+          leaseMs: req.body?.leaseMs,
+          claimOwner: req.body?.dispatcherId || 'telegram-bridge',
+          callbackId: req.body?.callbackId || '',
+        }),
+      Number(req.body?.waitMs) || 0,
+      controller.signal,
+    );
     if (res.destroyed) return;
     res.setHeader('Cache-Control', 'no-store, private');
     return res.json({ deliveries, waitSupported: true });

@@ -79,7 +79,14 @@ function formatVoiceLatencyDurationFields(prefix, value) {
  * Feature: Content-free numeric Voice stage telemetry.
  * Purpose: Retain timing fields when the existing info message is truncated.
  */
-function logVoiceLatencyNumericStage(logger, req, source, stage, stageStartAt = null, requestSha256 = null) {
+function logVoiceLatencyNumericStage(
+  logger,
+  req,
+  source,
+  stage,
+  stageStartAt = null,
+  requestSha256 = null,
+) {
   if (req?.viventiumVoiceLogLatency !== true) {
     return;
   }
@@ -88,16 +95,26 @@ function logVoiceLatencyNumericStage(logger, req, source, stage, stageStartAt = 
   logger.debug('[VoiceLatency][LC][Timing]', {
     source,
     stage,
-    ...(typeof requestSha256 === 'string' ? { request_sha256: requestSha256 } : {
-      request_id: typeof req.viventiumVoiceRequestId === 'string'
-        ? req.viventiumVoiceRequestId : 'unknown',
-    }),
-    ...(totalMs == null ? {} : {
-      total_ms: Math.round(totalMs), total_ms_f: Number(totalMs.toFixed(3)),
-    }),
-    ...(stageMs == null ? {} : {
-      stage_ms: Math.round(stageMs), stage_ms_f: Number(stageMs.toFixed(3)),
-    }),
+    ...(typeof requestSha256 === 'string'
+      ? { request_sha256: requestSha256 }
+      : {
+          request_id:
+            typeof req.viventiumVoiceRequestId === 'string'
+              ? req.viventiumVoiceRequestId
+              : 'unknown',
+        }),
+    ...(totalMs == null
+      ? {}
+      : {
+          total_ms: Math.round(totalMs),
+          total_ms_f: Number(totalMs.toFixed(3)),
+        }),
+    ...(stageMs == null
+      ? {}
+      : {
+          stage_ms: Math.round(stageMs),
+          stage_ms_f: Number(stageMs.toFixed(3)),
+        }),
   });
 }
 /* === VIVENTIUM END === */
@@ -108,22 +125,42 @@ function observeVoiceLatencyOperation(logger, req, source, stage, operation) {
   const startedAt = voiceLatencyNow();
   const record = (outcome) => {
     try {
-      const requestHash = crypto.createHash('sha256')
-        .update(String(req.viventiumVoiceRequestId || 'unknown')).digest('hex');
-      logVoiceLatencyNumericStage(logger, req, source, `${stage}_${outcome}`, startedAt, requestHash);
+      const requestHash = crypto
+        .createHash('sha256')
+        .update(String(req.viventiumVoiceRequestId || 'unknown'))
+        .digest('hex');
+      logVoiceLatencyNumericStage(
+        logger,
+        req,
+        source,
+        `${stage}_${outcome}`,
+        startedAt,
+        requestHash,
+      );
     } catch {
       // Passive measurements cannot change user data, authorization, or execution outcome.
     }
   };
   let result;
-  try { result = operation(); } catch (error) { record('failed'); throw error; }
+  try {
+    result = operation();
+  } catch (error) {
+    record('failed');
+    throw error;
+  }
   if (!result || typeof result.then !== 'function') {
     record('completed');
     return result;
   }
   return Promise.resolve(result).then(
-    (value) => { record('completed'); return value; },
-    (error) => { record('failed'); throw error; },
+    (value) => {
+      record('completed');
+      return value;
+    },
+    (error) => {
+      record('failed');
+      throw error;
+    },
   );
 }
 /* === VIVENTIUM END === */

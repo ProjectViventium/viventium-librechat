@@ -485,7 +485,9 @@ router.post('/:callSessionId/dispatch/claim', dispatchAuth, async (req, res) => 
 
     /* VIVENTIUM: actual Start owns prep; merely opening Voice settings starts no model. */
     if (session.contextPreparation && session.mode !== 'listen_only') {
-      void require('~/server/services/viventium/CallPreparationService').start(session).catch(() => undefined);
+      void require('~/server/services/viventium/CallPreparationService')
+        .start(session)
+        .catch(() => undefined);
     }
 
     const result = await claimDispatch({
@@ -505,9 +507,11 @@ router.post('/:callSessionId/dispatch/claim', dispatchAuth, async (req, res) => 
             user: { ...user, id: user._id.toString(), role: user.role || SystemRoles.USER },
           });
         })
-        .then(() => logger.debug('[VIVENTIUM][calls] model_catalog_warm_complete', {
-          durationMs: Date.now() - warmStartedAt,
-        }))
+        .then(() =>
+          logger.debug('[VIVENTIUM][calls] model_catalog_warm_complete', {
+            durationMs: Date.now() - warmStartedAt,
+          }),
+        )
         .catch(() => logger.warn('[VIVENTIUM][calls] model_catalog_warm_failed'));
     }
 

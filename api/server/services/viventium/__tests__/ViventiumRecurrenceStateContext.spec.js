@@ -47,15 +47,28 @@ describe('Main runtime recurrence context wiring', () => {
   const fs = require('fs');
   const path = require('path');
   const vm = require('vm');
-  const { NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES, getCurrentCallContext } = require('@librechat/api');
+  const {
+    NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+    getCurrentCallContext,
+    mainContinuityOutputCarrier,
+  } = require('@librechat/api');
   const { applyTimeContextDelivery } = require('../surfacePrompts');
   const {
+    mainContinuityCarrierPeerParts,
+    combineTurnContextInstructions,
+  } = require('../../../controllers/agents/client');
+  const { mainAttemptFactsAuthorityReserveBytes } = require('../ViventiumMainContextService');
+  const {
     conversationProviderUsesInvocationLocalTime,
+    conversationProviderUsesNativeBody,
   } = require('../GlassHiveConversationProviderService');
   const source = fs.readFileSync(
     path.join(__dirname, '../../../controllers/agents/client.js'),
     'utf8',
   );
+  const carrierLimitDeclaration = source.match(
+    /^const MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES = [^;]+;/m,
+  )?.[0];
   const start = source.indexOf('      const timeContextInstructions = replaysPinnedMainContext');
   const end = source.indexOf('      /* === VIVENTIUM NOTE END === */', start);
   const state = {
@@ -84,22 +97,28 @@ describe('Main runtime recurrence context wiring', () => {
       resolveActiveWorkTurnContext: async () => '',
       sourceSelectionTurnContext: () => '',
       stableAuthorityDigest: () => '',
-      loadAcceptedMainContext: async () => ({ capsule: '' }),
+      loadAcceptedMainContextForAdmission: async () => ({ capsule: '' }),
+      abortController: undefined,
+      mainAttemptFactsAuthorityReserveBytes,
+      mainContinuityOutputCarrier,
+      mainContinuityCarrierPeerParts,
+      conversationProviderUsesNativeBody,
       evalIsolationForRequest: () => ({ savedMemory: false }),
       isCancelledVoiceTask: () => false,
       shouldSkipAutomaticMemoryWriter: () => false,
       buildSavedMemoryWriterTurnContext: () => '',
-      combineTurnContextInstructions: (...parts) => parts.filter(Boolean).join('\n'),
+      combineTurnContextInstructions,
       buildRecurrenceStateCapsule,
       NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
       getCurrentCallContext,
       conversationProviderUsesInvocationLocalTime,
       applyTimeContextDelivery,
     };
+    expect(carrierLimitDeclaration).toBeDefined();
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
     await vm.runInNewContext(
-      `(async function() {${source.slice(start, end)}}).call(owner)`,
+      `${carrierLimitDeclaration} (async function() {${source.slice(start, end)}}).call(owner)`,
       context,
     );
     return { instructions: owner.options.agent.instructions, requestBody, surfacePromptLayers };

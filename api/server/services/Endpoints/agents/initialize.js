@@ -902,8 +902,10 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       req,
       capability: effectivePrimaryCapability,
     };
-    const invocationRefreshInstalled = installConversationProviderCapabilityRefresher(capabilityArgs);
-    await attachConversationProviderCapabilityBundle({ ...capabilityArgs,
+    const invocationRefreshInstalled =
+      installConversationProviderCapabilityRefresher(capabilityArgs);
+    await attachConversationProviderCapabilityBundle({
+      ...capabilityArgs,
       deferUntilInvocation: invocationRefreshInstalled === true,
     });
     bindConversationProviderStableAuthorityDigest(primaryConfig, primaryStableAuthoritySha256);
@@ -1018,10 +1020,12 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         .then(async (fallbackConfig) => {
           if (sideEffectsRestricted) {
             await prepareRestrictedVoiceCancellation({
-              req, signal,
+              req,
+              signal,
               endpointConfig: attachHarnessCancellationConfig(fallbackConfig, 'agentLlmFallback'),
               providerId: resolveConversationProviderId(fallbackAgent),
-              fallback: true, activate: false,
+              fallback: true,
+              activate: false,
             });
             fallbackConfig = sanitizeAgentForRestrictedVoiceTurn(fallbackConfig);
           }
@@ -1034,8 +1038,10 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
               mcpCapabilitySourceAgent: effectivePrimaryAgent,
               req,
             };
-            const invocationRefreshInstalled = installConversationProviderCapabilityRefresher(capabilityArgs);
-            await attachDeclaredConversationProviderCapabilityBundle({ ...capabilityArgs,
+            const invocationRefreshInstalled =
+              installConversationProviderCapabilityRefresher(capabilityArgs);
+            await attachDeclaredConversationProviderCapabilityBundle({
+              ...capabilityArgs,
               deferUntilInvocation: invocationRefreshInstalled === true,
             });
             bindConversationProviderStableAuthorityDigest(
@@ -1355,8 +1361,10 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
         declaredAgent: effectiveAgent,
         req,
       };
-      const invocationRefreshInstalled = installConversationProviderCapabilityRefresher(capabilityArgs);
-      await attachDeclaredConversationProviderCapabilityBundle({ ...capabilityArgs,
+      const invocationRefreshInstalled =
+        installConversationProviderCapabilityRefresher(capabilityArgs);
+      await attachDeclaredConversationProviderCapabilityBundle({
+        ...capabilityArgs,
         deferUntilInvocation: invocationRefreshInstalled === true,
       });
       bindConversationProviderStableAuthorityDigest(config, handoffStableAuthoritySha256);
@@ -1394,8 +1402,10 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
             mcpCapabilitySourceAgent: effectiveAgent,
             req,
           };
-          const invocationRefreshInstalled = installConversationProviderCapabilityRefresher(capabilityArgs);
-          await attachDeclaredConversationProviderCapabilityBundle({ ...capabilityArgs,
+          const invocationRefreshInstalled =
+            installConversationProviderCapabilityRefresher(capabilityArgs);
+          await attachDeclaredConversationProviderCapabilityBundle({
+            ...capabilityArgs,
             deferUntilInvocation: invocationRefreshInstalled === true,
           });
           bindConversationProviderStableAuthorityDigest(
@@ -1583,7 +1593,10 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * === VIVENTIUM END === */
   if (sideEffectsRestricted) {
     await prepareRestrictedVoiceCancellation({
-      req, signal, endpointConfig, providerId: effectivePrimaryProvider,
+      req,
+      signal,
+      endpointConfig,
+      providerId: effectivePrimaryProvider,
       fallback: primaryInitializationFallbackUsed === true,
     });
   } else {

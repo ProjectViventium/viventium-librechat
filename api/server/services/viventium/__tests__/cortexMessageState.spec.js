@@ -108,51 +108,93 @@ describe('cortexMessageState insight delivery projection', () => {
 
   test('projects persisted native ranges and exact callback controls without changing text', async () => {
     const text = 'Read-first 🧠.\nUseful spoken result.';
-    const content = [{ type: 'text', text, deliveryDispositionRanges: [
-      { start: 0, end: text.length, disposition: {
-        version: 1, audio: 'eligible', required: true, valid: true, source: 'model',
-      } },
-    ] }];
+    const content = [
+      {
+        type: 'text',
+        text,
+        deliveryDispositionRanges: [
+          {
+            start: 0,
+            end: text.length,
+            disposition: {
+              version: 1,
+              audio: 'eligible',
+              required: true,
+              valid: true,
+              source: 'model',
+            },
+          },
+        ],
+      },
+    ];
     const controls = { audioContent: content, sourceTextSha256: 'a'.repeat(64) };
-    mockGetMessages.mockResolvedValue([{ messageId: 'followup-native', text, content,
-      metadata: { viventium: { telegramDeliveryControls: controls } } }]);
+    mockGetMessages.mockResolvedValue([
+      {
+        messageId: 'followup-native',
+        text,
+        content,
+        metadata: { viventium: { telegramDeliveryControls: controls } },
+      },
+    ]);
     const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'parent-1' });
-    expect(state.followUp).toEqual(expect.objectContaining({ text, content, deliveryControls: controls }));
+    expect(state.followUp).toEqual(
+      expect.objectContaining({ text, content, deliveryControls: controls }),
+    );
   });
 
   test.each(['durable_terminal_callback', 'durable_work_callback'])(
     'leaves %s Main presentation to its native delivery owner, preserving ordinary Cortex follow-ups',
     async (followUpSource) => {
       const ordinary = {
-        messageId: 'cortex-follow-up', text: 'A useful independent Cortex clarification.',
+        messageId: 'cortex-follow-up',
+        text: 'A useful independent Cortex clarification.',
         metadata: { viventium: { followUpSource: 'cortex_aggregation' } },
       };
       const native = {
-        messageId: 'worker-main-follow-up', text: 'The Main-authored worker result.',
+        messageId: 'worker-main-follow-up',
+        text: 'The Main-authored worker result.',
         metadata: { viventium: { followUpSource } },
       };
-      mockGetMessages.mockImplementation(async (filter) => [ordinary, native].filter(
-        (message) => !filter['metadata.viventium.followUpSource']?.$nin?.includes(
-          message.metadata.viventium.followUpSource,
+      mockGetMessages.mockImplementation(async (filter) =>
+        [ordinary, native].filter(
+          (message) =>
+            !filter['metadata.viventium.followUpSource']?.$nin?.includes(
+              message.metadata.viventium.followUpSource,
+            ),
         ),
-      ));
+      );
       const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'parent-1' });
       expect(state.followUp).toMatchObject({
-        messageId: ordinary.messageId, text: ordinary.text, followUpSource: 'cortex_aggregation',
+        messageId: ordinary.messageId,
+        text: ordinary.text,
+        followUpSource: 'cortex_aggregation',
       });
-      expect(mockGetMessages).toHaveBeenCalledWith(expect.objectContaining({
-        user: 'owner-1', conversationId: 'conversation-1',
-        'metadata.viventium.parentMessageId': 'parent-1',
-        'metadata.viventium.followUpSource': { $nin: ['durable_terminal_callback', 'durable_work_callback'] },
-      }));
+      expect(mockGetMessages).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: 'owner-1',
+          conversationId: 'conversation-1',
+          'metadata.viventium.parentMessageId': 'parent-1',
+          'metadata.viventium.followUpSource': {
+            $nin: ['durable_terminal_callback', 'durable_work_callback'],
+          },
+        }),
+      );
     },
   );
 
   test.each(['durable_terminal_callback', 'durable_work_callback'])(
-    'never offers %s as a fallback when no ordinary follow-up exists', async (followUpSource) => {
+    'never offers %s as a fallback when no ordinary follow-up exists',
+    async (followUpSource) => {
       mockGetMessages.mockImplementation(async (filter) =>
         filter['metadata.viventium.followUpSource']?.$nin?.includes(followUpSource)
-          ? [] : [{ messageId: 'worker-main', text: 'Worker result.', metadata: { viventium: { followUpSource } } }],
+          ? []
+          : [
+              {
+                messageId: 'worker-main',
+                text: 'Worker result.',
+                metadata: { viventium: { followUpSource } },
+              },
+            ],
       );
       const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'parent-1' });
       expect(state.followUp).toBeNull();
@@ -172,34 +214,76 @@ describe('cortexMessageState insight delivery projection', () => {
     expect(mockGetInsightDeliveries).not.toHaveBeenCalled();
   });
 
-  test.each(['telegram', 'voice', 'scheduler'])('keeps a completed model-authored quiet %s final silent in polling', async (surface) => {
-    mockGetMessage.mockResolvedValue({ messageId: 'quiet-parent', conversationId: 'conversation-1',
-      text: '', content: [], isCreatedByUser: false, unfinished: false, error: false,
-      metadata: { viventium: { surface, deliveryDisposition: {
-        version: 1, audio: 'skip', required: true, valid: true, source: 'model',
-      } } } });
-    const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
-    expect(state.canonicalText).toBeNull();
-    expect(state.canonicalTextFallbackReason).toBe('');
-  });
+  test.each(['telegram', 'voice', 'scheduler'])(
+    'keeps a completed model-authored quiet %s final silent in polling',
+    async (surface) => {
+      mockGetMessage.mockResolvedValue({
+        messageId: 'quiet-parent',
+        conversationId: 'conversation-1',
+        text: '',
+        content: [],
+        isCreatedByUser: false,
+        unfinished: false,
+        error: false,
+        metadata: {
+          viventium: {
+            surface,
+            deliveryDisposition: {
+              version: 1,
+              audio: 'skip',
+              required: true,
+              valid: true,
+              source: 'model',
+            },
+          },
+        },
+      });
+      const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
+      expect(state.canonicalText).toBeNull();
+      expect(state.canonicalTextFallbackReason).toBe('');
+    },
+  );
 
   test('keeps quiet Main separate from active and completed Cortex follow-up delivery', async () => {
-    const main = { messageId: 'quiet-parent', conversationId: 'conversation-1',
-      text: '', isCreatedByUser: false, unfinished: false, error: false,
+    const main = {
+      messageId: 'quiet-parent',
+      conversationId: 'conversation-1',
+      text: '',
+      isCreatedByUser: false,
+      unfinished: false,
+      error: false,
       content: [{ type: 'cortex_activation', status: 'running' }],
-      metadata: { viventium: { deliveryDisposition: {
-        version: 1, audio: 'skip', required: true, valid: true, source: 'model',
-      } } } };
+      metadata: {
+        viventium: {
+          deliveryDisposition: {
+            version: 1,
+            audio: 'skip',
+            required: true,
+            valid: true,
+            source: 'model',
+          },
+        },
+      },
+    };
     mockGetMessage.mockResolvedValue(main);
     let state = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
-    expect(state).toMatchObject({ canonicalText: null, followUp: null,
-      canonicalTextFallbackReason: '' });
+    expect(state).toMatchObject({
+      canonicalText: null,
+      followUp: null,
+      canonicalTextFallbackReason: '',
+    });
     main.content = [{ type: 'cortex_insight', status: 'complete', insight: 'Useful evidence.' }];
     state = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
-    expect(state).toMatchObject({ canonicalText: null, followUp: null,
-      canonicalTextFallbackReason: '' });
-    const followUp = { messageId: 'ordinary-follow-up', text: 'A useful clarification.',
-      metadata: { viventium: { followUpSource: 'cortex_aggregation' } } };
+    expect(state).toMatchObject({
+      canonicalText: null,
+      followUp: null,
+      canonicalTextFallbackReason: '',
+    });
+    const followUp = {
+      messageId: 'ordinary-follow-up',
+      text: 'A useful clarification.',
+      metadata: { viventium: { followUpSource: 'cortex_aggregation' } },
+    };
     mockGetMessages.mockResolvedValue([followUp]);
     state = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
     expect(state.canonicalText).toBeNull();
@@ -208,46 +292,95 @@ describe('cortexMessageState insight delivery projection', () => {
     mockGetMessages.mockResolvedValue([]);
     main.metadata.viventium.cortexFollowUpDecision = { result: 'skipped' };
     state = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
-    expect(state).toMatchObject({ canonicalText: null, followUp: null,
-      followUpDecision: { result: 'skipped' }, canonicalTextFallbackReason: '' });
+    expect(state).toMatchObject({
+      canonicalText: null,
+      followUp: null,
+      followUpDecision: { result: 'skipped' },
+      canonicalTextFallbackReason: '',
+    });
   });
 
   test('requires committed completion and typed model skip before treating non-native polling as quiet', async () => {
-    const main = { messageId: 'quiet-parent', conversationId: 'conversation-1',
-      text: '', content: [], isCreatedByUser: false, unfinished: true, error: false,
-      metadata: { viventium: { deliveryDisposition: {
-        version: 1, audio: 'skip', required: true, valid: true, source: 'model',
-      } } } };
+    const main = {
+      messageId: 'quiet-parent',
+      conversationId: 'conversation-1',
+      text: '',
+      content: [],
+      isCreatedByUser: false,
+      unfinished: true,
+      error: false,
+      metadata: {
+        viventium: {
+          deliveryDisposition: {
+            version: 1,
+            audio: 'skip',
+            required: true,
+            valid: true,
+            source: 'model',
+          },
+        },
+      },
+    };
     mockGetMessage.mockResolvedValue(main);
-    const beforeCommit = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
+    const beforeCommit = await getCortexMessageState({
+      userId: 'owner-1',
+      messageId: 'quiet-parent',
+    });
     expect(beforeCommit.canonicalTextFallbackReason).toBe('empty_deferred_response');
     main.unfinished = false;
-    const afterCommit = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
+    const afterCommit = await getCortexMessageState({
+      userId: 'owner-1',
+      messageId: 'quiet-parent',
+    });
     expect(afterCommit.canonicalText).toBeNull();
     expect(afterCommit.canonicalTextFallbackReason).toBe('');
-    expect(mockGetMessage).toHaveBeenLastCalledWith(expect.anything(), expect.stringContaining(
-      'unfinished error aborted superseded isCreatedByUser',
-    ));
+    expect(mockGetMessage).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.stringContaining('unfinished error aborted superseded isCreatedByUser'),
+    );
     delete main.metadata.viventium.deliveryDisposition;
     const untyped = await getCortexMessageState({ userId: 'owner-1', messageId: 'quiet-parent' });
     expect(untyped.canonicalTextFallbackReason).toBe('empty_deferred_response');
   });
 
   test.each([
-    { unfinished: true }, { error: true }, { aborted: true }, { superseded: true },
-    { disposition: null }, { disposition: { valid: false } },
-    { disposition: { audio: 'eligible' } }, { disposition: { source: 'legacy_marker' } },
-  ])('keeps malformed, incomplete and failed empty results distinct from quiet completion: %j', async (change) => {
-    const disposition = { version: 1, audio: 'skip', required: true, valid: true, source: 'model',
-      ...(change.disposition || {}) };
-    mockGetMessage.mockResolvedValue({ messageId: 'empty-parent', conversationId: 'conversation-1',
-      text: '', content: [], isCreatedByUser: false, unfinished: false, error: false,
-      ...Object.fromEntries(Object.entries(change).filter(([key]) => key !== 'disposition')),
-      metadata: { viventium: { deliveryDisposition: change.disposition === null ? null : disposition } } });
-    const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'empty-parent' });
-    expect(state.canonicalText).toBeTruthy();
-    expect(state.canonicalTextFallbackReason).toBe('empty_deferred_response');
-  });
+    { unfinished: true },
+    { error: true },
+    { aborted: true },
+    { superseded: true },
+    { disposition: null },
+    { disposition: { valid: false } },
+    { disposition: { audio: 'eligible' } },
+    { disposition: { source: 'legacy_marker' } },
+  ])(
+    'keeps malformed, incomplete and failed empty results distinct from quiet completion: %j',
+    async (change) => {
+      const disposition = {
+        version: 1,
+        audio: 'skip',
+        required: true,
+        valid: true,
+        source: 'model',
+        ...(change.disposition || {}),
+      };
+      mockGetMessage.mockResolvedValue({
+        messageId: 'empty-parent',
+        conversationId: 'conversation-1',
+        text: '',
+        content: [],
+        isCreatedByUser: false,
+        unfinished: false,
+        error: false,
+        ...Object.fromEntries(Object.entries(change).filter(([key]) => key !== 'disposition')),
+        metadata: {
+          viventium: { deliveryDisposition: change.disposition === null ? null : disposition },
+        },
+      });
+      const state = await getCortexMessageState({ userId: 'owner-1', messageId: 'empty-parent' });
+      expect(state.canonicalText).toBeTruthy();
+      expect(state.canonicalTextFallbackReason).toBe('empty_deferred_response');
+    },
+  );
 });
 
 describe('cortexMessageState durable saved-memory receipt projection', () => {

@@ -63,12 +63,44 @@ function pending(kind = 'permission') {
       },
     },
   };
-  if(kind==='question') {
-    const key='Which size?'; request.kind='question';request.message=key;
-    request.requestedSchema={type:'object',required:['answers'],additionalProperties:false,properties:{
-      answers:{type:'object',additionalProperties:false,minProperties:1,maxProperties:16,properties:{[key]:{type:'array',uniqueItems:true,minItems:1,maxItems:1,items:{type:'string',enum:['Small','Other']}}}},
-      annotations:{type:'object',additionalProperties:false,properties:{[key]:{type:'object',additionalProperties:false,required:['notes'],properties:{notes:{type:'string',minLength:1,maxLength:8000}}}}},
-    }};
+  if (kind === 'question') {
+    const key = 'Which size?';
+    request.kind = 'question';
+    request.message = key;
+    request.requestedSchema = {
+      type: 'object',
+      required: ['answers'],
+      additionalProperties: false,
+      properties: {
+        answers: {
+          type: 'object',
+          additionalProperties: false,
+          minProperties: 1,
+          maxProperties: 16,
+          properties: {
+            [key]: {
+              type: 'array',
+              uniqueItems: true,
+              minItems: 1,
+              maxItems: 1,
+              items: { type: 'string', enum: ['Small', 'Other'] },
+            },
+          },
+        },
+        annotations: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            [key]: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['notes'],
+              properties: { notes: { type: 'string', minLength: 1, maxLength: 8000 } },
+            },
+          },
+        },
+      },
+    };
   }
   return request;
 }
@@ -156,28 +188,52 @@ describe('raw native input stays internal on mission Voice', () => {
     await mongoose.disconnect();
     await replica?.stop();
   });
-  test.each(['permission', 'question'])('keeps exact %s data without a raw speech claim', async (kind) => {
-    const fixtureRow = await fixture(kind === 'question' ? 'Which size?' : 'May I replace the file?', kind);
-    expect(await claimed()).toBeUndefined();
-    expect(await claimed()).toBeUndefined(); // Exact polling/replay cannot add another speech path.
-    const retained = await ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: fixtureRow.deliveryId }).lean();
-    expect(retained.status).toBe('pending');
-    expect(retained.text).toBe(fixtureRow.text);
-    expect(retained.nativeInputBinding).toEqual(fixtureRow.nativeInputBinding);
-    expect(await ViventiumGlassHiveCallbackDelivery.countDocuments({})).toBe(1);
-    expect(mockAccountRead).not.toHaveBeenCalled();
-  });
-  test.each(['pending', 'delivery_unknown', 'sent'])('does not revive an old raw %s receipt', async (status) => {
-    const row = await fixture();
-    await ViventiumGlassHiveCallbackDelivery.updateOne({ deliveryId: row.deliveryId }, { $set: { status, claimId: 'old-claim' } });
-    expect(await claimed()).toBeUndefined();
-    expect(await authorizeGlassHiveCallbackDeliveryDispatch({ ...scope, deliveryId: row.deliveryId, claimId: 'old-claim' })).toBeNull();
-    const retained = await ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: row.deliveryId }).lean();
-    expect(retained.status).toBe(status);
-  });
+  test.each(['permission', 'question'])(
+    'keeps exact %s data without a raw speech claim',
+    async (kind) => {
+      const fixtureRow = await fixture(
+        kind === 'question' ? 'Which size?' : 'May I replace the file?',
+        kind,
+      );
+      expect(await claimed()).toBeUndefined();
+      expect(await claimed()).toBeUndefined(); // Exact polling/replay cannot add another speech path.
+      const retained = await ViventiumGlassHiveCallbackDelivery.findOne({
+        deliveryId: fixtureRow.deliveryId,
+      }).lean();
+      expect(retained.status).toBe('pending');
+      expect(retained.text).toBe(fixtureRow.text);
+      expect(retained.nativeInputBinding).toEqual(fixtureRow.nativeInputBinding);
+      expect(await ViventiumGlassHiveCallbackDelivery.countDocuments({})).toBe(1);
+      expect(mockAccountRead).not.toHaveBeenCalled();
+    },
+  );
+  test.each(['pending', 'delivery_unknown', 'sent'])(
+    'does not revive an old raw %s receipt',
+    async (status) => {
+      const row = await fixture();
+      await ViventiumGlassHiveCallbackDelivery.updateOne(
+        { deliveryId: row.deliveryId },
+        { $set: { status, claimId: 'old-claim' } },
+      );
+      expect(await claimed()).toBeUndefined();
+      expect(
+        await authorizeGlassHiveCallbackDeliveryDispatch({
+          ...scope,
+          deliveryId: row.deliveryId,
+          claimId: 'old-claim',
+        }),
+      ).toBeNull();
+      const retained = await ViventiumGlassHiveCallbackDelivery.findOne({
+        deliveryId: row.deliveryId,
+      }).lean();
+      expect(retained.status).toBe(status);
+    },
+  );
   test('missing worker identity cannot make a raw callback eligible', async () => {
     const row = await fixture();
-    await mongoose.connection.collection('viventium_external_work').updateOne({ _id: row.originRef }, { $unset: { workerId: '' } });
+    await mongoose.connection
+      .collection('viventium_external_work')
+      .updateOne({ _id: row.originRef }, { $unset: { workerId: '' } });
     expect(await claimed()).toBeUndefined();
   });
 });

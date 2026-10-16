@@ -771,41 +771,61 @@ describe('GlassHiveActiveWorkProjectionService', () => {
     ).resolves.toEqual({ state: 'silent', unreadTerminal: false });
   });
 
-  test.each(['sent', 'suppressed', 'enqueued'])('quiet callback transport %s does not mark the current result read', async deliveryState => {
-    const { row, evidence } = currentResultFixture('silent');
-    row.deliveryState = deliveryState;
-    row.adjudicationState = 'silent';
-    row.followUpMessageId = '';
-    mockFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([row]) });
-    mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
-    const snapshot = await enrichActiveWorkSnapshot({ ownerId: 'owner-1', snapshot: {
-      snapshot: 'fresh', work: [{ workRef: row.workRef, state: 'completed',
-        delivery: { state: 'pending', unreadTerminal: true }, actions: ['dismiss'] }],
-    } });
-    expect(snapshot.work[0].delivery).toEqual({ state: 'silent', unreadTerminal: true });
-    expect(snapshot.work[0].actions).toEqual(['dismiss']);
-    expect(row.deliveryState).toBe(deliveryState);
-    expect(mockUpdateOne).not.toHaveBeenCalled();
-    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
-  });
-
-  test.each(['surface', 'web', 'acknowledged'])('a matching current public %s receipt settles a quiet result', async receipt => {
-    const { row, evidence } = currentResultFixture('silent');
-    row.adjudicationState = 'silent';
-    row.followUpMessageId = evidence.followUpMessageId = 'current-authored-result';
-    row.deliveryState = receipt === 'acknowledged' ? 'acknowledged' : receipt === 'surface' ? 'sent' : 'enqueued';
-    if (receipt === 'web') {
-      evidence.webPresentationMessageId = 'current-authored-result';
-      evidence.webPresentedAt = new Date('2026-01-01T00:00:00Z');
-    }
-    mockFindOne.mockResolvedValue(row);
-    mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
-    for (let read = 0; read < 2; read += 1) {
-      await expect(getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef })).resolves.toEqual({
-        state: receipt === 'acknowledged' ? 'acknowledged' : 'delivered', unreadTerminal: false,
+  test.each(['sent', 'suppressed', 'enqueued'])(
+    'quiet callback transport %s does not mark the current result read',
+    async (deliveryState) => {
+      const { row, evidence } = currentResultFixture('silent');
+      row.deliveryState = deliveryState;
+      row.adjudicationState = 'silent';
+      row.followUpMessageId = '';
+      mockFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([row]) });
+      mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
+      const snapshot = await enrichActiveWorkSnapshot({
+        ownerId: 'owner-1',
+        snapshot: {
+          snapshot: 'fresh',
+          work: [
+            {
+              workRef: row.workRef,
+              state: 'completed',
+              delivery: { state: 'pending', unreadTerminal: true },
+              actions: ['dismiss'],
+            },
+          ],
+        },
       });
-    }
-  });
+      expect(snapshot.work[0].delivery).toEqual({ state: 'silent', unreadTerminal: true });
+      expect(snapshot.work[0].actions).toEqual(['dismiss']);
+      expect(row.deliveryState).toBe(deliveryState);
+      expect(mockUpdateOne).not.toHaveBeenCalled();
+      expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(['surface', 'web', 'acknowledged'])(
+    'a matching current public %s receipt settles a quiet result',
+    async (receipt) => {
+      const { row, evidence } = currentResultFixture('silent');
+      row.adjudicationState = 'silent';
+      row.followUpMessageId = evidence.followUpMessageId = 'current-authored-result';
+      row.deliveryState =
+        receipt === 'acknowledged' ? 'acknowledged' : receipt === 'surface' ? 'sent' : 'enqueued';
+      if (receipt === 'web') {
+        evidence.webPresentationMessageId = 'current-authored-result';
+        evidence.webPresentedAt = new Date('2026-01-01T00:00:00Z');
+      }
+      mockFindOne.mockResolvedValue(row);
+      mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
+      for (let read = 0; read < 2; read += 1) {
+        await expect(
+          getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }),
+        ).resolves.toEqual({
+          state: receipt === 'acknowledged' ? 'acknowledged' : 'delivered',
+          unreadTerminal: false,
+        });
+      }
+    },
+  );
 
   test('a previous public follow-up cannot settle a different current quiet result', async () => {
     const { row, evidence } = currentResultFixture('silent');
@@ -817,8 +837,9 @@ describe('GlassHiveActiveWorkProjectionService', () => {
     evidence.webPresentedAt = new Date('2026-01-01T00:00:00Z');
     mockFindOne.mockResolvedValue(row);
     mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
-    await expect(getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }))
-      .resolves.toEqual({ state: 'silent', unreadTerminal: true });
+    await expect(
+      getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }),
+    ).resolves.toEqual({ state: 'silent', unreadTerminal: true });
   });
 
   test('explicit Core dismissal clears quiet unread without claiming public delivery', async () => {
@@ -828,8 +849,9 @@ describe('GlassHiveActiveWorkProjectionService', () => {
     row.dismissedAt = new Date('2026-01-01T00:00:00Z');
     mockFindOne.mockResolvedValue(row);
     mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
-    await expect(getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }))
-      .resolves.toEqual({ state: 'silent', unreadTerminal: false });
+    await expect(
+      getCoreWorkDelivery({ ownerId: 'owner-1', workRef: row.workRef }),
+    ).resolves.toEqual({ state: 'silent', unreadTerminal: false });
     expect(mockUpdateOne).not.toHaveBeenCalled();
   });
 
@@ -838,10 +860,20 @@ describe('GlassHiveActiveWorkProjectionService', () => {
     row.adjudicationState = 'silent';
     mockFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([row]) });
     mockMissionFind.mockReturnValue({ toArray: jest.fn().mockResolvedValue([evidence]) });
-    const snapshot = await enrichActiveWorkSnapshot({ ownerId: 'owner-1', snapshot: {
-      snapshot: 'fresh', work: [{ workRef: row.workRef, state: 'completed',
-        delivery: { state: 'pending', unreadTerminal: false }, actions: [] }],
-    } });
+    const snapshot = await enrichActiveWorkSnapshot({
+      ownerId: 'owner-1',
+      snapshot: {
+        snapshot: 'fresh',
+        work: [
+          {
+            workRef: row.workRef,
+            state: 'completed',
+            delivery: { state: 'pending', unreadTerminal: false },
+            actions: [],
+          },
+        ],
+      },
+    });
     expect(snapshot.work[0].delivery).toEqual({ state: 'silent', unreadTerminal: false });
     expect(evidence.state).toBe('silent');
     expect(mockUpdateOne).not.toHaveBeenCalled();

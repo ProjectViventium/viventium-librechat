@@ -96,7 +96,18 @@ jest.mock('~/db/models', () => ({
   ViventiumCortexInsightDelivery: {},
   Message: {
     exists: (...args) => mockMessageExists(...args),
-    findOne: (...args) => ({select:()=>({lean:async()=>{const original=await mockOriginalMessage(...args);return original===undefined?(await mockMessageExists(...args)?{}:null):original;}})}),
+    findOne: (...args) => ({
+      select: () => ({
+        lean: async () => {
+          const original = await mockOriginalMessage(...args);
+          return original === undefined
+            ? (await mockMessageExists(...args))
+              ? {}
+              : null
+            : original;
+        },
+      }),
+    }),
     updateOne: jest.fn(async () => ({ matchedCount: 1, modifiedCount: 1 })),
     findOneAndDelete: (...args) => mockMessageFindOneAndDelete(...args),
   },
@@ -157,66 +168,131 @@ describe('accepted source ledger before logical claim', () => {
     const req = makeReq();
     req.body.conversationId = 'new';
     req.body.text = 'Gather synthetic context.';
-    setTrustedInteractionContext(req, createSchedulerInteractionContext({
-      conversation_id: 'new', source_event_id: 'prep-synthetic-source',
-    }));
+    setTrustedInteractionContext(
+      req,
+      createSchedulerInteractionContext({
+        conversation_id: 'new',
+        source_event_id: 'prep-synthetic-source',
+      }),
+    );
     const context = await AgentController.__testables.captureRequestInteractionContext(req, {
-      conversationId: 'canonical-synthetic-conversation', streamId: 'prep-synthetic-stream',
+      conversationId: 'canonical-synthetic-conversation',
+      streamId: 'prep-synthetic-stream',
     });
-    expect(context).toMatchObject({ actor_kind: 'system', origin: 'scheduler',
-      conversation_id: 'canonical-synthetic-conversation', source_event_id: 'prep-synthetic-source' });
-    expect(mockGenerationJobManager.retainLogicalTurnInput).toHaveBeenCalledWith('user-1',
-      expect.objectContaining({ conversation_id: 'canonical-synthetic-conversation' }));
-    expect(context.source_segments).toEqual([expect.objectContaining({ text: 'Gather synthetic context.' })]);
+    expect(context).toMatchObject({
+      actor_kind: 'system',
+      origin: 'scheduler',
+      conversation_id: 'canonical-synthetic-conversation',
+      source_event_id: 'prep-synthetic-source',
+    });
+    expect(mockGenerationJobManager.retainLogicalTurnInput).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ conversation_id: 'canonical-synthetic-conversation' }),
+    );
+    expect(context.source_segments).toEqual([
+      expect.objectContaining({ text: 'Gather synthetic context.' }),
+    ]);
     expect(mockSaveMessage).not.toHaveBeenCalled(); // No invented external-user input permission.
-    const { captureMainContextSnapshot, traceMainHistoryAncestry } =
-      jest.requireActual('~/server/services/viventium/ViventiumMainContextService');
-    const snapshot = captureMainContextSnapshot(req, { agent: { id: 'synthetic-main' },
-      visibleMessages: [{ messageId: 'synthetic-current-input', role: 'user',
-        isCreatedByUser: true, text: req.body.text }],
+    const { captureMainContextSnapshot, traceMainHistoryAncestry } = jest.requireActual(
+      '~/server/services/viventium/ViventiumMainContextService',
+    );
+    const snapshot = captureMainContextSnapshot(req, {
+      agent: { id: 'synthetic-main' },
+      visibleMessages: [
+        {
+          messageId: 'synthetic-current-input',
+          role: 'user',
+          isCreatedByUser: true,
+          text: req.body.text,
+        },
+      ],
       messages: [{ role: 'user', content: req.body.text }],
-      historyAncestry: traceMainHistoryAncestry({ ownerId: 'user-1',
-        conversationId: 'canonical-synthetic-conversation', messages: [], headId: null }) });
-    expect(snapshot).toMatchObject({ conversationId: 'canonical-synthetic-conversation',
-      actorKind: 'system', origin: 'scheduler', memoryEligible: false });
+      historyAncestry: traceMainHistoryAncestry({
+        ownerId: 'user-1',
+        conversationId: 'canonical-synthetic-conversation',
+        messages: [],
+        headId: null,
+      }),
+    });
+    expect(snapshot).toMatchObject({
+      conversationId: 'canonical-synthetic-conversation',
+      actorKind: 'system',
+      origin: 'scheduler',
+      memoryEligible: false,
+    });
   });
 
   test.each(['canonical-synthetic-conversation', 'foreign-synthetic-conversation'])(
-    'preserves concrete scheduler binding %s for the existing ancestry guard', async (boundConversation) => {
+    'preserves concrete scheduler binding %s for the existing ancestry guard',
+    async (boundConversation) => {
       const req = makeReq();
       req.body.text = 'Gather synthetic context.';
-      setTrustedInteractionContext(req, createSchedulerInteractionContext({
-        conversation_id: boundConversation, source_event_id: 'prep-synthetic-source',
-      }));
+      setTrustedInteractionContext(
+        req,
+        createSchedulerInteractionContext({
+          conversation_id: boundConversation,
+          source_event_id: 'prep-synthetic-source',
+        }),
+      );
       const context = await AgentController.__testables.captureRequestInteractionContext(req, {
-        conversationId: 'canonical-synthetic-conversation', streamId: 'prep-synthetic-stream',
+        conversationId: 'canonical-synthetic-conversation',
+        streamId: 'prep-synthetic-stream',
       });
       expect(context.conversation_id).toBe(boundConversation);
-      const { captureMainContextSnapshot, traceMainHistoryAncestry } =
-        jest.requireActual('~/server/services/viventium/ViventiumMainContextService');
-      const visible = [{ messageId: 'synthetic-current-input', role: 'user',
-        isCreatedByUser: true, text: 'Gather synthetic context.' }];
-      const capture = () => captureMainContextSnapshot(req, { agent: { id: 'synthetic-main' },
-        visibleMessages: visible, messages: [{ role: 'user', content: 'Gather synthetic context.' }],
-        historyAncestry: traceMainHistoryAncestry({ ownerId: 'user-1',
-          conversationId: 'canonical-synthetic-conversation', messages: [], headId: null }) });
+      const { captureMainContextSnapshot, traceMainHistoryAncestry } = jest.requireActual(
+        '~/server/services/viventium/ViventiumMainContextService',
+      );
+      const visible = [
+        {
+          messageId: 'synthetic-current-input',
+          role: 'user',
+          isCreatedByUser: true,
+          text: 'Gather synthetic context.',
+        },
+      ];
+      const capture = () =>
+        captureMainContextSnapshot(req, {
+          agent: { id: 'synthetic-main' },
+          visibleMessages: visible,
+          messages: [{ role: 'user', content: 'Gather synthetic context.' }],
+          historyAncestry: traceMainHistoryAncestry({
+            ownerId: 'user-1',
+            conversationId: 'canonical-synthetic-conversation',
+            messages: [],
+            headId: null,
+          }),
+        });
       if (boundConversation === 'foreign-synthetic-conversation')
         expect(capture).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
       else expect(capture).not.toThrow();
-    });
+    },
+  );
 
   test('canonical fresh-source binding cannot remap an already claimed logical turn', async () => {
     const req = makeReq();
-    setTrustedInteractionContext(req, createSchedulerInteractionContext({
-      conversation_id: 'original-synthetic-conversation', source_event_id: 'prep-synthetic-source',
-    }));
+    setTrustedInteractionContext(
+      req,
+      createSchedulerInteractionContext({
+        conversation_id: 'original-synthetic-conversation',
+        source_event_id: 'prep-synthetic-source',
+      }),
+    );
     const original = getTrustedInteractionContext(req);
-    bindLogicalTurnContext(req, { ...original, logical_turn_id: 'claimed-synthetic-turn', revision: 1 });
-    const context = await AgentController.__testables.captureRequestInteractionContext(req, {
-      conversationId: 'different-synthetic-conversation', streamId: 'prep-synthetic-stream',
+    bindLogicalTurnContext(req, {
+      ...original,
+      logical_turn_id: 'claimed-synthetic-turn',
+      revision: 1,
     });
-    expect(context).toMatchObject({ conversation_id: 'original-synthetic-conversation',
-      logical_turn_id: 'claimed-synthetic-turn', actor_kind: 'system', origin: 'scheduler' });
+    const context = await AgentController.__testables.captureRequestInteractionContext(req, {
+      conversationId: 'different-synthetic-conversation',
+      streamId: 'prep-synthetic-stream',
+    });
+    expect(context).toMatchObject({
+      conversation_id: 'original-synthetic-conversation',
+      logical_turn_id: 'claimed-synthetic-turn',
+      actor_kind: 'system',
+      origin: 'scheduler',
+    });
   });
 
   test('captures the accepted text and owner-scoped files without trusting body/header source claims', async () => {
@@ -421,14 +497,32 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     jest.useRealTimers();
   });
 
-
-  test.each(['released', 'released_existing_error', 'unknown', 'wrong_stream', 'wrong_owner', 'wrong_message', 'wrong_generation', 'fallback_other_error', 'fallback_without_proof', 'fallback_foreign_proof'])(
-    'settled generation failure closes its snapshot without granting Native refusal authority: %s', async (mode) => {
+  test.each([
+    'released',
+    'released_existing_error',
+    'unknown',
+    'wrong_stream',
+    'wrong_owner',
+    'wrong_message',
+    'wrong_generation',
+    'fallback_other_error',
+    'fallback_without_proof',
+    'fallback_foreign_proof',
+  ])(
+    'settled generation failure closes its snapshot without granting Native refusal authority: %s',
+    async (mode) => {
       const released = mode === 'released' || mode === 'released_existing_error';
       const req = makeReq();
       req.body.streamId = 'stream-1';
       mockIsNativeCapacityRefusal.mockReturnValue(released);
-      const marker = { invocationId: 'invocation', bodySha256: 'a'.repeat(64), streamId: 'stream-1', userId: 'user-1', responseMessageId: 'resp-msg-1', jobCreatedAt: 1 };
+      const marker = {
+        invocationId: 'invocation',
+        bodySha256: 'a'.repeat(64),
+        streamId: 'stream-1',
+        userId: 'user-1',
+        responseMessageId: 'resp-msg-1',
+        jobCreatedAt: 1,
+      };
       if (mode === 'wrong_stream') marker.streamId = 'foreign';
       if (mode === 'wrong_owner') marker.userId = 'foreign';
       if (mode === 'wrong_message') marker.responseMessageId = 'foreign';
@@ -440,44 +534,93 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       const original = client.sendMessage.getMockImplementation();
       client.sendMessage.mockImplementation(async (...args) => {
         await original(...args);
-        if (mode !== 'unknown') req._viventiumNativeResponseUnaccepted = {
-          ...marker, streamId: mode === 'wrong_stream' ? 'foreign' : req._resumableStreamId,
+        if (mode !== 'unknown')
+          req._viventiumNativeResponseUnaccepted = {
+            ...marker,
+            streamId: mode === 'wrong_stream' ? 'foreign' : req._resumableStreamId,
+          };
+        const failure = {
+          code: mode === 'fallback_other_error' ? 'upstream_unavailable' : 'host_capacity',
         };
-        const failure = { code: mode === 'fallback_other_error' ? 'upstream_unavailable' : 'host_capacity' };
-        if (mode !== 'fallback_without_proof') failure.native_admission = {
-          version: 1, accepted: false, invocation_id: mode === 'fallback_foreign_proof' ? 'foreign' : marker.invocationId,
-          body_sha256: marker.bodySha256, stream_id: req._resumableStreamId, message_id: marker.responseMessageId,
+        if (mode !== 'fallback_without_proof')
+          failure.native_admission = {
+            version: 1,
+            accepted: false,
+            invocation_id: mode === 'fallback_foreign_proof' ? 'foreign' : marker.invocationId,
+            body_sha256: marker.bodySha256,
+            stream_id: req._resumableStreamId,
+            message_id: marker.responseMessageId,
+          };
+        req._viventiumNativeResponseIdentity = {
+          ...marker,
+          streamId: req._resumableStreamId,
+          userId: 'user-1',
+          responseMessageId: 'resp-msg-1',
+          jobCreatedAt: 1,
         };
-        req._viventiumNativeResponseIdentity = { ...marker, streamId: req._resumableStreamId,
-          userId: 'user-1', responseMessageId: 'resp-msg-1', jobCreatedAt: 1 };
-        const error = require('openai').APIError.generate(503, { error: failure }, undefined, new Headers());
+        const error = require('openai').APIError.generate(
+          503,
+          { error: failure },
+          undefined,
+          new Headers(),
+        );
         require('./client').handleCompletionErrorContentPart({
-          contentParts: mode === 'released_existing_error' ? client.contentParts : [], err: error, req, abortController: { signal: { aborted: false } },
+          contentParts: mode === 'released_existing_error' ? client.contentParts : [],
+          err: error,
+          req,
+          abortController: { signal: { aborted: false } },
           log: { warn: jest.fn(), error: jest.fn() },
         });
         if (mode === 'released_existing_error') {
           existingErrorPart = client.contentParts.find((part) => part.type === 'error');
-          Object.assign(existingErrorPart, { retry_after_seconds: 5, capacity_class: 'resource_pressure' });
+          Object.assign(existingErrorPart, {
+            retry_after_seconds: 5,
+            capacity_class: 'resource_pressure',
+          });
         }
         throw error;
       });
-      await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
       await jest.advanceTimersByTimeAsync(120);
       await Promise.resolve();
-      const save = mockSaveMessage.mock.calls.find(([, message, context]) =>
-        message.messageId === 'resp-msg-1' && message.error === true &&
-        context.context === 'api/server/controllers/agents/request.js - generation error snapshot');
+      const save = mockSaveMessage.mock.calls.find(
+        ([, message, context]) =>
+          message.messageId === 'resp-msg-1' &&
+          message.error === true &&
+          context.context ===
+            'api/server/controllers/agents/request.js - generation error snapshot',
+      );
       expect(save).toBeDefined();
-      expect(save[1]).toMatchObject({ error: true, text: 'Known partial progress.', unfinished: false });
-      if (released) expect(save[1].content).toContainEqual(expect.objectContaining({
-        type: 'error', error_class: 'host_capacity', error: 'Local AI capacity is busy. Please try again shortly.',
-      }));
+      expect(save[1]).toMatchObject({
+        error: true,
+        text: 'Known partial progress.',
+        unfinished: false,
+      });
+      if (released)
+        expect(save[1].content).toContainEqual(
+          expect.objectContaining({
+            type: 'error',
+            error_class: 'host_capacity',
+            error: 'Local AI capacity is busy. Please try again shortly.',
+          }),
+        );
       else expect(save[1].content.some((part) => part.type === 'error')).toBe(true);
       if (mode === 'released_existing_error') {
-        const capacityErrors = save[1].content.filter((part) => part.type === 'error' && part.error_class === 'host_capacity');
+        const capacityErrors = save[1].content.filter(
+          (part) => part.type === 'error' && part.error_class === 'host_capacity',
+        );
         expect(capacityErrors).toHaveLength(1);
         expect(capacityErrors[0]).toEqual(existingErrorPart);
-        expect(capacityErrors[0]).toMatchObject({ retry_after_seconds: 5, capacity_class: 'resource_pressure' });
+        expect(capacityErrors[0]).toMatchObject({
+          retry_after_seconds: 5,
+          capacity_class: 'resource_pressure',
+        });
         expect(save[1].text).not.toContain('Generation interrupted before completion.');
       }
       expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
@@ -487,45 +630,90 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     },
   );
 
-
-  test.each(['released', 'unknown', 'wrong_stream', 'wrong_owner', 'wrong_message', 'wrong_generation', 'new_invocation', 'new_body', 'healthy_fallback'])(
-    'failed unsupported host continuation closes while healthy fallback keeps its delivery owner: %s', async (mode) => {
+  test.each([
+    'released',
+    'unknown',
+    'wrong_stream',
+    'wrong_owner',
+    'wrong_message',
+    'wrong_generation',
+    'new_invocation',
+    'new_body',
+    'healthy_fallback',
+  ])(
+    'failed unsupported host continuation closes while healthy fallback keeps its delivery owner: %s',
+    async (mode) => {
       const req = makeReq();
       req.body.voiceMode = true;
-      setTrustedInteractionContext(req, {
-        actor_kind: 'external_user', origin: 'interactive', surface: 'voice',
-        conversation_id: 'conv-1', revision: 1, source_event_id: 'voice-source',
-      }, { segment_stability: 'immediate', supersede_scope: 'response_only' },
-      { commit_authority: 'external_adapter' });
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'voice',
+          conversation_id: 'conv-1',
+          revision: 1,
+          source_event_id: 'voice-source',
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_only' },
+        { commit_authority: 'external_adapter' },
+      );
       mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
       const client = makeClient(Promise.resolve());
       client.contentParts = [{ type: 'text', text: 'Known partial progress.' }];
       const original = client.sendMessage.getMockImplementation();
       client.sendMessage.mockImplementation(async (...args) => {
         const result = await original(...args);
-        const identity = { streamId: req._resumableStreamId, jobCreatedAt: 1, userId: 'user-1',
-          responseMessageId: 'resp-msg-1', invocationId: 'current', bodySha256: 'a'.repeat(64) };
-        req._viventiumNativeResponseIdentity = identity;
-        if (mode !== 'unknown') req._viventiumNativeResponseUnaccepted = { ...identity, terminalErrorConfirmed: true,
-          ...(mode === 'wrong_stream' ? { streamId: 'foreign' } : {}),
-          ...(mode === 'wrong_owner' ? { userId: 'foreign' } : {}),
-          ...(mode === 'wrong_message' ? { responseMessageId: 'foreign' } : {}),
-          ...(mode === 'wrong_generation' ? { jobCreatedAt: 2 } : {}),
-          ...(mode === 'new_invocation' ? { invocationId: 'prior' } : {}),
-          ...(mode === 'new_body' ? { bodySha256: 'b'.repeat(64) } : {}),
+        const identity = {
+          streamId: req._resumableStreamId,
+          jobCreatedAt: 1,
+          userId: 'user-1',
+          responseMessageId: 'resp-msg-1',
+          invocationId: 'current',
+          bodySha256: 'a'.repeat(64),
         };
-        mockGetNativeResponse.mockResolvedValue({ nativeResponse: { ...identity, status: 'unsupported' } });
-        result.content = mode === 'healthy_fallback' ? [{ type: 'text', text: 'The answer.' }] : [
-          { type: 'error', error_class: 'host_capacity', error: 'Local AI capacity is busy. Please try again shortly.' },
-        ];
+        req._viventiumNativeResponseIdentity = identity;
+        if (mode !== 'unknown')
+          req._viventiumNativeResponseUnaccepted = {
+            ...identity,
+            terminalErrorConfirmed: true,
+            ...(mode === 'wrong_stream' ? { streamId: 'foreign' } : {}),
+            ...(mode === 'wrong_owner' ? { userId: 'foreign' } : {}),
+            ...(mode === 'wrong_message' ? { responseMessageId: 'foreign' } : {}),
+            ...(mode === 'wrong_generation' ? { jobCreatedAt: 2 } : {}),
+            ...(mode === 'new_invocation' ? { invocationId: 'prior' } : {}),
+            ...(mode === 'new_body' ? { bodySha256: 'b'.repeat(64) } : {}),
+          };
+        mockGetNativeResponse.mockResolvedValue({
+          nativeResponse: { ...identity, status: 'unsupported' },
+        });
+        result.content =
+          mode === 'healthy_fallback'
+            ? [{ type: 'text', text: 'The answer.' }]
+            : [
+                {
+                  type: 'error',
+                  error_class: 'host_capacity',
+                  error: 'Local AI capacity is busy. Please try again shortly.',
+                },
+              ];
         return result;
       });
-      await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
       await jest.advanceTimersByTimeAsync(120);
-      const save = mockSaveMessage.mock.calls.find(([, , context]) =>
-        context.context === (mode !== 'healthy_fallback' ?
-          'api/server/controllers/agents/request.js - generation error snapshot' :
-          'native graph continuation owned by the host'));
+      const save = mockSaveMessage.mock.calls.find(
+        ([, , context]) =>
+          context.context ===
+          (mode !== 'healthy_fallback'
+            ? 'api/server/controllers/agents/request.js - generation error snapshot'
+            : 'native graph continuation owned by the host'),
+      );
       expect(save).toBeDefined();
       if (mode !== 'healthy_fallback') {
         expect(save[1].unfinished).toBe(false);
@@ -533,8 +721,13 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         expect(mockGenerationJobManager.markMainResponseComplete).not.toHaveBeenCalled();
         expect(mockCommitAcceptedMainTurn).not.toHaveBeenCalled();
       } else {
-        expect(mockSaveMessage.mock.calls.some(([, , context]) =>
-          context.context === 'api/server/controllers/agents/request.js - generation error snapshot')).toBe(false);
+        expect(
+          mockSaveMessage.mock.calls.some(
+            ([, , context]) =>
+              context.context ===
+              'api/server/controllers/agents/request.js - generation error snapshot',
+          ),
+        ).toBe(false);
       }
       expect(mockGenerationJobManager.failRevokedNativeResponse).not.toHaveBeenCalled();
     },
@@ -613,38 +806,68 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     },
   );
   test.each(['flag_only', 'typed_error', 'authored_partial'])(
-    'an externally acknowledged unsupported host failure closes without a pending ACK (%s)', async (kind) => {
+    'an externally acknowledged unsupported host failure closes without a pending ACK (%s)',
+    async (kind) => {
       const req = makeReq();
       req.body.voiceMode = true;
       req.body.viventiumVoiceTaskId = 'task-failed-host';
       req.body.streamId = 'stream-1';
       req.viventiumCallSession = { callSessionId: 'call-1' };
-      setTrustedInteractionContext(req, {
-        actor_kind: 'external_user', origin: 'interactive', surface: 'voice',
-        conversation_id: 'conv-1', revision: 1, source_event_id: 'voice-failed-fallback',
-      }, { segment_stability: 'immediate', supersede_scope: 'response_only' },
-      { commit_authority: 'external_adapter' });
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'voice',
+          conversation_id: 'conv-1',
+          revision: 1,
+          source_event_id: 'voice-failed-fallback',
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_only' },
+        { commit_authority: 'external_adapter' },
+      );
       req._viventiumNativeResponseIdentity = { invocationId: 'unsupported-host' };
       mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
       mockGetNativeResponse.mockResolvedValue({ nativeResponse: { status: 'unsupported' } });
       const client = makeClient(Promise.resolve());
       client.admitMemoryWriter = jest.fn(async () => true);
       const addTitle = jest.fn();
-      const part = { type: 'error', error_class: 'source_context_unavailable',
-        error: 'The conversation context could not be preserved. Please retry this turn.' };
-      const cortex = { type: 'cortex_insight', cortex_id: 'supporting-evidence', insight: 'Private supporting evidence.' };
-      const content = [cortex, ...(kind === 'typed_error' ? [part] : []),
-        ...(kind === 'authored_partial' ? [{ type: 'text', text: 'Saved partial words.' }] : [])];
+      const part = {
+        type: 'error',
+        error_class: 'source_context_unavailable',
+        error: 'The conversation context could not be preserved. Please retry this turn.',
+      };
+      const cortex = {
+        type: 'cortex_insight',
+        cortex_id: 'supporting-evidence',
+        insight: 'Private supporting evidence.',
+      };
+      const content = [
+        cortex,
+        ...(kind === 'typed_error' ? [part] : []),
+        ...(kind === 'authored_partial' ? [{ type: 'text', text: 'Saved partial words.' }] : []),
+      ];
       const original = client.sendMessage.getMockImplementation();
       client.sendMessage.mockImplementation(async (...args) => ({
-        ...await original(...args), error: true, content,
+        ...(await original(...args)),
+        error: true,
+        content,
         text: kind === 'authored_partial' ? 'Saved partial words.' : '',
       }));
-      await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), addTitle);
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        addTitle,
+      );
       await jest.advanceTimersByTimeAsync(120);
-      const save = mockSaveMessage.mock.calls.find(([, message, context]) =>
-        message.messageId === 'resp-msg-1' && context.context ===
-        'api/server/controllers/agents/request.js - generation error snapshot');
+      const save = mockSaveMessage.mock.calls.find(
+        ([, message, context]) =>
+          message.messageId === 'resp-msg-1' &&
+          context.context ===
+            'api/server/controllers/agents/request.js - generation error snapshot',
+      );
       expect(save).toBeDefined();
       expect(save[1]).toMatchObject({ error: true, unfinished: false });
       expect(save[1].content).toContainEqual(cortex);
@@ -652,7 +875,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       expect(save[1].text).toBe(kind === 'authored_partial' ? 'Saved partial words.' : '');
       expect(client.admitMemoryWriter).not.toHaveBeenCalled();
       expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
-        'task-failed-host', expect.objectContaining({ streamId: 'stream-1' }),
+        'task-failed-host',
+        expect.objectContaining({ streamId: 'stream-1' }),
         { error: expect.any(Error) },
       );
       expect(mockGenerationJobManager.emitDone).not.toHaveBeenCalled();
@@ -666,13 +890,16 @@ describe('ResumableAgentController Phase B stream completion window', () => {
   );
 
   test.each(['settled', 'user_cancelled', 'superseded'])(
-    'an error-publication failure preserves the %s presentation owner', async (mode) => {
+    'an error-publication failure preserves the %s presentation owner',
+    async (mode) => {
       const req = makeReq();
       req.body.streamId = 'stream-1';
       const signal = { aborted: false };
       mockGenerationJobManager.createJob.mockResolvedValue({
-        createdAt: 1, abortController: { signal, abort: jest.fn() },
-        readyPromise: Promise.resolve(), emitter: new EventEmitter(),
+        createdAt: 1,
+        abortController: { signal, abort: jest.fn() },
+        readyPromise: Promise.resolve(),
+        emitter: new EventEmitter(),
       });
       const client = makeClient(Promise.resolve());
       client.contentParts = [{ type: 'text', text: 'Partial authored words.' }];
@@ -688,13 +915,26 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         }
         throw Object.assign(new Error('Public failure.'), { code: 'source_context_unavailable' });
       });
-      await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
       await jest.advanceTimersByTimeAsync(120);
-      const outer = mockSaveMessage.mock.calls.filter(([, , context]) =>
-        context.context === 'api/server/controllers/agents/request.js - unhandled generation error snapshot');
+      const outer = mockSaveMessage.mock.calls.filter(
+        ([, , context]) =>
+          context.context ===
+          'api/server/controllers/agents/request.js - unhandled generation error snapshot',
+      );
       if (mode === 'settled') {
         expect(outer).toHaveLength(1);
-        expect(outer[0][1]).toMatchObject({ error: true, unfinished: false, text: 'Partial authored words.' });
+        expect(outer[0][1]).toMatchObject({
+          error: true,
+          unfinished: false,
+          text: 'Partial authored words.',
+        });
         expect(outer[0][1].content.filter((item) => item.type === 'error')).toHaveLength(1);
       } else {
         expect(outer).toHaveLength(0);
@@ -712,9 +952,18 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       { type: 'cortex_insight', cortex_id: 'synthetic-cortex', insight: 'Retained insight.' },
     ];
     client.sendMessage.mockImplementation(async (...args) => ({
-      ...await original(...args), text: '', content, error: false,
+      ...(await original(...args)),
+      text: '',
+      content,
+      error: false,
     }));
-    await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
     await jest.advanceTimersByTimeAsync(120);
     expect(mockSaveMessage).toHaveBeenCalledWith(
       req,
@@ -724,7 +973,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
   });
 
   test.each(['', 'Partial authored words.'])(
-    'a thrown completion failure retains failed truth and authored text (%s)', async (text) => {
+    'a thrown completion failure retains failed truth and authored text (%s)',
+    async (text) => {
       const req = makeReq();
       const client = makeClient(Promise.resolve());
       const original = client.sendMessage.getMockImplementation();
@@ -736,11 +986,22 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         await original(...args);
         throw Object.assign(new Error('Public failure.'), { code: 'source_context_unavailable' });
       });
-      await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+      await AgentController(
+        req,
+        makeRes(),
+        jest.fn(),
+        jest.fn(async () => ({ client })),
+        jest.fn(),
+      );
       await jest.advanceTimersByTimeAsync(120);
       expect(mockSaveMessage).toHaveBeenCalledWith(
         req,
-        expect.objectContaining({ messageId: 'resp-msg-1', error: true, unfinished: false, ...(text ? { text } : {}) }),
+        expect.objectContaining({
+          messageId: 'resp-msg-1',
+          error: true,
+          unfinished: false,
+          ...(text ? { text } : {}),
+        }),
         expect.any(Object),
       );
     },
@@ -933,40 +1194,58 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     const streamId = 'conv-1';
     await manager.createJob(streamId, 'user-1', 'conv-1', {
       interactionContext: {
-        actor_kind: 'external_user', origin: 'interactive',
-        surface: mode === 'current_voice' ? 'voice' : mode === 'current_telegram' ? 'telegram' : 'web',
-        conversation_id: 'conv-1', revision: 1, source_event_id: 'user-msg-1',
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface:
+          mode === 'current_voice' ? 'voice' : mode === 'current_telegram' ? 'telegram' : 'web',
+        conversation_id: 'conv-1',
+        revision: 1,
+        source_event_id: 'user-msg-1',
       },
     });
     await manager.updateMetadata(streamId, {
-      responseMessageId: 'resp-msg-1', userMessage: { messageId: 'user-msg-1' },
+      responseMessageId: 'resp-msg-1',
+      userMessage: { messageId: 'user-msg-1' },
     });
     const job = await store.getJob(streamId);
     const claim = { interactionContext: job.interactionContext };
     const identity = {
-      userId: 'user-1', conversationId: 'conv-1', responseMessageId: 'resp-msg-1',
-      streamId, jobCreatedAt: job.createdAt,
+      userId: 'user-1',
+      conversationId: 'conv-1',
+      responseMessageId: 'resp-msg-1',
+      streamId,
+      jobCreatedAt: job.createdAt,
       logicalTurnId: claim.interactionContext.logical_turn_id,
       revision: claim.interactionContext.revision,
-      invocationId: 'native-invocation', bodySha256: 'a'.repeat(64),
-      providerId: 'synthetic-provider', agentId: 'synthetic-agent', originSha256: 'b'.repeat(64),
+      invocationId: 'native-invocation',
+      bodySha256: 'a'.repeat(64),
+      providerId: 'synthetic-provider',
+      agentId: 'synthetic-agent',
+      originSha256: 'b'.repeat(64),
       source: { id: 'synthetic-source-id', messageId: 'user-msg-1', digest: 'c'.repeat(64) },
-      admittedAt: Date.now(), recoverUntil: Date.now() + 86_400_000,
+      admittedAt: Date.now(),
+      recoverUntil: Date.now() + 86_400_000,
     };
     expect(await manager.bindNativeResponse(identity)).toBe(true);
     if (mode === 'committed' || mode === 'committed_pending') {
       await manager.commitNativeResponse(identity, 'd'.repeat(64));
       if (mode === 'committed') {
         await manager.finishNativeResponse(identity, {
-          final: true, responseMessage: { messageId: identity.responseMessageId, text: 'Accepted answer.' },
+          final: true,
+          responseMessage: { messageId: identity.responseMessageId, text: 'Accepted answer.' },
         });
       }
     } else if (mode !== 'unrevoked') {
       await manager.revokeNativeResponse(identity);
       if (mode === 'stopped') {
-        await manager.finishNativeResponse(identity, {
-          final: true, responseMessage: { messageId: identity.responseMessageId, text: 'Stopped partial.' },
-        }, 'cancelled');
+        await manager.finishNativeResponse(
+          identity,
+          {
+            final: true,
+            responseMessage: { messageId: identity.responseMessageId, text: 'Stopped partial.' },
+          },
+          'cancelled',
+        );
       }
     }
     let supplied = { ...identity };
@@ -975,23 +1254,34 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     if (mode === 'wrong_incarnation') supplied.jobCreatedAt += 1;
     if (mode === 'other_stream') {
       const otherClaim = await store.claimLogicalTurn('another-stream', 'user-1', {
-        actor_kind: 'external_user', origin: 'interactive', surface: 'web',
-        conversation_id: 'another-conversation', revision: 1, source_event_id: 'another-source',
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'web',
+        conversation_id: 'another-conversation',
+        revision: 1,
+        source_event_id: 'another-source',
       });
       const other = await store.createJob('another-stream', 'user-1', 'another-conversation', {
-        responseMessageId: 'another-answer', interactionContext: otherClaim.interactionContext,
+        responseMessageId: 'another-answer',
+        interactionContext: otherClaim.interactionContext,
         userMessage: { messageId: 'user-msg-1' },
       });
-      supplied = { ...identity, streamId: other.streamId, jobCreatedAt: other.createdAt,
-        conversationId: other.conversationId, responseMessageId: other.responseMessageId,
+      supplied = {
+        ...identity,
+        streamId: other.streamId,
+        jobCreatedAt: other.createdAt,
+        conversationId: other.conversationId,
+        responseMessageId: other.responseMessageId,
         logicalTurnId: otherClaim.interactionContext.logical_turn_id,
-        revision: otherClaim.interactionContext.revision };
+        revision: otherClaim.interactionContext.revision,
+      };
       expect(await manager.bindNativeResponse(supplied)).toBe(true);
       await manager.revokeNativeResponse(supplied);
     }
     if (mode === 'superseded') {
       await store.claimLogicalTurn('newer-stream', 'user-1', {
-        ...claim.interactionContext, revision: claim.interactionContext.revision + 1,
+        ...claim.interactionContext,
+        revision: claim.interactionContext.revision + 1,
         source_event_id: 'newer-source',
       });
     }
@@ -1012,35 +1302,51 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       req.body.streamId = streamId;
     }
     if (mode !== 'non_native') req._viventiumNativeResponseIdentity = supplied;
-    const code = mode === 'untyped' ? undefined
-      : mode === 'different_error' ? 'source_context_unavailable' : 'native_response_message_deleted';
+    const code =
+      mode === 'untyped'
+        ? undefined
+        : mode === 'different_error'
+          ? 'source_context_unavailable'
+          : 'native_response_message_deleted';
     const error = Object.assign(new Error('native_response_message_deleted'), code ? { code } : {});
     const client = makeClient(Promise.resolve());
     client.sendMessage.mockRejectedValueOnce(error);
     mockGenerationJobManager.createJob.mockResolvedValueOnce({
       createdAt: job.createdAt,
       abortController: { signal: { aborted: false }, abort: jest.fn() },
-      readyPromise: Promise.resolve(), emitter: new EventEmitter(),
+      readyPromise: Promise.resolve(),
+      emitter: new EventEmitter(),
     });
     mockGenerationJobManager.getJob.mockImplementation(async () => ({ createdAt: job.createdAt }));
     // Use the actual identity fence and producer cleanup for revoked and Stop owners. Other
     // refusals keep generic finalization mocked to isolate this candidate's store mutation.
-    mockGenerationJobManager.failRevokedNativeResponse.mockImplementationOnce(
-      (...args) => manager.failRevokedNativeResponse(...args),
+    mockGenerationJobManager.failRevokedNativeResponse.mockImplementationOnce((...args) =>
+      manager.failRevokedNativeResponse(...args),
     );
     if (shouldFailRevoked || mode === 'stopped') {
-      mockGenerationJobManager.completeJob.mockImplementationOnce(
-        (...args) => manager.completeJob(...args),
+      mockGenerationJobManager.completeJob.mockImplementationOnce((...args) =>
+        manager.completeJob(...args),
       );
     }
-    await AgentController(req, makeRes(), jest.fn(), jest.fn(async () => ({ client })), jest.fn());
+    await AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => ({ client })),
+      jest.fn(),
+    );
     await jest.advanceTimersByTimeAsync(120);
     await Promise.resolve();
     if (shouldFailRevoked) {
-      expect(await store.getJob(streamId)).toMatchObject({ status: 'error',
-        error: 'The model provider could not complete this request.' });
+      expect(await store.getJob(streamId)).toMatchObject({
+        status: 'error',
+        error: 'The model provider could not complete this request.',
+      });
       expect(publicErrors).toHaveBeenCalledTimes(1);
-      expect(publicErrors).toHaveBeenCalledWith(streamId, 'The model provider could not complete this request.');
+      expect(publicErrors).toHaveBeenCalledWith(
+        streamId,
+        'The model provider could not complete this request.',
+      );
       expect(mockGenerationJobManager.emitError).not.toHaveBeenCalled();
       expect(manager.hasLocalNativeResponseProducer(identity)).toBe(false);
     } else {
@@ -1062,13 +1368,16 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       expect(mockGenerationJobManager.failRevokedNativeResponse).not.toHaveBeenCalled();
     } else if (shouldFailRevoked) {
       expect(mockGenerationJobManager.failRevokedNativeResponse).toHaveBeenCalledWith(
-        supplied, 'The model provider could not complete this request.',
+        supplied,
+        'The model provider could not complete this request.',
       );
     }
     if (mode === 'other_stream') {
       expect(await store.getJob('another-stream')).toMatchObject({ status: 'running' });
     }
-    expect(JSON.stringify(publicErrors.mock.calls)).not.toContain('native_response_message_deleted');
+    expect(JSON.stringify(publicErrors.mock.calls)).not.toContain(
+      'native_response_message_deleted',
+    );
     mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 1 });
     mockGenerationJobManager.failRevokedNativeResponse.mockReset();
   });
@@ -1401,25 +1710,52 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     async (surface) => {
       const req = makeReq();
       req._resumableStreamId = 'old-stream';
-      const context = { actor_kind: 'human', origin: 'interactive', surface,
-        conversation_id: 'conv-1', source_event_id: 'source-old',
-        logical_turn_id: 'turn-old', revision: 1 };
-      setTrustedInteractionContext(req, context,
+      const context = {
+        actor_kind: 'human',
+        origin: 'interactive',
+        surface,
+        conversation_id: 'conv-1',
+        source_event_id: 'source-old',
+        logical_turn_id: 'turn-old',
+        revision: 1,
+      };
+      setTrustedInteractionContext(
+        req,
+        context,
         { segment_stability: 'provisional', supersede_scope: 'response_only' },
-        { commit_authority: 'external_adapter' });
-      const receipt = { effect_kind: 'durable_work_accepted', effect_ref: 'work-old',
-        source_event_id: 'source-old', response_message_id: 'answer-old', committed_at: 1 };
-      mockGenerationJobManager.getJob.mockResolvedValue({ status: 'superseded',
-        interactionContext: context, responseMessageId: 'answer-old',
+        { commit_authority: 'external_adapter' },
+      );
+      const receipt = {
+        effect_kind: 'durable_work_accepted',
+        effect_ref: 'work-old',
+        source_event_id: 'source-old',
+        response_message_id: 'answer-old',
+        committed_at: 1,
+      };
+      mockGenerationJobManager.getJob.mockResolvedValue({
+        status: 'superseded',
+        interactionContext: context,
+        responseMessageId: 'answer-old',
         adapterCapabilities: { supersede_scope: 'response_only' },
-        deliveryPolicy: { commit_authority: 'external_adapter' }, durableEffectReceipt: receipt });
-      const result = await AgentController.__testables.timedSaveMessage(req,
-        { messageId: 'answer-old', conversationId: 'conv-1', isCreatedByUser: false,
-          text: 'Accepted operation.' }, {}, 'db_save_test');
+        deliveryPolicy: { commit_authority: 'external_adapter' },
+        durableEffectReceipt: receipt,
+      });
+      const result = await AgentController.__testables.timedSaveMessage(
+        req,
+        {
+          messageId: 'answer-old',
+          conversationId: 'conv-1',
+          isCreatedByUser: false,
+          text: 'Accepted operation.',
+        },
+        {},
+        'db_save_test',
+      );
       expect(result).toEqual({ suppressed: true, reason: 'superseded' });
       expect(mockSaveMessage).not.toHaveBeenCalled();
       expect(mockMessageFindOneAndDelete).toHaveBeenCalledWith(
-        expect.objectContaining({ messageId: 'answer-old', unfinished: true }));
+        expect.objectContaining({ messageId: 'answer-old', unfinished: true }),
+      );
       expect((await mockGenerationJobManager.getJob()).durableEffectReceipt).toEqual(receipt);
     },
   );
@@ -1722,7 +2058,10 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         reason === 'superseded'
           ? {}
           : {
-              error: { code: 'generation_aborted', message: 'Request aborted during initialization' },
+              error: {
+                code: 'generation_aborted',
+                message: 'Request aborted during initialization',
+              },
             },
       );
       expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
@@ -2059,14 +2398,26 @@ describe('ResumableAgentController Phase B stream completion window', () => {
 
   test('an externally delivered graph prepares its writer before FINAL and admits it once after acceptance', async () => {
     const req = makeReq();
-    setTrustedInteractionContext(req, {
-      actor_kind: 'external_user', origin: 'interactive', surface: 'telegram',
-      conversation_id: 'conv-1', revision: 1, source_event_id: 'telegram-graph-source',
-    }, { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
-    { commit_authority: 'external_adapter' });
-    Object.defineProperty(req, '_viventiumAcceptedMainCompactionIdentityV1', { value: {
-      ownerId: req.user.id, agentId: 'agent', stableAuthoritySha256: 'a'.repeat(64),
-    } });
+    setTrustedInteractionContext(
+      req,
+      {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conv-1',
+        revision: 1,
+        source_event_id: 'telegram-graph-source',
+      },
+      { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
+      { commit_authority: 'external_adapter' },
+    );
+    Object.defineProperty(req, '_viventiumAcceptedMainCompactionIdentityV1', {
+      value: {
+        ownerId: req.user.id,
+        agentId: 'agent',
+        stableAuthoritySha256: 'a'.repeat(64),
+      },
+    });
     req._viventiumNativeResponseIdentity = { invocationId: 'unsupported-graph' };
     mockRecoverSavedNativeResponse.mockResolvedValueOnce(null);
     mockGetNativeResponse.mockResolvedValueOnce({ nativeResponse: { status: 'unsupported' } });
@@ -2080,8 +2431,10 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     expect(client.prepareDeferredMemoryWriter).toHaveBeenCalledTimes(1);
     expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
     expect(client.admitMemoryWriter).not.toHaveBeenCalled();
-    expect(mockGenerationJobManager.emitDone).toHaveBeenCalledWith(expect.any(String),
-      expect.objectContaining({ memoryWriterScheduled: true }));
+    expect(mockGenerationJobManager.emitDone).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ memoryWriterScheduled: true }),
+    );
     // Disposal happens before the authenticated adapter ACK. Both captured follow-ups survive it.
     client.options = null;
     const { scheduleExternallyAcceptedMainCompaction } = require('@librechat/api');
@@ -2089,55 +2442,90 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     for (const status of ['failed', 'partial', 'removed']) {
       expect(scheduleExternallyAcceptedMainCompaction(presentation, { status })).toBe(false);
     }
-    expect(scheduleExternallyAcceptedMainCompaction({ ...presentation, userId: 'foreign' },
-      { status: 'committed' })).toBe(false);
-    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' })).toBe(true);
+    expect(
+      scheduleExternallyAcceptedMainCompaction(
+        { ...presentation, userId: 'foreign' },
+        { status: 'committed' },
+      ),
+    ).toBe(false);
+    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' })).toBe(
+      true,
+    );
     await Promise.resolve();
     expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
     expect(mockEnsureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
-    expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' })).toBe(false);
+    expect(
+      scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' }),
+    ).toBe(false);
     expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
   });
 
   test.each(['server', 'external_adapter'])(
-    'R15 native FINAL precedes memory graph preparation and accepted admission (%s)', async (authority) => {
+    'R15 native FINAL precedes memory graph preparation and accepted admission (%s)',
+    async (authority) => {
       const req = makeReq();
-      setTrustedInteractionContext(req, {
-        actor_kind: 'external_user', origin: 'interactive', surface: authority === 'server' ? 'web' : 'telegram',
-        conversation_id: 'conv-1', revision: 1, source_event_id: 'native-memory-source',
-      }, { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
-      { commit_authority: authority });
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: authority === 'server' ? 'web' : 'telegram',
+          conversation_id: 'conv-1',
+          revision: 1,
+          source_event_id: 'native-memory-source',
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_and_authoring' },
+        { commit_authority: authority },
+      );
       req._viventiumNativeResponseIdentity = { invocationId: 'native-memory' };
       const presentation = { userId: req.user.id, responseMessageId: 'resp-msg-1' };
-      mockGenerationJobManager.acknowledgeStreamDelivery.mockResolvedValue({ status: 'recorded', presentation });
+      mockGenerationJobManager.acknowledgeStreamDelivery.mockResolvedValue({
+        status: 'recorded',
+        presentation,
+      });
       let finishPreparation;
-      const graphPreparation = new Promise((resolve) => { finishPreparation = resolve; });
+      const graphPreparation = new Promise((resolve) => {
+        finishPreparation = resolve;
+      });
       const client = makeClient(Promise.resolve());
       client.prepareDeferredMemoryWriter = jest.fn(() => true);
       client.startDeferredMemoryWriter = jest.fn(() => graphPreparation);
       client.admitMemoryWriter = jest.fn(() => graphPreparation);
       await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), jest.fn());
       await jest.advanceTimersByTimeAsync(120);
-      expect(mockGenerationJobManager.finishNativeResponse).toHaveBeenCalledWith(expect.anything(),
-        expect.objectContaining({ memoryWriterScheduled: true }));
+      expect(mockGenerationJobManager.finishNativeResponse).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ memoryWriterScheduled: true }),
+      );
       expect(client.prepareDeferredMemoryWriter).toHaveBeenCalledTimes(1);
       expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
       if (authority === 'server') {
         expect(mockCommitAcceptedMainTurn).toHaveBeenCalled();
         expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
-        expect(mockGenerationJobManager.finishNativeResponse.mock.invocationCallOrder[0])
-          .toBeLessThan(client.admitMemoryWriter.mock.invocationCallOrder[0]);
+        expect(
+          mockGenerationJobManager.finishNativeResponse.mock.invocationCallOrder[0],
+        ).toBeLessThan(client.admitMemoryWriter.mock.invocationCallOrder[0]);
       } else {
         expect(client.admitMemoryWriter).not.toHaveBeenCalled();
         client.options = null;
         const { scheduleExternallyAcceptedMainCompaction } = require('@librechat/api');
-        expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'partial' })).toBe(false);
-        expect(scheduleExternallyAcceptedMainCompaction({ ...presentation, userId: 'foreign' },
-          { status: 'committed' })).toBe(false);
-        expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' })).toBe(true);
+        expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'partial' })).toBe(
+          false,
+        );
+        expect(
+          scheduleExternallyAcceptedMainCompaction(
+            { ...presentation, userId: 'foreign' },
+            { status: 'committed' },
+          ),
+        ).toBe(false);
+        expect(
+          scheduleExternallyAcceptedMainCompaction(presentation, { status: 'committed' }),
+        ).toBe(true);
         await Promise.resolve();
         expect(client.admitMemoryWriter).toHaveBeenCalledTimes(1);
-        expect(scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' })).toBe(false);
+        expect(
+          scheduleExternallyAcceptedMainCompaction(presentation, { status: 'already_committed' }),
+        ).toBe(false);
       }
       finishPreparation(true);
       await Promise.resolve();
@@ -2204,10 +2592,12 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       unfinished: true,
       'metadata.viventium.interactionContext.logical_turn_id': 'logical-a-c',
       'metadata.viventium.interactionContext.revision': 1,
-      $nor: [{
-        'nativeResponse.status': 'cancelled',
-        'nativeResponse.stopSnapshotStoredAt': { $gt: 0 },
-      }],
+      $nor: [
+        {
+          'nativeResponse.status': 'cancelled',
+          'nativeResponse.stopSnapshotStoredAt': { $gt: 0 },
+        },
+      ],
     });
     expect(mockConversationUpdateOne).toHaveBeenCalledWith(
       { user: 'user-1', conversationId: 'conv-1' },
@@ -2670,38 +3060,90 @@ describe('voice task cancellation persistence barrier', () => {
 });
 
 describe('rapid input before asynchronous initialization', () => {
-  test('original Web receipt precedes awaited admission and does not use preparation completion time',async()=>{
-    const clock=jest.spyOn(Date,'now').mockReturnValue(1000);
-    const admission=deferred();mockCheckAndIncrementPendingRequest.mockImplementationOnce(()=>admission.promise);
-    const req=makeReq();req.body.streamId='stream-1';
-    mockGenerationJobManager.createJob.mockResolvedValue({streamId:'stream-1',abortController:new AbortController(),emitter:new EventEmitter()});
-    const request=AgentController(req,makeRes(),jest.fn(),jest.fn(async()=>{throw new Error('Synthetic initialization stop');}),jest.fn());
-    await Promise.resolve();clock.mockReturnValue(5000);
-    admission.resolve({allowed:true,pendingRequests:0,limit:10});
-    try {await request;
-      const context=require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
+  test('original Web receipt precedes awaited admission and does not use preparation completion time', async () => {
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(1000);
+    const admission = deferred();
+    mockCheckAndIncrementPendingRequest.mockImplementationOnce(() => admission.promise);
+    const req = makeReq();
+    req.body.streamId = 'stream-1';
+    mockGenerationJobManager.createJob.mockResolvedValue({
+      streamId: 'stream-1',
+      abortController: new AbortController(),
+      emitter: new EventEmitter(),
+    });
+    const request = AgentController(
+      req,
+      makeRes(),
+      jest.fn(),
+      jest.fn(async () => {
+        throw new Error('Synthetic initialization stop');
+      }),
+      jest.fn(),
+    );
+    await Promise.resolve();
+    clock.mockReturnValue(5000);
+    admission.resolve({ allowed: true, pendingRequests: 0, limit: 10 });
+    try {
+      await request;
+      const context =
+        require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
       expect(context.source_received_at).toBe(1000);
       expect(context.source_segments[0].source_received_at).toBe(1000);
-    } finally {clock.mockRestore();}
+    } finally {
+      clock.mockRestore();
+    }
   });
 
-  test.each([['new',null,2000],['retained',{metadata:{viventium:{originalInputReceipt:{sourceEventId:'source-a',receivedAt:1000}}}},1000],['legacy',{},undefined]])(
-    'preserves server original input receipt for %s without re-admission backfill',async (_name,original,expected)=>{
-      const req=makeReq();
-      req.body.metadata={viventium:{originalInputReceipt:{sourceEventId:'source-a',receivedAt:999999}}};
-      setTrustedInteractionContext(req,{actor_kind:'external_user',origin:'interactive',surface:'telegram',
-        conversation_id:'conv-1',source_event_id:'source-a',source_received_at:2000});
-      mockOriginalMessage.mockImplementationOnce(async()=>original);
-      const result=await AgentController.captureAcceptedInteractionInput(req,{conversationId:'conv-1',text:'Owner reply'});
-      expect(mockOriginalMessage).toHaveBeenCalledWith(expect.objectContaining({user:req.user.id,
-        conversationId:'conv-1',isCreatedByUser:true}));
+  test.each([
+    ['new', null, 2000],
+    [
+      'retained',
+      {
+        metadata: {
+          viventium: { originalInputReceipt: { sourceEventId: 'source-a', receivedAt: 1000 } },
+        },
+      },
+      1000,
+    ],
+    ['legacy', {}, undefined],
+  ])(
+    'preserves server original input receipt for %s without re-admission backfill',
+    async (_name, original, expected) => {
+      const req = makeReq();
+      req.body.metadata = {
+        viventium: { originalInputReceipt: { sourceEventId: 'source-a', receivedAt: 999999 } },
+      };
+      setTrustedInteractionContext(req, {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'telegram',
+        conversation_id: 'conv-1',
+        source_event_id: 'source-a',
+        source_received_at: 2000,
+      });
+      mockOriginalMessage.mockImplementationOnce(async () => original);
+      const result = await AgentController.captureAcceptedInteractionInput(req, {
+        conversationId: 'conv-1',
+        text: 'Owner reply',
+      });
+      expect(mockOriginalMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: req.user.id,
+          conversationId: 'conv-1',
+          isCreatedByUser: true,
+        }),
+      );
       expect(result.source_received_at).toBe(expected);
       expect(result.source_segments[0].source_received_at).toBe(expected);
-      if(original) expect(mockSaveMessage).not.toHaveBeenCalled();
-      else expect(mockSaveMessage.mock.calls[0][1].metadata.viventium.originalInputReceipt)
-        .toEqual({sourceEventId:'source-a',receivedAt:2000});
+      if (original) expect(mockSaveMessage).not.toHaveBeenCalled();
+      else
+        expect(mockSaveMessage.mock.calls[0][1].metadata.viventium.originalInputReceipt).toEqual({
+          sourceEventId: 'source-a',
+          receivedAt: 2000,
+        });
       mockOriginalMessage.mockReset();
-  });
+    },
+  );
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -3011,7 +3453,6 @@ describe('rapid input before asynchronous initialization', () => {
   });
 });
 
-
 describe('Voice file delivery outcome', () => {
   const outcome = AgentController.__testables.voiceGenerationOutcome;
   const unavailable = { nativeOutputFile: { version: 1, status: 'unavailable' } };
@@ -3023,7 +3464,8 @@ describe('Voice file delivery outcome', () => {
     const response = { messageId: 'file-result', attachments };
     const before = JSON.stringify(response);
     expect(outcome(response)).toEqual({
-      resultMessageId: 'file-result', deliveryError: { code: 'native_output_file_unavailable' },
+      resultMessageId: 'file-result',
+      deliveryError: { code: 'native_output_file_unavailable' },
     });
     expect(response.attachments).toBe(attachments);
     expect(JSON.stringify(response)).toBe(before);
@@ -3041,10 +3483,13 @@ describe('Voice file delivery outcome', () => {
   });
 
   test('preserves the primary terminal failure when a file is also unavailable', () => {
-    expect(outcome({
-      messageId: 'file-result', attachments: [unavailable],
-      content: [{ type: 'error', error_class: 'provider_timeout', error: 'Provider timed out.' }],
-    })).toEqual({
+    expect(
+      outcome({
+        messageId: 'file-result',
+        attachments: [unavailable],
+        content: [{ type: 'error', error_class: 'provider_timeout', error: 'Provider timed out.' }],
+      }),
+    ).toEqual({
       resultMessageId: 'file-result',
       error: { code: 'provider_timeout', message: 'Provider timed out.' },
     });

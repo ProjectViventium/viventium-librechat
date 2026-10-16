@@ -350,27 +350,46 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
   }, 15000);
 
   test.each(['missing-task', 'mismatched-task'])(
-    'keeps persisted terminal replay fenced with a %s', async (mode) => {
-      const task = mode === 'mismatched-task' ? {
-        taskId: 'foreign-task', callSessionId: 'foreign-call', userId: 'owner-receiver-cas',
-        conversationId: 'conv-receiver-cas',
-      } : null;
+    'keeps persisted terminal replay fenced with a %s',
+    async (mode) => {
+      const task =
+        mode === 'mismatched-task'
+          ? {
+              taskId: 'foreign-task',
+              callSessionId: 'foreign-call',
+              userId: 'owner-receiver-cas',
+              conversationId: 'conv-receiver-cas',
+            }
+          : null;
       mockGetCallSession.mockResolvedValue({
-        callSessionId: 'call-receiver-cas', userId: 'owner-receiver-cas',
-        conversationId: 'conv-receiver-cas', status: 'ended',
+        callSessionId: 'call-receiver-cas',
+        userId: 'owner-receiver-cas',
+        conversationId: 'conv-receiver-cas',
+        status: 'ended',
       });
       mockGetVoiceTaskByStreamId.mockReturnValue(task);
       mockResolveGlassHiveCallbackContext.mockResolvedValue({
-        ...trustedContext(), destinations: [{ surface: 'voice',
-          voiceCallSessionId: 'call-receiver-cas', voiceRequestId: '' }],
+        ...trustedContext(),
+        destinations: [
+          { surface: 'voice', voiceCallSessionId: 'call-receiver-cas', voiceRequestId: '' },
+        ],
       });
       const body = terminalBody(1, 'a', 'Synthetic completed result.', {
-        surface: 'voice', voice_call_session_id: 'call-receiver-cas',
+        surface: 'voice',
+        voice_call_session_id: 'call-receiver-cas',
       });
-      mockMessages.push({ messageId: 'persisted-callback', parentMessageId: 'anchor-receiver-cas',
-        text: '', metadata: { viventium: { type: 'glasshive_worker_callback',
-          callbackId: body.callback_id, callbackKey: body.callback_id,
-        } } });
+      mockMessages.push({
+        messageId: 'persisted-callback',
+        parentMessageId: 'anchor-receiver-cas',
+        text: '',
+        metadata: {
+          viventium: {
+            type: 'glasshive_worker_callback',
+            callbackId: body.callback_id,
+            callbackKey: body.callback_id,
+          },
+        },
+      });
       const response = await callbackRequest(app, body);
       expect(mockCreateVoiceTask).not.toHaveBeenCalled();
       expect(mockSaveMessage).not.toHaveBeenCalled();
@@ -392,7 +411,8 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
         });
         expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenCalledTimes(1);
       }
-    }, 15000,
+    },
+    15000,
   );
 
   test('stops A before its first effect when B wins after A has accepted the real CAS', async () => {

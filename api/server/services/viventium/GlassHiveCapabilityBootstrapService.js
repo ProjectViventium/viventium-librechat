@@ -1187,7 +1187,9 @@ function mergePendingBrokerAuthorizationBundle({
   bundle.env = { ...(bundle.env || {}) };
   delete bundle.env[tokenEnvVar];
   const instruction = brokerContextBrief(allowedServers, {
-    contentReadScope, allowedHostTools, deferredServers,
+    contentReadScope,
+    allowedHostTools,
+    deferredServers,
   });
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
@@ -1202,7 +1204,9 @@ function applyContextBrief(
   { contentReadScope = false, allowedHostTools = [], deferredServers = [] } = {},
 ) {
   const brief = brokerContextBrief(allowedServers, {
-    contentReadScope, allowedHostTools, deferredServers,
+    contentReadScope,
+    allowedHostTools,
+    deferredServers,
   });
   if (toolName === 'workspace_launch' || toolName === 'workspace_schedule') {
     args.context = appendText(args.context, brief);
@@ -1262,11 +1266,12 @@ async function maybeInjectGlassHiveCapabilityBroker({
   }
   // VIVENTIUM START: Superseded authoring cannot create a new launch intent.
   config?.signal?.throwIfAborted();
-  const assertAuthor = () => assertCurrentGlassHiveSourceAuthor({
-    userId: String(config?.configurable?.user?.id || config?.configurable?.user?._id || ''),
-    requestBody: config?.configurable?.requestBody,
-    getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
-  });
+  const assertAuthor = () =>
+    assertCurrentGlassHiveSourceAuthor({
+      userId: String(config?.configurable?.user?.id || config?.configurable?.user?._id || ''),
+      requestBody: config?.configurable?.requestBody,
+      getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
+    });
   await assertAuthor();
   // VIVENTIUM END
   const launchContext = await registerGlassHiveLaunchContext({
@@ -1474,7 +1479,9 @@ async function maybeInjectGlassHiveCapabilityBroker({
     );
   }
   applyContextBrief(args, toolName, allowedServers, {
-    contentReadScope, allowedHostTools, deferredServers: authorization.deferredServers || [],
+    contentReadScope,
+    allowedHostTools,
+    deferredServers: authorization.deferredServers || [],
   });
   return finalizeTrustedLaunchArgs();
 }
@@ -1697,14 +1704,18 @@ async function buildConversationProviderBootstrapBundle({
   // Join a created current-turn grant to broker transport observations without decoding tokens.
   // Diagnostics carry hashes only and cannot change the grant or its delivery path.
   try {
-    const scopeHash = (value) => typeof value === 'string' && value
-      ? crypto.createHash('sha256').update(value).digest('hex') : null;
-    logger.info(JSON.stringify({
-      event: 'glasshive_broker_grant_created',
-      grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
-      message_id_sha256: scopeHash(mintedGrant.payload.message_id),
-      conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
-    }));
+    const scopeHash = (value) =>
+      typeof value === 'string' && value
+        ? crypto.createHash('sha256').update(value).digest('hex')
+        : null;
+    logger.info(
+      JSON.stringify({
+        event: 'glasshive_broker_grant_created',
+        grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
+        message_id_sha256: scopeHash(mintedGrant.payload.message_id),
+        conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
+      }),
+    );
   } catch {
     // A diagnostic failure must not turn a valid capability grant into an unavailable one.
   }

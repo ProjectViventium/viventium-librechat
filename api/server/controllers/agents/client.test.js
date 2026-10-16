@@ -590,7 +590,10 @@ describe('Feelings agent scope', () => {
     client.responseMessageId = 'current-assistant-reply';
     await client.scheduleFeelingsReaction({});
     expect(mockScheduleEmotionalReaction).toHaveBeenCalledWith(
-      expect.objectContaining({ stimulusId: 'current-user-message', userText: 'new voice stimulus' }),
+      expect.objectContaining({
+        stimulusId: 'current-user-message',
+        userText: 'new voice stimulus',
+      }),
     );
   });
 
@@ -1692,8 +1695,7 @@ describe('late completion error content parts', () => {
     };
     expect(AgentClient.createCompletionErrorContentPart(localCapacity)).toEqual({
       type: ContentTypes.ERROR,
-      [ContentTypes.ERROR]:
-        'Local AI capacity is busy. Please try again shortly.',
+      [ContentTypes.ERROR]: 'Local AI capacity is busy. Please try again shortly.',
       error_class: 'host_capacity',
       retryable: true,
       retry_after_seconds: 7,
@@ -1851,25 +1853,30 @@ describe('late completion error content parts', () => {
     );
   });
 
-  test.each([false, true])('keeps a denied workspace distinct from rejected credentials (wrapped=%s)', (wrapped) => {
-    const denied = APIError.generate(
-      403,
-      { detail: 'Custom GlassHive workspace is outside the configured workspace roots' },
-      undefined,
-      new Headers(),
-    );
-    const error = wrapped ? new Error('Model invocation failed', { cause: denied }) : denied;
-    expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
-      type: ContentTypes.ERROR,
-      [ContentTypes.ERROR]: 'The model provider denied access to this request.',
-      error_class: 'provider_access_denied',
-    });
-  });
+  test.each([false, true])(
+    'keeps a denied workspace distinct from rejected credentials (wrapped=%s)',
+    (wrapped) => {
+      const denied = APIError.generate(
+        403,
+        { detail: 'Custom GlassHive workspace is outside the configured workspace roots' },
+        undefined,
+        new Headers(),
+      );
+      const error = wrapped ? new Error('Model invocation failed', { cause: denied }) : denied;
+      expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+        type: ContentTypes.ERROR,
+        [ContentTypes.ERROR]: 'The model provider denied access to this request.',
+        error_class: 'provider_access_denied',
+      });
+    },
+  );
 
   test.each([401, 403])('preserves HTTP status semantics without SDK metadata (%s)', (status) => {
     const expected = status === 401 ? 'provider_unauthorized' : 'provider_access_denied';
-    expect(AgentClient.createCompletionErrorContentPart(new Error(`${status} Synthetic failure`)).error_class)
-      .toBe(expected);
+    expect(
+      AgentClient.createCompletionErrorContentPart(new Error(`${status} Synthetic failure`))
+        .error_class,
+    ).toBe(expected);
   });
 
   test('preserves explicit authentication evidence on a 403 response', () => {
@@ -1879,7 +1886,9 @@ describe('late completion error content parts', () => {
       undefined,
       new Headers(),
     );
-    expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe('provider_unauthorized');
+    expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe(
+      'provider_unauthorized',
+    );
   });
 
   test('keeps nested access denial public text free of private workspace details', () => {
@@ -5173,95 +5182,98 @@ describe('AgentClient - titleConvo', () => {
       }
     });
 
-    it.each([false, true])('replays a terminal quota failure only after native release (unconfirmed=%s)', async (nativeMemoryReleaseUnconfirmed) => {
-      const { HumanMessage } = require('@librechat/agents/langchain/messages');
-      const api = require('@librechat/api');
-      mockReq.config.memory = {
-        validKeys: ['core'],
-        agent: {
+    it.each([false, true])(
+      'replays a terminal quota failure only after native release (unconfirmed=%s)',
+      async (nativeMemoryReleaseUnconfirmed) => {
+        const { HumanMessage } = require('@librechat/agents/langchain/messages');
+        const api = require('@librechat/api');
+        mockReq.config.memory = {
+          validKeys: ['core'],
+          agent: {
+            provider: 'openai',
+            model: 'gpt-5.6-luna',
+            model_parameters: { reasoning_effort: 'medium' },
+            fallback: { provider: 'anthropic', model: 'claude-opus-5' },
+          },
+        };
+        const gated = new Set();
+        api.getMemoryWriterHealthGate.mockImplementation(({ provider }) =>
+          gated.has(provider)
+            ? {
+                blocked: true,
+                shouldLog: false,
+                reason: 'quota',
+                message: 'gated',
+                blockedUntil: Date.now() + 1000,
+              }
+            : { blocked: false },
+        );
+        api.markMemoryWriterRouteExhausted.mockImplementation(({ provider }) => {
+          gated.add(provider);
+          return { reason: 'quota' };
+        });
+        api.initializeAgent.mockImplementation(async ({ agent }) => ({ ...agent }));
+        const quotaFailure = [
+          {
+            type: Tools.memory,
+            [Tools.memory]: {
+              key: 'system',
+              type: 'error',
+              value: JSON.stringify({ errorType: 'usage_limit_reached', message: 'quota' }),
+            },
+          },
+        ];
+        const saved = [
+          { type: Tools.memory, [Tools.memory]: { key: 'core', type: 'update', value: 'x' } },
+        ];
+        const primaryProcess = jest.fn().mockResolvedValue(quotaFailure);
+        const fallbackProcess = jest.fn().mockResolvedValue(saved);
+        api.createMemoryProcessor.mockImplementation(async ({ config }) => [
+          null,
+          config.llmConfig.provider === 'openai' ? primaryProcess : fallbackProcess,
+        ]);
+
+        const routed = new AgentClient(mockOptions);
+        routed.conversationId = 'convo-123';
+        routed.responseMessageId = 'response-123';
+        routed.memoryWriterState = {
+          appConfig: mockReq.config,
+          userId: 'user-123',
+          memoryConfig: mockReq.config.memory,
+          memoryMethods: {},
+          memoryPolicyConfig: { tokenLimit: 8000 },
+        };
+
+        const result = await routed.runMemory([new HumanMessage('Remember the QA color word.')], {
+          req: mockReq,
+          res: mockRes,
+          userId: 'user-123',
+          appConfig: mockReq.config,
+          nativeMemoryReleaseUnconfirmed,
+        });
+
+        expect(primaryProcess).toHaveBeenCalledTimes(1);
+        if (nativeMemoryReleaseUnconfirmed) {
+          expect(api.markMemoryWriterRouteExhausted).not.toHaveBeenCalled();
+          expect(fallbackProcess).not.toHaveBeenCalled();
+          expect(result).toEqual(quotaFailure);
+          return;
+        }
+        expect(api.markMemoryWriterRouteExhausted).toHaveBeenCalledWith({
+          userId: 'user-123',
           provider: 'openai',
           model: 'gpt-5.6-luna',
-          model_parameters: { reasoning_effort: 'medium' },
-          fallback: { provider: 'anthropic', model: 'claude-opus-5' },
-        },
-      };
-      const gated = new Set();
-      api.getMemoryWriterHealthGate.mockImplementation(({ provider }) =>
-        gated.has(provider)
-          ? {
-              blocked: true,
-              shouldLog: false,
-              reason: 'quota',
-              message: 'gated',
-              blockedUntil: Date.now() + 1000,
-            }
-          : { blocked: false },
-      );
-      api.markMemoryWriterRouteExhausted.mockImplementation(({ provider }) => {
-        gated.add(provider);
-        return { reason: 'quota' };
-      });
-      api.initializeAgent.mockImplementation(async ({ agent }) => ({ ...agent }));
-      const quotaFailure = [
-        {
-          type: Tools.memory,
-          [Tools.memory]: {
-            key: 'system',
-            type: 'error',
-            value: JSON.stringify({ errorType: 'usage_limit_reached', message: 'quota' }),
-          },
-        },
-      ];
-      const saved = [
-        { type: Tools.memory, [Tools.memory]: { key: 'core', type: 'update', value: 'x' } },
-      ];
-      const primaryProcess = jest.fn().mockResolvedValue(quotaFailure);
-      const fallbackProcess = jest.fn().mockResolvedValue(saved);
-      api.createMemoryProcessor.mockImplementation(async ({ config }) => [
-        null,
-        config.llmConfig.provider === 'openai' ? primaryProcess : fallbackProcess,
-      ]);
-
-      const routed = new AgentClient(mockOptions);
-      routed.conversationId = 'convo-123';
-      routed.responseMessageId = 'response-123';
-      routed.memoryWriterState = {
-        appConfig: mockReq.config,
-        userId: 'user-123',
-        memoryConfig: mockReq.config.memory,
-        memoryMethods: {},
-        memoryPolicyConfig: { tokenLimit: 8000 },
-      };
-
-      const result = await routed.runMemory([new HumanMessage('Remember the QA color word.')], {
-        req: mockReq,
-        res: mockRes,
-        userId: 'user-123',
-        appConfig: mockReq.config,
-        nativeMemoryReleaseUnconfirmed,
-      });
-
-      expect(primaryProcess).toHaveBeenCalledTimes(1);
-      if (nativeMemoryReleaseUnconfirmed) {
-        expect(api.markMemoryWriterRouteExhausted).not.toHaveBeenCalled();
-        expect(fallbackProcess).not.toHaveBeenCalled();
-        expect(result).toEqual(quotaFailure);
-        return;
-      }
-      expect(api.markMemoryWriterRouteExhausted).toHaveBeenCalledWith({
-        userId: 'user-123',
-        provider: 'openai',
-        model: 'gpt-5.6-luna',
-        errorType: 'usage_limit_reached',
-      });
-      expect(fallbackProcess).toHaveBeenCalledTimes(1);
-      expect(result).toEqual(saved);
-      expect(routed.memoryWriterRoute).toEqual({
-        role: 'fallback',
-        provider: 'anthropic',
-        model: 'claude-opus-5',
-      });
-    });
+          errorType: 'usage_limit_reached',
+        });
+        expect(fallbackProcess).toHaveBeenCalledTimes(1);
+        expect(result).toEqual(saved);
+        expect(routed.memoryWriterRoute).toEqual({
+          role: 'fallback',
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+        });
+      },
+    );
 
     it('uses the captured artifact sink when detached writer completes after client cleanup', async () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
@@ -5289,7 +5301,9 @@ describe('AgentClient - titleConvo', () => {
 
     it('captures a deferred external writer before cleanup and admits the captured source only once', async () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
-      client.deferredMemoryWriterMessages = [new HumanMessage('Remember this accepted preference.')];
+      client.deferredMemoryWriterMessages = [
+        new HumanMessage('Remember this accepted preference.'),
+      ];
       expect(client.prepareDeferredMemoryWriter()).toBe(true);
       expect(db.admitMemoryWrite).not.toHaveBeenCalled();
       const pending = client.memoryWriterPromise;
@@ -5923,152 +5937,217 @@ describe('AgentClient - titleConvo', () => {
       });
     });
 
-    it.each([true, false])('carries visible scheduled answers and omits typed transport on a later turn (scheduler: %s)', async (scheduler) => {
-      client.useMemory = jest.fn().mockResolvedValue(undefined);
-      if (scheduler) {
-        setTrustedInteractionContext(
-          mockReq,
-          createSchedulerInteractionContext({
-            conversation_id: 'convo-123',
-            source_event_id: 'scheduler-stream',
-            schedule_id: 'schedule-daily-review',
-            schedule_run_id: 'run-next',
-          }),
-          { segment_stability: 'immediate', supersede_scope: 'response_only' },
-          { commit_authority: 'server' },
-        );
-      }
-      const internal = (context) => ({ viventium: { visibility: 'internal', ...context } });
-      const rows = [
-        {
-          messageId: 'envelope-0',
-          parentMessageId: null,
-          isCreatedByUser: true,
-          text: 'Run the private daily review.',
-          metadata: internal({
-            interactionContext: { actor_kind: 'system', origin: 'scheduler' },
-          }),
-        },
-        {
-          messageId: 'answer-0',
-          parentMessageId: 'envelope-0',
-          isCreatedByUser: false,
-          text: 'Review 0: printer rate is 3 per booklet.',
-        },
-        {
-          messageId: 'hidden-0',
-          parentMessageId: 'answer-0',
-          isCreatedByUser: false,
-          text: '{NTA}',
-          metadata: internal({}),
-        },
-        {
-          messageId: 'empty-error',
-          parentMessageId: 'hidden-0',
-          isCreatedByUser: false,
-          error: true,
-          text: '',
-          content: [{ type: 'error', error: 'provider_failed' }],
-        },
-        {
-          messageId: 'current',
-          parentMessageId: 'empty-error',
-          isCreatedByUser: true,
-          text: 'Continue the review.',
-        },
-      ];
+    it.each([true, false])(
+      'carries visible scheduled answers and omits typed transport on a later turn (scheduler: %s)',
+      async (scheduler) => {
+        client.useMemory = jest.fn().mockResolvedValue(undefined);
+        if (scheduler) {
+          setTrustedInteractionContext(
+            mockReq,
+            createSchedulerInteractionContext({
+              conversation_id: 'convo-123',
+              source_event_id: 'scheduler-stream',
+              schedule_id: 'schedule-daily-review',
+              schedule_run_id: 'run-next',
+            }),
+            { segment_stability: 'immediate', supersede_scope: 'response_only' },
+            { commit_authority: 'server' },
+          );
+        }
+        const internal = (context) => ({ viventium: { visibility: 'internal', ...context } });
+        const rows = [
+          {
+            messageId: 'envelope-0',
+            parentMessageId: null,
+            isCreatedByUser: true,
+            text: 'Run the private daily review.',
+            metadata: internal({
+              interactionContext: { actor_kind: 'system', origin: 'scheduler' },
+            }),
+          },
+          {
+            messageId: 'answer-0',
+            parentMessageId: 'envelope-0',
+            isCreatedByUser: false,
+            text: 'Review 0: printer rate is 3 per booklet.',
+          },
+          {
+            messageId: 'hidden-0',
+            parentMessageId: 'answer-0',
+            isCreatedByUser: false,
+            text: '{NTA}',
+            metadata: internal({}),
+          },
+          {
+            messageId: 'empty-error',
+            parentMessageId: 'hidden-0',
+            isCreatedByUser: false,
+            error: true,
+            text: '',
+            content: [{ type: 'error', error: 'provider_failed' }],
+          },
+          {
+            messageId: 'current',
+            parentMessageId: 'empty-error',
+            isCreatedByUser: true,
+            text: 'Continue the review.',
+          },
+        ];
 
-      const result = await client.buildMessages(rows, 'current', {});
+        const result = await client.buildMessages(rows, 'current', {});
 
-      expect(result.prompt.map((message) => message.messageId)).toEqual(['answer-0', 'current']);
-      expect(client._viventiumVisibleMessagesV1.map((message) => message.messageId))
-        .toEqual(['answer-0', 'current']);
-    });
-
+        expect(result.prompt.map((message) => message.messageId)).toEqual(['answer-0', 'current']);
+        expect(client._viventiumVisibleMessagesV1.map((message) => message.messageId)).toEqual([
+          'answer-0',
+          'current',
+        ]);
+      },
+    );
 
     it.each(['string', 'typed parts'])(
-      'keeps hydrated prior and current files in the shared lane with authored history (%s)', async (shape) => {
+      'keeps hydrated prior and current files in the shared lane with authored history (%s)',
+      async (shape) => {
         client.useMemory = jest.fn().mockResolvedValue(undefined);
-        const image = { type: 'image_url', image_url: { url: 'https://synthetic.invalid/image.png' } };
-        const prior = { messageId: 'file-input', parentMessageId: null, isCreatedByUser: true,
-          text: 'Use both notes in order.', fileContext: 'First note.\nSecond note.',
-          ...(shape === 'typed parts' ? { content: [{ type: 'text', text: 'Use both notes in order.' }, image] } : {}),
+        const image = {
+          type: 'image_url',
+          image_url: { url: 'https://synthetic.invalid/image.png' },
         };
-        const current = { messageId: 'current', parentMessageId: prior.messageId,
-          isCreatedByUser: true, text: 'Change the first worker only.',
+        const prior = {
+          messageId: 'file-input',
+          parentMessageId: null,
+          isCreatedByUser: true,
+          text: 'Use both notes in order.',
+          fileContext: 'First note.\nSecond note.',
+          ...(shape === 'typed parts'
+            ? { content: [{ type: 'text', text: 'Use both notes in order.' }, image] }
+            : {}),
+        };
+        const current = {
+          messageId: 'current',
+          parentMessageId: prior.messageId,
+          isCreatedByUser: true,
+          text: 'Change the first worker only.',
           fileContext: 'Current context uses its existing shared instruction lane.',
         };
         const result = await client.buildMessages([prior, current], 'current', {});
         const history = result.prompt.find((message) => message.messageId === prior.messageId);
-        expect(history.content).toEqual(shape === 'typed parts'
-          ? [{ type: 'text', text: 'Use both notes in order.' }, image]
-          : 'Use both notes in order.');
-        expect(result.prompt.find((message) => message.messageId === current.messageId).content)
-          .toBe(current.text);
+        expect(history.content).toEqual(
+          shape === 'typed parts'
+            ? [{ type: 'text', text: 'Use both notes in order.' }, image]
+            : 'Use both notes in order.',
+        );
+        expect(
+          result.prompt.find((message) => message.messageId === current.messageId).content,
+        ).toBe(current.text);
         expect(client.options.agent.instructions).toContain(prior.fileContext);
         expect(client.options.agent.instructions).toContain(current.fileContext);
-        expect(client.options.agent.instructions.indexOf(prior.fileContext))
-          .toBeLessThan(client.options.agent.instructions.indexOf(current.fileContext));
+        expect(client.options.agent.instructions.indexOf(prior.fileContext)).toBeLessThan(
+          client.options.agent.instructions.indexOf(current.fileContext),
+        );
         expect(client.options.agent.instructions.split(prior.fileContext)).toHaveLength(2);
         expect(client.options.agent.instructions.split(current.fileContext)).toHaveLength(2);
         expect(client._viventiumVisibleMessagesV1).toEqual([
           expect.objectContaining({ messageId: prior.messageId, text: prior.text }),
           expect.objectContaining({ messageId: current.messageId, text: current.text }),
         ]);
-        expect(client._viventiumVisibleMessagesV1.every((row) => !('fileContext' in row))).toBe(true);
+        expect(client._viventiumVisibleMessagesV1.every((row) => !('fileContext' in row))).toBe(
+          true,
+        );
         expect(prior.fileContext).toBe('First note.\nSecond note.');
-        expect(current.fileContext).toBe('Current context uses its existing shared instruction lane.');
-        if (shape === 'typed parts') expect(prior.content).toEqual([
-          { type: 'text', text: 'Use both notes in order.' }, image,
-        ]);
+        expect(current.fileContext).toBe(
+          'Current context uses its existing shared instruction lane.',
+        );
+        if (shape === 'typed parts')
+          expect(prior.content).toEqual([
+            { type: 'text', text: 'Use both notes in order.' },
+            image,
+          ]);
       },
     );
 
-    it.each(['ordinary', 'workspace'])('keeps full historical files in every participant shared lane (%s)', async (route) => {
-      client.useMemory = jest.fn().mockResolvedValue(undefined);
-      if (route === 'workspace') mockReq.config.endpoints = { agents: { providerCapabilities: {
-        [EModelEndpoint.openAI]: { workspace_binding: true, conversation_session: true,
-          time_context_delivery: 'per_turn_header' },
-      } } };
-      const parallel = { id: 'parallel', provider: EModelEndpoint.anthropic,
-        instructions: 'Parallel base instructions.' };
-      client.agentConfigs = new Map([['parallel', parallel]]);
-      const fileContext = 'Whole extracted context. '.repeat(18000) + ' Final file marker.';
-      const prior = { messageId: 'file-source', parentMessageId: null, sender: 'User',
-        isCreatedByUser: true, text: 'Use this file.', fileContext,
-        files: [{ file_id: 'source-file', filename: 'source.txt', source: 'text' }] };
-      const current = { messageId: 'current', parentMessageId: prior.messageId, sender: 'User',
-        isCreatedByUser: true, text: 'Read the last marker.' };
-      const result = await client.buildMessages([prior, current], current.messageId, {});
-      for (const agent of [client.options.agent, parallel]) {
-        expect(agent.instructions).toContain(fileContext);
-        expect(agent.instructions.split(fileContext)).toHaveLength(2);
-      }
-      expect(result.prompt.find((row) => row.messageId === prior.messageId).content).toBe(prior.text);
-      expect(client._viventiumVisibleMessagesV1[0]).toEqual(expect.objectContaining({
-        text: prior.text, files: prior.files, messageId: prior.messageId,
-      }));
-      expect(client._viventiumVisibleMessagesV1[0]).not.toHaveProperty('fileContext');
-      expect(prior.fileContext).toBe(fileContext);
-      const { captureMainContextSnapshot, applyMainContextAttempt } = require(
-        '~/server/services/viventium/ViventiumMainContextService',
-      );
-      const snapshot = captureMainContextSnapshot(mockReq, {
-        agent: client.options.agent,
-        messages: result.prompt,
-        visibleMessages: client._viventiumVisibleMessagesV1,
-        attemptState: { instructionsByAgentId: {
-          [client.options.agent.id]: client.options.agent.instructions,
-          [parallel.id]: parallel.instructions,
-        } },
-      });
-      const source = snapshot.visibleMessageChain.find((row) => row.id === prior.messageId);
-      expect(source.sha256).toBe(require('crypto').createHash('sha256').update(prior.text).digest('hex'));
-      const fallback = { id: 'configured-fallback', instructions: 'Fallback base instructions.' };
-      expect(applyMainContextAttempt({ agents: [fallback], snapshot, requestBody: {} })).toBe(true);
-      expect(fallback.instructions).toContain(fileContext);
-      expect(fallback.instructions.split(fileContext)).toHaveLength(2);
-    });
+    it.each(['ordinary', 'workspace'])(
+      'keeps full historical files in every participant shared lane (%s)',
+      async (route) => {
+        client.useMemory = jest.fn().mockResolvedValue(undefined);
+        if (route === 'workspace')
+          mockReq.config.endpoints = {
+            agents: {
+              providerCapabilities: {
+                [EModelEndpoint.openAI]: {
+                  workspace_binding: true,
+                  conversation_session: true,
+                  time_context_delivery: 'per_turn_header',
+                },
+              },
+            },
+          };
+        const parallel = {
+          id: 'parallel',
+          provider: EModelEndpoint.anthropic,
+          instructions: 'Parallel base instructions.',
+        };
+        client.agentConfigs = new Map([['parallel', parallel]]);
+        const fileContext = 'Whole extracted context. '.repeat(18000) + ' Final file marker.';
+        const prior = {
+          messageId: 'file-source',
+          parentMessageId: null,
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'Use this file.',
+          fileContext,
+          files: [{ file_id: 'source-file', filename: 'source.txt', source: 'text' }],
+        };
+        const current = {
+          messageId: 'current',
+          parentMessageId: prior.messageId,
+          sender: 'User',
+          isCreatedByUser: true,
+          text: 'Read the last marker.',
+        };
+        const result = await client.buildMessages([prior, current], current.messageId, {});
+        for (const agent of [client.options.agent, parallel]) {
+          expect(agent.instructions).toContain(fileContext);
+          expect(agent.instructions.split(fileContext)).toHaveLength(2);
+        }
+        expect(result.prompt.find((row) => row.messageId === prior.messageId).content).toBe(
+          prior.text,
+        );
+        expect(client._viventiumVisibleMessagesV1[0]).toEqual(
+          expect.objectContaining({
+            text: prior.text,
+            files: prior.files,
+            messageId: prior.messageId,
+          }),
+        );
+        expect(client._viventiumVisibleMessagesV1[0]).not.toHaveProperty('fileContext');
+        expect(prior.fileContext).toBe(fileContext);
+        const {
+          captureMainContextSnapshot,
+          applyMainContextAttempt,
+        } = require('~/server/services/viventium/ViventiumMainContextService');
+        const snapshot = captureMainContextSnapshot(mockReq, {
+          agent: client.options.agent,
+          messages: result.prompt,
+          visibleMessages: client._viventiumVisibleMessagesV1,
+          attemptState: {
+            instructionsByAgentId: {
+              [client.options.agent.id]: client.options.agent.instructions,
+              [parallel.id]: parallel.instructions,
+            },
+          },
+        });
+        const source = snapshot.visibleMessageChain.find((row) => row.id === prior.messageId);
+        expect(source.sha256).toBe(
+          require('crypto').createHash('sha256').update(prior.text).digest('hex'),
+        );
+        const fallback = { id: 'configured-fallback', instructions: 'Fallback base instructions.' };
+        expect(applyMainContextAttempt({ agents: [fallback], snapshot, requestBody: {} })).toBe(
+          true,
+        );
+        expect(fallback.instructions).toContain(fileContext);
+        expect(fallback.instructions.split(fileContext)).toHaveLength(2);
+      },
+    );
 
     it('preserves stored user text before upstream formatting drops an empty content array', async () => {
       client.useMemory = jest.fn().mockResolvedValue(undefined);
@@ -6733,102 +6812,207 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
   });
 
   test.each(['throw', 'part'])(
-    'keeps the provider SSE APIError code through actual-shaped failed fallback %s', async (mode) => {
-      const primaryError = new APIError(undefined, {
-        message: 'Connected tools did not start in time. Please try again.',
-        type: 'glasshive_runtime_error', code: 'native_mcp_unavailable',
-      }, undefined, new Headers());
-      const fallbackError = new APIError(undefined, {
-        message: 'Synthetic fallback login unavailable.',
-        type: 'glasshive_runtime_error', code: 'provider_auth_missing',
-      }, undefined, new Headers());
+    'keeps the provider SSE APIError code through actual-shaped failed fallback %s',
+    async (mode) => {
+      const primaryError = new APIError(
+        undefined,
+        {
+          message: 'Connected tools did not start in time. Please try again.',
+          type: 'glasshive_runtime_error',
+          code: 'native_mcp_unavailable',
+        },
+        undefined,
+        new Headers(),
+      );
+      const fallbackError = new APIError(
+        undefined,
+        {
+          message: 'Synthetic fallback login unavailable.',
+          type: 'glasshive_runtime_error',
+          code: 'provider_auth_missing',
+        },
+        undefined,
+        new Headers(),
+      );
       expect(primaryError.code).toBe('native_mcp_unavailable');
-      primaryAgent.viventiumFallbackLlm = { id: 'fallback', provider: EModelEndpoint.openAI,
-        model: 'synthetic-fallback', model_parameters: { model: 'synthetic-fallback' } };
-      client.chatCompletion = jest.fn().mockImplementationOnce(async () => {
-        client.contentParts.push(AgentClient.createCompletionErrorContentPart(primaryError));
-      }).mockImplementationOnce(async () => {
-        if (mode === 'throw') throw fallbackError;
-        client.contentParts.push(AgentClient.createCompletionErrorContentPart(fallbackError));
-      });
+      primaryAgent.viventiumFallbackLlm = {
+        id: 'fallback',
+        provider: EModelEndpoint.openAI,
+        model: 'synthetic-fallback',
+        model_parameters: { model: 'synthetic-fallback' },
+      };
+      client.chatCompletion = jest
+        .fn()
+        .mockImplementationOnce(async () => {
+          client.contentParts.push(AgentClient.createCompletionErrorContentPart(primaryError));
+        })
+        .mockImplementationOnce(async () => {
+          if (mode === 'throw') throw fallbackError;
+          client.contentParts.push(AgentClient.createCompletionErrorContentPart(fallbackError));
+        });
       if (mode === 'throw') {
-        const error = await client.sendCompletion({ text: 'Synthetic retained request' }).catch((error) => error);
+        const error = await client
+          .sendCompletion({ text: 'Synthetic retained request' })
+          .catch((error) => error);
         expect(error.originalError.error_class).toBe('native_mcp_unavailable');
         expect(error.code).toBe('provider_auth_missing');
-        expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe('native_mcp_unavailable');
+        expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe(
+          'native_mcp_unavailable',
+        );
       } else {
         const result = await client.sendCompletion({ text: 'Synthetic retained request' });
-        expect(result.completion).toEqual([{ type: ContentTypes.ERROR,
-          error_class: 'native_mcp_unavailable', error: 'Connected tools did not start in time. Please try again.' }]);
+        expect(result.completion).toEqual([
+          {
+            type: ContentTypes.ERROR,
+            error_class: 'native_mcp_unavailable',
+            error: 'Connected tools did not start in time. Please try again.',
+          },
+        ]);
       }
       expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     },
   );
 
   test.each(['throw', 'part'])(
-    'keeps primary native MCP failure when fallback returns %s', async (fallbackMode) => {
-      const primaryError = Object.assign(new Error('Synthetic native setup detail'), { code: 'native_mcp_unavailable' });
-      const fallbackError = Object.assign(new Error('Synthetic fallback login detail'), { code: 'provider_auth_missing' });
-      primaryAgent.viventiumFallbackLlm = { id: 'fallback', provider: EModelEndpoint.openAI,
-        model: 'synthetic-fallback', model_parameters: { model: 'synthetic-fallback' } };
-      client.chatCompletion = jest.fn().mockImplementationOnce(async () => { throw primaryError; })
+    'keeps primary native MCP failure when fallback returns %s',
+    async (fallbackMode) => {
+      const primaryError = Object.assign(new Error('Synthetic native setup detail'), {
+        code: 'native_mcp_unavailable',
+      });
+      const fallbackError = Object.assign(new Error('Synthetic fallback login detail'), {
+        code: 'provider_auth_missing',
+      });
+      primaryAgent.viventiumFallbackLlm = {
+        id: 'fallback',
+        provider: EModelEndpoint.openAI,
+        model: 'synthetic-fallback',
+        model_parameters: { model: 'synthetic-fallback' },
+      };
+      client.chatCompletion = jest
+        .fn()
+        .mockImplementationOnce(async () => {
+          throw primaryError;
+        })
         .mockImplementationOnce(async () => {
           if (fallbackMode === 'throw') throw fallbackError;
           client.contentParts.push(AgentClient.createCompletionErrorContentPart(fallbackError));
         });
       if (fallbackMode === 'throw') {
-        const error = await client.sendCompletion({ text: 'Synthetic request' }).catch((error) => error);
+        const error = await client
+          .sendCompletion({ text: 'Synthetic request' })
+          .catch((error) => error);
         expect(error.originalError).toBe(primaryError);
         expect(error.code).toBe('provider_auth_missing');
         expect(AgentClient.createCompletionErrorContentPart(error)).toMatchObject({
-          error_class: 'native_mcp_unavailable', error: 'Connected tools did not start in time. Please try again.',
+          error_class: 'native_mcp_unavailable',
+          error: 'Connected tools did not start in time. Please try again.',
         });
       } else {
         const result = await client.sendCompletion({ text: 'Synthetic request' });
-        expect(result.completion).toEqual([{ type: ContentTypes.ERROR,
-          error_class: 'native_mcp_unavailable', error: 'Connected tools did not start in time. Please try again.' }]);
+        expect(result.completion).toEqual([
+          {
+            type: ContentTypes.ERROR,
+            error_class: 'native_mcp_unavailable',
+            error: 'Connected tools did not start in time. Please try again.',
+          },
+        ]);
       }
       expect(client.chatCompletion).toHaveBeenCalledTimes(2);
     },
   );
 
   test('keeps a typed primary part even when the primary also throws an opaque wrapper', async () => {
-    primaryAgent.viventiumFallbackLlm = { id: 'fallback', provider: EModelEndpoint.openAI,
-      model: 'synthetic-fallback', model_parameters: { model: 'synthetic-fallback' } };
-    client.chatCompletion = jest.fn().mockImplementationOnce(async () => {
-      client.contentParts.push({ type: ContentTypes.ERROR, error_class: 'native_mcp_unavailable', error: 'Synthetic setup' });
-      throw new Error('Opaque wrapper');
-    }).mockImplementationOnce(async () => { throw Object.assign(new Error('Fallback auth'), { code: 'provider_auth_missing' }); });
-    const error = await client.sendCompletion({ text: 'Synthetic request' }).catch((error) => error);
-    expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe('native_mcp_unavailable');
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'synthetic-fallback',
+      model_parameters: { model: 'synthetic-fallback' },
+    };
+    client.chatCompletion = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        client.contentParts.push({
+          type: ContentTypes.ERROR,
+          error_class: 'native_mcp_unavailable',
+          error: 'Synthetic setup',
+        });
+        throw new Error('Opaque wrapper');
+      })
+      .mockImplementationOnce(async () => {
+        throw Object.assign(new Error('Fallback auth'), { code: 'provider_auth_missing' });
+      });
+    const error = await client
+      .sendCompletion({ text: 'Synthetic request' })
+      .catch((error) => error);
+    expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe(
+      'native_mcp_unavailable',
+    );
     expect(client.chatCompletion).toHaveBeenCalledTimes(2);
   });
 
   test('retains a returned primary MCP error part through failed fallback', async () => {
-    primaryAgent.viventiumFallbackLlm = { id: 'fallback', provider: EModelEndpoint.openAI,
-      model: 'synthetic-fallback', model_parameters: { model: 'synthetic-fallback' } };
-    const primaryPart = { type: ContentTypes.ERROR, error_class: 'native_mcp_unavailable', error: 'Synthetic native setup detail' };
-    const fallbackError = Object.assign(new Error('Synthetic fallback login detail'), { code: 'provider_auth_missing' });
-    client.chatCompletion = jest.fn().mockImplementationOnce(async () => { client.contentParts.push(primaryPart); })
-      .mockImplementationOnce(async () => { throw fallbackError; });
-    const error = await client.sendCompletion({ text: 'Synthetic request' }).catch((error) => error);
+    primaryAgent.viventiumFallbackLlm = {
+      id: 'fallback',
+      provider: EModelEndpoint.openAI,
+      model: 'synthetic-fallback',
+      model_parameters: { model: 'synthetic-fallback' },
+    };
+    const primaryPart = {
+      type: ContentTypes.ERROR,
+      error_class: 'native_mcp_unavailable',
+      error: 'Synthetic native setup detail',
+    };
+    const fallbackError = Object.assign(new Error('Synthetic fallback login detail'), {
+      code: 'provider_auth_missing',
+    });
+    client.chatCompletion = jest
+      .fn()
+      .mockImplementationOnce(async () => {
+        client.contentParts.push(primaryPart);
+      })
+      .mockImplementationOnce(async () => {
+        throw fallbackError;
+      });
+    const error = await client
+      .sendCompletion({ text: 'Synthetic request' })
+      .catch((error) => error);
     expect(error.originalError).toBe(primaryPart);
-    expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe('native_mcp_unavailable');
+    expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe(
+      'native_mcp_unavailable',
+    );
   });
 
   test.each(['abort', 'partial'])(
-    'keeps the failed fallback %s outcome owned by that attempt', async (mode) => {
-      const primaryError = Object.assign(new Error('Synthetic setup'), { code: 'native_mcp_unavailable' });
-      const fallbackError = Object.assign(new Error('Synthetic later failure'), mode === 'abort'
-        ? { name: 'AbortError', code: 'ABORT_ERR' } : { code: 'provider_auth_missing' });
-      primaryAgent.viventiumFallbackLlm = { id: 'fallback', provider: EModelEndpoint.openAI,
-        model: 'synthetic-fallback', model_parameters: { model: 'synthetic-fallback' } };
-      client.chatCompletion = jest.fn().mockImplementationOnce(async () => { throw primaryError; })
+    'keeps the failed fallback %s outcome owned by that attempt',
+    async (mode) => {
+      const primaryError = Object.assign(new Error('Synthetic setup'), {
+        code: 'native_mcp_unavailable',
+      });
+      const fallbackError = Object.assign(
+        new Error('Synthetic later failure'),
+        mode === 'abort'
+          ? { name: 'AbortError', code: 'ABORT_ERR' }
+          : { code: 'provider_auth_missing' },
+      );
+      primaryAgent.viventiumFallbackLlm = {
+        id: 'fallback',
+        provider: EModelEndpoint.openAI,
+        model: 'synthetic-fallback',
+        model_parameters: { model: 'synthetic-fallback' },
+      };
+      client.chatCompletion = jest
+        .fn()
         .mockImplementationOnce(async () => {
-          if (mode === 'partial') client.contentParts.push({ type: ContentTypes.TEXT, text: 'Visible partial.' });
+          throw primaryError;
+        })
+        .mockImplementationOnce(async () => {
+          if (mode === 'partial')
+            client.contentParts.push({ type: ContentTypes.TEXT, text: 'Visible partial.' });
           throw fallbackError;
         });
-      await expect(client.sendCompletion({ text: 'Synthetic request' })).rejects.toBe(fallbackError);
+      await expect(client.sendCompletion({ text: 'Synthetic request' })).rejects.toBe(
+        fallbackError,
+      );
       expect(fallbackError.originalError).toBeUndefined();
     },
   );
@@ -6850,16 +7034,21 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       expect(mockCreateRun).toHaveBeenCalled();
       expect(runOptions.nativeResponseFetch).toEqual(expect.any(Function));
       expect(runOptions.readMainBackgroundInputs).toEqual(expect.any(Function));
-      const readSpy = jest.spyOn(nativeResponseService, 'readCurrentMainBackgroundInputs').mockResolvedValue([]);
+      const readSpy = jest
+        .spyOn(nativeResponseService, 'readCurrentMainBackgroundInputs')
+        .mockResolvedValue([]);
       try {
         expect(await runOptions.readMainBackgroundInputs()).toEqual([]);
         expect(readSpy).toHaveBeenCalledWith(req, 'agent-primary');
-      } finally { readSpy.mockRestore(); }
+      } finally {
+        readSpy.mockRestore();
+      }
       expect(runOptions.mainContinuityHeaders).toBe(
         runOptions.agents[0].model_parameters.configuration.defaultHeaders,
       );
-      expect(runOptions.mainContinuityHeaders['X-Viventium-Visible-Message-Chain-B64'])
-        .toBeUndefined();
+      expect(
+        runOptions.mainContinuityHeaders['X-Viventium-Visible-Message-Chain-B64'],
+      ).toBeUndefined();
       const baseFetch = jest.fn();
       const route = { agentId: 'agent-primary', provider: EModelEndpoint.openAI };
       expect(runOptions.nativeResponseFetch(baseFetch, route)).toBe(wrapped);
@@ -6874,19 +7063,34 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const { combineTurnContextInstructions } = AgentClient;
     const { NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES } = jest.requireActual('@librechat/api');
     const continuity = `<viventium_main_continuity_v1>${'x'.repeat(24 * 1024)}</viventium_main_continuity_v1>`;
-    expect(combineTurnContextInstructions('Time.', '', '', '', continuity, '', '', '',
-      NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES)).toContain(continuity);
-    expect(() => combineTurnContextInstructions('Time.', '', '', '', continuity, '', ''))
-      .toThrow('Prior accepted Main history cannot be carried intact.');
+    expect(
+      combineTurnContextInstructions(
+        'Time.',
+        '',
+        '',
+        '',
+        continuity,
+        '',
+        '',
+        '',
+        NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
+      ),
+    ).toContain(continuity);
+    expect(() => combineTurnContextInstructions('Time.', '', '', '', continuity, '', '')).toThrow(
+      'Prior accepted Main history cannot be carried intact.',
+    );
   });
 
   test('current Call facts remain atomic through Main context budgeting', () => {
     const { combineTurnContextInstructions } = AgentClient;
-    const call = '<viventium_current_call_v1>{"requestedRoute":{"tts":{"provider":"local_tts"}}}</viventium_current_call_v1>';
-    expect(combineTurnContextInstructions('time'.repeat(1000), '', '', '', '', '', '', '', 512, call))
-      .toBe(call);
-    expect(() => combineTurnContextInstructions('', '', '', '', '', '', '', '', 32, call))
-      .toThrow('Prior accepted Main history cannot be carried intact.');
+    const call =
+      '<viventium_current_call_v1>{"requestedRoute":{"tts":{"provider":"local_tts"}}}</viventium_current_call_v1>';
+    expect(
+      combineTurnContextInstructions('time'.repeat(1000), '', '', '', '', '', '', '', 512, call),
+    ).toBe(call);
+    expect(() => combineTurnContextInstructions('', '', '', '', '', '', '', '', 32, call)).toThrow(
+      'Prior accepted Main history cannot be carried intact.',
+    );
   });
 
   test.each([16, 128])(
@@ -6895,32 +7099,70 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       const api = jest.requireActual('@librechat/api');
       const mainContext = require('~/server/services/viventium/ViventiumMainContextService');
       const dynamic = require('~/server/services/viventium/ViventiumDynamicTurnContext');
-      const projection = { mode: 'focused', requestedMode: 'focused', available: true,
-        snapshot: { snapshot: 'fresh', work: [], overflowCount: 0 } };
+      const projection = {
+        mode: 'focused',
+        requestedMode: 'focused',
+        available: true,
+        snapshot: { snapshot: 'fresh', work: [], overflowCount: 0 },
+      };
       const active = dynamic.buildActiveWorkCapsule(projection);
       dynamic.pinActiveWorkTurnProjection(req, active, projection);
       req._viventiumActiveWorkTurnContextPromise = Promise.resolve(active);
       req._viventiumContinuityActiveWorkContext = active;
-      const legacy = '<viventium_conversation_continuity_v1>Reviewed prior conversation.</viventium_conversation_continuity_v1>';
+      const legacy =
+        '<viventium_conversation_continuity_v1>Reviewed prior conversation.</viventium_conversation_continuity_v1>';
       client._viventiumConversationContinuityCapsule = legacy;
-      const recent = [1, 2, 3].map(index => ({ logicalTurnId: `recent-${index}`,
-        revision: 1, conversationId: 'conversation', userMessageId: `user-${index}`,
-        assistantMessageId: `assistant-${index}`, origin: 'interactive',
-        userText: 'u'.repeat(2000), assistantText: 'a'.repeat(2000), toolPairs: [],
-        committedAt: new Date('2026-01-01') }));
-      const summary = { version: 1, summary: 'Keep written approval required.',
-        pendingAsks: ['Ask before buying.'], commitments: [], corrections: [], decisions: [],
-        durableIdentifiers: ['project-123'], recurrenceOutcomes: [], toolPairs: [] };
-      const full = api.buildAcceptedMainContextCapsule({ acceptedTurns: recent,
-        semanticCompaction: summary, outputCarrier: api.mainContinuityOutputCarrier([], 0, 128 * 1024) });
-      mockLoadAcceptedMainContext.mockResolvedValueOnce({ status: 'available', capsule: full, turns: [] });
+      const recent = [1, 2, 3].map((index) => ({
+        logicalTurnId: `recent-${index}`,
+        revision: 1,
+        conversationId: 'conversation',
+        userMessageId: `user-${index}`,
+        assistantMessageId: `assistant-${index}`,
+        origin: 'interactive',
+        userText: 'u'.repeat(2000),
+        assistantText: 'a'.repeat(2000),
+        toolPairs: [],
+        committedAt: new Date('2026-01-01'),
+      }));
+      const summary = {
+        version: 1,
+        summary: 'Keep written approval required.',
+        pendingAsks: ['Ask before buying.'],
+        commitments: [],
+        corrections: [],
+        decisions: [],
+        durableIdentifiers: ['project-123'],
+        recurrenceOutcomes: [],
+        toolPairs: [],
+      };
+      const full = api.buildAcceptedMainContextCapsule({
+        acceptedTurns: recent,
+        semanticCompaction: summary,
+        outputCarrier: api.mainContinuityOutputCarrier([], 0, 128 * 1024),
+      });
+      mockLoadAcceptedMainContext.mockResolvedValueOnce({
+        status: 'available',
+        capsule: full,
+        turns: [],
+      });
       if (carrierKiB === 128) {
-        req.config.endpoints = { agents: { providerCapabilities: {
-          [EModelEndpoint.openAI]: { workspace_binding: true, conversation_session: true,
-            time_context_delivery: 'per_turn_header' } } } };
-        primaryAgent.model_parameters.configuration = { defaultHeaders: {
-          'X-GlassHive-Agent-Id': primaryAgent.id,
-          'X-Viventium-Visible-Message-Chain-B64': 'W10=' } };
+        req.config.endpoints = {
+          agents: {
+            providerCapabilities: {
+              [EModelEndpoint.openAI]: {
+                workspace_binding: true,
+                conversation_session: true,
+                time_context_delivery: 'per_turn_header',
+              },
+            },
+          },
+        };
+        primaryAgent.model_parameters.configuration = {
+          defaultHeaders: {
+            'X-GlassHive-Agent-Id': primaryAgent.id,
+            'X-Viventium-Visible-Message-Chain-B64': 'W10=',
+          },
+        };
       }
       mockCreateRun = jest.fn(async () => {
         throw Object.assign(new Error('synthetic stop after final Main encoding'), { status: 400 });
@@ -6932,17 +7174,37 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         const local = mainContext.getMainContextAttemptState(req);
         expect(local.turnContextText).toContain(full);
         expect(local.turnContextText).toContain(legacy);
-        const target = { ...primaryAgent, model_parameters: { ...primaryAgent.model_parameters,
-          configuration: { defaultHeaders: carrierKiB === 128
-            ? { 'X-GlassHive-Agent-Id': primaryAgent.id,
-                'X-Viventium-Visible-Message-Chain-B64': 'W10=' } : {} } } };
+        const target = {
+          ...primaryAgent,
+          model_parameters: {
+            ...primaryAgent.model_parameters,
+            configuration: {
+              defaultHeaders:
+                carrierKiB === 128
+                  ? {
+                      'X-GlassHive-Agent-Id': primaryAgent.id,
+                      'X-Viventium-Visible-Message-Chain-B64': 'W10=',
+                    }
+                  : {},
+            },
+          },
+        };
         const authority = mainContext.renderMainAttemptFactsAuthorityBlock(
-          mainContext.buildMainAttemptFactsForAgent({ snapshot, agent: target }));
+          mainContext.buildMainAttemptFactsForAgent({ snapshot, agent: target }),
+        );
         const body = {};
-        expect(mainContext.applyMainContextAttempt({ agents: [target], snapshot,
-          requestBody: body, attemptAuthorityBlock: authority,
-          turnContextDeliveryByAgentId: { [target.id]: 'per_turn_header' } })).toBe(true);
-        const decoded = Buffer.from(body.viventiumGlassHiveTurnContextB64, 'base64').toString('utf8');
+        expect(
+          mainContext.applyMainContextAttempt({
+            agents: [target],
+            snapshot,
+            requestBody: body,
+            attemptAuthorityBlock: authority,
+            turnContextDeliveryByAgentId: { [target.id]: 'per_turn_header' },
+          }),
+        ).toBe(true);
+        const decoded = Buffer.from(body.viventiumGlassHiveTurnContextB64, 'base64').toString(
+          'utf8',
+        );
         expect(Buffer.byteLength(decoded)).toBeLessThanOrEqual(carrierKiB * 1024);
         expect(decoded).toContain(full);
         expect(decoded).toContain(legacy);
@@ -6950,7 +7212,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         expect(decoded).toContain('Ask before buying.');
         expect(decoded).toContain('project-123');
         for (const turn of recent) {
-          expect(decoded).toContain(turn.userText); expect(decoded).toContain(turn.assistantText);
+          expect(decoded).toContain(turn.userText);
+          expect(decoded).toContain(turn.assistantText);
         }
         // This empty roster fits both carriers. The admitted projection must match its bytes.
         {
@@ -6958,26 +7221,48 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
           expect(local.activeWorkProjection).toEqual(projection);
           expect(decoded).toContain(active);
           const replayBody = {};
-          expect(mainContext.applyMainContextAttempt({ agents: [target], snapshot,
-            requestBody: replayBody, attemptAuthorityBlock: authority,
-            turnContextDeliveryByAgentId: { [target.id]: 'per_turn_header' } })).toBe(true);
-          expect(replayBody.viventiumGlassHiveTurnContextB64).toBe(body.viventiumGlassHiveTurnContextB64);
+          expect(
+            mainContext.applyMainContextAttempt({
+              agents: [target],
+              snapshot,
+              requestBody: replayBody,
+              attemptAuthorityBlock: authority,
+              turnContextDeliveryByAgentId: { [target.id]: 'per_turn_header' },
+            }),
+          ).toBe(true);
+          expect(replayBody.viventiumGlassHiveTurnContextB64).toBe(
+            body.viventiumGlassHiveTurnContextB64,
+          );
         }
-      } finally { mockCreateRun = mockActualCreateRun; }
+      } finally {
+        mockCreateRun = mockActualCreateRun;
+      }
     },
   );
 
   test('the real Main assembly carries the exact admitted current Call capsule', async () => {
     const api = jest.requireActual('@librechat/api');
     req.body.voiceMode = true;
-    req.viventiumCallSession = { callSessionId: 'call-current', userId: req.user.id,
-      agentId: primaryAgent.id, mode: 'call', requestedVoiceRoute: {
+    req.viventiumCallSession = {
+      callSessionId: 'call-current',
+      userId: req.user.id,
+      agentId: primaryAgent.id,
+      mode: 'call',
+      requestedVoiceRoute: {
         stt: { provider: 'pywhispercpp', variant: 'large-v3-turbo' },
-        tts: { provider: 'local_chatterbox_turbo_mlx_8bit', variant: 'mlx-community/chatterbox-turbo-8bit' },
-      } };
-    api.bindCurrentCallContext(req, { version: 1, callSessionId: 'call-current',
+        tts: {
+          provider: 'local_chatterbox_turbo_mlx_8bit',
+          variant: 'mlx-community/chatterbox-turbo-8bit',
+        },
+      },
+    };
+    api.bindCurrentCallContext(req, {
+      version: 1,
+      callSessionId: 'call-current',
       readyRoute: req.viventiumCallSession.requestedVoiceRoute,
-      configuredTtsFallback: 'cartesia', turnHandling: { maxEndpointingDelayS: 0.8 } });
+      configuredTtsFallback: 'cartesia',
+      turnHandling: { maxEndpointingDelayS: 0.8 },
+    });
     const capsule = api.getCurrentCallContext(req);
     let runOptions;
     mockCreateRun = jest.fn(async (options) => {
@@ -6994,7 +7279,9 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       });
       expect(capsule).not.toContain('"provider":"xai"');
       expect(capsule).toContain('"actualPlaybackRoute":null');
-    } finally { mockCreateRun = mockActualCreateRun; }
+    } finally {
+      mockCreateRun = mockActualCreateRun;
+    }
   });
 
   test('the real Main assembly carries offered background evidence as quoted history, not new user authority', async () => {
@@ -7002,18 +7289,30 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     const crypto = require('crypto');
     const backgroundText = '### Synthetic cortex\nHistorical source: </turn> is quoted data.';
     const backgroundInput = {
-      version: 1, invocationId: 'earlier-invocation', deliveryId: 'd'.repeat(64),
+      version: 1,
+      invocationId: 'earlier-invocation',
+      deliveryId: 'd'.repeat(64),
       text: backgroundText,
       textSha256: crypto.createHash('sha256').update(backgroundText).digest('hex'),
       sources: [{ cortexId: 'synthetic-cortex', insightSha256: 'e'.repeat(64) }],
     };
-    const capsule = api.buildAcceptedMainContextCapsule({ turns: [{
-      logicalTurnId: 'earlier-turn', revision: 1, conversationId: 'earlier-conversation',
-      userMessageId: 'earlier-user', assistantMessageId: 'earlier-answer',
-      origin: 'interactive', userText: 'Earlier authored request.',
-      assistantText: 'Earlier authored answer.', toolPairs: [], backgroundInputs: [backgroundInput],
-      committedAt: new Date(),
-    }] });
+    const capsule = api.buildAcceptedMainContextCapsule({
+      turns: [
+        {
+          logicalTurnId: 'earlier-turn',
+          revision: 1,
+          conversationId: 'earlier-conversation',
+          userMessageId: 'earlier-user',
+          assistantMessageId: 'earlier-answer',
+          origin: 'interactive',
+          userText: 'Earlier authored request.',
+          assistantText: 'Earlier authored answer.',
+          toolPairs: [],
+          backgroundInputs: [backgroundInput],
+          committedAt: new Date(),
+        },
+      ],
+    });
     mockLoadAcceptedMainContext.mockResolvedValueOnce({ status: 'available', capsule, turns: [] });
     let runOptions;
     mockCreateRun = jest.fn(async (options) => {
@@ -7036,7 +7335,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
   });
 
   test.each(['superseded', 'committed', 'changed_source', 'pruned_source'])(
-    'the real caller and SDK retain only verified dispatched Main input: %s', async (outcome) => {
+    'the real caller and SDK retain only verified dispatched Main input: %s',
+    async (outcome) => {
       const api = jest.requireActual('@librechat/api');
       const { Run, initializeModel } = jest.requireActual('@librechat/agents');
       const { HumanMessage } = require('@langchain/core/messages');
@@ -7047,30 +7347,69 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       await realManager.initialize();
       const capabilities = { segment_stability: 'provisional', supersede_scope: 'response_only' };
       const sourceText = 'Create a synthetic CSV with three rows.';
-      const makeContext = (source, text) => ({ actor_kind: 'external_user', origin: 'interactive',
-        surface: 'voice', conversation_id: client.conversationId, source_event_id: source,
-        revision: 1, source_segments: [{ ordinal: 0, source_event_id: source, source_index: 0, text }] });
+      const makeContext = (source, text) => ({
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'voice',
+        conversation_id: client.conversationId,
+        source_event_id: source,
+        revision: 1,
+        source_segments: [{ ordinal: 0, source_event_id: source, source_index: 0, text }],
+      });
       const interactionAdapter = require('~/server/services/viventium/interactionContext');
-      interactionAdapter.setTrustedInteractionContext(req, makeContext('source-first', sourceText),
-        capabilities, { commit_authority: 'external_adapter' });
-      const registeredInput = interactionAdapter.bindInteractionSourceSegments(req, sourceText, [], {
-        messageId: 'user-source', parentMessageId: '', persisted: true,
-      });
-      const first = await realManager.createJob(req._resumableStreamId, req.user.id, client.conversationId, {
-        interactionContext: registeredInput, adapterCapabilities: capabilities,
-        deliveryPolicy: { commit_authority: 'external_adapter' },
-      });
+      interactionAdapter.setTrustedInteractionContext(
+        req,
+        makeContext('source-first', sourceText),
+        capabilities,
+        { commit_authority: 'external_adapter' },
+      );
+      const registeredInput = interactionAdapter.bindInteractionSourceSegments(
+        req,
+        sourceText,
+        [],
+        {
+          messageId: 'user-source',
+          parentMessageId: '',
+          persisted: true,
+        },
+      );
+      const first = await realManager.createJob(
+        req._resumableStreamId,
+        req.user.id,
+        client.conversationId,
+        {
+          interactionContext: registeredInput,
+          adapterCapabilities: capabilities,
+          deliveryPolicy: { commit_authority: 'external_adapter' },
+        },
+      );
       await realManager.updateMetadata(req._resumableStreamId, {
-        responseMessageId: client.responseMessageId, userMessage: { messageId: 'user-source', text: sourceText },
+        responseMessageId: client.responseMessageId,
+        userMessage: { messageId: 'user-source', text: sourceText },
       });
-      const interaction = await realManager.commitLogicalTurnAuthor(req._resumableStreamId, req.user.id);
-      expect(interaction.source_segments).toEqual([expect.objectContaining({
-        source_message_id: 'user-source', source_persisted: true, authoring_revision: 1,
-      })]);
+      const interaction = await realManager.commitLogicalTurnAuthor(
+        req._resumableStreamId,
+        req.user.id,
+      );
+      expect(interaction.source_segments).toEqual([
+        expect.objectContaining({
+          source_message_id: 'user-source',
+          source_persisted: true,
+          authoring_revision: 1,
+        }),
+      ]);
       expect(interactionAdapter.bindLogicalTurnContext(req, interaction)).toEqual(interaction);
       req.body.voiceMode = true;
-      client._viventiumVisibleMessagesV1 = [{ user: req.user.id, conversationId: client.conversationId,
-        messageId: 'user-source', role: 'user', isCreatedByUser: true, text: sourceText }];
+      client._viventiumVisibleMessagesV1 = [
+        {
+          user: req.user.id,
+          conversationId: client.conversationId,
+          messageId: 'user-source',
+          role: 'user',
+          isCreatedByUser: true,
+          text: sourceText,
+        },
+      ];
       const messages = [...client._viventiumVisibleMessagesV1];
       let bound;
       let dispatchedBody;
@@ -7079,30 +7418,66 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       const transport = jest.fn(async (_input, init) => {
         dispatchedBody = JSON.parse(init.body);
         dispatchedHeaders = new Headers(init.headers);
-        return new Response('data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Ready."},"finish_reason":null}]}\n\ndata: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
-          { headers: { 'content-type': 'text/event-stream' } });
+        return new Response(
+          'data: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Ready."},"finish_reason":null}]}\n\ndata: {"id":"synthetic","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          { headers: { 'content-type': 'text/event-stream' } },
+        );
       });
-      primaryAgent.model_parameters = { model: 'synthetic', apiKey: 'synthetic', maxRetries: 0,
-        configuration: { baseURL: 'https://native.invalid/v1', fetch: transport,
-          defaultHeaders: { 'X-GlassHive-Agent-Id': primaryAgent.id } } };
-      const nativeSpy = jest.spyOn(require('~/server/services/viventium/nativeResponseService'),
-        'wrapNativeResponseFetch').mockImplementation((_req, _primaryId, baseFetch) =>
-        api.createNativeResponseFetch(baseFetch, async () => {
-          const job = await store.getJob(req._resumableStreamId);
-          return { userId: job.userId, conversationId: job.conversationId, responseMessageId: job.responseMessageId,
-            streamId: job.streamId, jobCreatedAt: job.createdAt, logicalTurnId: interaction.logical_turn_id,
-            revision: interaction.revision, providerId: 'native', agentId: primaryAgent.id,
-            source: { id: 'input-row', messageId: 'user-source', digest: sourceHash } };
-        }, (identity) => realManager.bindNativeResponse(identity), (identity) => { bound = identity; }));
+      primaryAgent.model_parameters = {
+        model: 'synthetic',
+        apiKey: 'synthetic',
+        maxRetries: 0,
+        configuration: {
+          baseURL: 'https://native.invalid/v1',
+          fetch: transport,
+          defaultHeaders: { 'X-GlassHive-Agent-Id': primaryAgent.id },
+        },
+      };
+      const nativeSpy = jest
+        .spyOn(
+          require('~/server/services/viventium/nativeResponseService'),
+          'wrapNativeResponseFetch',
+        )
+        .mockImplementation((_req, _primaryId, baseFetch) =>
+          api.createNativeResponseFetch(
+            baseFetch,
+            async () => {
+              const job = await store.getJob(req._resumableStreamId);
+              return {
+                userId: job.userId,
+                conversationId: job.conversationId,
+                responseMessageId: job.responseMessageId,
+                streamId: job.streamId,
+                jobCreatedAt: job.createdAt,
+                logicalTurnId: interaction.logical_turn_id,
+                revision: interaction.revision,
+                providerId: 'native',
+                agentId: primaryAgent.id,
+                source: { id: 'input-row', messageId: 'user-source', digest: sourceHash },
+              };
+            },
+            (identity) => realManager.bindNativeResponse(identity),
+            (identity) => {
+              bound = identity;
+            },
+          ),
+        );
       const runSpy = jest.spyOn(Run, 'create').mockImplementation(async ({ graphConfig }) => ({
         processStream: async ({ messages: input }) => {
           const projected = graphConfig.agents[0];
-          const model = initializeModel({ provider: projected.provider, clientOptions: projected.clientOptions });
-          const carried = outcome === 'changed_source'
-            ? [new HumanMessage({ id: 'user-source', content: 'Changed after snapshot.' })]
-            : outcome === 'pruned_source' ? [] : input;
+          const model = initializeModel({
+            provider: projected.provider,
+            clientOptions: projected.clientOptions,
+          });
+          const carried =
+            outcome === 'changed_source'
+              ? [new HumanMessage({ id: 'user-source', content: 'Changed after snapshot.' })]
+              : outcome === 'pruned_source'
+                ? []
+                : input;
           for await (const chunk of await model.stream(carried)) {
-            if (chunk.content) client.contentParts.push({ type: ContentTypes.TEXT, text: chunk.content });
+            if (chunk.content)
+              client.contentParts.push({ type: ContentTypes.TEXT, text: chunk.content });
           }
         },
       }));
@@ -7110,59 +7485,106 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       try {
         if (['changed_source', 'pruned_source'].includes(outcome)) {
           const denied = await client.sendCompletion(messages);
-          expect(denied.completion).toEqual([expect.objectContaining({ error_class: 'source_context_unavailable' })]);
+          expect(denied.completion).toEqual([
+            expect.objectContaining({ error_class: 'source_context_unavailable' }),
+          ]);
           expect(transport).not.toHaveBeenCalled();
           expect(bound).toBeUndefined();
-          expect((await store.getJob(req._resumableStreamId)).nativeAcceptedSources).toBeUndefined();
+          expect(
+            (await store.getJob(req._resumableStreamId)).nativeAcceptedSources,
+          ).toBeUndefined();
           return;
         }
         await client.sendCompletion(messages);
         expect(req._viventiumMainContextSnapshotV1.visibleMessageChain).toEqual([
-          expect.objectContaining({ id: 'user-source', current_input: true, accepted_source: true }),
+          expect.objectContaining({
+            id: 'user-source',
+            current_input: true,
+            accepted_source: true,
+          }),
         ]);
         expect(transport).toHaveBeenCalledTimes(1);
         expect((await store.getJob(req._resumableStreamId)).nativeAcceptedSources).toEqual({
-          invocationId: bound.invocationId, sources: [{ id: 'user-source', sha256: sourceHash }],
+          invocationId: bound.invocationId,
+          sources: [{ id: 'user-source', sha256: sourceHash }],
         });
-        const carriedChain = dispatchedBody.metadata?.visible_message_chain ?? JSON.parse(Buffer.from(
-          dispatchedHeaders.get('X-Viventium-Visible-Message-Chain-B64'), 'base64',
-        ).toString('utf8'));
+        const carriedChain =
+          dispatchedBody.metadata?.visible_message_chain ??
+          JSON.parse(
+            Buffer.from(
+              dispatchedHeaders.get('X-Viventium-Visible-Message-Chain-B64'),
+              'base64',
+            ).toString('utf8'),
+          );
         expect(dispatchedBody.messages).toEqual([{ role: 'user', content: sourceText }]);
         expect(carriedChain).toEqual([
-          expect.objectContaining({ id: 'user-source', role: 'user', sha256: sourceHash,
-            accepted_source: true, current_input: true, source_ordinals: [1] }),
+          expect.objectContaining({
+            id: 'user-source',
+            role: 'user',
+            sha256: sourceHash,
+            accepted_source: true,
+            current_input: true,
+            source_ordinals: [1],
+          }),
         ]);
-        expect(carriedChain).toEqual(req._viventiumMainContextSnapshotV1.visibleMessageChain.map((row) => ({
-          id: row.id, role: row.role, sha256: row.sha256, content_sha256: row.content_sha256,
-          accepted_source: row.accepted_source, current_input: row.current_input,
-          source_ordinals: row.source_ordinals,
-        })));
+        expect(carriedChain).toEqual(
+          req._viventiumMainContextSnapshotV1.visibleMessageChain.map((row) => ({
+            id: row.id,
+            role: row.role,
+            sha256: row.sha256,
+            content_sha256: row.content_sha256,
+            accepted_source: row.accepted_source,
+            current_input: row.current_input,
+            source_ordinals: row.source_ordinals,
+          })),
+        );
         expect(dispatchedHeaders.get('X-Viventium-Main-Context-Owner')).toBe('core');
         expect(dispatchedHeaders.get('X-Viventium-Actor-Kind')).toBe('external_user');
         expect(dispatchedHeaders.get('X-Viventium-Origin')).toBe('interactive');
         if (outcome === 'committed') await realManager.commitNativeResponse(bound, 'a'.repeat(64));
         await realManager.createJob('next-source-stream', req.user.id, client.conversationId, {
           interactionContext: makeContext('source-next', 'Tell me when it is ready.'),
-          adapterCapabilities: capabilities, deliveryPolicy: { commit_authority: 'external_adapter' },
+          adapterCapabilities: capabilities,
+          deliveryPolicy: { commit_authority: 'external_adapter' },
         });
         const readFacts = jest.fn(async () => ({ effects: [], work: [] }));
-        realManager.setNativeSourceRecovery(async (current, previous) => api.prepareNativeSourceRecovery(current, previous, {
-          beforeCapture: async () => Date.now() + 1000, getJob: (id) => store.getJob(id),
-          readFacts: async () => ({ facts: await readFacts(), pending: false }),
-          sleep: async () => { throw new Error('Unexpected pending proof'); },
-        }));
+        realManager.setNativeSourceRecovery(async (current, previous) =>
+          api.prepareNativeSourceRecovery(current, previous, {
+            beforeCapture: async () => Date.now() + 1000,
+            getJob: (id) => store.getJob(id),
+            readFacts: async () => ({ facts: await readFacts(), pending: false }),
+            sleep: async () => {
+              throw new Error('Unexpected pending proof');
+            },
+          }),
+        );
         if (outcome === 'superseded') {
           await realManager.completeJob(first.streamId);
-          expect(await realManager.acknowledgeDelivery({ logical_turn_id: interaction.logical_turn_id,
-            revision: interaction.revision, state: 'partial_removed', presentation_ref: client.responseMessageId,
-          }, 'voice')).toMatchObject({ status: 'recorded' });
+          expect(
+            await realManager.acknowledgeDelivery(
+              {
+                logical_turn_id: interaction.logical_turn_id,
+                revision: interaction.revision,
+                state: 'partial_removed',
+                presentation_ref: client.responseMessageId,
+              },
+              'voice',
+            ),
+          ).toMatchObject({ status: 'recorded' });
         }
         const next = await realManager.commitLogicalTurnAuthor('next-source-stream', req.user.id);
-        expect(api.ownedInteractionSources(next, capabilities).map(({ segment }) => segment.text))
-          .toEqual(outcome === 'committed' ? ['Tell me when it is ready.'] : [sourceText, 'Tell me when it is ready.']);
+        expect(
+          api.ownedInteractionSources(next, capabilities).map(({ segment }) => segment.text),
+        ).toEqual(
+          outcome === 'committed'
+            ? ['Tell me when it is ready.']
+            : [sourceText, 'Tell me when it is ready.'],
+        );
         expect(readFacts).toHaveBeenCalledTimes(outcome === 'committed' ? 0 : 1);
       } finally {
-        runSpy.mockRestore(); nativeSpy.mockRestore(); mockCreateRun = mockActualCreateRun;
+        runSpy.mockRestore();
+        nativeSpy.mockRestore();
+        mockCreateRun = mockActualCreateRun;
         await realManager.destroy();
       }
     },
@@ -7170,73 +7592,134 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
   test('unresolved stream keeps actual SDK stream loss incomplete and blocks fallback', async () => {
     const { initializeModel } = jest.requireActual('@librechat/agents');
-    const first = 'data: ' + JSON.stringify({
-      id: 'synthetic-current-request', object: 'chat.completion.chunk', model: 'synthetic',
-      choices: [{ index: 0, delta: { content: 'Useful public words. ',
-        provider_specific_fields: { viventium: { delivery_disposition: {
-          version: 1, audio: 'eligible', required: true, valid: true, source: 'model',
-        } } } }, finish_reason: null }],
-    });
+    const first =
+      'data: ' +
+      JSON.stringify({
+        id: 'synthetic-current-request',
+        object: 'chat.completion.chunk',
+        model: 'synthetic',
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content: 'Useful public words. ',
+              provider_specific_fields: {
+                viventium: {
+                  delivery_disposition: {
+                    version: 1,
+                    audio: 'eligible',
+                    required: true,
+                    valid: true,
+                    source: 'model',
+                  },
+                },
+              },
+            },
+            finish_reason: null,
+          },
+        ],
+      });
     const encoder = new TextEncoder();
     let bodyController;
-    const model = initializeModel({ provider: 'openAI', clientOptions: {
-      apiKey: 'synthetic-key', model: 'synthetic', streaming: true, streamUsage: false,
-      maxRetries: 0, __includeRawResponse: true, configuration: {
-        baseURL: 'http://synthetic.invalid/v1', fetch: async () => new Response(new ReadableStream({
-          start(controller) { bodyController = controller; controller.enqueue(encoder.encode(first+'\n\n')); },
-        }), { headers: { 'Content-Type': 'text/event-stream' } }),
+    const model = initializeModel({
+      provider: 'openAI',
+      clientOptions: {
+        apiKey: 'synthetic-key',
+        model: 'synthetic',
+        streaming: true,
+        streamUsage: false,
+        maxRetries: 0,
+        __includeRawResponse: true,
+        configuration: {
+          baseURL: 'http://synthetic.invalid/v1',
+          fetch: async () =>
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  bodyController = controller;
+                  controller.enqueue(encoder.encode(first + '\n\n'));
+                },
+              }),
+              { headers: { 'Content-Type': 'text/event-stream' } },
+            ),
+        },
       },
-    } });
+    });
     const abortController = new AbortController();
     primaryAgent.viventiumFallbackLlmInitializer = jest.fn();
     req._viventiumToolInvocationStarted = true;
     const effectReceipt = Object.freeze({ key: 'already-accepted', count: 1 });
     req._syntheticExistingEffectReceipt = effectReceipt;
-    mockCreateRun = jest.fn(async ({ signal }) => ({ processStream: async () => {
-      for await (const chunk of await model.stream('Synthetic current turn.', { signal })) {
-        if (chunk.content) {
-          client.contentParts.push({ type: ContentTypes.TEXT, text: chunk.content });
-          bodyController.error(new TypeError('terminated'));
+    mockCreateRun = jest.fn(async ({ signal }) => ({
+      processStream: async () => {
+        for await (const chunk of await model.stream('Synthetic current turn.', { signal })) {
+          if (chunk.content) {
+            client.contentParts.push({ type: ContentTypes.TEXT, text: chunk.content });
+            bodyController.error(new TypeError('terminated'));
+          }
         }
-      }
-    } }));
+      },
+    }));
     try {
-      await expect(client.sendCompletion({ messages: [] }, { abortController }))
-        .rejects.toThrow('terminated');
+      await expect(client.sendCompletion({ messages: [] }, { abortController })).rejects.toThrow(
+        'terminated',
+      );
       expect(client.contentParts.some((part) => part.text)).toBe(true);
       expect(primaryAgent.viventiumFallbackLlmInitializer).not.toHaveBeenCalled();
       expect(mockCreateRun).toHaveBeenCalledTimes(1);
       expect(req._syntheticExistingEffectReceipt).toBe(effectReceipt);
-      expect(AgentClient.createCompletionErrorContentPart(new Error('terminated')).error)
-        .toBe('The model stream ended before the response was complete.');
-    } finally { mockCreateRun = mockActualCreateRun; }
+      expect(AgentClient.createCompletionErrorContentPart(new Error('terminated')).error).toBe(
+        'The model stream ended before the response was complete.',
+      );
+    } finally {
+      mockCreateRun = mockActualCreateRun;
+    }
   });
 
   test('resolved stream preserves resolved completion when later finalization fails', async () => {
-    mockCreateRun = jest.fn(async () => ({ processStream: async () => {
-      client.contentParts.push({ type: ContentTypes.TEXT, text: 'Complete answer.' });
-    } }));
-    client.scheduleMemoryWriter = jest.fn(() => { throw new Error('synthetic finalization failure'); });
+    mockCreateRun = jest.fn(async () => ({
+      processStream: async () => {
+        client.contentParts.push({ type: ContentTypes.TEXT, text: 'Complete answer.' });
+      },
+    }));
+    client.scheduleMemoryWriter = jest.fn(() => {
+      throw new Error('synthetic finalization failure');
+    });
     try {
       await expect(client.sendCompletion({ messages: [] })).resolves.toMatchObject({
         completion: [{ type: ContentTypes.TEXT, text: 'Complete answer.' }],
       });
       expect(mockCreateRun).toHaveBeenCalledTimes(1);
-    } finally { mockCreateRun = mockActualCreateRun; }
+    } finally {
+      mockCreateRun = mockActualCreateRun;
+    }
   });
 
   test.each(['direct', 'native'])(
-    'clears a prior refusal before the actual outer %s fallback attempt', async (mode) => {
+    'clears a prior refusal before the actual outer %s fallback attempt',
+    async (mode) => {
       const refused = { invocationId: 'prior', terminalErrorConfirmed: true };
-      primaryAgent.viventiumFallbackLlm = { id: 'fallback', provider: mode === 'direct' ? EModelEndpoint.openAI : 'synthetic-native',
-        model: 'synthetic-fallback', model_parameters: { model: 'synthetic-fallback' }, tools: [] };
-      client.chatCompletion = jest.fn().mockImplementationOnce(async () => {
-        req._viventiumNativeResponseUnaccepted = refused;
-        client.contentParts.push({ type: ContentTypes.ERROR, error_class: 'provider_rate_limited', error: 'Try again.' });
-      }).mockImplementationOnce(async () => {
-        expect(req._viventiumNativeResponseUnaccepted).toBeUndefined();
-        client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
-      });
+      primaryAgent.viventiumFallbackLlm = {
+        id: 'fallback',
+        provider: mode === 'direct' ? EModelEndpoint.openAI : 'synthetic-native',
+        model: 'synthetic-fallback',
+        model_parameters: { model: 'synthetic-fallback' },
+        tools: [],
+      };
+      client.chatCompletion = jest
+        .fn()
+        .mockImplementationOnce(async () => {
+          req._viventiumNativeResponseUnaccepted = refused;
+          client.contentParts.push({
+            type: ContentTypes.ERROR,
+            error_class: 'provider_rate_limited',
+            error: 'Try again.',
+          });
+        })
+        .mockImplementationOnce(async () => {
+          expect(req._viventiumNativeResponseUnaccepted).toBeUndefined();
+          client.contentParts.push({ type: ContentTypes.TEXT, text: 'Fallback answer.' });
+        });
       await client.sendCompletion({ messages: [] });
       expect(client.chatCompletion).toHaveBeenCalledTimes(2);
       expect(req._viventiumNativeResponseUnaccepted).toBeUndefined();
@@ -7259,11 +7742,13 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     try {
       await client.sendCompletion({ messages: [] }).catch(() => undefined);
       expect(mockLoadAcceptedMainContext).toHaveBeenCalledTimes(2);
-      expect(mockLoadAcceptedMainContext.mock.calls.map(([identity]) => ({
-        ownerId: identity.ownerId,
-        agentId: identity.agentId,
-        stableAuthoritySha256: identity.stableAuthoritySha256,
-      }))).toEqual([captured, captured]);
+      expect(
+        mockLoadAcceptedMainContext.mock.calls.map(([identity]) => ({
+          ownerId: identity.ownerId,
+          agentId: identity.agentId,
+          stableAuthoritySha256: identity.stableAuthoritySha256,
+        })),
+      ).toEqual([captured, captured]);
       expect(req._viventiumAcceptedMainCompactionIdentityV1).toBe(captured);
       expect(client.options.agent.id).toBe('different-runtime-route');
     } finally {
@@ -7271,32 +7756,53 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     }
   });
 
-  test.each(['current-main', 'hidden', 'unbound', 'stale-invocation', 'wrong-run', 'wrong-thread']
-    .flatMap((mode) => [false, true].map((voice) => ({ mode, voice }))))(
-    'attributes a graph fallback receipt only to the actual current Main completion: $mode voice=$voice', async ({ mode, voice }) => {
+  test.each(
+    ['current-main', 'hidden', 'unbound', 'stale-invocation', 'wrong-run', 'wrong-thread'].flatMap(
+      (mode) => [false, true].map((voice) => ({ mode, voice })),
+    ),
+  )(
+    'attributes a graph fallback receipt only to the actual current Main completion: $mode voice=$voice',
+    async ({ mode, voice }) => {
       if (voice) {
         req.body.voiceMode = true;
         req.body.viventiumCallSessionId = 'synthetic-call';
-        setTrustedInteractionContext(req, { actor_kind: 'external_user', origin: 'interactive',
-          surface: 'voice', conversation_id: client.conversationId, source_event_id: 'synthetic-source',
-          logical_turn_id: 'synthetic-turn', revision: 1 });
-        primaryAgent.viventiumFallbackLlm = { id: primaryAgent.id, provider: EModelEndpoint.openAI,
-          model: 'synthetic-worker-fallback', model_parameters: { model: 'synthetic-worker-fallback' } };
+        setTrustedInteractionContext(req, {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'voice',
+          conversation_id: client.conversationId,
+          source_event_id: 'synthetic-source',
+          logical_turn_id: 'synthetic-turn',
+          revision: 1,
+        });
+        primaryAgent.viventiumFallbackLlm = {
+          id: primaryAgent.id,
+          provider: EModelEndpoint.openAI,
+          model: 'synthetic-worker-fallback',
+          model_parameters: { model: 'synthetic-worker-fallback' },
+        };
       }
       client.chatCompletion = jest.fn(async () => {
         const key = Symbol.for('viventium.graph.fallback.recovery.invocation.v1');
-        const invocation = Object.freeze({ agentId: primaryAgent.id,
-          runId: client.responseMessageId, threadId: client.conversationId });
+        const invocation = Object.freeze({
+          agentId: primaryAgent.id,
+          runId: client.responseMessageId,
+          threadId: client.conversationId,
+        });
         const receipt = { provider: 'openAI', model: 'synthetic-worker-fallback', ...invocation };
         if (mode === 'hidden') receipt.agentId = 'synthetic-hidden';
         if (mode === 'wrong-run') receipt.runId = 'earlier-response';
         if (mode === 'wrong-thread') receipt.threadId = 'other-conversation';
         if (mode !== 'unbound') Object.defineProperty(receipt, key, { value: invocation });
-        client.run = { Graph: { defaultAgentId: primaryAgent.id, runId: client.responseMessageId } };
+        client.run = {
+          Graph: { defaultAgentId: primaryAgent.id, runId: client.responseMessageId },
+        };
         Object.defineProperty(client.run.Graph, key, {
-          value: mode === 'stale-invocation' ? { ...invocation } : invocation });
+          value: mode === 'stale-invocation' ? { ...invocation } : invocation,
+        });
         Object.defineProperty(client.run.Graph, 'viventiumGraphFallbackRecoveryReceipt', {
-          value: receipt, enumerable: false,
+          value: receipt,
+          enumerable: false,
         });
         client.contentParts.push({ type: ContentTypes.TEXT, text: 'One final answer.' });
       });
@@ -7304,19 +7810,28 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       const refreshed = JSON.parse(JSON.stringify(completion));
       expect(client.chatCompletion).toHaveBeenCalledTimes(1);
       const expected = [{ type: ContentTypes.TEXT, text: 'One final answer.' }];
-      if (mode === 'current-main') expected.unshift({
-        type: ContentTypes.HARNESS_ACTIVITY,
-        harness_activity: expect.objectContaining({ event: 'fallback-recovery',
-          provider: 'openAI', model: 'synthetic-worker-fallback' }),
-      });
+      if (mode === 'current-main')
+        expected.unshift({
+          type: ContentTypes.HARNESS_ACTIVITY,
+          harness_activity: expect.objectContaining({
+            event: 'fallback-recovery',
+            provider: 'openAI',
+            model: 'synthetic-worker-fallback',
+          }),
+        });
       expect(refreshed).toEqual(expected);
       if (voice) {
         const completions = mockRecordVoiceOrchestrationTrace.mock.calls
-          .map(([event]) => event).filter((event) => event.stage === 'provider.attempt.completed');
-        expect(completions).toEqual([expect.objectContaining({ facts: expect.objectContaining({
-          attemptRole: mode === 'current-main' ? 'fallback' : 'primary',
-          model: mode === 'current-main' ? 'synthetic-worker-fallback' : 'gpt-4',
-        }) })]);
+          .map(([event]) => event)
+          .filter((event) => event.stage === 'provider.attempt.completed');
+        expect(completions).toEqual([
+          expect.objectContaining({
+            facts: expect.objectContaining({
+              attemptRole: mode === 'current-main' ? 'fallback' : 'primary',
+              model: mode === 'current-main' ? 'synthetic-worker-fallback' : 'gpt-4',
+            }),
+          }),
+        ]);
       }
     },
   );
@@ -7369,11 +7884,13 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       cortexCount: 1,
     });
     await new Promise((resolve) => setImmediate(resolve));
-    const liveCourier = require('~/server/services/viventium/nativeResponseService')
-      .deliverCompletedCortexBatchToRunningMain;
+    const liveCourier =
+      require('~/server/services/viventium/nativeResponseService').deliverCompletedCortexBatchToRunningMain;
     expect(liveCourier).toHaveBeenCalledTimes(1);
     expect(liveCourier.mock.calls[0][0]).toMatchObject({
-      ownerId: 'user-1', conversationId: 'conv-1', parentMessageId: 'resp-1',
+      ownerId: 'user-1',
+      conversationId: 'conv-1',
+      parentMessageId: 'resp-1',
       streamId: 'stream-1',
       context: expect.stringContaining('### Background\nBackground result.'),
     });
@@ -7769,24 +8286,36 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
 
   test('a pending live context ACK cannot delay the durable after-Main follow-up', async () => {
     const liveContext = deferred();
-    const courier = require('~/server/services/viventium/nativeResponseService')
-      .deliverCompletedCortexBatchToRunningMain;
+    const courier =
+      require('~/server/services/viventium/nativeResponseService').deliverCompletedCortexBatchToRunningMain;
     courier.mockImplementationOnce(() => liveContext.promise);
     client.contentParts.push({ type: ContentTypes.TEXT, text: 'Main answer.' });
-    const completed = { insights: [{ cortexId: 'background', cortexName: 'Background',
-      insight: 'Useful result.' }], mergedPrompt: 'Useful result.', cortexCount: 1 };
+    const completed = {
+      insights: [{ cortexId: 'background', cortexName: 'Background', insight: 'Useful result.' }],
+      mergedPrompt: 'Useful result.',
+      cortexCount: 1,
+    };
     try {
       await client.attachBackgroundCortexCompletionPipeline({
-        cortexExecutionPromise: Promise.resolve(completed), pendingCortexParts: [], req,
-        conversationId: 'conv-1', responseMessageId: 'resp-1', agent: primaryAgent,
-        getResponseContentParts: () => client.contentParts, responseController: null,
-        turnUserInputTime: 0, followupGraceMs: 0, shouldDeferMainResponse: false,
+        cortexExecutionPromise: Promise.resolve(completed),
+        pendingCortexParts: [],
+        req,
+        conversationId: 'conv-1',
+        responseMessageId: 'resp-1',
+        agent: primaryAgent,
+        getResponseContentParts: () => client.contentParts,
+        responseController: null,
+        turnUserInputTime: 0,
+        followupGraceMs: 0,
+        shouldDeferMainResponse: false,
         getActivatedCorticesList: () => [],
       });
       expect(courier).toHaveBeenCalledTimes(1);
       expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
       expect(mockCreateCortexFollowUpMessage.mock.calls[0][0].insightsData).toEqual(completed);
-    } finally { liveContext.resolve({ status: 'pending' }); }
+    } finally {
+      liveContext.resolve({ status: 'pending' });
+    }
   });
 
   /* === VIVENTIUM START ===
@@ -8285,7 +8814,10 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       model: 'claude-code:opus',
     };
     client.chatCompletion = jest.fn(async () => {
-      client.contentParts.push({ type: ContentTypes.TEXT, text: 'The consultant was rate-limited.' });
+      client.contentParts.push({
+        type: ContentTypes.TEXT,
+        text: 'The consultant was rate-limited.',
+      });
     });
 
     const { completion } = await client.sendCompletion({ text: 'hello' });
@@ -8643,7 +9175,9 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         warnSpy.mock.calls.filter(
           ([message]) =>
             typeof message === 'string' &&
-            message.startsWith('[AgentClient] Primary completion threw before fallback evaluation '),
+            message.startsWith(
+              '[AgentClient] Primary completion threw before fallback evaluation ',
+            ),
         ),
       ).toHaveLength(0);
     } finally {
@@ -9276,13 +9810,17 @@ describe('restricted voice configured fallback recovery', () => {
       const encoded = Buffer.from(
         shape === 'malformed'
           ? 'invalid-json'
-          : JSON.stringify({ provider_capabilities: shape === 'true' ? { native_tools: true } : {} }),
+          : JSON.stringify({
+              provider_capabilities: shape === 'true' ? { native_tools: true } : {},
+            }),
       ).toString('base64');
-      const signer = jest.spyOn(service, 'restrictedConversationProviderBootstrapHeaders').mockReturnValue({
-        'X-GlassHive-Bootstrap-Bundle-B64': encoded,
-        'X-GlassHive-Bootstrap-Timestamp': '1',
-        'X-GlassHive-Bootstrap-Signature': 'sha256=synthetic',
-      });
+      const signer = jest
+        .spyOn(service, 'restrictedConversationProviderBootstrapHeaders')
+        .mockReturnValue({
+          'X-GlassHive-Bootstrap-Bundle-B64': encoded,
+          'X-GlassHive-Bootstrap-Timestamp': '1',
+          'X-GlassHive-Bootstrap-Signature': 'sha256=synthetic',
+        });
       try {
         expect(await client.options.agent.viventiumFallbackLlmInitializer()).toBeNull();
         expect(client.options.agent.viventiumFallbackLlmInitializationError.code).toBe(
@@ -9348,7 +9886,10 @@ describe('restricted voice configured fallback recovery', () => {
     'provider_response_deadline_exceeded',
   ])('does not replace a terminal %s with configured recovery', async (errorClass) => {
     const client = makeClient();
-    const error = Object.assign(new Error('Synthetic terminal outcome'), { errorClass, status: 502 });
+    const error = Object.assign(new Error('Synthetic terminal outcome'), {
+      errorClass,
+      status: 502,
+    });
     client.chatCompletion = jest.fn(async () => {
       throw error;
     });
@@ -9666,23 +10207,28 @@ describe('Phase B follow-up input recovery', () => {
 });
 
 describe('native provider attention outcome presentation', () => {
-  test.each([200, 502])('preserves an exact typed stall over status %s and a wrapped provider boundary', (status) => {
-    const declared = APIError.generate(
-      status,
-      { error: { code: 'provider_progress_stalled', message: 'Synthetic private detail' } },
-      undefined,
-      new Headers(),
-    );
-    const error = new Error('Outer', { cause: declared });
-    AgentClient.markOpaqueProviderResponseFailure(error);
-    const part = AgentClient.createCompletionErrorContentPart(error);
-    expect(part).toEqual({
-      type: ContentTypes.ERROR,
-      error_class: 'provider_progress_stalled',
-      error: 'The model needs attention because progress stopped.',
-    });
-    expect(require('~/server/services/viventium/agentLlmFallback').shouldRetryWithFallback([part])).toBe(false);
-  });
+  test.each([200, 502])(
+    'preserves an exact typed stall over status %s and a wrapped provider boundary',
+    (status) => {
+      const declared = APIError.generate(
+        status,
+        { error: { code: 'provider_progress_stalled', message: 'Synthetic private detail' } },
+        undefined,
+        new Headers(),
+      );
+      const error = new Error('Outer', { cause: declared });
+      AgentClient.markOpaqueProviderResponseFailure(error);
+      const part = AgentClient.createCompletionErrorContentPart(error);
+      expect(part).toEqual({
+        type: ContentTypes.ERROR,
+        error_class: 'provider_progress_stalled',
+        error: 'The model needs attention because progress stopped.',
+      });
+      expect(
+        require('~/server/services/viventium/agentLlmFallback').shouldRetryWithFallback([part]),
+      ).toBe(false);
+    },
+  );
 });
 
 describe('native owner input outcome presentation', () => {
@@ -9709,72 +10255,129 @@ describe('native owner input outcome presentation', () => {
   });
 });
 
-
 describe('Voice message preparation timing', () => {
   const syntheticMemory = 'SYNTHETIC_PRIVATE_MEMORY_SENTINEL';
   const syntheticRequest = 'SYNTHETIC_PRIVATE_REQUEST_SENTINEL';
-  const addedStages = [
-    'build_messages_continuity_done',
-    'build_messages_format_tokens_done',
-  ];
+  const addedStages = ['build_messages_continuity_done', 'build_messages_format_tokens_done'];
   const modes = [
     { name: 'disabled', enabled: false, memory: true },
     { name: 'enabled with memory', enabled: true, memory: true },
     { name: 'enabled with empty memory', enabled: true, memory: false },
     { name: 'enabled with memory rejection', enabled: true, memoryReject: true },
     { name: 'enabled with timing sink rejection', enabled: true, memory: true, sinkReject: true },
-    { name: 'enabled with continuity rejection', enabled: true, memory: true, continuityReject: true },
+    {
+      name: 'enabled with continuity rejection',
+      enabled: true,
+      memory: true,
+      continuityReject: true,
+    },
     { name: 'enabled with extra agent and RAG', enabled: true, memory: true, context: true },
   ];
-  afterEach(() => { jest.useRealTimers(); jest.restoreAllMocks(); });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
   test.each(modes)('$name preserves actual output/context/call order', async (mode) => {
     jest.useFakeTimers({ now: new Date('2030-01-01T12:00:00.000Z') });
     const execute = async (enabled) => {
       jest.clearAllMocks();
       const continuity = require('~/server/services/viventium/ViventiumConversationContinuityService');
       continuity.resolveConversationContinuity.mockImplementation(async () => {
-        if (mode.continuityReject) throw Object.assign(new Error('synthetic private continuity'), { code: 'synthetic' });
+        if (mode.continuityReject)
+          throw Object.assign(new Error('synthetic private continuity'), { code: 'synthetic' });
         return null;
       });
-      require('~/server/services/viventium/conversationRecallPrompt').buildConversationRecallInstructions.mockReturnValue('');
+      require('~/server/services/viventium/conversationRecallPrompt').buildConversationRecallInstructions.mockReturnValue(
+        '',
+      );
       mockFormatInstructions.mockResolvedValue('Synthetic MCP context.');
       const lines = [];
       logger.info.mockImplementation((line) => {
-        if (typeof line !== 'string' || !addedStages.some((stage) => line.includes(`stage=${stage} `))) return;
+        if (
+          typeof line !== 'string' ||
+          !addedStages.some((stage) => line.includes(`stage=${stage} `))
+        )
+          return;
         lines.push(line);
         if (mode.sinkReject) throw new Error('synthetic private timing sink');
       });
       const req = {
         user: { id: 'synthetic-owner', personalization: { memories: true } },
-        body: { endpoint: EModelEndpoint.openAI }, config: { memory: { disabled: false } },
+        body: { endpoint: EModelEndpoint.openAI },
+        config: { memory: { disabled: false } },
         viventiumVoiceLogLatency: enabled,
         viventiumVoiceRequestId: syntheticRequest,
       };
-      const client = new AgentClient({ req, res: {}, endpoint: EModelEndpoint.agents,
-        agent: { id: 'synthetic-main', name: 'Synthetic Main', endpoint: EModelEndpoint.openAI,
-          provider: EModelEndpoint.openAI, instructions: 'Synthetic system.', model_parameters: { model: 'synthetic-model' }, tools: [] } });
-      client.conversationId = 'synthetic-conversation'; client.responseMessageId = 'synthetic-answer';
-      client.shouldSummarize = false; client.maxContextTokens = 4096;
+      const client = new AgentClient({
+        req,
+        res: {},
+        endpoint: EModelEndpoint.agents,
+        agent: {
+          id: 'synthetic-main',
+          name: 'Synthetic Main',
+          endpoint: EModelEndpoint.openAI,
+          provider: EModelEndpoint.openAI,
+          instructions: 'Synthetic system.',
+          model_parameters: { model: 'synthetic-model' },
+          tools: [],
+        },
+      });
+      client.conversationId = 'synthetic-conversation';
+      client.responseMessageId = 'synthetic-answer';
+      client.shouldSummarize = false;
+      client.maxContextTokens = 4096;
       const calls = [];
       client.useMemory = jest.fn(async () => {
-        calls.push('memory'); client.memoryReadAvailability = mode.memoryReject ? 'unavailable' : 'available';
+        calls.push('memory');
+        client.memoryReadAvailability = mode.memoryReject ? 'unavailable' : 'available';
         if (mode.memoryReject) throw new Error('synthetic private memory');
         return mode.memory ? syntheticMemory : undefined;
       });
       if (mode.context) {
-        client.contextHandlers = { createContext: jest.fn(async () => { calls.push('rag'); return 'Synthetic RAG.'; }) };
-        client.agentConfigs = new Map([['synthetic-peer', { id: 'synthetic-peer', provider: EModelEndpoint.openAI,
-          instructions: 'Synthetic peer.', tools: [] }]]);
+        client.contextHandlers = {
+          createContext: jest.fn(async () => {
+            calls.push('rag');
+            return 'Synthetic RAG.';
+          }),
+        };
+        client.agentConfigs = new Map([
+          [
+            'synthetic-peer',
+            {
+              id: 'synthetic-peer',
+              provider: EModelEndpoint.openAI,
+              instructions: 'Synthetic peer.',
+              tools: [],
+            },
+          ],
+        ]);
       }
-      const messages = [{ messageId: 'synthetic-user', parentMessageId: null,
-        isCreatedByUser: true, sender: 'User', text: 'Synthetic goal.' }];
+      const messages = [
+        {
+          messageId: 'synthetic-user',
+          parentMessageId: null,
+          isCreatedByUser: true,
+          sender: 'User',
+          text: 'Synthetic goal.',
+        },
+      ];
       const result = await client.buildMessages(messages, null, {});
-      return { functional: { result, messages, primary: client.options.agent,
-        peers: [...(client.agentConfigs || new Map())], workerMemory: client.glasshiveWorkerMemory,
-        requestMemory: req._viventiumGlassHiveWorkerMemory,
-        sourceIds: client.memoryWriterSourceMessageIds, sourceDigests: client.memoryWriterSourceMessageDigests,
-        visible: client._viventiumVisibleMessagesV1, calls }, lines,
-        memoryCalls: client.useMemory.mock.calls.length };
+      return {
+        functional: {
+          result,
+          messages,
+          primary: client.options.agent,
+          peers: [...(client.agentConfigs || new Map())],
+          workerMemory: client.glasshiveWorkerMemory,
+          requestMemory: req._viventiumGlassHiveWorkerMemory,
+          sourceIds: client.memoryWriterSourceMessageIds,
+          sourceDigests: client.memoryWriterSourceMessageDigests,
+          visible: client._viventiumVisibleMessagesV1,
+          calls,
+        },
+        lines,
+        memoryCalls: client.useMemory.mock.calls.length,
+      };
     };
     const before = await execute(false);
     const proposed = await execute(mode.enabled);
@@ -9783,7 +10386,8 @@ describe('Voice message preparation timing', () => {
     expect(before.lines).toEqual([]);
     expect(proposed.lines).toHaveLength(mode.enabled ? addedStages.length : 0);
     for (const stage of addedStages) {
-      if (mode.enabled) expect(proposed.lines.filter((line) => line.includes(`stage=${stage} `))).toHaveLength(1);
+      if (mode.enabled)
+        expect(proposed.lines.filter((line) => line.includes(`stage=${stage} `))).toHaveLength(1);
     }
     for (const line of proposed.lines) {
       expect(line).not.toContain(syntheticMemory);
@@ -9798,20 +10402,50 @@ describe('Voice message preparation timing', () => {
 /* === VIVENTIUM START === Current refusal proof stays private after SDK error presentation. === */
 describe('Native capacity refusal presentation ownership', () => {
   test.each(['matching', 'unknown', 'accepted', 'foreign', 'direct_fallback'])(
-    'keeps only the exact current refused attempt: %s', (mode) => {
-      const identity = { invocationId: 'invocation', bodySha256: 'a'.repeat(64), streamId: 'stream', responseMessageId: 'answer' };
+    'keeps only the exact current refused attempt: %s',
+    (mode) => {
+      const identity = {
+        invocationId: 'invocation',
+        bodySha256: 'a'.repeat(64),
+        streamId: 'stream',
+        responseMessageId: 'answer',
+      };
       const req = { _viventiumNativeResponseUnaccepted: { ...identity } };
-      const payload = { code: mode === 'direct_fallback' ? 'upstream_unavailable' : 'host_capacity', message: 'Private failure.',
-        ...(mode === 'unknown' ? {} : { native_admission: { version: 1, accepted: mode === 'accepted',
-          invocation_id: mode === 'foreign' ? 'foreign' : identity.invocationId,
-          body_sha256: identity.bodySha256, stream_id: identity.streamId, message_id: identity.responseMessageId } }) };
+      const payload = {
+        code: mode === 'direct_fallback' ? 'upstream_unavailable' : 'host_capacity',
+        message: 'Private failure.',
+        ...(mode === 'unknown'
+          ? {}
+          : {
+              native_admission: {
+                version: 1,
+                accepted: mode === 'accepted',
+                invocation_id: mode === 'foreign' ? 'foreign' : identity.invocationId,
+                body_sha256: identity.bodySha256,
+                stream_id: identity.streamId,
+                message_id: identity.responseMessageId,
+              },
+            }),
+      };
       const err = APIError.generate(503, { error: payload }, undefined, new Headers());
       mockIsNativeCapacityRefusal.mockReturnValue(mode === 'matching');
       const contentParts = [];
-      AgentClient.handleCompletionErrorContentPart({ contentParts, err, req,
-        abortController: { signal: { aborted: false } }, log: { warn: jest.fn(), error: jest.fn() } });
-      expect(mockIsNativeCapacityRefusal).toHaveBeenCalledWith(payload, expect.objectContaining(identity));
-      if (mode === 'matching') expect(req._viventiumNativeResponseUnaccepted).toMatchObject({ ...identity, terminalErrorConfirmed: true });
+      AgentClient.handleCompletionErrorContentPart({
+        contentParts,
+        err,
+        req,
+        abortController: { signal: { aborted: false } },
+        log: { warn: jest.fn(), error: jest.fn() },
+      });
+      expect(mockIsNativeCapacityRefusal).toHaveBeenCalledWith(
+        payload,
+        expect.objectContaining(identity),
+      );
+      if (mode === 'matching')
+        expect(req._viventiumNativeResponseUnaccepted).toMatchObject({
+          ...identity,
+          terminalErrorConfirmed: true,
+        });
       else expect(req._viventiumNativeResponseUnaccepted).toBeUndefined();
       expect(JSON.stringify(contentParts)).not.toContain('native_admission');
       expect(JSON.stringify(contentParts)).not.toContain(identity.invocationId);
@@ -10088,38 +10722,94 @@ describe('deep completion source-frame diagnostics', () => {
 describe('legacy mandatory Core allocation', () => {
   test('reserves actual larger Core source and keeps both full capsules within selected native body', () => {
     const api = require('@librechat/api');
-    const currentCall = 'current call'; const authority = 1500;
+    const currentCall = 'current call';
+    const authority = 1500;
     const core = 'Full accepted source. '.repeat(900);
-    const reserve = AgentClient.conversationContinuityContextReserveBytes([currentCall], authority,
-      Buffer.byteLength(core));
+    const reserve = AgentClient.conversationContinuityContextReserveBytes(
+      [currentCall],
+      authority,
+      Buffer.byteLength(core),
+    );
     expect(reserve).toBeGreaterThanOrEqual(Buffer.byteLength(core) + authority);
-    const contract = api.conversationMainCompactionOutputContract({ coveredRows: 20,
-      carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: reserve });
-    const proposal = { version: 1, summary: 's'.repeat(6135), pendingAsks: [], commitments: [],
-      corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
+    const contract = api.conversationMainCompactionOutputContract({
+      coveredRows: 20,
+      carrierMaxUtf8Bytes: 128 * 1024,
+      reservedContextUtf8Bytes: reserve,
+    });
+    const proposal = {
+      version: 1,
+      summary: 's'.repeat(6135),
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    };
     expect(api.inspectMainCompactionCarrier(proposal, contract)).toEqual({ ok: true });
     const legacy = api.renderConversationMainContinuityCapsule(proposal, 20);
-    const coreCarrier = api.mainContinuityOutputCarrier([currentCall, legacy], authority, 128 * 1024);
-    expect(Buffer.byteLength(core) + coreCarrier.reservedContextUtf8Bytes).toBeLessThanOrEqual(128 * 1024);
-    const complete = AgentClient.combineTurnContextInstructions('', '', '', '', core, '', '', legacy,
-      coreCarrier.carrierMaxUtf8Bytes, currentCall);
+    const coreCarrier = api.mainContinuityOutputCarrier(
+      [currentCall, legacy],
+      authority,
+      128 * 1024,
+    );
+    expect(Buffer.byteLength(core) + coreCarrier.reservedContextUtf8Bytes).toBeLessThanOrEqual(
+      128 * 1024,
+    );
+    const complete = AgentClient.combineTurnContextInstructions(
+      '',
+      '',
+      '',
+      '',
+      core,
+      '',
+      '',
+      legacy,
+      coreCarrier.carrierMaxUtf8Bytes,
+      currentCall,
+    );
     expect(complete).toContain(core);
     expect(complete).toContain(legacy);
-    expect(Buffer.byteLength(complete) + authority).toBeLessThanOrEqual(coreCarrier.carrierMaxUtf8Bytes);
+    expect(Buffer.byteLength(complete) + authority).toBeLessThanOrEqual(
+      coreCarrier.carrierMaxUtf8Bytes,
+    );
   });
 
   test('reserves a later full Core capsule even when the current one is empty', () => {
     const api = require('@librechat/api');
     const reserve = AgentClient.conversationContinuityContextReserveBytes([], 500);
     expect(reserve).toBeGreaterThanOrEqual(12 * 1024 + 500);
-    const contract = api.conversationMainCompactionOutputContract({ coveredRows: 20,
-      carrierMaxUtf8Bytes: 16 * 1024, reservedContextUtf8Bytes: reserve });
-    const proposal = { version: 1, summary: 's'.repeat(3000), pendingAsks: [], commitments: [],
-      corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
+    const contract = api.conversationMainCompactionOutputContract({
+      coveredRows: 20,
+      carrierMaxUtf8Bytes: 16 * 1024,
+      reservedContextUtf8Bytes: reserve,
+    });
+    const proposal = {
+      version: 1,
+      summary: 's'.repeat(3000),
+      pendingAsks: [],
+      commitments: [],
+      corrections: [],
+      decisions: [],
+      durableIdentifiers: [],
+      recurrenceOutcomes: [],
+      toolPairs: [],
+    };
     expect(api.inspectMainCompactionCarrier(proposal, contract)).toEqual({ ok: true });
     const delivered = api.renderConversationMainContinuityCapsule(proposal, 20);
-    const complete = AgentClient.combineTurnContextInstructions('', '', '', '', 'c'.repeat(12 * 1024),
-      '', '', delivered, 16 * 1024, '');
+    const complete = AgentClient.combineTurnContextInstructions(
+      '',
+      '',
+      '',
+      '',
+      'c'.repeat(12 * 1024),
+      '',
+      '',
+      delivered,
+      16 * 1024,
+      '',
+    );
     expect(complete).toContain(proposal.summary);
     expect(complete).toContain('c'.repeat(12 * 1024));
     expect(Buffer.byteLength(complete) + 500).toBeLessThanOrEqual(16 * 1024);
@@ -10262,19 +10952,32 @@ describe('legacy optional peer allocation', () => {
   });
 });
 
-
 describe('typed native MCP startup error presentation', () => {
   test.each(['code', 'header', 'wrapped', 'reconnect'])(
-    'preserves MCP startup class from %s', (shape) => {
-      const failure = Object.assign(new Error('Synthetic private setup detail'), { code: 'native_mcp_unavailable' });
-      const error = shape === 'header' ? { response: { headers: { 'x-glasshive-error-code': 'native_mcp_unavailable' } } }
-        : shape === 'wrapped' ? new Error('Outer', { cause: failure })
-        : shape === 'reconnect' ? Object.assign(new Error('Synthetic fallback login'), {
-          viventiumConnectedAccountReconnectRequired: true, cause: failure,
-        }) : failure;
-      expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({ type: ContentTypes.ERROR,
-        error_class: 'native_mcp_unavailable', error: 'Connected tools did not start in time. Please try again.' });
-      expect(AgentClient.createCompletionErrorContentPart({ code: 'provider_auth_missing' }).error_class).toBe('provider_auth_missing');
+    'preserves MCP startup class from %s',
+    (shape) => {
+      const failure = Object.assign(new Error('Synthetic private setup detail'), {
+        code: 'native_mcp_unavailable',
+      });
+      const error =
+        shape === 'header'
+          ? { response: { headers: { 'x-glasshive-error-code': 'native_mcp_unavailable' } } }
+          : shape === 'wrapped'
+            ? new Error('Outer', { cause: failure })
+            : shape === 'reconnect'
+              ? Object.assign(new Error('Synthetic fallback login'), {
+                  viventiumConnectedAccountReconnectRequired: true,
+                  cause: failure,
+                })
+              : failure;
+      expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+        type: ContentTypes.ERROR,
+        error_class: 'native_mcp_unavailable',
+        error: 'Connected tools did not start in time. Please try again.',
+      });
+      expect(
+        AgentClient.createCompletionErrorContentPart({ code: 'provider_auth_missing' }).error_class,
+      ).toBe('provider_auth_missing');
     },
   );
 });

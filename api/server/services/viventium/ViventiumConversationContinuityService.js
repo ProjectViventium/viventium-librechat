@@ -26,10 +26,7 @@ const {
   mainCompactionOutputContractDigest,
   renderConversationMainContinuityCapsule,
 } = require('@librechat/api');
-const {
-  hasUnreconciledMainHistory,
-  messageContentText,
-} = require('./ViventiumMainContextService');
+const { hasUnreconciledMainHistory, messageContentText } = require('./ViventiumMainContextService');
 
 /** Newer visible rows always carried intact after a reconciliation. */
 const TAIL_TARGET_ROWS = 48;
@@ -91,11 +88,19 @@ function projectConversationContinuity(record, orderedMessages) {
   // New accepted state carries its server-owned allocation outside the semantic fields. Reload
   // validates the complete candidate and contract; it never silently clips accepted context.
   if (record.semanticCompactionContract) {
-    const prepared = inspectMainCompactionCandidate(record.semanticCompaction, record.semanticCompactionContract);
-    if (!prepared.ok || !inspectMainCompactionCarrier(prepared.candidate, record.semanticCompactionContract).ok ||
-        record.semanticReview?.approved !== true ||
-        record.semanticReview?.candidateDigest !== mainCompactionCandidateDigest(prepared.candidate) ||
-        record.semanticReview?.outputContractDigest !== mainCompactionOutputContractDigest(record.semanticCompactionContract))
+    const prepared = inspectMainCompactionCandidate(
+      record.semanticCompaction,
+      record.semanticCompactionContract,
+    );
+    if (
+      !prepared.ok ||
+      !inspectMainCompactionCarrier(prepared.candidate, record.semanticCompactionContract).ok ||
+      record.semanticReview?.approved !== true ||
+      record.semanticReview?.candidateDigest !==
+        mainCompactionCandidateDigest(prepared.candidate) ||
+      record.semanticReview?.outputContractDigest !==
+        mainCompactionOutputContractDigest(record.semanticCompactionContract)
+    )
       return { ...unprojected, stale: true };
   }
   const throughIndex = rows.findIndex(
@@ -275,38 +280,73 @@ function createConversationContinuityStore({ Model, MessageModel, now = () => ne
     return result.modifiedCount === 1 ? lease : null;
   }
 
-  async function renew({ ownerId, conversationId, leaseId, sourceDigest, leaseExpiresAt,
-    expiresAt: requestedExpiresAt }) {
+  async function renew({
+    ownerId,
+    conversationId,
+    leaseId,
+    sourceDigest,
+    leaseExpiresAt,
+    expiresAt: requestedExpiresAt,
+  }) {
     const checkedAt = now();
     const expiresAt = boundedMainCompactionLeaseRenewal({
-      leaseExpiresAt, requestedExpiresAt, now: checkedAt.getTime(),
+      leaseExpiresAt,
+      requestedExpiresAt,
+      now: checkedAt.getTime(),
     });
     if (!expiresAt) return { status: 'stale_lease' };
-    const result = await Model.updateOne({ ownerId, conversationId,
-      'lease.leaseId': leaseId, 'lease.sourceDigest': sourceDigest,
-      'lease.expiresAt': new Date(leaseExpiresAt),
-      $expr: { $gt: ['$lease.expiresAt', '$$NOW'] },
-    }, { $set: { 'lease.expiresAt': expiresAt }, $inc: { version: 1 } });
-    return result.modifiedCount === 1 ? { status: 'renewed', leaseExpiresAt: expiresAt }
+    const result = await Model.updateOne(
+      {
+        ownerId,
+        conversationId,
+        'lease.leaseId': leaseId,
+        'lease.sourceDigest': sourceDigest,
+        'lease.expiresAt': new Date(leaseExpiresAt),
+        $expr: { $gt: ['$lease.expiresAt', '$$NOW'] },
+      },
+      { $set: { 'lease.expiresAt': expiresAt }, $inc: { version: 1 } },
+    );
+    return result.modifiedCount === 1
+      ? { status: 'renewed', leaseExpiresAt: expiresAt }
       : { status: 'stale_lease' };
   }
 
-  async function complete({ ownerId, conversationId, plan, leaseId, semanticCompaction, review,
-    inspectCandidateCarrier }) {
+  async function complete({
+    ownerId,
+    conversationId,
+    plan,
+    leaseId,
+    semanticCompaction,
+    review,
+    inspectCandidateCarrier,
+  }) {
     if (plan.outputContract) {
       const prepared = inspectMainCompactionCandidate(semanticCompaction, plan.outputContract);
-      const fit = prepared.ok && (inspectCandidateCarrier
-        ? await inspectCandidateCarrier({ candidate: prepared.candidate, claim: { outputContract: plan.outputContract } })
-        : inspectMainCompactionCarrier(prepared.candidate, plan.outputContract));
-      if (!prepared.ok || !fit.ok || review?.approved !== true ||
-          review.sourceDigest !== plan.sourceDigest ||
-          review.candidateDigest !== mainCompactionCandidateDigest(prepared.candidate) ||
-          review.outputContractDigest !== mainCompactionOutputContractDigest(plan.outputContract))
+      const fit =
+        prepared.ok &&
+        (inspectCandidateCarrier
+          ? await inspectCandidateCarrier({
+              candidate: prepared.candidate,
+              claim: { outputContract: plan.outputContract },
+            })
+          : inspectMainCompactionCarrier(prepared.candidate, plan.outputContract));
+      if (
+        !prepared.ok ||
+        !fit.ok ||
+        review?.approved !== true ||
+        review.sourceDigest !== plan.sourceDigest ||
+        review.candidateDigest !== mainCompactionCandidateDigest(prepared.candidate) ||
+        review.outputContractDigest !== mainCompactionOutputContractDigest(plan.outputContract)
+      )
         return { status: 'invalid_summary', reason: 'context_budget' };
     }
     // Promote only while every covered row still has the exact content the summary was built on.
     const ids = plan.coveredSource.map((row) => row.id);
-    const stored = await MessageModel.find({ user: ownerId, conversationId, messageId: { $in: ids } })
+    const stored = await MessageModel.find({
+      user: ownerId,
+      conversationId,
+      messageId: { $in: ids },
+    })
       .select('messageId role isCreatedByUser text content metadata')
       .lean();
     const byId = new Map((stored || []).map((row) => [String(row.messageId), row]));
@@ -389,9 +429,13 @@ async function ensureConversationLegacyContinuity({
   let sourceTargetBytes = MAIN_COMPACTION_SOURCE_TARGET_BYTES;
   const executionBudget = {};
   const contractFor = async (plan) => {
-    const carrier = resolveOutputCarrier ? await resolveOutputCarrier() :
-      { carrierMaxUtf8Bytes: 16 * 1024, reservedContextUtf8Bytes: 0 };
-    return conversationMainCompactionOutputContract({ ...carrier, coveredRows: plan.coveredSource.length });
+    const carrier = resolveOutputCarrier
+      ? await resolveOutputCarrier()
+      : { carrierMaxUtf8Bytes: 16 * 1024, reservedContextUtf8Bytes: 0 };
+    return conversationMainCompactionOutputContract({
+      ...carrier,
+      coveredRows: plan.coveredSource.length,
+    });
   };
   for (let index = 0; index < maxClaims; index += 1) {
     if (signal?.aborted) break;
@@ -422,10 +466,16 @@ async function ensureConversationLegacyContinuity({
         const outputContract = await contractFor(plan);
         if (!outputContract) return { status: 'degraded', reason: 'context_budget' };
         plan = { ...plan, outputContract };
-        const smaller = planConversationContinuityClaim({ record, orderedMessages,
-          sourceTargetBytes: Math.max(1, Math.floor(plan.sourceBytes / 2)) });
-        const canReduceSource = Boolean(smaller && smaller.sourceBytes < plan.sourceBytes &&
-          smaller.sourceDigest !== plan.sourceDigest);
+        const smaller = planConversationContinuityClaim({
+          record,
+          orderedMessages,
+          sourceTargetBytes: Math.max(1, Math.floor(plan.sourceBytes / 2)),
+        });
+        const canReduceSource = Boolean(
+          smaller &&
+          smaller.sourceBytes < plan.sourceBytes &&
+          smaller.sourceDigest !== plan.sourceDigest,
+        );
         const lease = await store.claim({
           ownerId,
           conversationId,
@@ -464,9 +514,15 @@ async function ensureConversationLegacyContinuity({
         });
         if (foreground || result.status !== 'compacted') return result;
         record = await store.load(ownerId, conversationId);
-        return { ...result, continuationPending: Boolean(planConversationContinuityClaim({
-          record, orderedMessages,
-        })) };
+        return {
+          ...result,
+          continuationPending: Boolean(
+            planConversationContinuityClaim({
+              record,
+              orderedMessages,
+            }),
+          ),
+        };
       },
       rejectCompaction: (input) =>
         store.reject({ ownerId, conversationId, leaseId: input.leaseId, reason: input.reason }),
@@ -493,7 +549,8 @@ async function ensureConversationLegacyContinuity({
         !smaller ||
         smaller.sourceBytes >= plan.sourceBytes ||
         smaller.sourceDigest === plan.sourceDigest
-      ) break;
+      )
+        break;
       sourceTargetBytes = nextTarget;
       continue;
     }
@@ -528,9 +585,12 @@ async function resolveConversationContinuity({
   // A positive conservative fit permits reuse of an exact reviewed prefix and intact tail.
   // False or unavailable estimates retain the existing reconciliation/admission owners;
   // this estimate is not the Native rendered-source limit and cannot reject a turn.
-  const fits = typeof options.canCarryWholeHistory === 'function' &&
-    await options.canCarryWholeHistory(existing.record ? existing.messages : rows,
-      existing.record ? existing.capsule : '') === true;
+  const fits =
+    typeof options.canCarryWholeHistory === 'function' &&
+    (await options.canCarryWholeHistory(
+      existing.record ? existing.messages : rows,
+      existing.record ? existing.capsule : '',
+    )) === true;
   if (fits && !(nativeBodyCarrier === true && nativeReplayBudgetKnown === true)) {
     return existing.record ? existing : null;
   }
@@ -538,22 +598,40 @@ async function resolveConversationContinuity({
     if (nativeBodyCarrier === true && nativeReplayBudgetKnown === true && fits) {
       const compaction = options.compaction || require('./ViventiumMainCompactionService');
       compaction.scheduleMainContinuityMaintenance({
-        ownerId, agentId: String(agent.id),
+        ownerId,
+        agentId: String(agent.id),
         stableAuthoritySha256: `conversation-continuity:${sha256(conversationId)}`,
         schedule: () => {
           // The idle owner has its own response and budget, independent of the finished request.
           const backgroundReq = Object.create(req || null);
           backgroundReq.viventiumSchedulerAuthoringDeadlineAt = undefined;
           return ensureConversationLegacyContinuity({
-            ...options, req: backgroundReq, res: undefined, agent, ownerId, conversationId,
-            orderedMessages: rows, Model, MessageModel, compaction,
-            foreground: false, signal: undefined, deadlineAt: undefined,
+            ...options,
+            req: backgroundReq,
+            res: undefined,
+            agent,
+            ownerId,
+            conversationId,
+            orderedMessages: rows,
+            Model,
+            MessageModel,
+            compaction,
+            foreground: false,
+            signal: undefined,
+            deadlineAt: undefined,
           });
         },
       });
     } else {
       record = await ensureConversationLegacyContinuity({
-        req, res, agent, ownerId, conversationId, orderedMessages: rows, Model, MessageModel,
+        req,
+        res,
+        agent,
+        ownerId,
+        conversationId,
+        orderedMessages: rows,
+        Model,
+        MessageModel,
         ...options,
       });
     }

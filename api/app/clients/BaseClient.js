@@ -256,10 +256,14 @@ class BaseClient {
       overrideUserMessageId ?? opts.overrideParentMessageId ?? crypto.randomUUID();
     let responseMessageId = opts.responseMessageId ?? crypto.randomUUID();
     let head = isEdited ? responseMessageId : parentMessageId;
-    this.currentMessages = (await observeVoiceLatencyOperation(
-      logger, this.options?.req, 'base_client', 'history_load',
-      () => this.loadHistory(conversationId, head, parentMessageId),
-    )) ?? [];
+    this.currentMessages =
+      (await observeVoiceLatencyOperation(
+        logger,
+        this.options?.req,
+        'base_client',
+        'history_load',
+        () => this.loadHistory(conversationId, head, parentMessageId),
+      )) ?? [];
     this.conversationId = conversationId;
 
     if (isEdited && !isContinued) {

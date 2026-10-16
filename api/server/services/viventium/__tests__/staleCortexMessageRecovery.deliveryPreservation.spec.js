@@ -2655,15 +2655,26 @@ describe('staleCortexMessageRecovery', () => {
 describe('owned Voice recovery author entry', () => {
   test('binds a server-only authority recheck without deriving permission from an error marker', async () => {
     const { bindOwnedVoiceCortexRecovery } = require('../BackgroundCortexFollowUpService');
-    mockFindOneLean({ messageId: 'parent-owned', agent_id: 'agent-owned', text: 'A completed reply.' });
+    mockFindOneLean({
+      messageId: 'parent-owned',
+      agent_id: 'agent-owned',
+      text: 'A completed reply.',
+    });
     mockGetUserById.mockResolvedValue({ _id: 'owner-owned', role: 'USER' });
     mockGetAgent.mockResolvedValue({ id: 'agent-owned' });
     mockGetAppConfig.mockResolvedValue({});
     mockCreateCortexFollowUpMessage.mockResolvedValue({ messageId: 'child-owned' });
-    await expect(createRecoveredCortexFollowUp({ ownerId: 'owner-owned', conversationId: 'conversation-owned',
-      parentMessageId: 'parent-owned', surface: 'voice', insights: [{ cortexId: 'review', insight: 'Useful.' }],
-      deliveryBatch: { claimed: [{ deliveryId: 'delivery-owned' }] }, recoveryContext: {} }))
-      .resolves.toMatchObject({ messageId: 'child-owned' });
+    await expect(
+      createRecoveredCortexFollowUp({
+        ownerId: 'owner-owned',
+        conversationId: 'conversation-owned',
+        parentMessageId: 'parent-owned',
+        surface: 'voice',
+        insights: [{ cortexId: 'review', insight: 'Useful.' }],
+        deliveryBatch: { claimed: [{ deliveryId: 'delivery-owned' }] },
+        recoveryContext: {},
+      }),
+    ).resolves.toMatchObject({ messageId: 'child-owned' });
     expect(bindOwnedVoiceCortexRecovery).toHaveBeenCalledTimes(1);
     const req = mockCreateCortexFollowUpMessage.mock.calls[0][0].req;
     expect(bindOwnedVoiceCortexRecovery).toHaveBeenCalledWith(req, expect.any(Function));

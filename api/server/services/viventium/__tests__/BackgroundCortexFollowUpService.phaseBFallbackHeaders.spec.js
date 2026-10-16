@@ -11,9 +11,11 @@ beforeAll(() => {
   const bundlePath = path.join(promptFixtureDirectory, 'bundle.json');
   fs.writeFileSync(
     bundlePath,
-    JSON.stringify(buildPromptBundleFixture(
-      path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts'),
-    )),
+    JSON.stringify(
+      buildPromptBundleFixture(
+        path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts'),
+      ),
+    ),
   );
   process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
 });
@@ -78,42 +80,91 @@ describe('owned occupied-session recovery producer', () => {
     [409, 'conversation_session_authority_conflict', 'native_session_occupied'],
     [409, 'other_conflict', 'generation_failed_without_fallback'],
     [503, 'host_capacity_unavailable', 'generation_failed_without_fallback'],
-  ])('only exact generation failure %s/%s becomes durable row occupancy', (status, code, expected) => {
-    const { resolveCortexInsightDropReason } = require('../BackgroundCortexFollowUpService');
-    expect(resolveCortexInsightDropReason({ decision: { generationFailed: true },
-      generationFailure: { status, code } })).toBe(expected);
-  });
+  ])(
+    'only exact generation failure %s/%s becomes durable row occupancy',
+    (status, code, expected) => {
+      const { resolveCortexInsightDropReason } = require('../BackgroundCortexFollowUpService');
+      expect(
+        resolveCortexInsightDropReason({
+          decision: { generationFailed: true },
+          generationFailure: { status, code },
+        }),
+      ).toBe(expected);
+    },
+  );
   test('actual empty-text producer settles exact occupancy on every admitted row even if parent metadata write fails', async () => {
     const { persistPreparedCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
     const delivery = require('../CortexInsightDeliveryService');
     const db = require('~/models');
-    const message = jest.spyOn(db, 'getMessage').mockRejectedValue(new Error('Synthetic parent metadata write failure'));
-    const claims = ['delivery-a', 'delivery-b'].map((deliveryId) => ({ deliveryId,
-      claimToken: 'claim-a', claimGeneration: 1, attemptNumber: 1 }));
+    const message = jest
+      .spyOn(db, 'getMessage')
+      .mockRejectedValue(new Error('Synthetic parent metadata write failure'));
+    const claims = ['delivery-a', 'delivery-b'].map((deliveryId) => ({
+      deliveryId,
+      claimToken: 'claim-a',
+      claimGeneration: 1,
+      attemptNumber: 1,
+    }));
     try {
-      expect(await persistPreparedCortexFollowUpMessage({
-        req: { user: { id: 'owner-a' }, body: {} }, parentMessageId: 'parent-a',
-        deliveryBatch: { claimed: claims },
-      }, { text: '', decision: { generationFailed: true }, followUpDecisionRecord: {
-        generationFailed: true, generationFailure: { status: 409, code: 'conversation_session_authority_conflict' },
-      } })).toBeNull();
+      expect(
+        await persistPreparedCortexFollowUpMessage(
+          {
+            req: { user: { id: 'owner-a' }, body: {} },
+            parentMessageId: 'parent-a',
+            deliveryBatch: { claimed: claims },
+          },
+          {
+            text: '',
+            decision: { generationFailed: true },
+            followUpDecisionRecord: {
+              generationFailed: true,
+              generationFailure: { status: 409, code: 'conversation_session_authority_conflict' },
+            },
+          },
+        ),
+      ).toBeNull();
       expect(delivery.markCortexInsightDeliveryBatchFailed).toHaveBeenCalledWith({
-        ownerId: 'owner-a', claims, reason: 'native_session_occupied',
+        ownerId: 'owner-a',
+        claims,
+        reason: 'native_session_occupied',
       });
       expect(delivery.markCortexInsightDeliveryBatchDropped).not.toHaveBeenCalled();
-    } finally { message.mockRestore(); }
+    } finally {
+      message.mockRestore();
+    }
   });
   test('shared existing publication wake retries persistence without changing its event identity', async () => {
     const { publishCortexVoiceFollowUp } = require('../BackgroundCortexFollowUpService');
     const event = jest.fn().mockReturnValueOnce({ sequence: 4 }).mockReturnValue(null);
-    const flush = jest.fn().mockRejectedValueOnce(new Error('Synthetic failed flush')).mockResolvedValue();
-    const dependencies = { hydrateVoiceTask: jest.fn(async () => ({ taskId: 'task-a',
-      callSessionId: 'call-a', userId: 'owner-a', conversationId: 'conversation-a' })),
-      getVoiceTaskOwnerBinding: jest.fn(() => ({ taskId: 'task-a', callSessionId: 'call-a',
-        userId: 'owner-a', conversationId: 'conversation-a' })),
-      observeGenerationEvent: event, flushVoiceTaskPersistence: flush };
-    const input = { ownerId: 'owner-a', callSessionId: 'call-a', voiceTaskId: 'task-a',
-      conversationId: 'conversation-a', parentMessageId: 'parent-a', messageId: 'child-a', dependencies };
+    const flush = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('Synthetic failed flush'))
+      .mockResolvedValue();
+    const dependencies = {
+      hydrateVoiceTask: jest.fn(async () => ({
+        taskId: 'task-a',
+        callSessionId: 'call-a',
+        userId: 'owner-a',
+        conversationId: 'conversation-a',
+      })),
+      getVoiceTaskOwnerBinding: jest.fn(() => ({
+        taskId: 'task-a',
+        callSessionId: 'call-a',
+        userId: 'owner-a',
+        conversationId: 'conversation-a',
+      })),
+      observeGenerationEvent: event,
+      flushVoiceTaskPersistence: flush,
+    };
+    const input = {
+      ownerId: 'owner-a',
+      callSessionId: 'call-a',
+      voiceTaskId: 'task-a',
+      conversationId: 'conversation-a',
+      parentMessageId: 'parent-a',
+      messageId: 'child-a',
+      dependencies,
+    };
     await expect(publishCortexVoiceFollowUp(input)).rejects.toThrow('Synthetic failed flush');
     await expect(publishCortexVoiceFollowUp(input)).resolves.toBe(true);
     expect(event.mock.calls[0]).toEqual(event.mock.calls[1]);
@@ -121,44 +172,100 @@ describe('owned occupied-session recovery producer', () => {
   });
   test('shared wake rejects foreign retained task and never publishes parent as its own child', async () => {
     const { publishCortexVoiceFollowUp } = require('../BackgroundCortexFollowUpService');
-    const dependencies = { hydrateVoiceTask: jest.fn(async () => ({ taskId: 'task-a',
-      callSessionId: 'foreign', userId: 'owner-a', conversationId: 'conversation-a' })),
-      getVoiceTaskOwnerBinding: jest.fn(() => ({ taskId: 'task-a', callSessionId: 'foreign',
-        userId: 'owner-a', conversationId: 'conversation-a' })),
-      observeGenerationEvent: jest.fn(), flushVoiceTaskPersistence: jest.fn() };
-    const input = { ownerId: 'owner-a', callSessionId: 'call-a', voiceTaskId: 'task-a',
-      conversationId: 'conversation-a', parentMessageId: 'parent-a', messageId: 'child-a', dependencies };
+    const dependencies = {
+      hydrateVoiceTask: jest.fn(async () => ({
+        taskId: 'task-a',
+        callSessionId: 'foreign',
+        userId: 'owner-a',
+        conversationId: 'conversation-a',
+      })),
+      getVoiceTaskOwnerBinding: jest.fn(() => ({
+        taskId: 'task-a',
+        callSessionId: 'foreign',
+        userId: 'owner-a',
+        conversationId: 'conversation-a',
+      })),
+      observeGenerationEvent: jest.fn(),
+      flushVoiceTaskPersistence: jest.fn(),
+    };
+    const input = {
+      ownerId: 'owner-a',
+      callSessionId: 'call-a',
+      voiceTaskId: 'task-a',
+      conversationId: 'conversation-a',
+      parentMessageId: 'parent-a',
+      messageId: 'child-a',
+      dependencies,
+    };
     expect(await publishCortexVoiceFollowUp(input)).toBe(false);
     expect(await publishCortexVoiceFollowUp({ ...input, messageId: 'parent-a' })).toBe(false);
     expect(dependencies.observeGenerationEvent).not.toHaveBeenCalled();
   });
 
-  const { bindOwnedVoiceCortexRecovery, prepareCortexFollowUpMessage, persistPreparedCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+  const {
+    bindOwnedVoiceCortexRecovery,
+    prepareCortexFollowUpMessage,
+    persistPreparedCortexFollowUpMessage,
+  } = require('../BackgroundCortexFollowUpService');
   const db = require('~/models');
   const cause = { status: 409, code: 'conversation_session_authority_conflict' };
-  const agent = { id: 'synthetic-main', provider: 'glasshive-harness', model: 'grok-build:grok-4.7-build-fast',
-    model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' } };
-  const request = () => ({ user: { id: 'synthetic-owner' }, body: {
-    conversationId: 'synthetic-conversation', messageId: 'synthetic-parent',
-    viventiumSurface: 'voice', voiceMode: true,
-  }, config: { endpoints: { agents: { providerCapabilities: { 'glasshive-harness': {
-    workspace_binding: true, conversation_session: true, activity_stream: true, responses_api: false,
-  } } } } } });
-  const input = (req) => ({ req, agent, conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent',
-    recentResponse: 'The primary reply is complete.', insightsData: { insights: [{ cortexId: 'synthetic-cortex', insight: 'A useful result.' }] } });
+  const agent = {
+    id: 'synthetic-main',
+    provider: 'glasshive-harness',
+    model: 'grok-build:grok-4.7-build-fast',
+    model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' },
+  };
+  const request = () => ({
+    user: { id: 'synthetic-owner' },
+    body: {
+      conversationId: 'synthetic-conversation',
+      messageId: 'synthetic-parent',
+      viventiumSurface: 'voice',
+      voiceMode: true,
+    },
+    config: {
+      endpoints: {
+        agents: {
+          providerCapabilities: {
+            'glasshive-harness': {
+              workspace_binding: true,
+              conversation_session: true,
+              activity_stream: true,
+              responses_api: false,
+            },
+          },
+        },
+      },
+    },
+  });
+  const input = (req) => ({
+    req,
+    agent,
+    conversationId: 'synthetic-conversation',
+    parentMessageId: 'synthetic-parent',
+    recentResponse: 'The primary reply is complete.',
+    insightsData: { insights: [{ cortexId: 'synthetic-cortex', insight: 'A useful result.' }] },
+  });
   test('recovery signer is server-only, native zero-tool, and retains the same parent/agent idempotency', async () => {
     const previous = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-recovery-signing-key';
-    const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream: jest.fn(async () => 'Useful result.') });
+    const run = jest
+      .spyOn(Run, 'create')
+      .mockResolvedValue({ processStream: jest.fn(async () => 'Useful result.') });
     try {
       const req = request();
       bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'live' }));
       await generateFollowUpText(input(req));
       const headers = run.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
-      expect(JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64').toString('utf8')))
-        .toEqual({ provider_capabilities: { native_tools: false } });
+      expect(
+        JSON.parse(
+          Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64').toString('utf8'),
+        ),
+      ).toEqual({ provider_capabilities: { native_tools: false } });
       expect(headers['X-GlassHive-Bootstrap-Signature']).toMatch(/^sha256=[a-f0-9]{64}$/);
-      expect(headers['X-GlassHive-Idempotency-Key']).toBe('phase_b:synthetic-main:synthetic-parent');
+      expect(headers['X-GlassHive-Idempotency-Key']).toBe(
+        'phase_b:synthetic-main:synthetic-parent',
+      );
       expect(headers['X-Viventium-Stream-Id']).toBe('phase_b:synthetic-main:synthetic-parent');
       expect(run.mock.calls[0][0].graphConfig.llmConfig.modelKwargs.reasoning_effort).toBe('high');
       expect(req.body.viventiumActorTrust).toBeUndefined();
@@ -169,20 +276,32 @@ describe('owned occupied-session recovery producer', () => {
       else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = previous;
     }
   });
-  test.each([[409, 'conversation_session_authority_conflict', cause], [409, 'other_conflict', undefined], [503, 'host_capacity_unavailable', undefined]])(
-    'only exact pre-admission failure %s/%s is retained for recovery', async (status, code, expected) => {
+  test.each([
+    [409, 'conversation_session_authority_conflict', cause],
+    [409, 'other_conflict', undefined],
+    [503, 'host_capacity_unavailable', undefined],
+  ])(
+    'only exact pre-admission failure %s/%s is retained for recovery',
+    async (status, code, expected) => {
       const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
       const message = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
-      const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream: jest.fn(async () => {
-        throw Object.assign(new Error('Synthetic provider refusal'), { status, code });
-      }) });
+      const run = jest.spyOn(Run, 'create').mockResolvedValue({
+        processStream: jest.fn(async () => {
+          throw Object.assign(new Error('Synthetic provider refusal'), { status, code });
+        }),
+      });
       try {
         const req = request();
-        req.config.endpoints.agents.providerCapabilities['glasshive-harness'].workspace_binding = false;
+        req.config.endpoints.agents.providerCapabilities['glasshive-harness'].workspace_binding =
+          false;
         const result = await prepareCortexFollowUpMessage(input(req));
         expect(result.followUpDecisionRecord.generationFailure).toEqual(expected);
         expect(result.followUpDecisionRecord.generationFailed).toBe(true);
-      } finally { messages.mockRestore(); message.mockRestore(); run.mockRestore(); }
+      } finally {
+        messages.mockRestore();
+        message.mockRestore();
+        run.mockRestore();
+      }
     },
   );
   test('Stop arriving after preparation suppresses before any persistence', async () => {
@@ -190,60 +309,106 @@ describe('owned occupied-session recovery producer', () => {
     bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'suppressed' }));
     const save = jest.spyOn(db, 'saveMessage').mockResolvedValue({ messageId: 'not-saved' });
     try {
-      expect(await persistPreparedCortexFollowUpMessage(input(req), { suppressed: false, text: 'Late result.' })).toBeNull();
+      expect(
+        await persistPreparedCortexFollowUpMessage(input(req), {
+          suppressed: false,
+          text: 'Late result.',
+        }),
+      ).toBeNull();
       expect(save).not.toHaveBeenCalled();
-    } finally { save.mockRestore(); }
+    } finally {
+      save.mockRestore();
+    }
   });
   test('Stop before preparation starts no author', async () => {
     const req = request();
     bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'suppressed' }));
     const run = jest.spyOn(Run, 'create');
     try {
-      expect(await prepareCortexFollowUpMessage(input(req))).toEqual({ suppressed: true, dropReason: 'voice_task_suppressed' });
+      expect(await prepareCortexFollowUpMessage(input(req))).toEqual({
+        suppressed: true,
+        dropReason: 'voice_task_suppressed',
+      });
       expect(run).not.toHaveBeenCalled();
-    } finally { run.mockRestore(); }
+    } finally {
+      run.mockRestore();
+    }
   });
   test('lease gap before preparation starts no author and preserves pending authority', async () => {
     const req = request();
     bindOwnedVoiceCortexRecovery(req, async () => ({ state: 'waiting' }));
     const run = jest.spyOn(Run, 'create');
     try {
-      await expect(prepareCortexFollowUpMessage(input(req))).rejects.toMatchObject({ code: 'cortex_voice_recovery_authority_pending' });
+      await expect(prepareCortexFollowUpMessage(input(req))).rejects.toMatchObject({
+        code: 'cortex_voice_recovery_authority_pending',
+      });
       expect(run).not.toHaveBeenCalled();
-    } finally { run.mockRestore(); }
+    } finally {
+      run.mockRestore();
+    }
   });
-  test.each(['linked_text', 'waiting'])('%s during authoring keeps text without restoring microphone permission', async (state) => {
-    const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
-    const message = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
-    const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream: jest.fn(async () => 'A useful completed result.') });
-    const req = request();
-    const scope = { callSessionId: 'synthetic-call', taskId: 'synthetic-task', streamId: 'synthetic-stream' };
-    const recheck = jest.fn().mockResolvedValueOnce({ ...scope, state: 'live', session: {
-      callSessionId: scope.callSessionId, userId: req.user.id,
-    } }).mockResolvedValue({ ...scope, state });
-    bindOwnedVoiceCortexRecovery(req, recheck);
-    req.config.endpoints.agents.providerCapabilities['glasshive-harness'].workspace_binding = false;
-    try {
-      const result = await prepareCortexFollowUpMessage(input(req));
-      expect(result.text).toBe('A useful completed result.');
-      expect(result.followUpDecisionRecord.recoveryAuthority).toBe('owned_voice_source');
-      expect(result.followUpDecisionRecord.recoveryCause).toBeUndefined();
-      expect(req.body.voiceMode).toBe(false);
-      expect(req.body.viventiumInputMode).toBe('text');
-      expect(req.viventiumCallSession).toBeUndefined();
-      expect(req.body.viventiumCanAuthorizeSideEffects).toBeUndefined();
-      expect(recheck).toHaveBeenCalledTimes(2);
-    } finally { messages.mockRestore(); message.mockRestore(); run.mockRestore(); }
-  });
+  test.each(['linked_text', 'waiting'])(
+    '%s during authoring keeps text without restoring microphone permission',
+    async (state) => {
+      const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+      const message = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
+      const run = jest
+        .spyOn(Run, 'create')
+        .mockResolvedValue({ processStream: jest.fn(async () => 'A useful completed result.') });
+      const req = request();
+      const scope = {
+        callSessionId: 'synthetic-call',
+        taskId: 'synthetic-task',
+        streamId: 'synthetic-stream',
+      };
+      const recheck = jest
+        .fn()
+        .mockResolvedValueOnce({
+          ...scope,
+          state: 'live',
+          session: {
+            callSessionId: scope.callSessionId,
+            userId: req.user.id,
+          },
+        })
+        .mockResolvedValue({ ...scope, state });
+      bindOwnedVoiceCortexRecovery(req, recheck);
+      req.config.endpoints.agents.providerCapabilities['glasshive-harness'].workspace_binding =
+        false;
+      try {
+        const result = await prepareCortexFollowUpMessage(input(req));
+        expect(result.text).toBe('A useful completed result.');
+        expect(result.followUpDecisionRecord.recoveryAuthority).toBe('owned_voice_source');
+        expect(result.followUpDecisionRecord.recoveryCause).toBeUndefined();
+        expect(req.body.voiceMode).toBe(false);
+        expect(req.body.viventiumInputMode).toBe('text');
+        expect(req.viventiumCallSession).toBeUndefined();
+        expect(req.body.viventiumCanAuthorizeSideEffects).toBeUndefined();
+        expect(recheck).toHaveBeenCalledTimes(2);
+      } finally {
+        messages.mockRestore();
+        message.mockRestore();
+        run.mockRestore();
+      }
+    },
+  );
   test('caller body flags cannot invoke the owned recovery recheck', async () => {
     const req = request();
     req.body.ownedVoiceCortexRecovery = true;
     req.body._viventiumCortexOccupiedSessionRecovery = true;
-    const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream: jest.fn(async () => 'Ordinary result.') });
+    const run = jest
+      .spyOn(Run, 'create')
+      .mockResolvedValue({ processStream: jest.fn(async () => 'Ordinary result.') });
     try {
       await generateFollowUpText(input(req));
-      expect(run.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64']).toBeUndefined();
-    } finally { run.mockRestore(); }
+      expect(
+        run.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders[
+          'X-GlassHive-Bootstrap-Bundle-B64'
+        ],
+      ).toBeUndefined();
+    } finally {
+      run.mockRestore();
+    }
   });
 });
 
@@ -331,6 +496,7 @@ describe('Phase B follow-up serial fallback arming', () => {
                     workspace_binding: true,
                     default_access: 'workspace',
                     phase_b_followup: true,
+                    conversation_session: true,
                     responses_api: false,
                   },
                 },
@@ -384,127 +550,145 @@ describe('Phase B follow-up serial fallback arming', () => {
 });
 
 describe('verified mission image input', () => {
-  test.each(['artifact_ref', 'download_url', 'open_url'])('passes observed images to Main and delivers only its selected %s', async (selectionField) => {
-    const bytes = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
-      'base64',
-    );
-    const sha256 = require('crypto').createHash('sha256').update(bytes).digest('hex');
-    const base = 'https://artifacts.example.test';
-    const makeMedia = (runId, suffix) => ({
-      observations: [
-        {
-          kind: 'image',
-          source: 'native_tool_result',
-          artifact_ref: `artifact_sha256:${sha256}`,
-          run_id: runId,
-          tool_call_id: 'native-call',
-          content_index: 0,
-          mime_type: 'image/png',
-          bytes: bytes.length,
-          sha256,
-          download_url: `${base}/v1/link-refs/ghr_1234567890abcdef${suffix}`,
-          open_url: `${base}/v1/link-refs/ghr_fedcba0987654321${suffix}`,
-        },
-      ],
-      omitted_count: 0,
-    });
-    const first = makeMedia('run-a', 'a');
-    const second = makeMedia('run-b', 'b');
-    const selected = `![Readable result](${second.observations[0].download_url})`;
-    const processStream = jest.fn().mockResolvedValue(`![Readable result](${second.observations[0][selectionField]})`);
-    const onNativeMediaSelection = jest.fn();
-    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
-    const fetchImage = jest
-      .spyOn(global, 'fetch')
-      .mockImplementation(
-        async () => new Response(bytes, { headers: { 'content-type': 'image/png' } }),
+  test.each(['artifact_ref', 'download_url', 'open_url'])(
+    'passes observed images to Main and delivers only its selected %s',
+    async (selectionField) => {
+      const bytes = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        'base64',
       );
-    const originalEnv = { ...process.env };
-    process.env.GLASSHIVE_ARTIFACT_BASE_URL = base;
-    process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://127.0.0.1:8766/v1';
-    process.env.WPR_API_TOKEN = 'synthetic-token';
-    process.env.VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET = 'synthetic-secret';
-    process.env.VIVENTIUM_TENANT_ID = 'synthetic-tenant';
-    try {
-      const req = {
-        body: { conversationId: 'conv-1', messageId: 'msg-1' },
-        user: { id: 'user-1' },
-        config: {
-          endpoints: {
-            agents: {
-              providerCapabilities: {
-                'glasshive-harness': {
-                  workspace_binding: true,
-                  default_access: 'workspace',
-                  phase_b_followup: true,
-                  responses_api: false,
+      const sha256 = require('crypto').createHash('sha256').update(bytes).digest('hex');
+      const base = 'https://artifacts.example.test';
+      const makeMedia = (runId, suffix) => ({
+        observations: [
+          {
+            kind: 'image',
+            source: 'native_tool_result',
+            artifact_ref: `artifact_sha256:${sha256}`,
+            run_id: runId,
+            tool_call_id: 'native-call',
+            content_index: 0,
+            mime_type: 'image/png',
+            bytes: bytes.length,
+            sha256,
+            download_url: `${base}/v1/link-refs/ghr_1234567890abcdef${suffix}`,
+            open_url: `${base}/v1/link-refs/ghr_fedcba0987654321${suffix}`,
+          },
+        ],
+        omitted_count: 0,
+      });
+      const first = makeMedia('run-a', 'a');
+      const second = makeMedia('run-b', 'b');
+      const selected = `![Readable result](${second.observations[0].download_url})`;
+      const processStream = jest
+        .fn()
+        .mockResolvedValue(`![Readable result](${second.observations[0][selectionField]})`);
+      const onNativeMediaSelection = jest.fn();
+      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      const fetchImage = jest
+        .spyOn(global, 'fetch')
+        .mockImplementation(
+          async () => new Response(bytes, { headers: { 'content-type': 'image/png' } }),
+        );
+      const originalEnv = { ...process.env };
+      process.env.GLASSHIVE_ARTIFACT_BASE_URL = base;
+      process.env.GLASSHIVE_PROVIDER_BASE_URL = 'http://127.0.0.1:8766/v1';
+      process.env.WPR_API_TOKEN = 'synthetic-token';
+      process.env.VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET = 'synthetic-secret';
+      process.env.VIVENTIUM_TENANT_ID = 'synthetic-tenant';
+      try {
+        const req = {
+          body: { conversationId: 'conv-1', messageId: 'msg-1' },
+          user: { id: 'user-1' },
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  'glasshive-harness': {
+                    workspace_binding: true,
+                    default_access: 'workspace',
+                    phase_b_followup: true,
+                    conversation_session: true,
+                    responses_api: false,
+                  },
                 },
               },
             },
           },
-        },
-      };
-      setTrustedInteractionContext(req, {
-        actor_kind: 'worker',
-        origin: 'callback',
-        surface: 'web',
-        conversation_id: 'conv-1',
-        source_event_id: 'root-event',
-      });
-      const output = await generateFollowUpText({
-        req,
-        agent: {
-          id: 'agent-main',
-          provider: 'glasshive-harness',
-          endpoint: 'glasshive-harness',
-          model: 'codex-cli:gpt-5.6-sol',
-          model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'medium' },
-          glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
-        },
-        insightsData: {
-          insights: [first, second].map((nativeMedia) => ({
-            cortexName: 'Mission evidence',
-            insight: 'The requested local application observation is complete.',
-            nativeMedia,
-            authority: {
-              kind: 'durable_terminal_callback',
-              runId: nativeMedia.observations[0].run_id,
-            },
-          })),
-        },
-        recentResponse: 'The work is running.',
-        runId: 'image-followup',
-        onNativeMediaSelection,
-        conversationId: 'conv-1',
-        parentMessageId: 'msg-1',
-      });
-      const messages = processStream.mock.calls[0][0].messages;
-      expect(messages[0].content.filter((part) => part.type === 'image_url')).toHaveLength(2);
-      expect(
-        messages[0].content
-          .filter((part) => part.type === 'text')
-          .map((part) => part.text)
-          .join('\n'),
-      ).toContain(first.observations[0].download_url);
-      expect(fetchImage).toHaveBeenCalledTimes(2);
-      expect(createRun.mock.calls[0][0].graphConfig.tools).toEqual([]);
-      expect(output).toBe(selected);
-      expect(onNativeMediaSelection).toHaveBeenCalledWith({ run_id: 'run-b',
-        tool_call_id: 'native-call', content_index: 0, artifact_ref: second.observations[0].artifact_ref, label: 'Readable result' });
-      expect(output).not.toContain(first.observations[0].download_url);
-    } finally {
-      process.env = originalEnv;
-      fetchImage.mockRestore();
-      createRun.mockRestore();
-    }
-  });
+        };
+        setTrustedInteractionContext(req, {
+          actor_kind: 'worker',
+          origin: 'callback',
+          surface: 'web',
+          conversation_id: 'conv-1',
+          source_event_id: 'root-event',
+        });
+        const output = await generateFollowUpText({
+          req,
+          agent: {
+            id: 'agent-main',
+            provider: 'glasshive-harness',
+            endpoint: 'glasshive-harness',
+            model: 'codex-cli:gpt-5.6-sol',
+            model_parameters: { model: 'codex-cli:gpt-5.6-sol', reasoning_effort: 'medium' },
+            glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
+          },
+          insightsData: {
+            insights: [first, second].map((nativeMedia) => ({
+              cortexName: 'Mission evidence',
+              insight: 'The requested local application observation is complete.',
+              nativeMedia,
+              authority: {
+                kind: 'durable_terminal_callback',
+                runId: nativeMedia.observations[0].run_id,
+              },
+            })),
+          },
+          recentResponse: 'The work is running.',
+          runId: 'image-followup',
+          onNativeMediaSelection,
+          conversationId: 'conv-1',
+          parentMessageId: 'msg-1',
+        });
+        const messages = processStream.mock.calls[0][0].messages;
+        expect(messages[0].content.filter((part) => part.type === 'image_url')).toHaveLength(2);
+        expect(
+          messages[0].content
+            .filter((part) => part.type === 'text')
+            .map((part) => part.text)
+            .join('\n'),
+        ).toContain(first.observations[0].download_url);
+        expect(fetchImage).toHaveBeenCalledTimes(2);
+        expect(createRun.mock.calls[0][0].graphConfig.tools).toEqual([]);
+        expect(output).toBe(selected);
+        expect(onNativeMediaSelection).toHaveBeenCalledWith({
+          run_id: 'run-b',
+          tool_call_id: 'native-call',
+          content_index: 0,
+          artifact_ref: second.observations[0].artifact_ref,
+          label: 'Readable result',
+        });
+        expect(output).not.toContain(first.observations[0].download_url);
+      } finally {
+        process.env = originalEnv;
+        fetchImage.mockRestore();
+        createRun.mockRestore();
+      }
+    },
+  );
 });
 
 describe('Phase B follow-up carrier', () => {
-  test.each(['X-GlassHive-Turn-Context-B64', 'x-glasshive-turn-context-b64'])(
-    'does not forward the Main turn carrier binding or oversized %s to its own follow-up carrier',
-    async (turnContextHeader) => {
+  test.each([
+    [true, 'X-GlassHive-Turn-Context-B64'],
+    [false, 'X-GlassHive-Turn-Context-B64'],
+    [true, 'x-glasshive-turn-context-b64'],
+    [false, 'x-glasshive-turn-context-b64'],
+  ])(
+    'isolates follow-up authority and Feeling state (enabled=%s, header=%s)',
+    async (enabled, turnContextHeader) => {
+      const capsule = '<viventium_feeling_state>follow-up-state-c</viventium_feeling_state>';
+      const mainCapsule = '<viventium_feeling_state>main-only-state-m</viventium_feeling_state>';
       const processStream = jest.fn().mockResolvedValue('The reading list card is ready.');
       const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
       const mainTurnBinding = {
@@ -519,7 +703,7 @@ describe('Phase B follow-up carrier', () => {
         'X-Viventium-Visible-Message-Chain-B64': Buffer.from(
           JSON.stringify([{ id: 'user-1' }, { id: 'assistant-1' }, { id: 'user-2' }]),
         ).toString('base64'),
-        'X-GlassHive-Developer-Instruction-Tail-B64': Buffer.from('Main-only tail').toString('base64'),
+        'X-GlassHive-Developer-Instruction-Tail-B64': Buffer.from(mainCapsule).toString('base64'),
         'X-GlassHive-Stable-Authority-SHA256': 'd'.repeat(64),
         [turnContextHeader]: Buffer.from('Synthetic Main-only continuity. '.repeat(1200)).toString(
           'base64',
@@ -528,6 +712,12 @@ describe('Phase B follow-up carrier', () => {
       try {
         const req = {
           id: 'synthetic-phase-b-carrier',
+          _viventiumFeelingSnapshot: {
+            enabled,
+            agentScope: 'conscious_agent',
+            snapshotHash: 'synthetic-followup-feeling-hash',
+            capsule,
+          },
           body: { conversationId: 'conv-1', messageId: 'msg-1' },
           user: { id: 'user-1' },
           config: {
@@ -538,6 +728,7 @@ describe('Phase B follow-up carrier', () => {
                     workspace_binding: true,
                     default_access: 'workspace',
                     phase_b_followup: true,
+                    conversation_session: true,
                     responses_api: false,
                   },
                 },
@@ -565,8 +756,10 @@ describe('Phase B follow-up carrier', () => {
               configuration: { defaultHeaders: mainTurnBinding },
             },
             glasshive_options: {
-              workspace: { mode: 'life' }, access: 'full',
-              fallback_model: 'claude-code:claude-opus-5-5', fallback_reasoning_effort: 'high',
+              workspace: { mode: 'life' },
+              access: 'full',
+              fallback_model: 'claude-code:claude-opus-5-5',
+              fallback_reasoning_effort: 'high',
             },
           },
           insightsData: {
@@ -586,9 +779,21 @@ describe('Phase B follow-up carrier', () => {
           expect(sent).not.toContain(name.toLowerCase());
         }
         const ownTail = Buffer.from(
-          headers['X-GlassHive-Developer-Instruction-Tail-B64'], 'base64',
+          headers['X-GlassHive-Developer-Instruction-Tail-B64'],
+          'base64',
         ).toString('utf8');
-        expect(ownTail).not.toContain('Main-only tail');
+        const { getViventiumUserFactGuard } = require('../feelingPromptTail');
+        expect(ownTail).toBe(
+          [getViventiumUserFactGuard(), enabled ? capsule : ''].filter(Boolean).join('\n\n'),
+        );
+        const instructions = createRun.mock.calls[0][0].graphConfig.instructions;
+        expect(instructions.split(capsule).length - 1).toBe(enabled ? 1 : 0);
+        expect(instructions.split('<viventium_feeling_state>').length - 1).toBe(enabled ? 1 : 0);
+        expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(mainCapsule);
+        expect(JSON.stringify(createRun.mock.calls[0][0])).not.toContain(
+          Buffer.from(mainCapsule).toString('base64'),
+        );
+        expect(ownTail).not.toContain(mainCapsule);
         expect(createRun.mock.calls[0][0].graphConfig.instructions.endsWith(ownTail)).toBe(true);
         expect(headers['X-GlassHive-Agent-Id']).toBe('agent-main:phase_b:followup');
         expect(headers['X-Viventium-Origin']).toBe('interactive');
@@ -615,37 +820,83 @@ describe('Phase B native parent readiness', () => {
     const req = {
       user: { id: 'owner-readiness' },
       body: { conversationId: 'conversation-readiness', messageId: 'parent-readiness' },
-      config: { endpoints: { agents: { providerCapabilities: {
-        'glasshive-harness': { workspace_binding: true, default_access: 'workspace',
-          phase_b_followup: true, responses_api: false },
-      } } } },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                workspace_binding: true,
+                default_access: 'workspace',
+                phase_b_followup: true,
+                responses_api: false,
+              },
+            },
+          },
+        },
+      },
     };
-    setTrustedInteractionContext(req, {
-      actor_kind: 'external_user', origin: 'interactive', surface: 'web',
-      conversation_id: 'conversation-readiness', source_event_id: 'event-readiness',
-    }, undefined, { commit_authority: authority });
-    return { req, agent: { id: 'main-readiness', provider: 'glasshive-harness',
-      model: 'codex-cli:gpt-6.1-sol', model_parameters: {
-        model: 'codex-cli:gpt-6.1-sol', reasoning_effort: 'high',
-      } }, runId: 'parent-readiness', conversationId: 'conversation-readiness',
-      parentMessageId: 'parent-readiness', recentResponse: 'The Main answer is complete.',
-      insightsData: { insights: [{ cortexId: 'cortex-readiness', insight: 'A useful calculation.' }] },
+    setTrustedInteractionContext(
+      req,
+      {
+        actor_kind: 'external_user',
+        origin: 'interactive',
+        surface: 'web',
+        conversation_id: 'conversation-readiness',
+        source_event_id: 'event-readiness',
+      },
+      undefined,
+      { commit_authority: authority },
+    );
+    return {
+      req,
+      agent: {
+        id: 'main-readiness',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-6.1-sol',
+        model_parameters: {
+          model: 'codex-cli:gpt-6.1-sol',
+          reasoning_effort: 'high',
+        },
+      },
+      runId: 'parent-readiness',
+      conversationId: 'conversation-readiness',
+      parentMessageId: 'parent-readiness',
+      recentResponse: 'The Main answer is complete.',
+      insightsData: {
+        insights: [{ cortexId: 'cortex-readiness', insight: 'A useful calculation.' }],
+      },
     };
   }
 
   test.each(['server', 'external_adapter'])(
-    '%s publication readiness precedes the first Phase B provider invocation', async (authority) => {
+    '%s publication readiness precedes the first Phase B provider invocation',
+    async (authority) => {
       let release;
       let enter;
-      const ready = new Promise((resolve) => { release = resolve; });
-      const entered = new Promise((resolve) => { enter = resolve; });
+      const ready = new Promise((resolve) => {
+        release = resolve;
+      });
+      const entered = new Promise((resolve) => {
+        enter = resolve;
+      });
       const unavailable = Object.assign(new Error('Exact parent is still publishing'), {
         code: 'native_graph_tool_evidence_parent_unfinished',
       });
-      const oneShot = jest.fn(async () => { enter(); throw unavailable; });
-      const publication = jest.fn(async () => { enter(); await ready; return []; });
-      const service = jest.spyOn(require('../nativeResponseService'), 'getService')
-        .mockReturnValue({ readToolEvidence: oneShot, readToolEvidenceForPresentation: publication });
+      const oneShot = jest.fn(async () => {
+        enter();
+        throw unavailable;
+      });
+      const publication = jest.fn(async () => {
+        enter();
+        await ready;
+        return [];
+      });
+      const service = jest
+        .spyOn(require('../nativeResponseService'), 'getService')
+        .mockReturnValue({
+          readToolEvidence: oneShot,
+          readToolEvidenceForPresentation: publication,
+        });
       const processStream = jest.fn().mockResolvedValue('{NTA}');
       const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
       let generation;
@@ -653,8 +904,12 @@ describe('Phase B native parent readiness', () => {
         generation = generateFollowUpText(input(authority));
         generation.catch(() => {});
         await entered;
-        expect(publication).toHaveBeenCalledWith('owner-readiness', 'conversation-readiness',
-          'parent-readiness', expect.any(Number));
+        expect(publication).toHaveBeenCalledWith(
+          'owner-readiness',
+          'conversation-readiness',
+          'parent-readiness',
+          expect.any(Number),
+        );
         expect(oneShot).not.toHaveBeenCalled();
         expect(processStream).not.toHaveBeenCalled();
         release();
@@ -678,7 +933,8 @@ describe('Phase B native parent readiness', () => {
     const error = Object.assign(new Error('Exact publication authority rejected'), { code });
     const oneShot = jest.fn().mockResolvedValue([]);
     const publication = jest.fn().mockRejectedValue(error);
-    const service = jest.spyOn(require('../nativeResponseService'), 'getService')
+    const service = jest
+      .spyOn(require('../nativeResponseService'), 'getService')
       .mockReturnValue({ readToolEvidence: oneShot, readToolEvidenceForPresentation: publication });
     const processStream = jest.fn().mockResolvedValue('Must not author');
     const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
@@ -696,59 +952,96 @@ describe('Phase B native parent readiness', () => {
 
 /* === VIVENTIUM START === Canonical Worker synthesis inherits the saved call brain. === */
 describe('Worker completion Voice brain consumption', () => {
-  test.each([true, false])('keeps configured model, High effort and fallback with Voice assignment %s', async (configured) => {
-    const processStream = jest.fn().mockResolvedValue('The verified worker result.');
-    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
-    const agent = {
-      id: 'agent-main',
-      provider: 'glasshive-harness',
-      model: 'synthetic-main-model',
-      model_parameters: { model: 'synthetic-main-model', reasoning_effort: 'high' },
-      voice_llm_provider: configured ? 'glasshive-harness' : '',
-      voice_llm_model: configured ? 'synthetic-voice-model' : '',
-      voice_llm_model_parameters: { reasoning_effort: 'high' },
-      glasshive_options: {
-        workspace: { mode: 'life' }, access: 'full',
-        fallback_model: 'synthetic-fallback', fallback_reasoning_effort: 'high',
-      },
-    };
-    const before = JSON.stringify(agent);
-    try {
-      await generateFollowUpText({
-        req: {
-          user: { id: 'user-1' },
-          body: { viventiumSurface: 'voice', voiceMode: true,
-            viventiumInputMode: 'voice_call', viventiumCallSessionId: 'live-call',
-            viventiumStreamId: 'unrelated-foreground-stream' },
-          _resumableStreamId: 'unrelated-foreground-stream',
-          config: { endpoints: { agents: { providerCapabilities: {
-            'glasshive-harness': {
-              workspace_binding: true, default_access: 'full',
-              phase_b_followup: true, responses_api: false, voice_pipeline_llm: true,
-            },
-          } } } },
+  test.each([true, false])(
+    'keeps configured model, High effort and fallback with Voice assignment %s',
+    async (configured) => {
+      const processStream = jest.fn().mockResolvedValue('The verified worker result.');
+      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      const agent = {
+        id: 'agent-main',
+        provider: 'glasshive-harness',
+        model: 'synthetic-main-model',
+        model_parameters: { model: 'synthetic-main-model', reasoning_effort: 'high' },
+        voice_llm_provider: configured ? 'glasshive-harness' : '',
+        voice_llm_model: configured ? 'synthetic-voice-model' : '',
+        voice_llm_model_parameters: { reasoning_effort: 'high' },
+        glasshive_options: {
+          workspace: { mode: 'life' },
+          access: 'full',
+          fallback_model: 'synthetic-fallback',
+          fallback_reasoning_effort: 'high',
         },
-        agent, runId: 'mission-synthesis', conversationId: 'conv-1', parentMessageId: 'msg-1',
-        recentResponse: 'The worker is running.',
-        insightsData: { insights: [{ cortexName: 'Worker', insight: 'Verified result.',
-          authority: { kind: 'durable_terminal_callback', runId: 'worker-run',
-            event: 'run.completed', workState: 'completed' },
-        }] },
-      });
-      expect(createRun).toHaveBeenCalledTimes(1);
-      const config = createRun.mock.calls[0][0].graphConfig.llmConfig;
-      expect(config.model).toBe('viventium-chat-completions');
-      expect(config.modelKwargs.model).toBe(configured ? agent.voice_llm_model : agent.model);
-      expect(config.modelKwargs.reasoning_effort).toBe('high');
-      expect(config.configuration.defaultHeaders['X-GlassHive-Fallback-Model']).toBe('synthetic-fallback');
-      expect(config.configuration.defaultHeaders['X-GlassHive-Fallback-Reasoning-Effort']).toBe('high');
-      expect(config.configuration.defaultHeaders['X-GlassHive-Access']).toBe('full');
-      expect(config.configuration.defaultHeaders['X-Viventium-Stream-Id']).toBe('phase_b:agent-main:mission-synthesis');
-      expect(JSON.stringify(agent)).toBe(before);
-    } finally {
-      createRun.mockRestore();
-    }
-  });
+      };
+      const before = JSON.stringify(agent);
+      try {
+        await generateFollowUpText({
+          req: {
+            user: { id: 'user-1' },
+            body: {
+              viventiumSurface: 'voice',
+              voiceMode: true,
+              viventiumInputMode: 'voice_call',
+              viventiumCallSessionId: 'live-call',
+              viventiumStreamId: 'unrelated-foreground-stream',
+            },
+            _resumableStreamId: 'unrelated-foreground-stream',
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    'glasshive-harness': {
+                      workspace_binding: true,
+                      default_access: 'full',
+                      phase_b_followup: true,
+                      responses_api: false,
+                      voice_pipeline_llm: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          agent,
+          runId: 'mission-synthesis',
+          conversationId: 'conv-1',
+          parentMessageId: 'msg-1',
+          recentResponse: 'The worker is running.',
+          insightsData: {
+            insights: [
+              {
+                cortexName: 'Worker',
+                insight: 'Verified result.',
+                authority: {
+                  kind: 'durable_terminal_callback',
+                  runId: 'worker-run',
+                  event: 'run.completed',
+                  workState: 'completed',
+                },
+              },
+            ],
+          },
+        });
+        expect(createRun).toHaveBeenCalledTimes(1);
+        const config = createRun.mock.calls[0][0].graphConfig.llmConfig;
+        expect(config.model).toBe('viventium-chat-completions');
+        expect(config.modelKwargs.model).toBe(configured ? agent.voice_llm_model : agent.model);
+        expect(config.modelKwargs.reasoning_effort).toBe('high');
+        expect(config.configuration.defaultHeaders['X-GlassHive-Fallback-Model']).toBe(
+          'synthetic-fallback',
+        );
+        expect(config.configuration.defaultHeaders['X-GlassHive-Fallback-Reasoning-Effort']).toBe(
+          'high',
+        );
+        expect(config.configuration.defaultHeaders['X-GlassHive-Access']).toBe('full');
+        expect(config.configuration.defaultHeaders['X-Viventium-Stream-Id']).toBe(
+          'phase_b:agent-main:mission-synthesis',
+        );
+        expect(JSON.stringify(agent)).toBe(before);
+      } finally {
+        createRun.mockRestore();
+      }
+    },
+  );
 });
 /* === VIVENTIUM END === */
 
@@ -779,9 +1072,12 @@ describe('Phase B signed bootstrap body dispatch', () => {
         baseURL: 'https://native.example.test/v1',
         defaultHeaders: headers,
       });
-      const bootstrap = jest.spyOn(require('../GlassHiveCapabilityBootstrapService'),
-        'buildConversationProviderBootstrapBundle').mockResolvedValue(
-          JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')));
+      const bootstrap = jest
+        .spyOn(
+          require('../GlassHiveCapabilityBootstrapService'),
+          'buildConversationProviderBootstrapBundle',
+        )
+        .mockResolvedValue(JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')));
       const priorSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
       process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-body-dispatch-secret';
       const sent = [];
@@ -840,7 +1136,10 @@ describe('Phase B signed bootstrap body dispatch', () => {
             provider: 'glasshive-harness',
             model: 'synthetic-model',
             tools: ['native', 'conflicting'].includes(mode)
-              ? [`lookup${require('librechat-data-provider').Constants.mcp_delimiter}synthetic-account`] : [],
+              ? [
+                  `lookup${require('librechat-data-provider').Constants.mcp_delimiter}synthetic-account`,
+                ]
+              : [],
             model_parameters: { model: 'synthetic-model', reasoning_effort: 'high' },
           },
           runId: 'signed-bootstrap',
@@ -850,7 +1149,9 @@ describe('Phase B signed bootstrap body dispatch', () => {
         if (['native', 'conflicting'].includes(mode)) {
           expect(bootstrap).toHaveBeenCalledTimes(1);
           expect(configuration.defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64']).toBe(encoded);
-          expect(configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature']).not.toBe('synthetic-signature');
+          expect(configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature']).not.toBe(
+            'synthetic-signature',
+          );
         } else expect(bootstrap).not.toHaveBeenCalled();
         const body = JSON.stringify({
           model: 'synthetic-model',
@@ -891,14 +1192,18 @@ describe('Phase B signed bootstrap body dispatch', () => {
           if (mode === 'non-native') expect(configuration.fetch).toBeUndefined();
           expect(payload.metadata.retain).toBe('original');
           expect(payload.metadata.bootstrap_bundle_b64).toBeUndefined();
-          expect(wireHeaders.get('X-GlassHive-Bootstrap-Bundle-B64')).toBe(
-            null,
-          );
+          expect(wireHeaders.get('X-GlassHive-Bootstrap-Bundle-B64')).toBe(null);
         }
         expect(wireHeaders.get('X-GlassHive-Bootstrap-Signature')).toBe(
-          mode === 'native' ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature'] : null);
+          mode === 'native'
+            ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature']
+            : null,
+        );
         expect(wireHeaders.get('X-GlassHive-Bootstrap-Timestamp')).toBe(
-          mode === 'native' ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Timestamp'] : null);
+          mode === 'native'
+            ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Timestamp']
+            : null,
+        );
         expect(payload.messages).toEqual([{ role: 'user', content: 'Review.' }]);
         expect(admitted[0].bodySha256).toBe(
           require('crypto').createHash('sha256').update(sent[0].body).digest('hex'),
@@ -907,8 +1212,10 @@ describe('Phase B signed bootstrap body dispatch', () => {
         expect(sent[1].body).toBe(sent[0].body);
       } finally {
         fetchSpy.mockRestore();
-        createRun.mockRestore(); bootstrap.mockRestore();
-        if (priorSecret === undefined) delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+        createRun.mockRestore();
+        bootstrap.mockRestore();
+        if (priorSecret === undefined)
+          delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
         else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = priorSecret;
       }
     },
@@ -958,16 +1265,28 @@ test('bootstrap relocation after Native admission changes the bound body digest'
 /* === VIVENTIUM START === Phase B uses the declared Native output contract. === */
 describe('Phase B declared audio output contract', () => {
   const modelDisposition = (audio) => ({
-    version: 1, audio, required: true, valid: true, source: 'model',
+    version: 1,
+    audio,
+    required: true,
+    valid: true,
+    source: 'model',
   });
-  async function runFollowUp({ trustedCall = true, capability = true, output, text = 'The file is ready.', requestOverrides = {} } = {}) {
+  async function runFollowUp({
+    trustedCall = true,
+    capability = true,
+    output,
+    text = 'The file is ready.',
+    requestOverrides = {},
+  } = {}) {
     let runOptions;
     const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => {
       runOptions = options;
-      return { processStream: jest.fn(async () => {
-        await options.customHandlers?.on_chat_model_end?.handle('on_chat_model_end', { output });
-        return text;
-      }) };
+      return {
+        processStream: jest.fn(async () => {
+          await options.customHandlers?.on_chat_model_end?.handle('on_chat_model_end', { output });
+          return text;
+        }),
+      };
     });
     const onDeliveryDisposition = jest.fn();
     const onNativeSilentDecision = jest.fn();
@@ -976,24 +1295,47 @@ describe('Phase B declared audio output contract', () => {
       body: { voiceMode: true, viventiumSurface: 'voice', viventiumCallSessionId: 'caller-label' },
       ...(trustedCall ? { viventiumCallSession: { callSessionId: 'owned-active-call' } } : {}),
       ...requestOverrides,
-      config: { endpoints: { agents: { providerCapabilities: { 'glasshive-harness': {
-        workspace_binding: true, conversation_session: true, responses_api: false,
-        ...(capability ? { messaging_delivery_disposition: true,
-          messaging_delivery_disposition_version: 1 } : {}),
-      } } } } },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              'glasshive-harness': {
+                workspace_binding: true,
+                conversation_session: true,
+                responses_api: false,
+                ...(capability
+                  ? {
+                      messaging_delivery_disposition: true,
+                      messaging_delivery_disposition_version: 1,
+                    }
+                  : {}),
+              },
+            },
+          },
+        },
+      },
     };
     try {
-      const result = await generateFollowUpText({ req,
-        agent: { id: 'synthetic-main', provider: 'glasshive-harness',
+      const result = await generateFollowUpText({
+        req,
+        agent: {
+          id: 'synthetic-main',
+          provider: 'glasshive-harness',
           model: 'grok-build:grok-4.7-build-fast',
-          model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' } },
+          model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' },
+        },
         insightsData: { insights: [{ cortexName: 'Synthetic', insight: 'A verified file.' }] },
-        recentResponse: 'The worker is preparing it.', runId: 'synthetic-phase-b',
-        conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent',
-        onDeliveryDisposition, onNativeSilentDecision,
+        recentResponse: 'The worker is preparing it.',
+        runId: 'synthetic-phase-b',
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
+        onDeliveryDisposition,
+        onNativeSilentDecision,
       });
       return { result, runOptions, onDeliveryDisposition, onNativeSilentDecision };
-    } finally { createRun.mockRestore(); }
+    } finally {
+      createRun.mockRestore();
+    }
   }
   test.each([
     ['strict native silence', '', '', 'skip', true, false, true],
@@ -1003,67 +1345,140 @@ describe('Phase B declared audio output contract', () => {
     ['native transfer', '', '', 'skip', true, true, false],
     ['lost authored text', '', 'A useful answer.', 'skip', true, false, false],
     ['useful authored answer', 'A useful answer.', 'A useful answer.', 'skip', true, false, false],
-  ])('keeps explicit completed native silence distinct from %s', async (_label, text, content, audio, capability, transfer, expected) => {
-    const output = { additional_kwargs: { __raw_response: { choices: [{ message: {
-      role: 'assistant', content, ...(transfer ? { tool_calls: [{ id: 'transfer', type: 'function' }] } : {}),
-      ...(audio ? { provider_specific_fields: { viventium: { delivery_disposition: modelDisposition(audio) } } } : {}),
-    } }] } } };
-    const result = await runFollowUp({ text, output, capability });
-    expect(result.onNativeSilentDecision).toHaveBeenCalledWith(expected);
-    expect(result.result).toBe(text);
-  });
-  test.each(['eligible', 'skip'])('retains Native %s metadata with authored content', async (audio) => {
-    const disposition = modelDisposition(audio);
-    const result = await runFollowUp({ output: { additional_kwargs: {
-      provider_specific_fields: { viventium: { delivery_disposition: disposition } },
-    } } });
-    expect(result.result).toBe('The file is ready.');
-    expect(result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders['X-Viventium-Audio-Eligible']).toBe('true');
-    expect(result.runOptions.graphConfig.llmConfig.__includeRawResponse).toBe(true);
-    expect(result.onDeliveryDisposition).toHaveBeenCalledWith(disposition);
-  });
+  ])(
+    'keeps explicit completed native silence distinct from %s',
+    async (_label, text, content, audio, capability, transfer, expected) => {
+      const output = {
+        additional_kwargs: {
+          __raw_response: {
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content,
+                  ...(transfer ? { tool_calls: [{ id: 'transfer', type: 'function' }] } : {}),
+                  ...(audio
+                    ? {
+                        provider_specific_fields: {
+                          viventium: { delivery_disposition: modelDisposition(audio) },
+                        },
+                      }
+                    : {}),
+                },
+              },
+            ],
+          },
+        },
+      };
+      const result = await runFollowUp({ text, output, capability });
+      expect(result.onNativeSilentDecision).toHaveBeenCalledWith(expected);
+      expect(result.result).toBe(text);
+    },
+  );
+  test.each(['eligible', 'skip'])(
+    'retains Native %s metadata with authored content',
+    async (audio) => {
+      const disposition = modelDisposition(audio);
+      const result = await runFollowUp({
+        output: {
+          additional_kwargs: {
+            provider_specific_fields: { viventium: { delivery_disposition: disposition } },
+          },
+        },
+      });
+      expect(result.result).toBe('The file is ready.');
+      expect(
+        result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders[
+          'X-Viventium-Audio-Eligible'
+        ],
+      ).toBe('true');
+      expect(result.runOptions.graphConfig.llmConfig.__includeRawResponse).toBe(true);
+      expect(result.onDeliveryDisposition).toHaveBeenCalledWith(disposition);
+    },
+  );
   test.each([
     ['missing', {}, 'required_missing'],
-    ['malformed', { provider_specific_fields: { viventium: { delivery_disposition: {
-      ...modelDisposition('eligible'), extra: true,
-    } } } }, 'required_malformed'],
-  ])('fails closed for required %s metadata without discarding text', async (_label, output, source) => {
-    const result = await runFollowUp({ output });
-    expect(result.result).toBe('The file is ready.');
-    expect(result.onDeliveryDisposition).toHaveBeenCalledWith({
-      version: 1, audio: 'skip', required: true, valid: false, source,
-    });
-  });
+    [
+      'malformed',
+      {
+        provider_specific_fields: {
+          viventium: {
+            delivery_disposition: {
+              ...modelDisposition('eligible'),
+              extra: true,
+            },
+          },
+        },
+      },
+      'required_malformed',
+    ],
+  ])(
+    'fails closed for required %s metadata without discarding text',
+    async (_label, output, source) => {
+      const result = await runFollowUp({ output });
+      expect(result.result).toBe('The file is ready.');
+      expect(result.onDeliveryDisposition).toHaveBeenCalledWith({
+        version: 1,
+        audio: 'skip',
+        required: true,
+        valid: false,
+        source,
+      });
+    },
+  );
   test('a caller Call label cannot declare an eligible output contract', async () => {
-    const literal = '{"type":"assistant_response","tool_name":null,"voice":"eligible","content":"A literal JSON example."}';
+    const literal =
+      '{"type":"assistant_response","tool_name":null,"voice":"eligible","content":"A literal JSON example."}';
     const result = await runFollowUp({ trustedCall: false, text: literal });
-    expect(result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders['X-Viventium-Audio-Eligible']).toBe('false');
+    expect(
+      result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders[
+        'X-Viventium-Audio-Eligible'
+      ],
+    ).toBe('false');
     expect(result.result).toBe(literal);
     expect(result.onDeliveryDisposition).toHaveBeenCalledWith(null);
   });
   test('a provider without the declared capability retains literal JSON and legacy behavior', async () => {
     const literal = '{"voice":"skip","content":"Literal data"}';
     const result = await runFollowUp({ capability: false, text: literal });
-    expect(result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders['X-Viventium-Audio-Eligible']).toBeUndefined();
+    expect(
+      result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders[
+        'X-Viventium-Audio-Eligible'
+      ],
+    ).toBeUndefined();
     expect(result.result).toBe(literal);
     expect(result.onDeliveryDisposition).toHaveBeenCalledWith(null);
   });
-  test.each([false, true])('Telegram audio eligibility requires authenticated adapter=%s', async (authenticated) => {
-    const result = await runFollowUp({ trustedCall: false, requestOverrides: {
-      _viventiumTelegram: authenticated,
-      body: { viventiumSurface: 'telegram', telegramAudioRequested: true },
-    } });
-    expect(result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders['X-Viventium-Audio-Eligible'])
-      .toBe(String(authenticated));
-    expect(result.onDeliveryDisposition).toHaveBeenCalledWith(authenticated
-      ? { version: 1, audio: 'skip', required: true, valid: false, source: 'required_missing' }
-      : null);
-  });
+  test.each([false, true])(
+    'Telegram audio eligibility requires authenticated adapter=%s',
+    async (authenticated) => {
+      const result = await runFollowUp({
+        trustedCall: false,
+        requestOverrides: {
+          _viventiumTelegram: authenticated,
+          body: { viventiumSurface: 'telegram', telegramAudioRequested: true },
+        },
+      });
+      expect(
+        result.runOptions.graphConfig.llmConfig.configuration.defaultHeaders[
+          'X-Viventium-Audio-Eligible'
+        ],
+      ).toBe(String(authenticated));
+      expect(result.onDeliveryDisposition).toHaveBeenCalledWith(
+        authenticated
+          ? { version: 1, audio: 'skip', required: true, valid: false, source: 'required_missing' }
+          : null,
+      );
+    },
+  );
   test('retains no-response silence with a valid model disposition', async () => {
     const disposition = modelDisposition('skip');
-    const result = await runFollowUp({ text: '{NTA}', output: {
-      provider_specific_fields: { viventium: { delivery_disposition: disposition } },
-    } });
+    const result = await runFollowUp({
+      text: '{NTA}',
+      output: {
+        provider_specific_fields: { viventium: { delivery_disposition: disposition } },
+      },
+    });
     expect(result.result).toBe('{NTA}');
     expect(result.onDeliveryDisposition).toHaveBeenCalledWith(disposition);
   });
@@ -1079,41 +1494,72 @@ describe('Phase B typed terminal result failure', () => {
     ['server_error', 502, false],
   ])('%s/%s retains its terminal or transport meaning', async (code, status, terminal) => {
     const failure = Object.assign(new Error('Synthetic result failure'), {
-      code, ...(status == null ? {} : { status }),
+      code,
+      ...(status == null ? {} : { status }),
     });
-    const processStream = jest.fn().mockRejectedValueOnce(failure).mockResolvedValue('A verified result.');
+    const processStream = jest
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue('A verified result.');
     const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
     try {
       const operation = generateFollowUpText({
-        req: { user: { id: 'synthetic-owner' }, body: {}, config: { endpoints: { agents: {
-          providerCapabilities: { 'glasshive-harness': {
-            workspace_binding: true, conversation_session: true, activity_stream: true,
-            responses_api: false,
-          } },
-        } } } },
-        agent: { id: 'synthetic-main', provider: 'glasshive-harness',
-          model: 'codex-cli:gpt-6.1-sol', model_parameters: { model: 'codex-cli:gpt-6.1-sol' } },
-        runId: 'synthetic-terminal-followup', conversationId: 'synthetic-conversation',
-        parentMessageId: 'synthetic-parent', recentResponse: 'Working.',
+        req: {
+          user: { id: 'synthetic-owner' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                providerCapabilities: {
+                  'glasshive-harness': {
+                    workspace_binding: true,
+                    conversation_session: true,
+                    activity_stream: true,
+                    responses_api: false,
+                  },
+                },
+              },
+            },
+          },
+        },
+        agent: {
+          id: 'synthetic-main',
+          provider: 'glasshive-harness',
+          model: 'codex-cli:gpt-6.1-sol',
+          model_parameters: { model: 'codex-cli:gpt-6.1-sol' },
+        },
+        runId: 'synthetic-terminal-followup',
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
+        recentResponse: 'Working.',
         insightsData: { insights: [{ cortexName: 'Worker', insight: 'The result is ready.' }] },
       });
       if (terminal) await expect(operation).rejects.toBe(failure);
       else await expect(operation).resolves.toBe('A verified result.');
       expect(processStream).toHaveBeenCalledTimes(terminal ? 1 : 2);
-    } finally { createRun.mockRestore(); }
+    } finally {
+      createRun.mockRestore();
+    }
   });
 });
 /* === VIVENTIUM END === */
 
 /* === VIVENTIUM START === Installed caller respects exact result conflicts. === */
 describe('installed Phase B model caller result status', () => {
-  test.each([[409, 1], [502, 2]])('status %s makes exactly %s attempts', async (status, attempts) => {
+  test.each([
+    [409, 1],
+    [502, 2],
+  ])('status %s makes exactly %s attempts', async (status, attempts) => {
     const { AsyncCaller } = require('@langchain/core/utils/async_caller');
     const caller = new AsyncCaller({ maxRetries: 1 });
     const failure = Object.assign(new Error('Synthetic native publication response'), {
-      status, code: status === 409 ? 'native_output_files_identity_unavailable' : 'server_error',
+      status,
+      code: status === 409 ? 'native_output_files_identity_unavailable' : 'server_error',
     });
-    const invoke = jest.fn().mockRejectedValueOnce(failure).mockResolvedValue('Recovered transport.');
+    const invoke = jest
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue('Recovered transport.');
     const operation = caller.call(invoke);
     if (status === 409) await expect(operation).rejects.toBe(failure);
     else await expect(operation).resolves.toBe('Recovered transport.');
@@ -1125,62 +1571,132 @@ describe('installed Phase B model caller result status', () => {
 /* === VIVENTIUM START === Phase B selected files survive pre-merge streams without requiring audio. === */
 describe('Phase B native file carrier transport', () => {
   test.each(['stream', 'terminal', 'replaced', 'foreign'])(
-    '%s keeps only the actual emitting source before SDK concatenation', async (mode) => {
+    '%s keeps only the actual emitting source before SDK concatenation',
+    async (mode) => {
       const onNativeOutputFiles = jest.fn();
       let expectedSource;
       const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
         processStream: async () => {
           const headers = options.graphConfig.llmConfig.configuration.defaultHeaders;
-          expectedSource = { owner_id: headers['X-Viventium-User-Id'],
+          expectedSource = {
+            owner_id: headers['X-Viventium-User-Id'],
             conversation_id: headers['X-Viventium-Conversation-Id'],
             message_id: headers['X-Viventium-Message-Id'],
-            stream_id: headers['X-Viventium-Stream-Id'], agent_id: headers['X-GlassHive-Agent-Id'] };
-          const envelope = { version: 1, ...expectedSource, logical_turn_id: '', logical_turn_revision: 1,
-            request_id: 'native-request', run_id: 'native-run', attempt_id: 'native-attempt', invocation_id: '',
-            files: [{ filename: 'shape.svg', mime_type: 'image/svg+xml', bytes: 138, sha256: 'a'.repeat(64),
-              download_url: 'https://artifacts.example.test/v1/link-refs/ghr_main1234567890abcdef' }] };
+            stream_id: headers['X-Viventium-Stream-Id'],
+            agent_id: headers['X-GlassHive-Agent-Id'],
+          };
+          const envelope = {
+            version: 1,
+            ...expectedSource,
+            logical_turn_id: '',
+            logical_turn_revision: 1,
+            request_id: 'native-request',
+            run_id: 'native-run',
+            attempt_id: 'native-attempt',
+            invocation_id: '',
+            files: [
+              {
+                filename: 'shape.svg',
+                mime_type: 'image/svg+xml',
+                bytes: 138,
+                sha256: 'a'.repeat(64),
+                download_url:
+                  'https://artifacts.example.test/v1/link-refs/ghr_main1234567890abcdef',
+              },
+            ],
+          };
           if (mode === 'foreign') envelope.owner_id = 'foreign';
-          const chunk = { additional_kwargs: { __raw_response: { id: 'native-request',
-            object: mode === 'terminal' ? 'chat.completion' : 'chat.completion.chunk',
-            glasshive: { output_files: envelope } } } };
+          const chunk = {
+            additional_kwargs: {
+              __raw_response: {
+                id: 'native-request',
+                object: mode === 'terminal' ? 'chat.completion' : 'chat.completion.chunk',
+                glasshive: { output_files: envelope },
+              },
+            },
+          };
           const handlers = options.customHandlers;
           expect(handlers.on_chat_model_stream).toBeDefined();
           expect(options.graphConfig.llmConfig.__includeRawResponse).toBe(true);
           handlers.on_chat_model_start.handle('on_chat_model_start', {});
-          if (mode !== 'terminal') handlers.on_chat_model_stream.handle('on_chat_model_stream', { chunk });
+          if (mode !== 'terminal')
+            handlers.on_chat_model_stream.handle('on_chat_model_stream', { chunk });
           if (mode === 'replaced') handlers.on_chat_model_start.handle('on_chat_model_start', {});
-          handlers.on_chat_model_end.handle('on_chat_model_end', { output: mode === 'terminal' ? chunk : {
-            additional_kwargs: { __raw_response: { id: 'native-requestnative-request',
-              object: 'chat.completion.chunk', glasshive: { output_files: envelope } } },
-          } });
+          handlers.on_chat_model_end.handle('on_chat_model_end', {
+            output:
+              mode === 'terminal'
+                ? chunk
+                : {
+                    additional_kwargs: {
+                      __raw_response: {
+                        id: 'native-requestnative-request',
+                        object: 'chat.completion.chunk',
+                        glasshive: { output_files: envelope },
+                      },
+                    },
+                  },
+          });
           return 'Here is your file.';
         },
       }));
       try {
         await generateFollowUpText({
-          req: { id: 'synthetic-files', user: { id: 'owner' },
-            body: { conversationId: 'conversation', messageId: 'accepted-parent', viventiumSurface: 'web' },
-            config: { endpoints: { agents: { providerCapabilities: { 'glasshive-harness': {
-              workspace_binding: true, conversation_session: true, responses_api: false,
-            } } } } } },
-          agent: { id: 'main', provider: 'glasshive-harness', model: 'grok-build:grok-4.7-build-fast',
-            model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' } },
-          insightsData: { insights: [{ cortexName: 'Worker', insight: 'The verified shape is ready.' }] },
-          recentResponse: 'Preparing your file.', runId: 'stable-synthesis',
-          conversationId: 'conversation', parentMessageId: 'accepted-parent', onNativeOutputFiles,
+          req: {
+            id: 'synthetic-files',
+            user: { id: 'owner' },
+            body: {
+              conversationId: 'conversation',
+              messageId: 'accepted-parent',
+              viventiumSurface: 'web',
+            },
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    'glasshive-harness': {
+                      workspace_binding: true,
+                      conversation_session: true,
+                      responses_api: false,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          agent: {
+            id: 'main',
+            provider: 'glasshive-harness',
+            model: 'grok-build:grok-4.7-build-fast',
+            model_parameters: { model: 'grok-build:grok-4.7-build-fast', reasoning_effort: 'high' },
+          },
+          insightsData: {
+            insights: [{ cortexName: 'Worker', insight: 'The verified shape is ready.' }],
+          },
+          recentResponse: 'Preparing your file.',
+          runId: 'stable-synthesis',
+          conversationId: 'conversation',
+          parentMessageId: 'accepted-parent',
+          onNativeOutputFiles,
         });
         expect(onNativeOutputFiles).toHaveBeenCalledTimes(1);
         const capture = onNativeOutputFiles.mock.calls[0][0];
         if (mode === 'replaced' || mode === 'foreign') expect(capture).toEqual({ error: true });
         else {
           expect(capture.envelope).toMatchObject(expectedSource);
-          expect(capture.identity).toMatchObject({ userId: 'owner', conversationId: 'conversation',
-            responseMessageId: 'accepted-parent', requestId: 'native-request', runId: 'native-run',
-            attemptId: 'native-attempt' });
+          expect(capture.identity).toMatchObject({
+            userId: 'owner',
+            conversationId: 'conversation',
+            responseMessageId: 'accepted-parent',
+            requestId: 'native-request',
+            runId: 'native-run',
+            attemptId: 'native-attempt',
+          });
           expect(capture.presentationAgentId).toBe('main');
           expect(JSON.stringify(capture)).not.toContain('synthetic-harness-key');
         }
-      } finally { createRun.mockRestore(); }
+      } finally {
+        createRun.mockRestore();
+      }
     },
   );
 });
@@ -1188,44 +1704,102 @@ describe('Phase B native file carrier transport', () => {
 /* === VIVENTIUM START === Request-local native declaration continuity. === */
 describe('Phase B invocation-fresh native declarations', () => {
   const endpoints = require('~/server/services/Config/getEndpointsConfig');
-  beforeEach(() => endpoints.getEndpointsConfig.mockResolvedValue({ agents: { capabilities: ['web_search'] } }));
-  afterEach(() => endpoints.getEndpointsConfig.mockImplementation(
-    jest.requireActual('~/server/services/Config/getEndpointsConfig').getEndpointsConfig));
-  test.each(['text', 'voice'].flatMap((surface) => [false, true, 'partial'].flatMap((persisted) =>
-    ['declared', 'omitted', 'undefined', 'null', 'empty', 'denied', 'null_bundle', 'empty_bundle',
-      'workspace_unbound'].map((mode) => [surface, persisted, mode]))))(
+  beforeEach(() =>
+    endpoints.getEndpointsConfig.mockResolvedValue({ agents: { capabilities: ['web_search'] } }),
+  );
+  afterEach(() =>
+    endpoints.getEndpointsConfig.mockImplementation(
+      jest.requireActual('~/server/services/Config/getEndpointsConfig').getEndpointsConfig,
+    ),
+  );
+  test.each(
+    ['text', 'voice'].flatMap((surface) =>
+      [false, true, 'partial'].flatMap((persisted) =>
+        [
+          'declared',
+          'omitted',
+          'undefined',
+          'null',
+          'empty',
+          'denied',
+          'null_bundle',
+          'empty_bundle',
+          'workspace_unbound',
+        ].map((mode) => [surface, persisted, mode]),
+      ),
+    ),
+  )(
     '%s preserves %s canonical rehydrate with %s declarations',
     async (surface, persisted, mode) => {
       const { Constants } = require('librechat-data-provider');
-      const declarations = Object.freeze([`lookup${Constants.mcp_delimiter}synthetic-account`, 'web_search']);
+      const declarations = Object.freeze([
+        `lookup${Constants.mcp_delimiter}synthetic-account`,
+        'web_search',
+      ]);
       const agent = {
-        id: 'native-main', provider: persisted === 'partial' ? '' : 'glasshive-harness', model: 'synthetic-model',
-        tools: [], model_parameters: { reasoning_effort: 'high', configuration: { defaultHeaders: {
-          'x-glasshive-bootstrap-bundle-b64': 'old-main-bundle',
-          'X-GLASSHIVE-BOOTSTRAP-TIMESTAMP': 'old-main-timestamp',
-          'X-GlassHive-Bootstrap-Signature': 'old-main-signature',
-          'X-Synthetic-Existing': 'keep-structural',
-        } } },
-        voice_llm_provider: persisted === 'partial' ? '' : 'glasshive-harness', voice_llm_model: 'synthetic-voice-model',
+        id: 'native-main',
+        provider: persisted === 'partial' ? '' : 'glasshive-harness',
+        model: 'synthetic-model',
+        tools: [],
+        model_parameters: {
+          reasoning_effort: 'high',
+          configuration: {
+            defaultHeaders: {
+              'x-glasshive-bootstrap-bundle-b64': 'old-main-bundle',
+              'X-GLASSHIVE-BOOTSTRAP-TIMESTAMP': 'old-main-timestamp',
+              'X-GlassHive-Bootstrap-Signature': 'old-main-signature',
+              'X-Synthetic-Existing': 'keep-structural',
+            },
+          },
+        },
+        voice_llm_provider: persisted === 'partial' ? '' : 'glasshive-harness',
+        voice_llm_model: 'synthetic-voice-model',
         glasshive_options: { workspace: { mode: 'life' }, access: 'full' },
       };
-      if (mode !== 'omitted') Object.defineProperty(agent, 'declaredToolNames', {
-        value: ['declared', 'denied', 'null_bundle', 'empty_bundle', 'workspace_unbound'].includes(mode)
-          ? declarations : mode === 'empty' ? Object.freeze([]) :
-          mode === 'null' ? null : undefined, enumerable: false,
-      });
+      if (mode !== 'omitted')
+        Object.defineProperty(agent, 'declaredToolNames', {
+          value: [
+            'declared',
+            'denied',
+            'null_bundle',
+            'empty_bundle',
+            'workspace_unbound',
+          ].includes(mode)
+            ? declarations
+            : mode === 'empty'
+              ? Object.freeze([])
+              : mode === 'null'
+                ? null
+                : undefined,
+          enumerable: false,
+        });
       const beforeDeclaration = Object.getOwnPropertyDescriptor(agent, 'declaredToolNames');
       const beforeAgent = JSON.stringify(agent);
       const canonical = require('~/models/Agent').getAgent;
-      canonical.mockResolvedValue(persisted ? { ...agent, provider: 'glasshive-harness',
-        model_parameters: { ...agent.model_parameters, temperature: 0.37 },
-        tools: [`lookup${Constants.mcp_delimiter}stale-account`] } : null);
-      const bundle = { glasshive_capability_broker: { grant_id: 'fresh-phase-b' },
-        conversation_provider_instructions: 'Freshly authorized capabilities.' };
-      const bootstrap = jest.spyOn(require('../GlassHiveCapabilityBootstrapService'),
-        'buildConversationProviderBootstrapBundle');
-      if (mode === 'denied') bootstrap.mockRejectedValue(new Error('Synthetic fresh authorization denied'));
-      else bootstrap.mockResolvedValue(mode === 'null_bundle' ? null : mode === 'empty_bundle' ? {} : bundle);
+      canonical.mockResolvedValue(
+        persisted
+          ? {
+              ...agent,
+              provider: 'glasshive-harness',
+              model_parameters: { ...agent.model_parameters, temperature: 0.37 },
+              tools: [`lookup${Constants.mcp_delimiter}stale-account`],
+            }
+          : null,
+      );
+      const bundle = {
+        glasshive_capability_broker: { grant_id: 'fresh-phase-b' },
+        conversation_provider_instructions: 'Freshly authorized capabilities.',
+      };
+      const bootstrap = jest.spyOn(
+        require('../GlassHiveCapabilityBootstrapService'),
+        'buildConversationProviderBootstrapBundle',
+      );
+      if (mode === 'denied')
+        bootstrap.mockRejectedValue(new Error('Synthetic fresh authorization denied'));
+      else
+        bootstrap.mockResolvedValue(
+          mode === 'null_bundle' ? null : mode === 'empty_bundle' ? {} : bundle,
+        );
       const run = jest.spyOn(Run, 'create').mockResolvedValue({
         processStream: jest.fn().mockResolvedValue('Verified result.'),
       });
@@ -1233,23 +1807,49 @@ describe('Phase B invocation-fresh native declarations', () => {
       process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-phase-b-secret';
       try {
         await generateFollowUpText({
-          req: { user: { id: 'synthetic-owner' }, body: {
-            viventiumSurface: surface, voiceMode: surface === 'voice',
-            ...(surface === 'voice' ? { viventiumActorTrust: 'owner_participant',
-              viventiumCanAuthorizeSideEffects: true } : {}),
-            viventiumInputMode: surface === 'voice' ? 'voice_call' : 'text',
-          }, config: { endpoints: { agents: { providerCapabilities: {
-            'glasshive-harness': { workspace_binding: mode !== 'workspace_unbound', phase_b_followup: true,
-              responses_api: false, voice_pipeline_llm: true, native_tools: true,
-              host_tools_transport: 'broker_mcp', host_tools: ['web_search'] },
-          } } } } }, agent, runId: 'worker-result', conversationId: 'synthetic-conversation',
-          parentMessageId: 'synthetic-parent', recentResponse: 'Working.',
+          req: {
+            user: { id: 'synthetic-owner' },
+            body: {
+              viventiumSurface: surface,
+              voiceMode: surface === 'voice',
+              ...(surface === 'voice'
+                ? {
+                    viventiumActorTrust: 'owner_participant',
+                    viventiumCanAuthorizeSideEffects: true,
+                  }
+                : {}),
+              viventiumInputMode: surface === 'voice' ? 'voice_call' : 'text',
+            },
+            config: {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    'glasshive-harness': {
+                      workspace_binding: mode !== 'workspace_unbound',
+                      phase_b_followup: true,
+                      responses_api: false,
+                      voice_pipeline_llm: true,
+                      native_tools: true,
+                      host_tools_transport: 'broker_mcp',
+                      host_tools: ['web_search'],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          agent,
+          runId: 'worker-result',
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          recentResponse: 'Working.',
           insightsData: { insights: [{ cortexName: 'Worker', insight: 'Verified result.' }] },
         });
         expect(canonical).toHaveBeenCalledTimes(persisted === 'partial' ? 2 : 1);
         expect(canonical).toHaveBeenCalledWith({ id: 'native-main' });
         expect(bootstrap).toHaveBeenCalledTimes(
-          ['declared', 'denied', 'null_bundle', 'empty_bundle'].includes(mode) ? 1 : 0);
+          ['declared', 'denied', 'null_bundle', 'empty_bundle'].includes(mode) ? 1 : 0,
+        );
         const config = run.mock.calls[0][0].graphConfig.llmConfig;
         if (persisted) expect(config.temperature).toBe(0.37);
         const headers = config.configuration.defaultHeaders;
@@ -1262,21 +1862,31 @@ describe('Phase B invocation-fresh native declarations', () => {
           return;
         }
         expect(bootstrap.mock.calls[0][0]).toMatchObject({
-          allowedServerNames: ['synthetic-account'], allowedHostTools: ['web_search'],
-          requestBody: { conversationId: 'synthetic-conversation',
-            parentMessageId: 'synthetic-parent', messageId: 'synthetic-parent',
+          allowedServerNames: ['synthetic-account'],
+          allowedHostTools: ['web_search'],
+          requestBody: {
+            conversationId: 'synthetic-conversation',
+            parentMessageId: 'synthetic-parent',
+            messageId: 'synthetic-parent',
             viventiumGlassHiveIdempotencyKey: 'phase_b:native-main:worker-result',
-            viventiumStreamId: 'phase_b:native-main:worker-result' },
+            viventiumStreamId: 'phase_b:native-main:worker-result',
+          },
         });
-        expect(JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')))
-          .toEqual(bundle);
+        expect(
+          JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')),
+        ).toEqual(bundle);
         expect(headers['X-GlassHive-Bootstrap-Signature']).toMatch(/^sha256=/);
         expect(JSON.stringify(agent)).toBe(beforeAgent);
       } finally {
         expect(JSON.stringify(agent)).toBe(beforeAgent);
-        expect(Object.getOwnPropertyDescriptor(agent, 'declaredToolNames')).toEqual(beforeDeclaration);
-        bootstrap.mockRestore(); run.mockRestore(); canonical.mockResolvedValue(null);
-        if (priorSecret === undefined) delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+        expect(Object.getOwnPropertyDescriptor(agent, 'declaredToolNames')).toEqual(
+          beforeDeclaration,
+        );
+        bootstrap.mockRestore();
+        run.mockRestore();
+        canonical.mockResolvedValue(null);
+        if (priorSecret === undefined)
+          delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
         else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = priorSecret;
       }
     },

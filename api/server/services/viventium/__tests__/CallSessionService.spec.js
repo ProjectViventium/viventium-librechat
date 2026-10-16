@@ -100,38 +100,106 @@ describe('CallSessionService', () => {
   });
 
   test('normal End flushes latest deferred compaction without waiting for the model', async () => {
-    const { deferAcceptedMainCompactionForCall, resetMainCompactionSchedulingForTests } = require('@librechat/api');
+    const {
+      deferAcceptedMainCompactionForCall,
+      resetMainCompactionSchedulingForTests,
+    } = require('@librechat/api');
     resetMainCompactionSchedulingForTests();
-    const user = await User.create({ name: 'Call User', email: 'maintenance@example.com', provider: 'local' });
-    const session = await createCallSession({ userId: String(user._id), agentId: 'agent_1', conversationId: 'maintenance-conversation' });
+    const user = await User.create({
+      name: 'Call User',
+      email: 'maintenance@example.com',
+      provider: 'local',
+    });
+    const session = await createCallSession({
+      userId: String(user._id),
+      agentId: 'agent_1',
+      conversationId: 'maintenance-conversation',
+    });
     let release;
     const first = jest.fn(async () => 'old');
-    const latest = jest.fn(() => new Promise((resolve) => { release = resolve; }));
+    const latest = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
     for (const schedule of [first, latest]) {
-      expect(deferAcceptedMainCompactionForCall({ ownerId: String(user._id), domainKey: 'maintenance-domain', call: session, schedule })).toBe(true);
+      expect(
+        deferAcceptedMainCompactionForCall({
+          ownerId: String(user._id),
+          domainKey: 'maintenance-domain',
+          call: session,
+          schedule,
+        }),
+      ).toBe(true);
     }
     try {
-      const ended = await syncCallSessionState({ callSessionId: session.callSessionId, touch: false, status: 'ended' });
+      const ended = await syncCallSessionState({
+        callSessionId: session.callSessionId,
+        touch: false,
+        status: 'ended',
+      });
       expect(ended.status).toBe('ended');
-      expect(first).not.toHaveBeenCalled(); expect(latest).toHaveBeenCalledTimes(1);
-      await syncCallSessionState({ callSessionId: session.callSessionId, touch: false, status: 'ended' });
+      expect(first).not.toHaveBeenCalled();
       expect(latest).toHaveBeenCalledTimes(1);
-    } finally { release?.('completed'); resetMainCompactionSchedulingForTests(); }
+      await syncCallSessionState({
+        callSessionId: session.callSessionId,
+        touch: false,
+        status: 'ended',
+      });
+      expect(latest).toHaveBeenCalledTimes(1);
+    } finally {
+      release?.('completed');
+      resetMainCompactionSchedulingForTests();
+    }
   });
 
   test('Main maintenance lookup uses owner, agent, status, expiry and fatal guards across conversations', async () => {
-    const user = await User.create({ name: 'Maintenance User', email: 'maintenance@example.com', provider: 'local' });
+    const user = await User.create({
+      name: 'Maintenance User',
+      email: 'maintenance@example.com',
+      provider: 'local',
+    });
     const ownerId = String(user._id);
-    const call = await createCallSession({ userId: ownerId, agentId: 'main-agent', conversationId: 'a-different-conversation' });
-    expect((await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' })).callSessionId).toBe(call.callSessionId);
-    expect(await getActiveCallSessionForMainMaintenance({ userId: 'other-owner', agentId: 'main-agent' })).toBeNull();
-    expect(await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'other-agent' })).toBeNull();
-    await ViventiumCallSession.updateOne({ callSessionId: call.callSessionId }, { $set: { callStatus: 'ended' } });
-    expect(await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' })).toBeNull();
-    await ViventiumCallSession.updateOne({ callSessionId: call.callSessionId }, { $set: { callStatus: 'listening', callFailure: { fatal: true } } });
-    expect(await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' })).toBeNull();
-    await ViventiumCallSession.updateOne({ callSessionId: call.callSessionId }, { $set: { callFailure: null, expiresAt: new Date(0) } });
-    expect(await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' })).toBeNull();
+    const call = await createCallSession({
+      userId: ownerId,
+      agentId: 'main-agent',
+      conversationId: 'a-different-conversation',
+    });
+    expect(
+      (await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }))
+        .callSessionId,
+    ).toBe(call.callSessionId);
+    expect(
+      await getActiveCallSessionForMainMaintenance({
+        userId: 'other-owner',
+        agentId: 'main-agent',
+      }),
+    ).toBeNull();
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'other-agent' }),
+    ).toBeNull();
+    await ViventiumCallSession.updateOne(
+      { callSessionId: call.callSessionId },
+      { $set: { callStatus: 'ended' } },
+    );
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }),
+    ).toBeNull();
+    await ViventiumCallSession.updateOne(
+      { callSessionId: call.callSessionId },
+      { $set: { callStatus: 'listening', callFailure: { fatal: true } } },
+    );
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }),
+    ).toBeNull();
+    await ViventiumCallSession.updateOne(
+      { callSessionId: call.callSessionId },
+      { $set: { callFailure: null, expiresAt: new Date(0) } },
+    );
+    expect(
+      await getActiveCallSessionForMainMaintenance({ userId: ownerId, agentId: 'main-agent' }),
+    ).toBeNull();
   });
 
   test('completion lookup returns the actual exported same-owner live Call', async () => {
@@ -861,7 +929,7 @@ describe('CallSessionService', () => {
       const deadline = new Date(Date.now() + 60_000);
       await ViventiumCallSession.updateOne(
         { callSessionId: created.callSessionId },
-        { $set: { browserCapabilityExpiresAt: deadline } }
+        { $set: { browserCapabilityExpiresAt: deadline } },
       );
       const ended = await syncCallSessionState({
         callSessionId: created.callSessionId,
@@ -875,7 +943,7 @@ describe('CallSessionService', () => {
       await expect(
         assertCallBrowserCapability(created.callSessionId, created.browserCapability, {
           allowEnded: true,
-        })
+        }),
       ).resolves.toMatchObject({
         callSessionId: created.callSessionId,
         userId: String(user._id),
@@ -883,7 +951,7 @@ describe('CallSessionService', () => {
         status: 'ended',
       });
       await expect(
-        assertCallBrowserCapability(created.callSessionId, created.browserCapability)
+        assertCallBrowserCapability(created.callSessionId, created.browserCapability),
       ).rejects.toMatchObject({ status: 410 });
       const heartbeat = await heartbeatCallSession({
         callSessionId: created.callSessionId,
@@ -907,7 +975,7 @@ describe('CallSessionService', () => {
         .select('+browserCapabilityExpiresAt')
         .lean();
       expect(afterDelayed.browserCapabilityExpiresAt.getTime()).toBe(deadline.getTime());
-    }
+    },
   );
 
   test('terminal reload remains fail-closed for expired and foreign capabilities', async () => {
@@ -934,30 +1002,30 @@ describe('CallSessionService', () => {
     await expect(
       assertCallBrowserCapability(first.callSessionId, second.browserCapability, {
         allowEnded: true,
-      })
+      }),
     ).rejects.toMatchObject({ status: 401 });
     await expect(
       assertCallBrowserCapability(second.callSessionId, first.browserCapability, {
         allowEnded: true,
-      })
+      }),
     ).rejects.toMatchObject({ status: 401 });
     await ViventiumCallSession.updateOne(
       { callSessionId: first.callSessionId },
-      { $set: { browserCapabilityExpiresAt: new Date(Date.now() - 1) } }
+      { $set: { browserCapabilityExpiresAt: new Date(Date.now() - 1) } },
     );
     await expect(
       assertCallBrowserCapability(first.callSessionId, first.browserCapability, {
         allowEnded: true,
-      })
+      }),
     ).rejects.toMatchObject({ status: 410 });
     await ViventiumCallSession.updateOne(
       { callSessionId: second.callSessionId },
-      { $set: { expiresAt: new Date(Date.now() - 1) } }
+      { $set: { expiresAt: new Date(Date.now() - 1) } },
     );
     await expect(
       assertCallBrowserCapability(second.callSessionId, second.browserCapability, {
         allowEnded: true,
-      })
+      }),
     ).rejects.toMatchObject({ status: 410 });
   });
 
@@ -2264,7 +2332,9 @@ describe('CallSessionService', () => {
         livekitPlayground: { tts: { provider: 'xai', variant: 'Sal' } },
       },
     });
-    expect(await resolveUserVoiceRoute(user._id.toString(), { includeSources: true })).toMatchObject({
+    expect(
+      await resolveUserVoiceRoute(user._id.toString(), { includeSources: true }),
+    ).toMatchObject({
       stt: {
         provider: 'assemblyai',
         variant: 'universal-streaming-multilingual',
@@ -2274,11 +2344,18 @@ describe('CallSessionService', () => {
     });
     await User.updateOne(
       { _id: user._id },
-      { $set: { 'viventiumVoicePreferences.livekitPlayground.stt': {
-        provider: 'openai', variant: 'whisper-1',
-      } } },
+      {
+        $set: {
+          'viventiumVoicePreferences.livekitPlayground.stt': {
+            provider: 'openai',
+            variant: 'whisper-1',
+          },
+        },
+      },
     );
-    expect(await resolveUserVoiceRoute(user._id.toString(), { includeSources: true })).toMatchObject({
+    expect(
+      await resolveUserVoiceRoute(user._id.toString(), { includeSources: true }),
+    ).toMatchObject({
       stt: { provider: 'openai', variant: 'whisper-1', source: 'saved' },
     });
     expect(await resolveUserVoiceRoute(user._id.toString())).toMatchObject({
@@ -2609,12 +2686,17 @@ describe('CallSessionService', () => {
         versions: [],
       });
       mockGetAppConfig.mockRejectedValue(new Error('display getter must not run'));
-      const providerCapabilities = mode === 'unregistered'
-        ? { 'different-provider': { label: 'Foreign label',
-            models: [{ id: 'unknown-model', label: 'Wrong owner model' }] } }
-        : mode === 'malformed'
-          ? { 'custom-provider': { label: 17, models: 'not-an-array' } }
-          : undefined;
+      const providerCapabilities =
+        mode === 'unregistered'
+          ? {
+              'different-provider': {
+                label: 'Foreign label',
+                models: [{ id: 'unknown-model', label: 'Wrong owner model' }],
+              },
+            }
+          : mode === 'malformed'
+            ? { 'custom-provider': { label: 17, models: 'not-an-array' } }
+            : undefined;
       const call = await createCallSession({
         userId: user._id.toString(),
         agentId: 'agent-raw-route',
@@ -2731,8 +2813,9 @@ describe('CallSessionService', () => {
       ]),
     );
     expect(created.contextualKeyterms).toHaveLength(3);
-    expect(await resolveVoiceContextKeyterms({ userId: user._id.toString(), conversationId }))
-      .toEqual(created.contextualKeyterms);
+    expect(
+      await resolveVoiceContextKeyterms({ userId: user._id.toString(), conversationId }),
+    ).toEqual(created.contextualKeyterms);
     expect(created.contextualKeyterms.join(' ')).not.toContain('Other Owner');
     expect(created.contextualKeyterms.join(' ')).not.toContain('not-forwarded');
     expect((await getCallSession(created.callSessionId)).contextualKeyterms).toEqual(
@@ -2802,14 +2885,33 @@ describe('CallSessionService', () => {
   });
 
   test('shared voice keyterms require an existing owner conversation', async () => {
-    const owner = await User.create({ name: 'Owner', email: 'owner-keyterms@example.com', provider: 'local' });
-    const foreign = await User.create({ name: 'Foreign', email: 'foreign-keyterms@example.com', provider: 'local' });
-    await Conversation.create({ conversationId: 'foreign-keyterm-conversation',
-      user: foreign._id.toString(), endpoint: 'agents', files: [] });
+    const owner = await User.create({
+      name: 'Owner',
+      email: 'owner-keyterms@example.com',
+      provider: 'local',
+    });
+    const foreign = await User.create({
+      name: 'Foreign',
+      email: 'foreign-keyterms@example.com',
+      provider: 'local',
+    });
+    await Conversation.create({
+      conversationId: 'foreign-keyterm-conversation',
+      user: foreign._id.toString(),
+      endpoint: 'agents',
+      files: [],
+    });
     const nativeLookup = jest.spyOn(Message, 'find');
     try {
-      for (const conversationId of ['', 'new', 'missing-keyterm-conversation', 'foreign-keyterm-conversation']) {
-        expect(await resolveVoiceContextKeyterms({ userId: owner._id.toString(), conversationId })).toEqual([]);
+      for (const conversationId of [
+        '',
+        'new',
+        'missing-keyterm-conversation',
+        'foreign-keyterm-conversation',
+      ]) {
+        expect(
+          await resolveVoiceContextKeyterms({ userId: owner._id.toString(), conversationId }),
+        ).toEqual([]);
       }
       expect(nativeLookup).not.toHaveBeenCalled();
     } finally {
@@ -2818,11 +2920,23 @@ describe('CallSessionService', () => {
   });
 
   test('shared voice keyterms return empty for an owned empty conversation', async () => {
-    const owner = await User.create({ name: 'Empty', email: 'empty-keyterms@example.com', provider: 'local' });
-    await Conversation.create({ conversationId: 'empty-keyterm-conversation',
-      user: owner._id.toString(), endpoint: 'agents', files: [] });
-    expect(await resolveVoiceContextKeyterms({ userId: owner._id.toString(),
-      conversationId: 'empty-keyterm-conversation' })).toEqual([]);
+    const owner = await User.create({
+      name: 'Empty',
+      email: 'empty-keyterms@example.com',
+      provider: 'local',
+    });
+    await Conversation.create({
+      conversationId: 'empty-keyterm-conversation',
+      user: owner._id.toString(),
+      endpoint: 'agents',
+      files: [],
+    });
+    expect(
+      await resolveVoiceContextKeyterms({
+        userId: owner._id.toString(),
+        conversationId: 'empty-keyterm-conversation',
+      }),
+    ).toEqual([]);
   });
 
   test('resolves only one exact owner/conversation session with a current gateway lease', async () => {

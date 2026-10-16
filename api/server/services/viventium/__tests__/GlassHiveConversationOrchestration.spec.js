@@ -98,16 +98,16 @@ describe('GlassHive conversation orchestration Active Work contract', () => {
       'Completed work is successful and must never be retried',
     );
     expect(ACTIVE_WORK_ACTION_SEMANTICS).toContain(
-      'Message can continue completed work when its actions list allows it',
+      'Message can continue terminal work when its actions list allows it',
     );
     expect(ACTIVE_WORK_ACTION_SEMANTICS).toContain(
       'Retry is only for failed or otherwise retryable terminal work whose actions list includes retry',
     );
     expect(ACTIVE_WORK_ACTION_SEMANTICS).toContain(
-      'when retryable failed work needs both recovery and a new instruction',
+      'Retry can include updated recovery guidance in instruction; that guidance is included in the same continuation before execution starts',
     );
     expect(ACTIVE_WORK_ACTION_SEMANTICS).not.toContain(
-      'when terminal work needs both recovery and a new instruction',
+      'when retryable failed work needs both recovery and a new instruction',
     );
   });
 

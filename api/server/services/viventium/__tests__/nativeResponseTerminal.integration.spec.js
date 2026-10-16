@@ -98,6 +98,7 @@ beforeEach(async () => {
     sender: 'AI',
     userMessage: { messageId: 'source', conversationId: 'conversation', text: 'Request.' },
   });
+  const admittedAt = Date.now();
   identity = {
     userId: user,
     conversationId: 'conversation',
@@ -112,8 +113,8 @@ beforeEach(async () => {
     providerId: 'provider',
     agentId: 'agent',
     source: await methods.captureNativeResponseSource(user, 'conversation', 'source'),
-    admittedAt: Date.now(),
-    recoverUntil: Date.now() + 86400000,
+    admittedAt,
+    recoverUntil: admittedAt + 86400000,
     deliveryContext: { surface: 'web' },
   };
   store.setContentParts('stream', [{ type: 'text', text: partial }]);

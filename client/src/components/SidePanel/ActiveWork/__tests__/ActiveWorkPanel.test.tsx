@@ -1262,13 +1262,24 @@ describe('Active work Control Panel', () => {
     ).toBeEnabled();
   });
   test('an unreported quiet result remains visible without claiming delivery', () => {
-    setWork({ work: [{ workRef: 'quiet-unreported', title: 'Finished calculation', state: 'completed',
-      delivery: { state: 'silent', unreadTerminal: true }, actions: ['dismiss'] }] });
+    setWork({
+      work: [
+        {
+          workRef: 'quiet-unreported',
+          title: 'Finished calculation',
+          state: 'completed',
+          delivery: { state: 'silent', unreadTerminal: true },
+          actions: ['dismiss'],
+        },
+      ],
+    });
     render(<ActiveWorkPanel />);
     expect(screen.getByText('Complete')).toBeVisible();
     expect(screen.getByText(/com_ui_parallel_work_delivery_unread/)).toBeVisible();
     expect(screen.queryByText('Result delivered.')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'com_ui_parallel_work_action_dismiss' })).toBeEnabled();
+    expect(
+      screen.getByRole('button', { name: 'com_ui_parallel_work_action_dismiss' }),
+    ).toBeEnabled();
   });
 
   test('a completed silent decision does not claim a result was delivered', () => {

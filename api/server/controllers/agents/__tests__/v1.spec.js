@@ -6,7 +6,9 @@ const { nanoid } = require('nanoid');
 jest.mock('~/models/Agent');
 jest.mock('~/models/Action');
 jest.mock('nanoid');
-getAgentVersion.mockImplementation(async (query, index) => (await getAgent(query))?.versions?.[index] ?? null);
+getAgentVersion.mockImplementation(
+  async (query, index) => (await getAgent(query))?.versions?.[index] ?? null,
+);
 
 describe('duplicateAgent', () => {
   let req, res;

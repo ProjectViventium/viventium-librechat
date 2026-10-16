@@ -183,6 +183,85 @@ test('host graph keeps foreground flags and a new successful augmentation can cl
   expect(after.metadata.viventium.messageRevision).toBe(2);
 });
 
+test.each([
+  ['committed', 1, 1],
+  ['committed', 3, 2],
+  ['failed', 1, 2],
+])(
+  'augmentation keeps %s receipt revision %s when requested revision is %s',
+  async (state, revision, requestedRevision) => {
+    const prior = { ...acknowledgement, state, revision };
+    await Message.updateOne(
+      { user, messageId: 'answer' },
+      {
+        $set: { 'metadata.viventium.deliveryAcknowledgement': prior },
+      },
+    );
+    await save('augmentation', {
+      messageId: 'answer',
+      text: 'Host result.',
+      unfinished: false,
+      error: false,
+      metadata: { viventium: { messageRevision: requestedRevision } },
+    });
+    expect((await read()).metadata.viventium.deliveryAcknowledgement).toEqual(prior);
+  },
+);
+
+test.each([
+  ['failed', acknowledgement],
+  ['new revision', { ...acknowledgement, state: 'committed', revision: 2 }],
+  ['same revision', { ...acknowledgement, state: 'committed', presentation_ref: 'voice:new' }],
+])(
+  'a concurrent %s receipt rejects host promotion so its caller can publish a child',
+  async (_kind, winner) => {
+    const prior = { ...acknowledgement, state: 'committed' };
+    await Message.updateOne(
+      { user, messageId: 'answer' },
+      {
+        $set: { 'metadata.viventium.deliveryAcknowledgement': prior },
+      },
+    );
+    let release;
+    let entered;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const write = Message.findOneAndUpdate.bind(Message);
+    const spy = jest.spyOn(Message, 'findOneAndUpdate').mockImplementationOnce((...args) => {
+      entered();
+      return held.then(() => write(...args));
+    });
+    const updating = save('augmentation', {
+      messageId: 'answer',
+      text: 'New presentation.',
+      unfinished: false,
+      error: false,
+      metadata: { viventium: { messageRevision: 2 } },
+    });
+    try {
+      await started;
+      await Message.updateOne(
+        { user, messageId: 'answer' },
+        {
+          $set: { 'metadata.viventium.deliveryAcknowledgement': winner },
+        },
+      );
+      release();
+      await expect(updating).rejects.toThrow('native_response_presentation_changed');
+      const after = await read();
+      expect(after.text).toBe('Working.');
+      expect(after.metadata.viventium.deliveryAcknowledgement).toEqual(winner);
+    } finally {
+      release();
+      spy.mockRestore();
+    }
+  },
+);
+
 test.each(['source', 'receipt', 'presentation', 'cortex'])(
   'shared host snapshot retries when concurrent %s wins after its read',
   async (mutation) => {

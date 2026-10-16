@@ -412,15 +412,24 @@ describe('/api/viventium/calls', () => {
     const app = express();
     app.use(express.json());
     app.use('/api/viventium/calls', require('../calls'));
-    await request(app).post('/api/viventium/calls').send({
-      conversationId: 'conversation-existing', agentId: 'agent_selected',
-    }).expect(200);
-    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(1,
-      expect.objectContaining({ agentId: 'agent_previous' }));
-    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(2,
-      expect.objectContaining({ agentId: 'agent_selected' }));
-    expect(require('~/server/services/viventium/CallSessionService').createCallSession)
-      .toHaveBeenCalledWith(expect.objectContaining({ agentId: 'agent_selected' }));
+    await request(app)
+      .post('/api/viventium/calls')
+      .send({
+        conversationId: 'conversation-existing',
+        agentId: 'agent_selected',
+      })
+      .expect(200);
+    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ agentId: 'agent_previous' }),
+    );
+    expect(mockAssertVoiceAgentAccess).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ agentId: 'agent_selected' }),
+    );
+    expect(
+      require('~/server/services/viventium/CallSessionService').createCallSession,
+    ).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'agent_selected' }));
   });
 
   test('POST fails closed when the configured playground has no listener', async () => {
@@ -851,24 +860,36 @@ describe('/api/viventium/calls', () => {
       const { getModelsConfig } = require('~/server/controllers/ModelController');
       const { getUserById } = require('~/models');
       let releaseCatalog;
-      getModelsConfig.mockImplementationOnce(() => new Promise(resolve => { releaseCatalog = resolve; }));
-      const result = await startRequest().send({ user: { id: 'untrusted-owner' } }).expect(200);
+      getModelsConfig.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseCatalog = resolve;
+          }),
+      );
+      const result = await startRequest()
+        .send({ user: { id: 'untrusted-owner' } })
+        .expect(200);
       expect(result.body).toMatchObject({ status: 'claimed', claimId: 'claim_1' });
       expect(getUserById).toHaveBeenCalledWith('user_1', '-password -__v -totpSecret -backupCodes');
       expect(getModelsConfig).toHaveBeenCalledTimes(1);
-      expect(getModelsConfig).toHaveBeenCalledWith({ user: { _id: 'user_1', id: 'user_1', role: 'USER' } });
+      expect(getModelsConfig).toHaveBeenCalledWith({
+        user: { _id: 'user_1', id: 'user_1', role: 'USER' },
+      });
       releaseCatalog({});
     });
 
-    test.each(['already', 'in_flight', 'expired'])('does not discover models for a %s claim', async (status) => {
-      const { claimDispatch } = require('~/server/services/viventium/CallSessionService');
-      const { getModelsConfig } = require('~/server/controllers/ModelController');
-      const { getUserById } = require('~/models');
-      claimDispatch.mockResolvedValueOnce({ status, session: null });
-      await startRequest().send({}).expect(200);
-      expect(getUserById).not.toHaveBeenCalled();
-      expect(getModelsConfig).not.toHaveBeenCalled();
-    });
+    test.each(['already', 'in_flight', 'expired'])(
+      'does not discover models for a %s claim',
+      async (status) => {
+        const { claimDispatch } = require('~/server/services/viventium/CallSessionService');
+        const { getModelsConfig } = require('~/server/controllers/ModelController');
+        const { getUserById } = require('~/models');
+        claimDispatch.mockResolvedValueOnce({ status, session: null });
+        await startRequest().send({}).expect(200);
+        expect(getUserById).not.toHaveBeenCalled();
+        expect(getModelsConfig).not.toHaveBeenCalled();
+      },
+    );
 
     test('does not discover models before a rejected claim or for Listen-Only', async () => {
       const calls = require('~/server/services/viventium/CallSessionService');
@@ -877,8 +898,11 @@ describe('/api/viventium/calls', () => {
       calls.claimDispatch.mockRejectedValueOnce(new Error('Synthetic claim rejection'));
       await startRequest().send({}).expect(500);
       calls.assertCallSessionSecret.mockResolvedValueOnce({
-        callSessionId: 'call_session_test', userId: 'user_1', mode: 'listen_only',
-        roomName: 'lc-calltest', gatewayAgentName: 'librechat-voice-gateway',
+        callSessionId: 'call_session_test',
+        userId: 'user_1',
+        mode: 'listen_only',
+        roomName: 'lc-calltest',
+        gatewayAgentName: 'librechat-voice-gateway',
       });
       await startRequest().send({}).expect(200);
       expect(getUserById).not.toHaveBeenCalled();
@@ -898,10 +922,15 @@ describe('/api/viventium/calls', () => {
       const app = express();
       app.use(express.json());
       app.use('/api/viventium/calls', require('../calls'));
-      await request(app).post('/api/viventium/calls').send({ conversationId: 'new', agentId: 'agent_123' }).expect(200);
-      await request(app).get('/api/viventium/calls/call_session_test/voice-settings')
+      await request(app)
+        .post('/api/viventium/calls')
+        .send({ conversationId: 'new', agentId: 'agent_123' })
+        .expect(200);
+      await request(app)
+        .get('/api/viventium/calls/call_session_test/voice-settings')
         .set('x-viventium-call-secret', 'secret')
-        .set('x-viventium-call-capability', 'A'.repeat(43)).expect(200);
+        .set('x-viventium-call-capability', 'A'.repeat(43))
+        .expect(200);
       expect(getModelsConfig).not.toHaveBeenCalled();
     });
 
@@ -924,18 +953,21 @@ describe('/api/viventium/calls', () => {
       expect(getModelsConfig).not.toHaveBeenCalled();
     });
 
-    test.each(['owner', 'catalog'])('keeps %s warming failure background-only and private', async (stage) => {
-      const { getModelsConfig } = require('~/server/controllers/ModelController');
-      const { getUserById } = require('~/models');
-      const { logger } = require('@librechat/data-schemas');
-      const failure = new Error('synthetic-private-provider-payload');
-      if (stage === 'owner') getUserById.mockRejectedValueOnce(failure);
-      else getModelsConfig.mockRejectedValueOnce(failure);
-      await startRequest().send({}).expect(200);
-      await new Promise(resolve => setImmediate(resolve));
-      expect(logger.warn).toHaveBeenCalledWith('[VIVENTIUM][calls] model_catalog_warm_failed');
-      expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(failure.message);
-    });
+    test.each(['owner', 'catalog'])(
+      'keeps %s warming failure background-only and private',
+      async (stage) => {
+        const { getModelsConfig } = require('~/server/controllers/ModelController');
+        const { getUserById } = require('~/models');
+        const { logger } = require('@librechat/data-schemas');
+        const failure = new Error('synthetic-private-provider-payload');
+        if (stage === 'owner') getUserById.mockRejectedValueOnce(failure);
+        else getModelsConfig.mockRejectedValueOnce(failure);
+        await startRequest().send({}).expect(200);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(logger.warn).toHaveBeenCalledWith('[VIVENTIUM][calls] model_catalog_warm_failed');
+        expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(failure.message);
+      },
+    );
   });
 
   test('POST dispatch/claim can request confirmed-dispatch reclaim', async () => {
@@ -1060,50 +1092,70 @@ describe('/api/viventium/calls', () => {
     expect(confirmDispatch).not.toHaveBeenCalled();
   });
 
-  test.each(['get', 'post'])('browser %s voice-settings opts into exact catalog labels', async (method) => {
-    const service = require('~/server/services/viventium/CallSessionService');
-    const effective = {
-      provider: 'glasshive-harness',
-      model: 'grok-build:grok-4.7-build-fast',
-      effort: 'high',
-      providerLabel: 'xPerfect',
-      modelLabel: 'Grok / Grok 4.7 Fast',
-    };
-    const providerCapabilities = { 'glasshive-harness': { label: 'xPerfect',
-      models: [{ id: effective.model, label: effective.modelLabel }] } };
-    const settings = { callSessionId: 'call_session_test',
-      assistantRoute: { primary: effective, effective, inheritsPrimary: true } };
-    if (method === 'get') {
-      service.getCallSessionVoiceSettings.mockImplementationOnce(async (_id, options) => ({
-        ...settings,
-        assistantRoute: options?.assistantProviderCapabilities === providerCapabilities ? settings.assistantRoute : null,
-      }));
-    } else {
-      service.updateCallSessionVoiceSettings.mockImplementationOnce(async (options) => ({
-        ...settings,
-        assistantRoute: options?.assistantProviderCapabilities === providerCapabilities ? settings.assistantRoute : null,
-      }));
-    }
-    const app = express();
-    app.locals.agentProviderCapabilities = providerCapabilities;
-    app.use(express.json());
-    app.use('/api/viventium/calls', require('../calls'));
-    const req = request(app)[method]('/api/viventium/calls/call_session_test/voice-settings')
-      .set('x-viventium-call-secret', 'secret')
-      .set('x-viventium-call-capability', 'A'.repeat(43));
-    if (method === 'post') req.send({ assistantProviderCapabilities: { untrusted: {} } });
-    const res = await req.expect(200);
-    expect(res.body.assistantRoute.effective).toEqual(effective);
-    if (method === 'get') {
-      expect(service.getCallSessionVoiceSettings).toHaveBeenCalledWith(
-        'call_session_test', expect.objectContaining({ assistantProviderCapabilities: providerCapabilities }),
-      );
-    } else {
-      expect(service.updateCallSessionVoiceSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ assistantProviderCapabilities: providerCapabilities, persistToUserDefaults: false }),
-      );
-    }
-  });
+  test.each(['get', 'post'])(
+    'browser %s voice-settings opts into exact catalog labels',
+    async (method) => {
+      const service = require('~/server/services/viventium/CallSessionService');
+      const effective = {
+        provider: 'glasshive-harness',
+        model: 'grok-build:grok-4.7-build-fast',
+        effort: 'high',
+        providerLabel: 'xPerfect',
+        modelLabel: 'Grok / Grok 4.7 Fast',
+      };
+      const providerCapabilities = {
+        'glasshive-harness': {
+          label: 'xPerfect',
+          models: [{ id: effective.model, label: effective.modelLabel }],
+        },
+      };
+      const settings = {
+        callSessionId: 'call_session_test',
+        assistantRoute: { primary: effective, effective, inheritsPrimary: true },
+      };
+      if (method === 'get') {
+        service.getCallSessionVoiceSettings.mockImplementationOnce(async (_id, options) => ({
+          ...settings,
+          assistantRoute:
+            options?.assistantProviderCapabilities === providerCapabilities
+              ? settings.assistantRoute
+              : null,
+        }));
+      } else {
+        service.updateCallSessionVoiceSettings.mockImplementationOnce(async (options) => ({
+          ...settings,
+          assistantRoute:
+            options?.assistantProviderCapabilities === providerCapabilities
+              ? settings.assistantRoute
+              : null,
+        }));
+      }
+      const app = express();
+      app.locals.agentProviderCapabilities = providerCapabilities;
+      app.use(express.json());
+      app.use('/api/viventium/calls', require('../calls'));
+      const req = request(app)
+        [method]('/api/viventium/calls/call_session_test/voice-settings')
+        .set('x-viventium-call-secret', 'secret')
+        .set('x-viventium-call-capability', 'A'.repeat(43));
+      if (method === 'post') req.send({ assistantProviderCapabilities: { untrusted: {} } });
+      const res = await req.expect(200);
+      expect(res.body.assistantRoute.effective).toEqual(effective);
+      if (method === 'get') {
+        expect(service.getCallSessionVoiceSettings).toHaveBeenCalledWith(
+          'call_session_test',
+          expect.objectContaining({ assistantProviderCapabilities: providerCapabilities }),
+        );
+      } else {
+        expect(service.updateCallSessionVoiceSettings).toHaveBeenCalledWith(
+          expect.objectContaining({
+            assistantProviderCapabilities: providerCapabilities,
+            persistToUserDefaults: false,
+          }),
+        );
+      }
+    },
+  );
 
   test('GET voice-settings returns both saved defaults and requested route', async () => {
     const callsRouter = require('../calls');
@@ -1183,23 +1235,38 @@ describe('/api/viventium/calls', () => {
 
   test('JWT owner explicitly saves the persisted call choices as account defaults', async () => {
     const service = require('~/server/services/viventium/CallSessionService');
-    const route = { stt: { provider: 'assemblyai', variant: 'u3-rt-pro' },
-      tts: { provider: 'xai', variant: 'eve' } };
-    service.getCallSession.mockResolvedValue({ callSessionId: 'call_session_test',
-      userId: 'user_1', requestedVoiceRoute: route });
+    const route = {
+      stt: { provider: 'assemblyai', variant: 'u3-rt-pro' },
+      tts: { provider: 'xai', variant: 'eve' },
+    };
+    service.getCallSession.mockResolvedValue({
+      callSessionId: 'call_session_test',
+      userId: 'user_1',
+      requestedVoiceRoute: route,
+    });
     const app = express();
     app.use(express.json());
     app.use('/api/viventium/calls', require('../calls'));
-    await request(app).post('/api/viventium/calls/call_session_test/voice-defaults')
-      .send({ requestedVoiceRoute: { stt: { provider: 'untrusted' } } }).expect(200);
+    await request(app)
+      .post('/api/viventium/calls/call_session_test/voice-defaults')
+      .send({ requestedVoiceRoute: { stt: { provider: 'untrusted' } } })
+      .expect(200);
     expect(service.updateCallSessionVoiceSettings).toHaveBeenCalledWith(
-      expect.objectContaining({ requestedVoiceRoute: route, persistToUserDefaults: true, touch: false, assistantProviderCapabilities: {} }),
+      expect.objectContaining({
+        requestedVoiceRoute: route,
+        persistToUserDefaults: true,
+        touch: false,
+        assistantProviderCapabilities: {},
+      }),
     );
   });
 
   test('account defaults cannot be saved from another owner call', async () => {
     const service = require('~/server/services/viventium/CallSessionService');
-    service.getCallSession.mockResolvedValue({ callSessionId: 'call_session_test', userId: 'other' });
+    service.getCallSession.mockResolvedValue({
+      callSessionId: 'call_session_test',
+      userId: 'other',
+    });
     const app = express();
     app.use(express.json());
     app.use('/api/viventium/calls', require('../calls'));

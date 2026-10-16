@@ -628,6 +628,13 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(msg.metadata.viventium.telegramDeliveryControls).toEqual({
       skipVoice: true,
       segments: ['First beat.', 'Second beat.'],
+      deliveryDisposition: {
+        version: 1,
+        audio: 'skip',
+        required: false,
+        valid: true,
+        source: 'legacy_marker',
+      },
     });
     expect(JSON.stringify(msg)).not.toContain('{MSG_BREAK}');
     expect(JSON.stringify(msg)).not.toContain('{SKIP_VOICE}');
@@ -1231,6 +1238,61 @@ describe('BackgroundCortexFollowUpService', () => {
     );
   });
 
+  test('a lost presentation race saves the follow-up as a separate child', async () => {
+    const req = { user: { id: 'u1' } };
+    db.getMessages.mockResolvedValueOnce([
+      { messageId: 'm-parent', parentMessageId: 'u-message', sender: 'AI', text: '' },
+    ]);
+    db.getMessage.mockResolvedValue({
+      messageId: 'm-parent',
+      conversationId: 'c-123',
+      parentMessageId: 'u-message',
+      sender: 'Viventium',
+      text: '',
+      unfinished: true,
+      content: [{ type: 'cortex_insight', cortex_id: 'agent_123', status: 'complete' }],
+      metadata: { viventium: { messageRevision: 1 } },
+    });
+    const previousUpdate = db.updateMessage.getMockImplementation();
+    db.updateMessage.mockImplementation(async (...args) => {
+      if (args[1]?.metadata?.viventium?.promotedToEmptyParent === true)
+        throw Object.assign(new Error('native_response_presentation_changed'), {
+          code: 'native_response_presentation_changed',
+        });
+      return previousUpdate?.(...args);
+    });
+    Run.create.mockResolvedValueOnce({
+      processStream: jest.fn(async () => 'Verified finding.'),
+    });
+    let msg;
+    try {
+      msg = await createCortexFollowUpMessage({
+        req,
+        conversationId: 'c-123',
+        parentMessageId: 'm-parent',
+        agent: { id: 'agent_123', provider: 'openai', model: 'gpt-5.4', model_parameters: {} },
+        insightsData: {
+          cortexCount: 1,
+          insights: [{ cortexName: 'Synthetic cortex', insight: 'Verified finding.' }],
+        },
+        recentResponse: '',
+        forceVisibleFollowUp: true,
+      });
+    } finally {
+      db.updateMessage.mockImplementation(previousUpdate);
+    }
+    const promotionCalls = db.updateMessage.mock.calls
+      .map((args, index) => ({ args, index }))
+      .filter(({ args }) => args[1]?.metadata?.viventium?.promotedToEmptyParent === true);
+    expect(promotionCalls).toHaveLength(1);
+    await expect(db.updateMessage.mock.results[promotionCalls[0].index].value).rejects.toThrow(
+      'native_response_presentation_changed',
+    );
+    expect(db.saveMessage).toHaveBeenCalledTimes(1);
+    expect(msg.messageId).not.toBe('m-parent');
+    expect(msg).toMatchObject({ parentMessageId: 'm-parent', text: 'Verified finding.' });
+  });
+
   test('promotes clean Telegram text with structured controls onto an empty canonical parent', async () => {
     const req = {
       user: { id: 'u1' },
@@ -1292,6 +1354,13 @@ describe('BackgroundCortexFollowUpService', () => {
             telegramDeliveryControls: {
               skipVoice: true,
               segments: ['First beat.', 'Second beat.'],
+              deliveryDisposition: {
+                version: 1,
+                audio: 'skip',
+                required: false,
+                valid: true,
+                source: 'legacy_marker',
+              },
             },
           }),
         }),
@@ -2754,7 +2823,9 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     let runConfig = Run.create.mock.calls[0][0];
-    expect(runConfig.graphConfig.instructions).toContain('The conversation may have moved on');
+    expect(runConfig.graphConfig.instructions).toContain(
+      'The conversation continued after the earlier response.',
+    );
 
     jest.clearAllMocks();
     getAgent.mockResolvedValue(null);
@@ -2770,7 +2841,9 @@ describe('BackgroundCortexFollowUpService', () => {
     });
 
     runConfig = Run.create.mock.calls[0][0];
-    expect(runConfig.graphConfig.instructions).not.toContain('The conversation may have moved on');
+    expect(runConfig.graphConfig.instructions).not.toContain(
+      'The conversation continued after the earlier response.',
+    );
   });
   // === VIVENTIUM NOTE ===
 });

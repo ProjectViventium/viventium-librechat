@@ -148,7 +148,10 @@ const {
  * Purpose: Keep follow-up system/user prompt contracts in the prompt registry while retaining
  * required registered prompts for ordinary follow-ups. Primary-mode compatibility is unchanged.
  * === VIVENTIUM END === */
-const { getPromptText, getRequiredPromptText } = require('~/server/services/viventium/promptRegistry');
+const {
+  getPromptText,
+  getRequiredPromptText,
+} = require('~/server/services/viventium/promptRegistry');
 const {
   logFeelingsEvent,
   summarizeFeelingCapsulePlacement,
@@ -177,10 +180,12 @@ const { buildNoResponseInstructions } = require('~/server/services/viventium/noR
 /* === VIVENTIUM START === Owned recovery of a retained Voice follow-up. === */
 const ownedVoiceCortexRecovery = Symbol('ownedVoiceCortexRecovery');
 const OCCUPIED_CORTEX_FAILURE = Object.freeze({
-  status: 409, code: 'conversation_session_authority_conflict',
+  status: 409,
+  code: 'conversation_session_authority_conflict',
 });
 function bindOwnedVoiceCortexRecovery(req, recheck) {
-  if (!req || typeof recheck !== 'function') throw new TypeError('Cortex recovery requires its owner check');
+  if (!req || typeof recheck !== 'function')
+    throw new TypeError('Cortex recovery requires its owner check');
   Object.defineProperty(req, ownedVoiceCortexRecovery, { value: recheck });
 }
 async function refreshOwnedVoiceCortexRecovery(req, { allowWaiting = false } = {}) {
@@ -630,9 +635,11 @@ function claimedCortexPresentationClaimToken(deliveryBatch) {
 }
 
 function resolveCortexInsightDropReason({ decision, generationFailure } = {}) {
-  if (decision?.generationFailed === true &&
-      generationFailure?.status === OCCUPIED_CORTEX_FAILURE.status &&
-      generationFailure?.code === OCCUPIED_CORTEX_FAILURE.code) {
+  if (
+    decision?.generationFailed === true &&
+    generationFailure?.status === OCCUPIED_CORTEX_FAILURE.status &&
+    generationFailure?.code === OCCUPIED_CORTEX_FAILURE.code
+  ) {
     return 'native_session_occupied';
   }
   if (decision?.generationFailed === true) {
@@ -1146,8 +1153,12 @@ function resolveFollowUpPersistenceText({
   let text = String(generatedText || '').trim();
   // The strict native producer represents authored silence as a completed empty
   // assistant response with validated model skip controls, rather than prose tags.
-  if (!text && nativeSilentDecision === true && generationFailed !== true &&
-      shouldForceVisibleFollowUp !== true) {
+  if (
+    !text &&
+    nativeSilentDecision === true &&
+    generationFailed !== true &&
+    shouldForceVisibleFollowUp !== true
+  ) {
     decision.nativeSilentDecision = true;
     decision.llmResult = 'native_silent';
     decision.selectedStrategy = 'native_silent_suppressed';
@@ -1303,7 +1314,8 @@ function resolveFollowUpRuntimeAssignment(
   const baseRuntimeAgent = hasExplicitFollowUpRoute(agent, { useVoiceModel })
     ? cloneFollowUpAgent(agent)
     : preserveFollowUpNativeDeclarations(
-        rewriteAgentForRuntime(agent || {}, { capabilityRequiredProviders }), agent,
+        rewriteAgentForRuntime(agent || {}, { capabilityRequiredProviders }),
+        agent,
       );
   /* === VIVENTIUM NOTE ===
    * Voice follow-ups should respect the same machine-level fast voice override contract as the
@@ -1312,16 +1324,19 @@ function resolveFollowUpRuntimeAssignment(
    * === VIVENTIUM NOTE === */
   const voiceAssignment = useVoiceModel ? resolveVoiceOverrideAssignment(baseRuntimeAgent) : null;
   const runtimeAgent = voiceAssignment
-    ? preserveFollowUpNativeDeclarations({
-        ...baseRuntimeAgent,
-        voice_llm_provider: voiceAssignment.provider,
-        voice_llm_model: voiceAssignment.model,
-        model_parameters: resolveVoiceModelParameters(
-          baseRuntimeAgent,
-          voiceAssignment.model,
-          voiceAssignment.provider,
-        ),
-      }, baseRuntimeAgent)
+    ? preserveFollowUpNativeDeclarations(
+        {
+          ...baseRuntimeAgent,
+          voice_llm_provider: voiceAssignment.provider,
+          voice_llm_model: voiceAssignment.model,
+          model_parameters: resolveVoiceModelParameters(
+            baseRuntimeAgent,
+            voiceAssignment.model,
+            voiceAssignment.provider,
+          ),
+        },
+        baseRuntimeAgent,
+      )
     : baseRuntimeAgent;
   const effectiveModel = resolveGovernedFollowUpModel(runtimeAgent, { useVoiceModel });
   const effectiveProvider = resolveFollowUpProvider(runtimeAgent, { useVoiceModel });
@@ -1773,44 +1788,65 @@ async function resolveDurableMissionUserSources({ req, insightsData, conversatio
   const insights = insightsData?.insights;
   if (!Array.isArray(insights) || !insights.some(isDurableMissionInsight)) return insightsData;
   const ownerId = String(req?.user?.id || '');
-  const requestedSources = insights.filter(isDurableMissionInsight)
+  const requestedSources = insights
+    .filter(isDurableMissionInsight)
     .map((insight) => insight.authority.userSource)
     .filter((source) => source?.messageId && source?.conversationId);
   const sourceKey = (source) => JSON.stringify([source.conversationId, source.messageId]);
   const sources = new Map();
   const remember = (message) => {
-    if (!ownerId || message?.isCreatedByUser !== true || String(message.user || '') !== ownerId ||
-        message.deletedAt || message.cleanupTombstone?.tombstonedAt) return;
+    if (
+      !ownerId ||
+      message?.isCreatedByUser !== true ||
+      String(message.user || '') !== ownerId ||
+      message.deletedAt ||
+      message.cleanupTombstone?.tombstonedAt
+    )
+      return;
     sources.set(sourceKey(message), message);
   };
   for (const message of messages || []) remember(message);
   const missing = requestedSources.filter((source) => !sources.has(sourceKey(source)));
   if (ownerId && missing.length) {
     try {
-      const additional = await db.getMessages({
-        user: ownerId,
-        conversationId: { $in: [...new Set(missing.map((source) => source.conversationId))] },
-        messageId: { $in: [...new Set(missing.map((source) => source.messageId))] },
-      }, 'user conversationId messageId isCreatedByUser text content deletedAt cleanupTombstone');
+      const additional = await db.getMessages(
+        {
+          user: ownerId,
+          conversationId: { $in: [...new Set(missing.map((source) => source.conversationId))] },
+          messageId: { $in: [...new Set(missing.map((source) => source.messageId))] },
+        },
+        'user conversationId messageId isCreatedByUser text content deletedAt cleanupTombstone',
+      );
       for (const message of additional || []) remember(message);
     } catch (error) {
-      logger.warn('[BackgroundCortexFollowUpService] Failed loading durable user sources:',
-        sanitizeFollowUpErrorForLog(error));
+      logger.warn(
+        '[BackgroundCortexFollowUpService] Failed loading durable user sources:',
+        sanitizeFollowUpErrorForLog(error),
+      );
     }
   }
-  return { ...insightsData, insights: insights.map((insight) => {
-    if (!isDurableMissionInsight(insight)) return insight;
-    const source = insight.authority.userSource;
-    const message = source?.messageId && source?.conversationId
-      ? sources.get(sourceKey(source)) : null;
-    const text = message ? extractRecentResponseTextFromMessage(message) : '';
-    return { ...insight, authority: { ...insight.authority, userSource: {
-      messageId: source?.messageId || null,
-      conversationId: source?.conversationId || conversationId || null,
-      status: text ? 'available' : 'unavailable',
-      ...(text ? { text } : {}),
-    } } };
-  }) };
+  return {
+    ...insightsData,
+    insights: insights.map((insight) => {
+      if (!isDurableMissionInsight(insight)) return insight;
+      const source = insight.authority.userSource;
+      const message =
+        source?.messageId && source?.conversationId ? sources.get(sourceKey(source)) : null;
+      const text = message ? extractRecentResponseTextFromMessage(message) : '';
+      return {
+        ...insight,
+        authority: {
+          ...insight.authority,
+          userSource: {
+            messageId: source?.messageId || null,
+            conversationId: source?.conversationId || conversationId || null,
+            status: text ? 'available' : 'unavailable',
+            ...(text ? { text } : {}),
+          },
+        },
+      };
+    }),
+  };
 }
 
 async function loadFollowUpContinuationContext({ req, conversationId, parentMessageId }) {
@@ -2513,7 +2549,9 @@ function formatFollowUpPrompt({
           .join('\n\n')
       : cleanUserRequest;
   const userRequestBlock = currentUserRequest
-    ? durableMissionEvidence ? currentUserRequest : currentUserRequest.slice(0, 4200)
+    ? durableMissionEvidence
+      ? currentUserRequest
+      : currentUserRequest.slice(0, 4200)
     : '(user request unavailable; answer only from the background evidence and state uncertainty)';
 
   if (primaryResponseMode) {
@@ -2597,7 +2635,9 @@ function buildFollowUpSystemPrompt({
           'Do not output {NTA} if the insights contain substantive user-visible information.',
           'Do not re-ask questions, do not mention background processing, and do not introduce yourself.',
           noResponseInstructions,
-        ].filter(Boolean).join('\n\n'),
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
         variables,
       )
     : getRequiredPromptText('cortex.follow_up_phase_b.system', variables);
@@ -2827,8 +2867,10 @@ async function promoteForcedFollowUpToEmptyParent({
     if (nativeDeliveryContent) {
       for (const part of nextContent) {
         if (part.type === 'text' && part.text === normalizedText)
-          part.deliveryDispositionRanges = nativeDeliveryContent[0]?.text === normalizedText
-            ? nativeDeliveryContent[0].deliveryDispositionRanges : [];
+          part.deliveryDispositionRanges =
+            nativeDeliveryContent[0]?.text === normalizedText
+              ? nativeDeliveryContent[0].deliveryDispositionRanges
+              : [];
       }
     }
     const existingViventium = existing.metadata?.viventium || {};
@@ -2886,28 +2928,32 @@ async function promoteForcedFollowUpToEmptyParent({
     let attachmentPreparation;
     if (typeof dependencies.prepareAttachments === 'function') {
       attachmentPreparation = await dependencies.prepareAttachments(promotedMessage);
-      const attachments = Array.isArray(attachmentPreparation) ? attachmentPreparation : attachmentPreparation?.attachments || [];
+      const attachments = Array.isArray(attachmentPreparation)
+        ? attachmentPreparation
+        : attachmentPreparation?.attachments || [];
       if (attachments.length)
         promotedMessage.attachments = [...(existing.attachments || []), ...attachments];
     }
 
-    await publishPreparedFollowUpAttachments(attachmentPreparation, () => db.updateMessage(
-      req,
-      {
-        messageId: parentMessageId,
-        text: normalizedText,
-        content: promotedMessage.content,
-        metadata: nextMetadata,
-        unfinished: false,
-        error: false,
-        ...(promotedMessage.attachments ? { attachments: promotedMessage.attachments } : {}),
-      },
-      {
-        operationKind: 'system',
-        context:
-          'viventium/services/BackgroundCortexFollowUpService.promoteForcedFollowUpToEmptyParent',
-      },
-    ));
+    await publishPreparedFollowUpAttachments(attachmentPreparation, () =>
+      db.updateMessage(
+        req,
+        {
+          messageId: parentMessageId,
+          text: normalizedText,
+          content: promotedMessage.content,
+          metadata: nextMetadata,
+          unfinished: false,
+          error: false,
+          ...(promotedMessage.attachments ? { attachments: promotedMessage.attachments } : {}),
+        },
+        {
+          operationKind: 'system',
+          context:
+            'viventium/services/BackgroundCortexFollowUpService.promoteForcedFollowUpToEmptyParent',
+        },
+      ),
+    );
 
     logger.info(
       `[BackgroundCortexFollowUpService] Promoted forced Phase B follow-up onto empty canonical parent: conversationId=${conversationId || ''} parent=${parentMessageId || ''}`,
@@ -3080,10 +3126,14 @@ async function generateFollowUpText({
   }
   const nativeFileSource = nativeFollowUpOutputSource({
     headers: llmConfig.configuration?.defaultHeaders || {},
-    userId: String(req?.user?.id || ''), conversationId, sourceMessageId: parentMessageId,
+    userId: String(req?.user?.id || ''),
+    conversationId,
+    sourceMessageId: parentMessageId,
     agentId: `${runtimeAgent.id}:${PHASE_B_PROVIDER_SESSION_LANE}`,
-    presentationAgentId: String(agent.id || ''), providerId: providerName,
-    baseURL: llmConfig.configuration?.baseURL, capability: followUpProviderCapability,
+    presentationAgentId: String(agent.id || ''),
+    providerId: providerName,
+    baseURL: llmConfig.configuration?.baseURL,
+    capability: followUpProviderCapability,
   });
   let nativeOutputFiles;
   let nativeFileStreamed = false;
@@ -3093,8 +3143,10 @@ async function generateFollowUpText({
     try {
       const captured = captureNativeFollowUpOutputFiles(value, nativeFileSource);
       if (!captured) return;
-      if (nativeOutputFiles?.identity &&
-          nativeOutputFiles.identity.requestId !== captured.identity.requestId) {
+      if (
+        nativeOutputFiles?.identity &&
+        nativeOutputFiles.identity.requestId !== captured.identity.requestId
+      ) {
         nativeOutputFiles = { error: true };
         return;
       }
@@ -3250,7 +3302,10 @@ async function generateFollowUpText({
     try {
       const evidenceService = require('./nativeResponseService').getService();
       nativeToolEvidence = await evidenceService.readToolEvidenceForPresentation(
-        req.user.id, conversationId, parentMessageId, getCortexFollowupGraceMs(),
+        req.user.id,
+        conversationId,
+        parentMessageId,
+        getCortexFollowupGraceMs(),
       );
     } catch (error) {
       // Accepted worker results carry their own fenced authority. A failed or
@@ -3310,12 +3365,22 @@ async function generateFollowUpText({
   if (typeof onDeliveryDisposition === 'function') onDeliveryDisposition(deliveryDisposition);
   if (typeof onNativeSilentDecision === 'function') {
     const nativeDecision = inspectProviderDeliveryDisposition(nativeFinalOutput);
-    const nativeMessage = nativeFinalOutput?.additional_kwargs?.__raw_response?.choices?.[0]?.message ??
+    const nativeMessage =
+      nativeFinalOutput?.additional_kwargs?.__raw_response?.choices?.[0]?.message ??
       nativeFinalOutput?.__raw_response?.choices?.[0]?.message ??
-      nativeFinalOutput?.choices?.[0]?.message ?? nativeFinalOutput;
-    onNativeSilentDecision(Boolean(audioEligible && nativeFileSource && nativeMessage?.content === '' &&
-      !nativeMessage?.tool_calls?.length && rawText.length === 0 &&
-      nativeDecision.status === 'valid' && nativeDecision.disposition.audio === 'skip'));
+      nativeFinalOutput?.choices?.[0]?.message ??
+      nativeFinalOutput;
+    onNativeSilentDecision(
+      Boolean(
+        audioEligible &&
+        nativeFileSource &&
+        nativeMessage?.content === '' &&
+        !nativeMessage?.tool_calls?.length &&
+        rawText.length === 0 &&
+        nativeDecision.status === 'valid' &&
+        nativeDecision.disposition.audio === 'skip',
+      ),
+    );
   }
   if (rawText.length === 0) {
     return '';
@@ -3353,7 +3418,9 @@ async function prepareCortexFollowUpMessage({
   recentResponse,
   forceVisibleFollowUp = false,
 }) {
-  const recoverySuppression = req?.[ownedVoiceCortexRecovery] ? await refreshOwnedVoiceCortexRecovery(req) : false;
+  const recoverySuppression = req?.[ownedVoiceCortexRecovery]
+    ? await refreshOwnedVoiceCortexRecovery(req)
+    : false;
   if (recoverySuppression) return { suppressed: true, dropReason: recoverySuppression };
   const voiceTaskId = String(req?.body?.viventiumVoiceTaskId || '').trim();
   if (voiceTaskId && (await isFollowUpVoiceTaskSuppressed(req, voiceTaskId))) {
@@ -3379,19 +3446,29 @@ async function prepareCortexFollowUpMessage({
     );
   }
   insightsData = await resolveDurableMissionUserSources({
-    req, insightsData, conversationId, messages: conversationMessages,
+    req,
+    insightsData,
+    conversationId,
+    messages: conversationMessages,
   });
   /* === VIVENTIUM START: Terminal synthesis follows the current Native Main author. === */
-  const durableMissionEvidence = hasInsights && insightsData.insights.every(isDurableMissionInsight);
+  const durableMissionEvidence =
+    hasInsights && insightsData.insights.every(isDurableMissionInsight);
   let currentMainReadyAfterRelease;
-  if (durableMissionEvidence && await require('./nativeResponseService')
-    .offerMissionEvidenceToCurrentMain({
-      ownerId: String(req?.user?.id || ''), conversationId,
+  if (
+    durableMissionEvidence &&
+    (await require('./nativeResponseService').offerMissionEvidenceToCurrentMain({
+      ownerId: String(req?.user?.id || ''),
+      conversationId,
       currentLeafMessageId: continuationContext.currentLeafMessageId,
-      messages: conversationMessages, mainAgentId: agent?.id,
+      messages: conversationMessages,
+      mainAgentId: agent?.id,
       insights: insightsData.insights,
-      onPending: (recheck) => { currentMainReadyAfterRelease = recheck; },
-    })) {
+      onPending: (recheck) => {
+        currentMainReadyAfterRelease = recheck;
+      },
+    }))
+  ) {
     return { currentMainPending: true, currentMainReadyAfterRelease };
   }
   /* === VIVENTIUM END === */
@@ -3448,18 +3525,28 @@ async function prepareCortexFollowUpMessage({
         primaryResponseMode: shouldForceVisibleFollowUp,
         conversationId,
         parentMessageId,
-        onDeliveryDisposition: (disposition) => { deliveryDisposition = disposition; },
-        onNativeDeliveryOutput: (output) => { nativeDeliveryOutput = output; },
-        onNativeSilentDecision: (silent) => { nativeSilentDecision = silent === true; },
-        onNativeOutputFiles: (capture) => { nativeOutputFiles = capture; },
+        onDeliveryDisposition: (disposition) => {
+          deliveryDisposition = disposition;
+        },
+        onNativeDeliveryOutput: (output) => {
+          nativeDeliveryOutput = output;
+        },
+        onNativeSilentDecision: (silent) => {
+          nativeSilentDecision = silent === true;
+        },
+        onNativeOutputFiles: (capture) => {
+          nativeOutputFiles = capture;
+        },
         onNativeMediaSelection: (selection) => {
           selectedNativeMedia.set(JSON.stringify(selection), selection);
         },
       });
     } catch (err) {
       generationFailed = true;
-      if (getFollowUpErrorStatus(err) === 409 &&
-          getFollowUpErrorCode(err) === 'CONVERSATION_SESSION_AUTHORITY_CONFLICT') {
+      if (
+        getFollowUpErrorStatus(err) === 409 &&
+        getFollowUpErrorCode(err) === 'CONVERSATION_SESSION_AUTHORITY_CONFLICT'
+      ) {
         generationFailure = { ...OCCUPIED_CORTEX_FAILURE };
       }
       const failure = sanitizeFollowUpErrorForLog(err);
@@ -3534,21 +3621,26 @@ async function prepareCortexFollowUpMessage({
           : projected;
       })
     : null;
-  const nativeDeliveryContent = nativeDeliveryRanges === null
-    ? undefined
-    : [{ type: 'text', text, deliveryDispositionRanges: nativeDeliveryRanges }];
+  const nativeDeliveryContent =
+    nativeDeliveryRanges === null
+      ? undefined
+      : [{ type: 'text', text, deliveryDispositionRanges: nativeDeliveryRanges }];
   if (nativeDeliveryContent) {
     deliveryDisposition = {
       version: 1,
       audio: nativeDeliveryRanges.some((range) => range.disposition.audio === 'eligible')
-        ? 'eligible' : 'skip',
+        ? 'eligible'
+        : 'skip',
       required: true,
       valid: nativeDeliveryRanges.length > 0,
       source: nativeDeliveryRanges.length > 0 ? 'model' : 'required_malformed',
     };
     if (telegramDeliveryControls) {
       telegramDeliveryControls.audioContent = nativeDeliveryContent;
-      telegramDeliveryControls.sourceTextSha256 = crypto.createHash('sha256').update(text).digest('hex');
+      telegramDeliveryControls.sourceTextSha256 = crypto
+        .createHash('sha256')
+        .update(text)
+        .digest('hex');
     }
   }
   /* === VIVENTIUM END === */
@@ -3556,7 +3648,8 @@ async function prepareCortexFollowUpMessage({
   if (telegramDeliveryControls && deliveryDisposition)
     telegramDeliveryControls.deliveryDisposition = deliveryDisposition;
   const lateRecoverySuppression = req?.[ownedVoiceCortexRecovery]
-    ? await refreshOwnedVoiceCortexRecovery(req, { allowWaiting: true }) : false;
+    ? await refreshOwnedVoiceCortexRecovery(req, { allowWaiting: true })
+    : false;
   if (lateRecoverySuppression) return { suppressed: true, dropReason: lateRecoverySuppression };
   const followUpDecisionRecord = buildFollowUpDecisionRecord({
     req,
@@ -3573,7 +3666,8 @@ async function prepareCortexFollowUpMessage({
   });
 
   if (generationFailure) followUpDecisionRecord.generationFailure = generationFailure;
-  if (req?.[ownedVoiceCortexRecovery]) followUpDecisionRecord.recoveryAuthority = 'owned_voice_source';
+  if (req?.[ownedVoiceCortexRecovery])
+    followUpDecisionRecord.recoveryAuthority = 'owned_voice_source';
 
   return {
     suppressed: false,
@@ -3596,13 +3690,21 @@ async function prepareCortexFollowUpMessage({
 
 /* === VIVENTIUM START === Retry the existing exact child wake without claiming speech. === */
 async function publishCortexVoiceFollowUp({
-  ownerId, callSessionId, voiceTaskId, conversationId, parentMessageId, messageId,
+  ownerId,
+  callSessionId,
+  voiceTaskId,
+  conversationId,
+  parentMessageId,
+  messageId,
   dependencies = null,
 }) {
-  if (!ownerId || !callSessionId || !voiceTaskId || !messageId || messageId === parentMessageId) return false;
+  if (!ownerId || !callSessionId || !voiceTaskId || !messageId || messageId === parentMessageId)
+    return false;
   const tasks = dependencies || require('./VoiceTaskService');
   const task = await tasks.hydrateVoiceTask(voiceTaskId, {
-    callSessionId, userId: ownerId, requireDurable: true,
+    callSessionId,
+    userId: ownerId,
+    requireDurable: true,
   });
   const owner = tasks.getVoiceTaskOwnerBinding(voiceTaskId);
   if (
@@ -3618,7 +3720,8 @@ async function publishCortexVoiceFollowUp({
   )
     return false;
   tasks.observeGenerationEvent(voiceTaskId, {
-    event: 'on_cortex_followup', data: { messageId, parentMessageId, conversationId },
+    event: 'on_cortex_followup',
+    data: { messageId, parentMessageId, conversationId },
   });
   // The existing event key deduplicates this child. Still retry a failed durable flush.
   await tasks.flushVoiceTaskPersistence();
@@ -3630,7 +3733,12 @@ async function publishPreparedFollowUpAttachments(preparation, operation) {
   const authorize = Array.isArray(preparation) ? undefined : preparation?.authorizePublication;
   if (typeof authorize !== 'function') return operation();
   return require('./GlassHiveTerminalCallbackTransaction').runGlassHiveTerminalCallbackTransaction(
-    async (session) => { await authorize(session); return operation(); }, { retry: 'native' });
+    async (session) => {
+      await authorize(session);
+      return operation();
+    },
+    { retry: 'native' },
+  );
 }
 
 async function persistPreparedCortexFollowUpMessage(
@@ -3645,9 +3753,11 @@ async function persistPreparedCortexFollowUpMessage(
   },
   prepared,
 ) {
-  const recoverySuppression = prepared?.dropReason ||
+  const recoverySuppression =
+    prepared?.dropReason ||
     (req?.[ownedVoiceCortexRecovery]
-      ? await refreshOwnedVoiceCortexRecovery(req, { allowWaiting: true }) : false);
+      ? await refreshOwnedVoiceCortexRecovery(req, { allowWaiting: true })
+      : false);
   if (!prepared || prepared.suppressed === true || recoverySuppression) {
     if (deliveryBatch?.claimed?.length) {
       await dropCortexInsightDeliveryBatch({
@@ -3659,14 +3769,22 @@ async function persistPreparedCortexFollowUpMessage(
     }
     return null;
   }
-  if ((prepared.nativeOutputFiles || (req?.user?.id && collectGlassHiveNativeMediaReferences(String(prepared.text || '')).length)) &&
-      typeof dependencies.prepareAttachments !== 'function') {
+  if (
+    (prepared.nativeOutputFiles ||
+      (req?.user?.id &&
+        collectGlassHiveNativeMediaReferences(String(prepared.text || '')).length)) &&
+    typeof dependencies.prepareAttachments !== 'function'
+  ) {
     dependencies = {
       ...dependencies,
-      prepareAttachments: (message) => require('./nativeOutputFiles').prepareMissionOutputFiles({
-        req, rows: [], message, sourceMessageId: parentMessageId,
-        nativeOutputFiles: prepared.nativeOutputFiles,
-      }),
+      prepareAttachments: (message) =>
+        require('./nativeOutputFiles').prepareMissionOutputFiles({
+          req,
+          rows: [],
+          message,
+          sourceMessageId: parentMessageId,
+          nativeOutputFiles: prepared.nativeOutputFiles,
+        }),
     };
   }
   const {
@@ -3696,7 +3814,8 @@ async function persistPreparedCortexFollowUpMessage(
         deliveryBatch,
         decisionRecord: followUpDecisionRecord,
         dropReason: resolveCortexInsightDropReason({
-          decision: prepared.decision, generationFailure: followUpDecisionRecord?.generationFailure,
+          decision: prepared.decision,
+          generationFailure: followUpDecisionRecord?.generationFailure,
         }),
       });
     }
@@ -3795,9 +3914,13 @@ async function persistPreparedCortexFollowUpMessage(
       type: 'cortex_followup',
       ...(deliveryDisposition ? { deliveryDisposition } : {}),
       ...(durableMissionEvidence === true
-        ? { followUpSource: insightsData.insights.every((insight) =>
-            insight.authority?.kind === 'durable_terminal_callback')
-            ? 'durable_terminal_callback' : 'durable_work_callback' }
+        ? {
+            followUpSource: insightsData.insights.every(
+              (insight) => insight.authority?.kind === 'durable_terminal_callback',
+            )
+              ? 'durable_terminal_callback'
+              : 'durable_work_callback',
+          }
         : {}),
       parentMessageId,
       cortexCount: insightsData?.cortexCount ?? undefined,
@@ -3839,8 +3962,11 @@ async function persistPreparedCortexFollowUpMessage(
     if (attachments.length) followUpMessage.attachments = attachments;
     if (!Array.isArray(preparation) && typeof preparation?.authorizePublication === 'function') {
       const saveMessage = dependencies.saveMessage || db.saveMessage;
-      dependencies = { ...dependencies, saveMessage: (...args) =>
-        publishPreparedFollowUpAttachments(preparation, () => saveMessage(...args)) };
+      dependencies = {
+        ...dependencies,
+        saveMessage: (...args) =>
+          publishPreparedFollowUpAttachments(preparation, () => saveMessage(...args)),
+      };
     }
   }
 
@@ -3884,17 +4010,28 @@ async function persistPreparedCortexFollowUpMessage(
   }
 
   /* === VIVENTIUM START === Persisted Cortex publication wakes the existing call task tail. === */
-  if (voiceTaskId && durableMissionEvidence !== true &&
-      followUpMessage.messageId !== parentMessageId) {
+  if (
+    voiceTaskId &&
+    durableMissionEvidence !== true &&
+    followUpMessage.messageId !== parentMessageId
+  ) {
     try {
       await publishCortexVoiceFollowUp({
         ownerId: String(req?.user?.id || '').trim(),
-        callSessionId: String(req?.viventiumCallSession?.callSessionId || req?.body?.viventiumCallSessionId || '').trim(),
-        voiceTaskId, conversationId, parentMessageId, messageId: followUpMessage.messageId,
+        callSessionId: String(
+          req?.viventiumCallSession?.callSessionId || req?.body?.viventiumCallSessionId || '',
+        ).trim(),
+        voiceTaskId,
+        conversationId,
+        parentMessageId,
+        messageId: followUpMessage.messageId,
       });
     } catch (error) {
       logger.warn('[BackgroundCortexFollowUpService] Voice publication wake deferred', {
-        code: String(error?.code || error?.name || 'voice_task_publication_unavailable').slice(0, 120),
+        code: String(error?.code || error?.name || 'voice_task_publication_unavailable').slice(
+          0,
+          120,
+        ),
       });
     }
   }

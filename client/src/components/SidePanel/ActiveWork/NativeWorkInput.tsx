@@ -44,7 +44,25 @@ export default function NativeWorkInput({
         requestFingerprint: input.requestFingerprint,
         action,
         ...(action === 'accept' && input.mode === 'form'
-          ? { content: input.kind === 'question' ? {answers:questionAnswers.answers,...(Object.values(questionAnswers.annotations||{}).some(value=>value.notes.length>0) ? {annotations:Object.fromEntries(Object.entries(questionAnswers.annotations||{}).filter(([,value])=>value.notes.length>0))}: {})} : values }
+          ? {
+              content:
+                input.kind === 'question'
+                  ? {
+                      answers: questionAnswers.answers,
+                      ...(Object.values(questionAnswers.annotations || {}).some(
+                        (value) => value.notes.length > 0,
+                      )
+                        ? {
+                            annotations: Object.fromEntries(
+                              Object.entries(questionAnswers.annotations || {}).filter(
+                                ([, value]) => value.notes.length > 0,
+                              ),
+                            ),
+                          }
+                        : {}),
+                    }
+                  : values,
+            }
           : {}),
       },
     };
@@ -97,17 +115,25 @@ export default function NativeWorkInput({
                 <input
                   type={field.maxItems === 1 ? 'radio' : 'checkbox'}
                   name={key}
-                  checked={(Object.hasOwn(questionAnswers.answers,key) ? questionAnswers.answers[key]?.includes(option) : false) || false}
+                  checked={
+                    (Object.hasOwn(questionAnswers.answers, key)
+                      ? questionAnswers.answers[key]?.includes(option)
+                      : false) || false
+                  }
                   onChange={(event) =>
                     setQuestionAnswers((current) => {
-                      const before = Object.hasOwn(current.answers,key) ? current.answers[key] : [];
+                      const before = Object.hasOwn(current.answers, key)
+                        ? current.answers[key]
+                        : [];
                       const selected = event.target.checked
                         ? field.maxItems === 1
                           ? [option]
                           : [...before, option]
                         : before.filter((value) => value !== option);
-                      const answers = selected.length ? {...current.answers,[key]:selected} : {...current.answers};
-                      if(!selected.length) delete answers[key];
+                      const answers = selected.length
+                        ? { ...current.answers, [key]: selected }
+                        : { ...current.answers };
+                      if (!selected.length) delete answers[key];
                       const annotations = { ...current.annotations };
                       if (!selected.includes('Other')) delete annotations[key];
                       return {
@@ -120,22 +146,31 @@ export default function NativeWorkInput({
                 {option}
               </label>
             ))}
-            {(Object.hasOwn(questionAnswers.answers,key) && questionAnswers.answers[key]?.includes('Other')) && (
-              <label className="block">
-                {localize('com_ui_response')}
-                <input
-                  aria-label={`${localize('com_ui_response')}: ${field.title || key}`}
-                  maxLength={8000}
-                  value={(questionAnswers.annotations && Object.hasOwn(questionAnswers.annotations,key) ? questionAnswers.annotations[key]?.notes : '') || ''}
-                  onChange={(event) =>
-                    setQuestionAnswers((current) => ({
-                      ...current,
-                      annotations: { ...current.annotations, [key]: { notes: event.target.value } },
-                    }))
-                  }
-                />
-              </label>
-            )}
+            {Object.hasOwn(questionAnswers.answers, key) &&
+              questionAnswers.answers[key]?.includes('Other') && (
+                <label className="block">
+                  {localize('com_ui_response')}
+                  <input
+                    aria-label={`${localize('com_ui_response')}: ${field.title || key}`}
+                    maxLength={8000}
+                    value={
+                      (questionAnswers.annotations &&
+                      Object.hasOwn(questionAnswers.annotations, key)
+                        ? questionAnswers.annotations[key]?.notes
+                        : '') || ''
+                    }
+                    onChange={(event) =>
+                      setQuestionAnswers((current) => ({
+                        ...current,
+                        annotations: {
+                          ...current.annotations,
+                          [key]: { notes: event.target.value },
+                        },
+                      }))
+                    }
+                  />
+                </label>
+              )}
           </fieldset>
         ))}
       {input.mode === 'form' &&

@@ -18,15 +18,25 @@ describe('BaseClient history owner voice timing', () => {
     const rows = [{ messageId: 'synthetic-parent', text: 'Private source text.' }];
     client.loadHistory = jest.fn(async () => rows);
     const logs = jest.spyOn(logger, 'debug').mockImplementation(() => {});
-    const result = await client.setMessageOptions({ user: 'synthetic-user',
-      conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent' });
-    expect(client.loadHistory).toHaveBeenCalledWith('synthetic-conversation',
-      'synthetic-parent', 'synthetic-parent');
+    const result = await client.setMessageOptions({
+      user: 'synthetic-user',
+      conversationId: 'synthetic-conversation',
+      parentMessageId: 'synthetic-parent',
+    });
+    expect(client.loadHistory).toHaveBeenCalledWith(
+      'synthetic-conversation',
+      'synthetic-parent',
+      'synthetic-parent',
+    );
     expect(client.currentMessages).toBe(rows);
     expect(result.conversationId).toBe('synthetic-conversation');
     const timings = logs.mock.calls.filter((call) => call[0] === '[VoiceLatency][LC][Timing]');
     expect(timings).toHaveLength(enabled ? 1 : 0);
-    if (enabled) expect(timings[0][1]).toMatchObject({ source: 'base_client', stage: 'history_load_completed' });
+    if (enabled)
+      expect(timings[0][1]).toMatchObject({
+        source: 'base_client',
+        stage: 'history_load_completed',
+      });
     expect(JSON.stringify(timings)).not.toContain('Private source text.');
   });
 
@@ -37,9 +47,13 @@ describe('BaseClient history owner voice timing', () => {
     client.options = { req };
     client.getSaveOptions = () => ({});
     const error = new Error('Private failed source.');
-    client.loadHistory = jest.fn(async () => { throw error; });
+    client.loadHistory = jest.fn(async () => {
+      throw error;
+    });
     const logs = jest.spyOn(logger, 'debug').mockImplementation(() => {});
-    await expect(client.setMessageOptions({ conversationId: 'synthetic-conversation' })).rejects.toBe(error);
+    await expect(
+      client.setMessageOptions({ conversationId: 'synthetic-conversation' }),
+    ).rejects.toBe(error);
     const timings = logs.mock.calls.filter((call) => call[0] === '[VoiceLatency][LC][Timing]');
     expect(timings[0][1].stage).toBe('history_load_failed');
     expect(JSON.stringify(timings)).not.toContain(error.message);

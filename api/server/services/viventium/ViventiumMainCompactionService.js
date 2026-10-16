@@ -196,11 +196,19 @@ function buildCompactionPrompt(claim, correctionReason = '', candidate = null) {
     acceptedOlderTurns: claim.sourceTurns || [],
     outputConstraints: claim.outputContract || mainCompactionOutputConstraints,
     ...(claim.legacyInputs?.length ? { legacyInputs: claim.legacyInputs } : {}),
-    ...(candidate ? { candidate, typedToolIdentityComparison: compareMainCompactionToolIdentities({
-      previousSemanticCompaction: claim.previousSemanticCompaction || null,
-      sourceTurns: claim.sourceTurns || [],
-      legacyInputs: claim.legacyInputs,
-    }, candidate) } : {}),
+    ...(candidate
+      ? {
+          candidate,
+          typedToolIdentityComparison: compareMainCompactionToolIdentities(
+            {
+              previousSemanticCompaction: claim.previousSemanticCompaction || null,
+              sourceTurns: claim.sourceTurns || [],
+              legacyInputs: claim.legacyInputs,
+            },
+            candidate,
+          ),
+        }
+      : {}),
     ...(correctionReason ? { priorRejection: correctionReason } : {}),
   });
   // Claims batch whole turns. A single larger turn remains indivisible and goes through the
@@ -364,19 +372,26 @@ async function defaultExecuteCompactor({
 function ensureAcceptedMainCompaction(input = {}) {
   const domainKey = compactionEpochKey(input);
   if (input.foreground === true) discardDeferredMainCompaction(domainKey);
-  if (input.trigger === 'accepted_turn' && input.foreground !== true &&
-      deferAcceptedMainCompactionForCall({
-        ownerId: String(input.ownerId || '').trim(), domainKey,
-        call: input.req?.viventiumCallSession,
-        schedule: () => runBackgroundMainCompaction(input),
-      })) {
+  if (
+    input.trigger === 'accepted_turn' &&
+    input.foreground !== true &&
+    deferAcceptedMainCompactionForCall({
+      ownerId: String(input.ownerId || '').trim(),
+      domainKey,
+      call: input.req?.viventiumCallSession,
+      schedule: () => runBackgroundMainCompaction(input),
+    })
+  ) {
     logger.info('[VIVENTIUM][main-continuity] Accepted compaction deferred until Call End', {
-      reason: 'active_call', domainHash: crypto.createHash('sha256').update(domainKey).digest('hex').slice(0, 16),
+      reason: 'active_call',
+      domainHash: crypto.createHash('sha256').update(domainKey).digest('hex').slice(0, 16),
     });
     return Promise.resolve({ status: 'deferred', reason: 'active_call', attempts: 0 });
   }
-  return ['accepted_turn', 'conversation_legacy'].includes(input.trigger) && input.foreground !== true
-    ? runBackgroundMainCompaction(input) : runAcceptedMainCompaction(input);
+  return ['accepted_turn', 'conversation_legacy'].includes(input.trigger) &&
+    input.foreground !== true
+    ? runBackgroundMainCompaction(input)
+    : runAcceptedMainCompaction(input);
 }
 
 /** Thin binding to the existing bounded per-domain idle owner and foreground fence. */
@@ -384,11 +399,14 @@ function scheduleMainContinuityMaintenance(input = {}) {
   if (typeof input.schedule !== 'function') return false;
   const ownerId = String(input.ownerId || '').trim();
   return deferAcceptedMainCompactionForIdle({
-    ownerId, domainKey: compactionEpochKey(input), schedule: input.schedule,
+    ownerId,
+    domainKey: compactionEpochKey(input),
+    schedule: input.schedule,
     shouldYield: () => (interactiveAdmissionFencesByOwnerId.get(ownerId)?.size || 0) > 0,
-    onError: error => logger.warn('[VIVENTIUM][main-continuity] Deferred maintenance unavailable', {
-      errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
-    }),
+    onError: (error) =>
+      logger.warn('[VIVENTIUM][main-continuity] Deferred maintenance unavailable', {
+        errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+      }),
   });
 }
 
@@ -403,36 +421,62 @@ async function runBackgroundMainCompaction(input) {
       let call;
       try {
         call = await require('./CallSessionService').getActiveCallSessionForMainMaintenance({
-          userId: ownerId, agentId: input.agentId,
+          userId: ownerId,
+          agentId: input.agentId,
         });
       } catch {
         return { status: 'deferred', reason: 'call_liveness_unavailable', attempts: 0 };
       }
-      if (deferAcceptedMainCompactionForCall({ ownerId, domainKey, call,
-        schedule: () => runBackgroundMainCompaction({ ...input, executionBudget }),
-      })) return { status: 'deferred', reason: 'active_call', attempts: 0 };
-      return runAcceptedMainCompaction({ ...input, deadlineAt, executionBudget, previousSourceClaim });
+      if (
+        deferAcceptedMainCompactionForCall({
+          ownerId,
+          domainKey,
+          call,
+          schedule: () => runBackgroundMainCompaction({ ...input, executionBudget }),
+        })
+      )
+        return { status: 'deferred', reason: 'active_call', attempts: 0 };
+      return runAcceptedMainCompaction({
+        ...input,
+        deadlineAt,
+        executionBudget,
+        previousSourceClaim,
+      });
     },
     shouldYield: () => input.signal?.aborted || shouldYield(),
     deadlineAt: input.deadlineAt,
     now: input.now,
   });
-  if (!input.deadlineAt && ((result.status === 'compacted' && result.continuationPending === true &&
+  if (
+    !input.deadlineAt &&
+    ((result.status === 'compacted' &&
+      result.continuationPending === true &&
       result.reason === 'idle_budget_exhausted') ||
-      (result.status === 'degraded' && result.reason === 'compaction_enclosing_deadline' &&
-        result.repairPending === true))) {
-    deferAcceptedMainCompactionForIdle({ ownerId, domainKey, signal: input.signal, shouldYield,
+      (result.status === 'degraded' &&
+        result.reason === 'compaction_enclosing_deadline' &&
+        result.repairPending === true))
+  ) {
+    deferAcceptedMainCompactionForIdle({
+      ownerId,
+      domainKey,
+      signal: input.signal,
+      shouldYield,
       schedule: () => runBackgroundMainCompaction({ ...input, executionBudget }),
-      onError: error => logger.warn('[VIVENTIUM][main-continuity] Idle continuation unavailable', {
-        errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
-      }),
+      onError: (error) =>
+        logger.warn('[VIVENTIUM][main-continuity] Idle continuation unavailable', {
+          errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
+        }),
     });
   }
   return result;
 }
 
 async function runAcceptedMainCompaction(input = {}) {
-  input = { ...input, agent: resolveMainCompactionAgent(input.req, input.agent), outputCarrier: input.outputCarrier || input.req?._viventiumAcceptedMainOutputCarrierV1 };
+  input = {
+    ...input,
+    agent: resolveMainCompactionAgent(input.req, input.agent),
+    outputCarrier: input.outputCarrier || input.req?._viventiumAcceptedMainOutputCarrierV1,
+  };
   const ownerId = String(input.ownerId || '').trim();
   const controller = new AbortController();
   let settleActive;
@@ -462,8 +506,8 @@ async function runAcceptedMainCompaction(input = {}) {
   const claimCompaction = input.claimCompaction || claimAcceptedMainCompaction;
   const completeCompaction = input.completeCompaction || completeAcceptedMainCompaction;
   const rejectCompaction = input.rejectCompaction || rejectAcceptedMainCompaction;
-  const renewCompaction = input.renewCompaction ||
-    (input.claimCompaction ? null : renewAcceptedMainCompaction);
+  const renewCompaction =
+    input.renewCompaction || (input.claimCompaction ? null : renewAcceptedMainCompaction);
   const yieldToInteractive = () =>
     input.foreground !== true && yieldToInteractiveMainAdmission(ownerId, controller);
   const retrySleep = typeof input.sleep === 'function' ? input.sleep : sleep;
@@ -485,34 +529,50 @@ async function runAcceptedMainCompaction(input = {}) {
   // retain time even when a smaller claim is selected; a new claim never resets that deadline.
   const executionBudget = input.executionBudget || {};
   if (Number.isFinite(deadlineMs) && executionBudget.completionReserveMs == null)
-    executionBudget.completionReserveMs = Math.min(COMPACTOR_TIMEOUT_MS,
-      Math.max(0, Math.floor((deadlineMs - now()) / 3)));
+    executionBudget.completionReserveMs = Math.min(
+      COMPACTOR_TIMEOUT_MS,
+      Math.max(0, Math.floor((deadlineMs - now()) / 3)),
+    );
   let slowestCallMs = executionBudget.slowestCallMs || 0;
   let slowestCompactionCallMs = executionBudget.slowestCompactionCallMs || 0;
   let slowestReviewCallMs = executionBudget.slowestReviewCallMs || 0;
   const providerId = input.agent?.endpoint || input.agent?.provider;
   const capability = input.req?.config?.endpoints?.agents?.providerCapabilities?.[providerId];
-  const nativeStageDeadline = input.foreground !== true &&
-    typeof renewCompaction === 'function' && capability?.workspace_binding === true &&
+  const nativeStageDeadline =
+    input.foreground !== true &&
+    typeof renewCompaction === 'function' &&
+    capability?.workspace_binding === true &&
     capability?.conversation_session === true;
-  const nativeAdmissionWindow = (stage) => stage === 'review'
-    ? executionBudget.nativeReviewAdmissionWindowMs || 0 : executionBudget.nativeCompactionAdmissionWindowMs || 0;
+  const nativeAdmissionWindow = (stage) =>
+    stage === 'review'
+      ? executionBudget.nativeReviewAdmissionWindowMs || 0
+      : executionBudget.nativeCompactionAdmissionWindowMs || 0;
   try {
     releaseCancellationDelivery = retainMainCompactionCancellationDelivery({
-      signal: inputSignal, settled,
+      signal: inputSignal,
+      settled,
       capacityReleased: () => active.capacityReleaseAcknowledged === true,
     });
     if (yieldToInteractive()) {
       return { status: 'degraded', attempts: 0, reason: 'interactive_priority' };
     }
     const epochKey = compactionEpochKey(input);
-    if (Number.isFinite(deadlineMs) && !mainCompactionStageBudget({
-      leaseExpiresAt: deadlineAt, deadlineAt,
-      completionReserveMs: executionBudget.completionReserveMs,
-      now: now(), slowestCallMs, slowestCompactionCallMs, slowestReviewCallMs,
-      maxCallMs: COMPACTOR_TIMEOUT_MS, stage: 'compaction',
-      nativeDeadlineAdmission: nativeStageDeadline, nativeAdmittedWindowMs: nativeAdmissionWindow('compaction'),
-    }).allowed)
+    if (
+      Number.isFinite(deadlineMs) &&
+      !mainCompactionStageBudget({
+        leaseExpiresAt: deadlineAt,
+        deadlineAt,
+        completionReserveMs: executionBudget.completionReserveMs,
+        now: now(),
+        slowestCallMs,
+        slowestCompactionCallMs,
+        slowestReviewCallMs,
+        maxCallMs: COMPACTOR_TIMEOUT_MS,
+        stage: 'compaction',
+        nativeDeadlineAdmission: nativeStageDeadline,
+        nativeAdmittedWindowMs: nativeAdmissionWindow('compaction'),
+      }).allowed
+    )
       return { status: 'degraded', attempts: 0, reason: 'compaction_enclosing_deadline' };
     // After an unaccepted proposal the next claim takes less whole-turn source; none is dropped.
     const learnedSourceTarget = mainCompactionSourceTargetBytes(epochKey);
@@ -524,42 +584,64 @@ async function runAcceptedMainCompaction(input = {}) {
     });
     if (claim.status !== 'claimed') return claim;
     const previousSourceClaim = input.previousSourceClaim;
-    if (previousSourceClaim && (
-      !Number.isSafeInteger(previousSourceClaim.sourceBytes) || previousSourceClaim.sourceBytes <= 0 ||
-      typeof previousSourceClaim.sourceDigest !== 'string' || !previousSourceClaim.sourceDigest ||
-      typeof previousSourceClaim.domainEpochKey !== 'string' || !previousSourceClaim.domainEpochKey ||
-      claim.domainEpochKey !== previousSourceClaim.domainEpochKey ||
-      typeof claim.sourceDigest !== 'string' || !claim.sourceDigest ||
-      claim.sourceDigest === previousSourceClaim.sourceDigest ||
-      !Number.isSafeInteger(claim.sourceBytes) || claim.sourceBytes <= 0 ||
-      claim.sourceBytes >= previousSourceClaim.sourceBytes ||
-      !Number.isSafeInteger(previousSourceClaim.nextSourceTargetBytes) ||
-      previousSourceClaim.nextSourceTargetBytes <= 0 ||
-      previousSourceClaim.nextSourceTargetBytes >= previousSourceClaim.sourceBytes
-    )) {
+    if (
+      previousSourceClaim &&
+      (!Number.isSafeInteger(previousSourceClaim.sourceBytes) ||
+        previousSourceClaim.sourceBytes <= 0 ||
+        typeof previousSourceClaim.sourceDigest !== 'string' ||
+        !previousSourceClaim.sourceDigest ||
+        typeof previousSourceClaim.domainEpochKey !== 'string' ||
+        !previousSourceClaim.domainEpochKey ||
+        claim.domainEpochKey !== previousSourceClaim.domainEpochKey ||
+        typeof claim.sourceDigest !== 'string' ||
+        !claim.sourceDigest ||
+        claim.sourceDigest === previousSourceClaim.sourceDigest ||
+        !Number.isSafeInteger(claim.sourceBytes) ||
+        claim.sourceBytes <= 0 ||
+        claim.sourceBytes >= previousSourceClaim.sourceBytes ||
+        !Number.isSafeInteger(previousSourceClaim.nextSourceTargetBytes) ||
+        previousSourceClaim.nextSourceTargetBytes <= 0 ||
+        previousSourceClaim.nextSourceTargetBytes >= previousSourceClaim.sourceBytes)
+    ) {
       // Release only this store-owned claim. No provider runs and no reviewed cursor advances;
       // keep the original oversize feedback for the same domain's indivisible source.
-      await rejectCompaction({ ...input, leaseId: claim.leaseId,
-        reason: claim.domainEpochKey === previousSourceClaim.domainEpochKey
-          ? 'schema_invalid' : 'source_reduction_unavailable' });
+      await rejectCompaction({
+        ...input,
+        leaseId: claim.leaseId,
+        reason:
+          claim.domainEpochKey === previousSourceClaim.domainEpochKey
+            ? 'schema_invalid'
+            : 'source_reduction_unavailable',
+      });
       return { status: 'degraded', attempts: 0, reason: 'source_reduction_unavailable' };
     }
     const contractKey = compactionContractKey(input.agent, claim.outputContract);
     const pendingRepair = claim.pendingCompactionRepair;
-    if (pendingRepair?.version === 1 && pendingRepair.sourceDigest === claim.sourceDigest &&
-        pendingRepair.contractKey === contractKey &&
-        Number.isSafeInteger(pendingRepair.semanticAttempts) && pendingRepair.semanticAttempts > 0 &&
-        pendingRepair.semanticAttempts < MAX_ATTEMPTS &&
-        Number.isSafeInteger(pendingRepair.transportRetries) && pendingRepair.transportRetries >= 0 &&
-        pendingRepair.transportRetries <= MAX_TRANSPORT_RETRIES &&
-        pendingRepair.correction?.code === 'semantic_fidelity') {
+    if (
+      pendingRepair?.version === 1 &&
+      pendingRepair.sourceDigest === claim.sourceDigest &&
+      pendingRepair.contractKey === contractKey &&
+      Number.isSafeInteger(pendingRepair.semanticAttempts) &&
+      pendingRepair.semanticAttempts > 0 &&
+      pendingRepair.semanticAttempts < MAX_ATTEMPTS &&
+      Number.isSafeInteger(pendingRepair.transportRetries) &&
+      pendingRepair.transportRetries >= 0 &&
+      pendingRepair.transportRetries <= MAX_TRANSPORT_RETRIES &&
+      pendingRepair.correction?.code === 'semantic_fidelity'
+    ) {
       semanticAttempts = pendingRepair.semanticAttempts;
       transportRetries = pendingRepair.transportRetries;
       correctionReason = pendingRepair.correction;
     }
-    const effectiveLeaseExpiry = () => Number.isFinite(deadlineMs)
-      ? new Date(Math.min(new Date(claim.leaseExpiresAt).getTime(),
-          deadlineMs - (executionBudget.completionReserveMs || 0))) : claim.leaseExpiresAt;
+    const effectiveLeaseExpiry = () =>
+      Number.isFinite(deadlineMs)
+        ? new Date(
+            Math.min(
+              new Date(claim.leaseExpiresAt).getTime(),
+              deadlineMs - (executionBudget.completionReserveMs || 0),
+            ),
+          )
+        : claim.leaseExpiresAt;
     // An identical claim that already failed under the same contract is not re-run; its
     // degraded reason stays visible until the source, contract or compactor changes.
     const repeatedReason = repeatedFailedMainCompaction({
@@ -575,23 +657,39 @@ async function runAcceptedMainCompaction(input = {}) {
     }
     // Eligibility alone opens the bounded third/fourth repair. Admission and any awaited
     // renewal run once inside the stage's error owner, after prompt preparation.
-    const mayRepairSize = () => sizeRepair?.converging === true &&
+    const mayRepairSize = () =>
+      sizeRepair?.converging === true &&
       semanticAttempts < MAIN_COMPACTION_SIZE_REPAIR_MAX_ATTEMPTS;
     // Every native call and retry wait ends within the store-owned claim lease.
     const leaseRemainingMs = () => mainCompactionLeaseRemainingMs(effectiveLeaseExpiry(), now());
     let pendingLeaseRenewalDisposition = 'not_required';
-    const claimHash = crypto.createHash('sha256').update(String(claim.leaseId)).digest('hex').slice(0, 16);
+    const claimHash = crypto
+      .createHash('sha256')
+      .update(String(claim.leaseId))
+      .digest('hex')
+      .slice(0, 16);
     const runId = getTrustedInteractionContext(input.req)?.schedule_run_id;
-    const runHash = runId ? crypto.createHash('sha256').update(runId).digest('hex').slice(0, 16) : undefined;
+    const runHash = runId
+      ? crypto.createHash('sha256').update(runId).digest('hex').slice(0, 16)
+      : undefined;
     const observeStageStart = (stage, timeoutMs) => {
       const startedMs = now();
       logger.debug('[VIVENTIUM][main-continuity] Stage call issued', {
-        stage, timeoutMs, claimHash, ...(runHash ? { runHash } : {}),
-        compactionObservedMs: slowestCompactionCallMs, reviewObservedMs: slowestReviewCallMs,
-        compactionKnown: slowestCompactionCallMs > 0, reviewKnown: slowestReviewCallMs > 0,
+        stage,
+        timeoutMs,
+        claimHash,
+        ...(runHash ? { runHash } : {}),
+        compactionObservedMs: slowestCompactionCallMs,
+        reviewObservedMs: slowestReviewCallMs,
+        compactionKnown: slowestCompactionCallMs > 0,
+        reviewKnown: slowestReviewCallMs > 0,
         leaseRemainingMs: mainCompactionLeaseRemainingMs(claim.leaseExpiresAt, startedMs),
-        ...(Number.isFinite(deadlineMs) ? { enclosingRemainingMs: Math.max(0, deadlineMs - startedMs),
-          completionReserveMs: executionBudget.completionReserveMs } : {}),
+        ...(Number.isFinite(deadlineMs)
+          ? {
+              enclosingRemainingMs: Math.max(0, deadlineMs - startedMs),
+              completionReserveMs: executionBudget.completionReserveMs,
+            }
+          : {}),
         leaseRenewalDisposition: pendingLeaseRenewalDisposition,
       });
       pendingLeaseRenewalDisposition = 'not_required';
@@ -600,71 +698,113 @@ async function runAcceptedMainCompaction(input = {}) {
     const observeStageEnd = (stage, startedMs, outcome) => {
       if (startedMs === undefined) return;
       logger.debug('[VIVENTIUM][main-continuity] Stage call settled', {
-        stage, elapsedMs: Math.max(0, now() - startedMs), outcome,
-        claimHash, ...(runHash ? { runHash } : {}),
+        stage,
+        elapsedMs: Math.max(0, now() - startedMs),
+        outcome,
+        claimHash,
+        ...(runHash ? { runHash } : {}),
       });
     };
     const nativeGraceMs = require('../BackgroundCortexService').getCortexExecutionGuardGraceMs();
     const nativeDeadlineLimit = Number.isFinite(deadlineMs)
-      ? deadlineMs - Math.max(0, executionBudget.completionReserveMs || 0) : Infinity;
+      ? deadlineMs - Math.max(0, executionBudget.completionReserveMs || 0)
+      : Infinity;
     const executeStage = async (params) => {
-      const lease = nativeStageDeadline ? createMainCompactionStageLease({
-        signal: controller.signal,
-        graceMs: nativeGraceMs,
-        leaseExpiresAt: () => claim.leaseExpiresAt,
-        renew: async (expiresAt) => {
-          const result = await renewCompaction({ ...input, leaseId: claim.leaseId,
-            sourceDigest: claim.sourceDigest, leaseExpiresAt: claim.leaseExpiresAt, expiresAt });
-          if (result.status === 'renewed' && !controller.signal.aborted)
-            claim.leaseExpiresAt = result.leaseExpiresAt;
-          return result;
-        },
-        onLost: () => controller.abort('compaction_lease_lost'),
-      }) : null;
+      const lease = nativeStageDeadline
+        ? createMainCompactionStageLease({
+            signal: controller.signal,
+            graceMs: nativeGraceMs,
+            leaseExpiresAt: () => claim.leaseExpiresAt,
+            renew: async (expiresAt) => {
+              const result = await renewCompaction({
+                ...input,
+                leaseId: claim.leaseId,
+                sourceDigest: claim.sourceDigest,
+                leaseExpiresAt: claim.leaseExpiresAt,
+                expiresAt,
+              });
+              if (result.status === 'renewed' && !controller.signal.aborted)
+                claim.leaseExpiresAt = result.leaseExpiresAt;
+              return result;
+            },
+            onLost: () => controller.abort('compaction_lease_lost'),
+          })
+        : null;
       try {
-        return await executeCompactor({ ...params,
-          ...(lease ? { onNativeAdmission: (receipt) => {
-            // Native admission may extend the short stage guard, never the enclosing idle batch.
-            const receiptDeadline = Date.parse(receipt.responseDeadlineAt);
-            const reviewReserveMs = params.stage === 'review' ? 0 : slowestReviewCallMs;
-            if (receiptDeadline + nativeGraceMs + reviewReserveMs > nativeDeadlineLimit)
-              return false;
-            const admittedAt = now();
-            return lease.admit(receipt).then((accepted) => {
-              if (accepted) {
-                const key = params.stage === 'review'
-                  ? 'nativeReviewAdmissionWindowMs' : 'nativeCompactionAdmissionWindowMs';
-                executionBudget[key] = Math.max(executionBudget[key] || 0,
-                  receiptDeadline + nativeGraceMs - admittedAt);
+        return await executeCompactor({
+          ...params,
+          ...(lease
+            ? {
+                onNativeAdmission: (receipt) => {
+                  // Native admission may extend the short stage guard, never the enclosing idle batch.
+                  const receiptDeadline = Date.parse(receipt.responseDeadlineAt);
+                  const reviewReserveMs = params.stage === 'review' ? 0 : slowestReviewCallMs;
+                  if (receiptDeadline + nativeGraceMs + reviewReserveMs > nativeDeadlineLimit)
+                    return false;
+                  const admittedAt = now();
+                  return lease.admit(receipt).then((accepted) => {
+                    if (accepted) {
+                      const key =
+                        params.stage === 'review'
+                          ? 'nativeReviewAdmissionWindowMs'
+                          : 'nativeCompactionAdmissionWindowMs';
+                      executionBudget[key] = Math.max(
+                        executionBudget[key] || 0,
+                        receiptDeadline + nativeGraceMs - admittedAt,
+                      );
+                    }
+                    return accepted;
+                  });
+                },
               }
-              return accepted;
-            });
-          } } : {}),
+            : {}),
         });
-      } finally { await lease?.settle(); }
+      } finally {
+        await lease?.settle();
+      }
     };
     const stageBudget = async (stage) => {
       const budgetInput = {
-        leaseExpiresAt: claim.leaseExpiresAt, deadlineAt,
+        leaseExpiresAt: claim.leaseExpiresAt,
+        deadlineAt,
         completionReserveMs: executionBudget.completionReserveMs,
-        now: now(), slowestCallMs, slowestCompactionCallMs, slowestReviewCallMs,
-        maxCallMs: COMPACTOR_TIMEOUT_MS, stage,
-        nativeDeadlineAdmission: nativeStageDeadline, nativeAdmittedWindowMs: nativeAdmissionWindow(stage),
+        now: now(),
+        slowestCallMs,
+        slowestCompactionCallMs,
+        slowestReviewCallMs,
+        maxCallMs: COMPACTOR_TIMEOUT_MS,
+        stage,
+        nativeDeadlineAdmission: nativeStageDeadline,
+        nativeAdmittedWindowMs: nativeAdmissionWindow(stage),
       };
-      const expiresAt = !controller.signal.aborted && renewCompaction &&
-        (nativeStageDeadline ? boundedMainCompactionLeaseRenewal({
-          leaseExpiresAt: claim.leaseExpiresAt,
-          requestedExpiresAt: Math.min(now() + MAIN_COMPACTION_LEASE_MS, nativeDeadlineLimit), now: now(),
-        }) : mainCompactionStageLeaseRenewal(budgetInput));
+      const expiresAt =
+        !controller.signal.aborted &&
+        renewCompaction &&
+        (nativeStageDeadline
+          ? boundedMainCompactionLeaseRenewal({
+              leaseExpiresAt: claim.leaseExpiresAt,
+              requestedExpiresAt: Math.min(now() + MAIN_COMPACTION_LEASE_MS, nativeDeadlineLimit),
+              now: now(),
+            })
+          : mainCompactionStageLeaseRenewal(budgetInput));
       if (expiresAt) {
-        const renewed = await renewCompaction({ ...input, leaseId: claim.leaseId,
-          sourceDigest: claim.sourceDigest, leaseExpiresAt: claim.leaseExpiresAt, expiresAt });
+        const renewed = await renewCompaction({
+          ...input,
+          leaseId: claim.leaseId,
+          sourceDigest: claim.sourceDigest,
+          leaseExpiresAt: claim.leaseExpiresAt,
+          expiresAt,
+        });
         pendingLeaseRenewalDisposition = renewed.status;
         if (renewed.status === 'renewed') claim.leaseExpiresAt = renewed.leaseExpiresAt;
-        else if (nativeStageDeadline && renewed.status !== 'busy') controller.abort('compaction_lease_lost');
+        else if (nativeStageDeadline && renewed.status !== 'busy')
+          controller.abort('compaction_lease_lost');
       }
-      return mainCompactionStageBudget({ ...budgetInput,
-        leaseExpiresAt: claim.leaseExpiresAt, now: now() });
+      return mainCompactionStageBudget({
+        ...budgetInput,
+        leaseExpiresAt: claim.leaseExpiresAt,
+        now: now(),
+      });
     };
     if (yieldToInteractive()) {
       terminalReason = 'interactive_priority';
@@ -688,21 +828,32 @@ async function runAcceptedMainCompaction(input = {}) {
         }
         const budget = await stageBudget('compaction');
         if (controller.signal.aborted) {
-          terminalReason = controller.signal.reason === 'maintenance_yield'
-            ? 'interactive_priority' : 'compaction_cancelled';
+          terminalReason =
+            controller.signal.reason === 'maintenance_yield'
+              ? 'interactive_priority'
+              : 'compaction_cancelled';
           break;
         }
         // Use the current lease after the final admission/renewal await. A timeout saved
         // before prompt preparation can otherwise cap a newly admitted whole-source repair.
-        const sizeBudget = attempt > MAX_ATTEMPTS && !nativeStageDeadline ? mainCompactionSizeRepairBudget({
-          state: sizeRepair, attempts: semanticAttempts,
-          leaseExpiresAt: effectiveLeaseExpiry(), now: now(),
-          slowestCallMs, slowestCompactionCallMs, slowestReviewCallMs,
-          maxCallMs: COMPACTOR_TIMEOUT_MS,
-        }) : { allowed: true, timeoutMs: COMPACTOR_TIMEOUT_MS };
+        const sizeBudget =
+          attempt > MAX_ATTEMPTS && !nativeStageDeadline
+            ? mainCompactionSizeRepairBudget({
+                state: sizeRepair,
+                attempts: semanticAttempts,
+                leaseExpiresAt: effectiveLeaseExpiry(),
+                now: now(),
+                slowestCallMs,
+                slowestCompactionCallMs,
+                slowestReviewCallMs,
+                maxCallMs: COMPACTOR_TIMEOUT_MS,
+              })
+            : { allowed: true, timeoutMs: COMPACTOR_TIMEOUT_MS };
         const callTimeoutMs = Math.min(budget.timeoutMs, sizeBudget.timeoutMs);
         if (!budget.allowed || !sizeBudget.allowed || callTimeoutMs <= 0) {
-          terminalReason = Number.isFinite(deadlineMs) ? 'compaction_enclosing_deadline' : 'compaction_lease_expired';
+          terminalReason = Number.isFinite(deadlineMs)
+            ? 'compaction_enclosing_deadline'
+            : 'compaction_lease_expired';
           break;
         }
         active.capacityReleaseAcknowledged = null;
@@ -726,7 +877,11 @@ async function runAcceptedMainCompaction(input = {}) {
         slowestCallMs = Math.max(slowestCallMs, slowestCompactionCallMs);
         executionBudget.slowestCallMs = slowestCallMs;
       } catch (error) {
-        observeStageEnd('compaction', callStartedMs, controller.signal.aborted ? 'cancelled' : providerErrorReason(error));
+        observeStageEnd(
+          'compaction',
+          callStartedMs,
+          controller.signal.aborted ? 'cancelled' : providerErrorReason(error),
+        );
         if (controller.signal.aborted) {
           terminalReason =
             controller.signal.reason === 'maintenance_yield'
@@ -768,9 +923,10 @@ async function runAcceptedMainCompaction(input = {}) {
         legacyInputs: claim.legacyInputs,
       });
       if (prepared.ok && claim.outputContract) {
-        const fit = typeof input.inspectCandidateCarrier === 'function'
-          ? await input.inspectCandidateCarrier({ claim, candidate: prepared.candidate })
-          : inspectMainCompactionCarrier(prepared.candidate, claim.outputContract);
+        const fit =
+          typeof input.inspectCandidateCarrier === 'function'
+            ? await input.inspectCandidateCarrier({ claim, candidate: prepared.candidate })
+            : inspectMainCompactionCarrier(prepared.candidate, claim.outputContract);
         if (!fit.ok) prepared = fit;
       }
       if (!prepared.ok) {
@@ -780,12 +936,16 @@ async function runAcceptedMainCompaction(input = {}) {
           semanticAttempts,
           proposal,
         );
-        const proposalSizeRejected = prepared.issue?.constraint === 'max_bytes' &&
+        const proposalSizeRejected =
+          prepared.issue?.constraint === 'max_bytes' &&
           ['', 'summary', '$carrier'].includes(prepared.issue.path);
         // Regenerate size repairs from the complete source and typed feedback. Echoing the
         // oversized unaccepted draft can itself overflow the next request's input budget.
-        correctionReason = { code: 'schema_invalid', issue: prepared.issue,
-          ...(proposalSizeRejected ? {} : { candidate: raw }) };
+        correctionReason = {
+          code: 'schema_invalid',
+          issue: prepared.issue,
+          ...(proposalSizeRejected ? {} : { candidate: raw }),
+        };
         // The source owner proves an actual smaller whole prefix. Do not spend serial size
         // correction calls on this same source when that existing planner can reduce it now.
         if (proposalSizeRejected && claim.canReduceSource === true) {
@@ -803,13 +963,17 @@ async function runAcceptedMainCompaction(input = {}) {
         if (yieldToInteractive()) continue;
         const reviewBudget = await stageBudget('review');
         if (controller.signal.aborted) {
-          terminalReason = controller.signal.reason === 'maintenance_yield'
-            ? 'interactive_priority' : 'compaction_cancelled';
+          terminalReason =
+            controller.signal.reason === 'maintenance_yield'
+              ? 'interactive_priority'
+              : 'compaction_cancelled';
           break;
         }
         const reviewTimeoutMs = reviewBudget.timeoutMs;
         if (!reviewBudget.allowed || reviewTimeoutMs <= 0) {
-          terminalReason = Number.isFinite(deadlineMs) ? 'compaction_enclosing_deadline' : 'compaction_lease_expired';
+          terminalReason = Number.isFinite(deadlineMs)
+            ? 'compaction_enclosing_deadline'
+            : 'compaction_lease_expired';
           break;
         }
         active.capacityReleaseAcknowledged = null;
@@ -836,10 +1000,16 @@ async function runAcceptedMainCompaction(input = {}) {
         slowestCallMs = Math.max(slowestCallMs, slowestReviewCallMs);
         executionBudget.slowestCallMs = slowestCallMs;
       } catch (error) {
-        observeStageEnd('review', reviewStartedMs, controller.signal.aborted ? 'cancelled' : providerErrorReason(error));
+        observeStageEnd(
+          'review',
+          reviewStartedMs,
+          controller.signal.aborted ? 'cancelled' : providerErrorReason(error),
+        );
         terminalReason = `review_${providerErrorReason(error)}`;
-        canReduceRejectedSizeSource = providerErrorStatus(error) === 413 &&
-          claim.canReduceSource === true && !controller.signal.aborted;
+        canReduceRejectedSizeSource =
+          providerErrorStatus(error) === 413 &&
+          claim.canReduceSource === true &&
+          !controller.signal.aborted;
         if (canReduceRejectedSizeSource) terminalReason = 'source_packet_budget';
         if (controller.signal.aborted) {
           terminalReason =
@@ -877,7 +1047,9 @@ async function runAcceptedMainCompaction(input = {}) {
           sourceDigest: claim.sourceDigest,
           candidateDigest: mainCompactionCandidateDigest(parsed),
           approved: true,
-          ...(claim.outputContract ? { outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract) } : {}),
+          ...(claim.outputContract
+            ? { outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract) }
+            : {}),
         },
       });
       if (completed.status === 'compacted') {
@@ -921,21 +1093,39 @@ async function runAcceptedMainCompaction(input = {}) {
         reason: finalReason,
       });
     }
-    const canContinueRepair = terminalReason === 'compaction_enclosing_deadline' &&
-      active.capacityReleaseAcknowledged === true && !controller.signal.aborted &&
-      semanticAttempts > 0 && semanticAttempts < MAX_ATTEMPTS &&
+    const canContinueRepair =
+      terminalReason === 'compaction_enclosing_deadline' &&
+      active.capacityReleaseAcknowledged === true &&
+      !controller.signal.aborted &&
+      semanticAttempts > 0 &&
+      semanticAttempts < MAX_ATTEMPTS &&
       correctionReason?.code === 'semantic_fidelity';
     const rejected = await rejectCompaction({
       ...input,
       leaseId: claim.leaseId,
       reason: finalReason,
-      sourceDigest: claim.sourceDigest, contractKey, semanticAttempts, transportRetries,
+      sourceDigest: claim.sourceDigest,
+      contractKey,
+      semanticAttempts,
+      transportRetries,
       capacityReleaseAcknowledged: active.capacityReleaseAcknowledged === true,
-      ...(canContinueRepair ? { pendingCompactionRepair: {
-        version: 1, sourceDigest: claim.sourceDigest, contractKey,
-        semanticAttempts, transportRetries, correction: { ...correctionReason,
-          candidate: JSON.stringify(parseSemanticCompactionOutput(correctionReason.candidate)) },
-      } } : {}),
+      ...(canContinueRepair
+        ? {
+            pendingCompactionRepair: {
+              version: 1,
+              sourceDigest: claim.sourceDigest,
+              contractKey,
+              semanticAttempts,
+              transportRetries,
+              correction: {
+                ...correctionReason,
+                candidate: JSON.stringify(
+                  parseSemanticCompactionOutput(correctionReason.candidate),
+                ),
+              },
+            },
+          }
+        : {}),
     });
     return {
       status: 'degraded',
@@ -943,11 +1133,16 @@ async function runAcceptedMainCompaction(input = {}) {
       ...(canContinueRepair && rejected?.repairPending === true ? { repairPending: true } : {}),
       ...(transportRetries ? { transportRetries } : {}),
       ...(nextSourceTargetBytes ? { nextSourceTargetBytes } : {}),
-      ...(canReduceRejectedSizeSource && nextSourceTargetBytes > 0 &&
-        nextSourceTargetBytes < claim.sourceBytes ? {
-          canReduceSource: true, sourceDigest: claim.sourceDigest,
-          sourceBytes: claim.sourceBytes, domainEpochKey: claim.domainEpochKey,
-        } : {}),
+      ...(canReduceRejectedSizeSource &&
+      nextSourceTargetBytes > 0 &&
+      nextSourceTargetBytes < claim.sourceBytes
+        ? {
+            canReduceSource: true,
+            sourceDigest: claim.sourceDigest,
+            sourceBytes: claim.sourceBytes,
+            domainEpochKey: claim.domainEpochKey,
+          }
+        : {}),
       reason: finalReason,
     };
   } finally {
@@ -967,19 +1162,31 @@ async function runAcceptedMainCompaction(input = {}) {
 /** Thin service binding for the shared typed admission recovery owner. */
 function loadAcceptedMainContextForAdmission(input = {}) {
   const pinned = input.req?._viventiumAcceptedMainCarrierContextV1;
-  let usePinned = !input.loadContext && pinned &&
-    ['ownerId', 'agentId', 'stableAuthoritySha256'].every(key => pinned.identity[key] === input[key]);
-  return recoverMainContinuityCarrierForAdmission({ request: input.req,
+  let usePinned =
+    !input.loadContext &&
+    pinned &&
+    ['ownerId', 'agentId', 'stableAuthoritySha256'].every(
+      (key) => pinned.identity[key] === input[key],
+    );
+  return recoverMainContinuityCarrierForAdmission({
+    request: input.req,
     identityKey: `${input.agentId}:${input.stableAuthoritySha256}`,
     load: () => {
       if (usePinned) {
         usePinned = false;
-        return Promise.resolve(renderAcceptedMainContextForCarrier(pinned.context, input.outputCarrier));
+        return Promise.resolve(
+          renderAcceptedMainContextForCarrier(pinned.context, input.outputCarrier),
+        );
       }
       return (input.loadContext || loadAcceptedMainContext)(input);
     },
-    ensure: () => (input.ensureCompaction || ensureAcceptedMainCompaction)({ ...input,
-      trigger: 'context_carrier', foreground: true, reallocateOutputCarrier: true }),
+    ensure: () =>
+      (input.ensureCompaction || ensureAcceptedMainCompaction)({
+        ...input,
+        trigger: 'context_carrier',
+        foreground: true,
+        reallocateOutputCarrier: true,
+      }),
   });
 }
 

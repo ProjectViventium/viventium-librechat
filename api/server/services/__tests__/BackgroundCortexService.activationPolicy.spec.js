@@ -88,101 +88,246 @@ const exactOutboxReceipt = (batch) => ({
 });
 
 describe('BackgroundCortexService activation policy helpers', () => {
-  test.each([['internal', true], ['deliver', false]])(
-    'admitted native deadline extends only the private structured actor: %s', async (policy, extended) => {
-      jest.useFakeTimers(); jest.setSystemTime(1000);
-      let ready; const started = new Promise(resolve => { ready = resolve; });
+  test.each([
+    ['internal', true],
+    ['deliver', false],
+  ])(
+    'admitted native deadline extends only the private structured actor: %s',
+    async (policy, extended) => {
+      jest.useFakeTimers();
+      jest.setSystemTime(1000);
+      let ready;
+      const started = new Promise((resolve) => {
+        ready = resolve;
+      });
       let runSignal;
       const onNativeAdmission = jest.fn(() => true);
-      const agent = { id: 'synthetic-private-deadline', provider: 'openai', model: 'synthetic-model',
-        tools: [], instructions: '', model_parameters: { model: 'synthetic-model' } };
-      const req = { user: { id: 'owner-synthetic' }, body: {}, config: { endpoints: { agents: {
-        allowedProviders: ['openai'], providerCapabilities: { openai: {
-          workspace_binding: true, conversation_session: true } },
-      } } } };
+      const agent = {
+        id: 'synthetic-private-deadline',
+        provider: 'openai',
+        model: 'synthetic-model',
+        tools: [],
+        instructions: '',
+        model_parameters: { model: 'synthetic-model' },
+      };
+      const req = {
+        user: { id: 'owner-synthetic' },
+        body: {},
+        config: {
+          endpoints: {
+            agents: {
+              allowedProviders: ['openai'],
+              providerCapabilities: {
+                openai: {
+                  workspace_binding: true,
+                  conversation_session: true,
+                },
+              },
+            },
+          },
+        },
+      };
       try {
-        const result = executeCortexOnce({ agent, req, messages: [], runId: 'synthetic-deadline-run',
-          contextMode: 'minimal', mainContextBinding: 'isolated', completedResultPolicy: policy,
-          insightMode: 'structured', nativeTools: false, executionTimeoutMs: 240000, onNativeAdmission,
-        }, {
-          initializeAgentFn: jest.fn(async () => ({ ...agent, model_parameters: {
-            model: agent.model, configuration: { fetch: jest.fn(async () => new Response('', { headers: {
-              'X-GlassHive-Request-Id': 'native-private-request',
-              'X-GlassHive-Response-Deadline-At': new Date(661000).toISOString(),
-            } })) } } })),
-          prepareCapabilityFn: jest.fn(async () => undefined),
-          createRunFn: jest.fn(async ({ agents, signal }) => ({ processStream: async () => {
-            runSignal = signal;
-            await agents[0].model_parameters.configuration.fetch('https://native.invalid/v1/chat/completions');
-            ready();
-            await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
-            return [{ type: 'text', text: '{}' }];
-          } })),
-        });
-        await Promise.race([started, result.then(() => { throw new Error('Cortex ended before native admission'); })]);
+        const result = executeCortexOnce(
+          {
+            agent,
+            req,
+            messages: [],
+            runId: 'synthetic-deadline-run',
+            contextMode: 'minimal',
+            mainContextBinding: 'isolated',
+            completedResultPolicy: policy,
+            insightMode: 'structured',
+            nativeTools: false,
+            executionTimeoutMs: 240000,
+            onNativeAdmission,
+          },
+          {
+            initializeAgentFn: jest.fn(async () => ({
+              ...agent,
+              model_parameters: {
+                model: agent.model,
+                configuration: {
+                  fetch: jest.fn(
+                    async () =>
+                      new Response('', {
+                        headers: {
+                          'X-GlassHive-Request-Id': 'native-private-request',
+                          'X-GlassHive-Response-Deadline-At': new Date(661000).toISOString(),
+                        },
+                      }),
+                  ),
+                },
+              },
+            })),
+            prepareCapabilityFn: jest.fn(async () => undefined),
+            createRunFn: jest.fn(async ({ agents, signal }) => ({
+              processStream: async () => {
+                runSignal = signal;
+                await agents[0].model_parameters.configuration.fetch(
+                  'https://native.invalid/v1/chat/completions',
+                );
+                ready();
+                await new Promise((resolve) =>
+                  signal.addEventListener('abort', resolve, { once: true }),
+                );
+                return [{ type: 'text', text: '{}' }];
+              },
+            })),
+          },
+        );
+        await Promise.race([
+          started,
+          result.then(() => {
+            throw new Error('Cortex ended before native admission');
+          }),
+        ]);
         await jest.advanceTimersByTimeAsync(240000);
         expect(runSignal.aborted).toBe(!extended);
         if (extended) {
           expect(onNativeAdmission).toHaveBeenCalledTimes(1);
-          const log = logger.info.mock.calls.map(([line]) => String(line)).find(line =>
-            line.includes('Native deadline admission') && line.includes('\"accepted\":true'));
-          expect(log).toBeDefined(); expect(log).not.toContain('native-private-request');
+          const log = logger.info.mock.calls
+            .map(([line]) => String(line))
+            .find(
+              (line) =>
+                line.includes('Native deadline admission') && line.includes('"accepted":true'),
+            );
+          expect(log).toBeDefined();
+          expect(log).not.toContain('native-private-request');
           await jest.advanceTimersByTimeAsync(435000);
           expect(runSignal.aborted).toBe(true);
         } else expect(onNativeAdmission).not.toHaveBeenCalled();
-        const outcome = await result; expect(outcome.errorClass).toBe('timeout');
-      } finally { jest.useRealTimers(); }
+        const outcome = await result;
+        expect(outcome.errorClass).toBe('timeout');
+      } finally {
+        jest.useRealTimers();
+      }
     },
   );
 
   test('read-only text compactor preserves zero-tool option through the real cortex attempt', async () => {
     const prepareCapabilityFn = jest.fn(async () => undefined);
-    const agent = { id: 'synthetic-compactor', provider: 'openai', model: 'test-model',
-      tools: [], instructions: '', model_parameters: { model: 'test-model' } };
-    const result = await executeCortexOnce({ agent, messages: [], runId: 'synthetic-compact-run',
-      conversationId: 'synthetic-compaction', contextMode: 'minimal',
-      mainContextBinding: 'isolated', completedResultPolicy: 'internal', nativeTools: false,
-      req: { user: { id: 'owner-synthetic' }, body: {}, config: { endpoints: { agents: {
-        allowedProviders: ['openai'], providerCapabilities: {},
-      } } } } }, {
-      initializeAgentFn: jest.fn(async () => ({ ...agent,
-        model_parameters: { model: 'test-model', configuration: { defaultHeaders: {} } } })),
-      createRunFn: jest.fn(async () => ({ processStream: jest.fn(async () => [{ type: 'text', text: 'done' }]) })),
-      prepareCapabilityFn,
-    });
+    const agent = {
+      id: 'synthetic-compactor',
+      provider: 'openai',
+      model: 'test-model',
+      tools: [],
+      instructions: '',
+      model_parameters: { model: 'test-model' },
+    };
+    const result = await executeCortexOnce(
+      {
+        agent,
+        messages: [],
+        runId: 'synthetic-compact-run',
+        conversationId: 'synthetic-compaction',
+        contextMode: 'minimal',
+        mainContextBinding: 'isolated',
+        completedResultPolicy: 'internal',
+        nativeTools: false,
+        req: {
+          user: { id: 'owner-synthetic' },
+          body: {},
+          config: {
+            endpoints: {
+              agents: {
+                allowedProviders: ['openai'],
+                providerCapabilities: {},
+              },
+            },
+          },
+        },
+      },
+      {
+        initializeAgentFn: jest.fn(async () => ({
+          ...agent,
+          model_parameters: { model: 'test-model', configuration: { defaultHeaders: {} } },
+        })),
+        createRunFn: jest.fn(async () => ({
+          processStream: jest.fn(async () => [{ type: 'text', text: 'done' }]),
+        })),
+        prepareCapabilityFn,
+      },
+    );
     expect(result.error).toBeUndefined();
     expect(result.nativeOwnership).toBe('none');
-    expect(prepareCapabilityFn).toHaveBeenCalledWith(expect.objectContaining({ nativeTools: false }));
+    expect(prepareCapabilityFn).toHaveBeenCalledWith(
+      expect.objectContaining({ nativeTools: false }),
+    );
   });
   test.each([
-    ['internal', 'structured', true, false], ['internal', 'user_facing', false, false],
-    ['deliver', 'structured', false, false], ['owner_batch', 'structured', false, false],
+    ['internal', 'structured', true, false],
+    ['internal', 'user_facing', false, false],
+    ['deliver', 'structured', false, false],
+    ['owner_batch', 'structured', false, false],
     ['internal', 'structured', false, undefined],
-  ])('private state capability follows actual result owner %s/%s', async (completedResultPolicy, insightMode, expected, nativeTools) => {
-    const prepareCapabilityFn = jest.fn(async () => undefined);
-    const agent = { id: 'synthetic-structured-actor', provider: 'openai', tools: [], instructions: '',
-      model_parameters: { model: 'test-model' } };
-    await executeCortexOnce({ agent, messages: [], runId: 'synthetic-structured-run', contextMode: 'minimal',
-      mainContextBinding: 'isolated', completedResultPolicy, insightMode, nativeTools,
-      req: { user: { id: 'owner-synthetic' }, body: {}, config: { endpoints: { agents: {
-        allowedProviders: ['openai'], providerCapabilities: {},
-      } } } } }, {
-      initializeAgentFn: jest.fn(async () => ({ ...agent })),
-      createRunFn: jest.fn(async () => ({ processStream: jest.fn(async () => [{ type: 'text', text: '{"approved":true}' }]) })),
-      prepareCapabilityFn,
-    });
-    expect(prepareCapabilityFn).toHaveBeenCalledWith(expect.objectContaining({ privateStructuredResponse: expected }));
-  });
+  ])(
+    'private state capability follows actual result owner %s/%s',
+    async (completedResultPolicy, insightMode, expected, nativeTools) => {
+      const prepareCapabilityFn = jest.fn(async () => undefined);
+      const agent = {
+        id: 'synthetic-structured-actor',
+        provider: 'openai',
+        tools: [],
+        instructions: '',
+        model_parameters: { model: 'test-model' },
+      };
+      await executeCortexOnce(
+        {
+          agent,
+          messages: [],
+          runId: 'synthetic-structured-run',
+          contextMode: 'minimal',
+          mainContextBinding: 'isolated',
+          completedResultPolicy,
+          insightMode,
+          nativeTools,
+          req: {
+            user: { id: 'owner-synthetic' },
+            body: {},
+            config: {
+              endpoints: {
+                agents: {
+                  allowedProviders: ['openai'],
+                  providerCapabilities: {},
+                },
+              },
+            },
+          },
+        },
+        {
+          initializeAgentFn: jest.fn(async () => ({ ...agent })),
+          createRunFn: jest.fn(async () => ({
+            processStream: jest.fn(async () => [{ type: 'text', text: '{"approved":true}' }]),
+          })),
+          prepareCapabilityFn,
+        },
+      );
+      expect(prepareCapabilityFn).toHaveBeenCalledWith(
+        expect.objectContaining({ privateStructuredResponse: expected }),
+      );
+    },
+  );
   test('read-only text compactor carries explicit zero-tool option to attach and refresh', async () => {
-    const attachBundle = jest.fn(async () => true), installRefresher = jest.fn();
-    const targetAgent = { tools: [] }, declaredAgent = { tools: [], viventiumProviderSessionMode: 'stateless' };
-    await prepareCortexConversationProviderCapability({ targetAgent, declaredAgent, req: {},
-      capability: { workspace_binding: true }, requestBody: {}, nativeTools: false,
-      attachBundle, installRefresher });
+    const attachBundle = jest.fn(async () => true),
+      installRefresher = jest.fn();
+    const targetAgent = { tools: [] },
+      declaredAgent = { tools: [], viventiumProviderSessionMode: 'stateless' };
+    await prepareCortexConversationProviderCapability({
+      targetAgent,
+      declaredAgent,
+      req: {},
+      capability: { workspace_binding: true },
+      requestBody: {},
+      nativeTools: false,
+      attachBundle,
+      installRefresher,
+    });
     expect(attachBundle).toHaveBeenCalledWith(expect.objectContaining({ nativeTools: false }));
     expect(installRefresher).toHaveBeenCalledWith(expect.objectContaining({ nativeTools: false }));
     expect(targetAgent.model_parameters.configuration.defaultHeaders).toMatchObject({
-      'X-GlassHive-Access': 'read_only', 'X-GlassHive-Provider-Session-Mode': 'stateless',
+      'X-GlassHive-Access': 'read_only',
+      'X-GlassHive-Provider-Session-Mode': 'stateless',
     });
   });
 
@@ -400,7 +545,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
     const debugSpy = jest.spyOn(logger, 'debug').mockImplementation(() => undefined);
     const req = requestWithMainSnapshot();
     req.config = {
-      endpoints: { agents: { providerCapabilities: { 'native-test': { workspace_binding: true } } } },
+      endpoints: {
+        agents: { providerCapabilities: { 'native-test': { workspace_binding: true } } },
+      },
     };
     try {
       await executeCortexOnce(
@@ -429,7 +576,9 @@ describe('BackgroundCortexService activation policy helpers', () => {
           createRunFn: jest.fn(async () => ({ processStream: jest.fn(async () => '{NTA}') })),
         },
       );
-      const trace = debugSpy.mock.calls.find(([message]) => message === '[PromptFrameTraceTelemetry]');
+      const trace = debugSpy.mock.calls.find(
+        ([message]) => message === '[PromptFrameTraceTelemetry]',
+      );
       expect(trace).toBeDefined();
       const frame = JSON.parse(trace[1]);
       const { buildPromptFrameRequestIdentityHash } = require('../viventium/promptFrameTelemetry');
@@ -1846,21 +1995,41 @@ describe('BackgroundCortexService activation policy helpers', () => {
     expect(installRefresher).toHaveBeenCalledWith(args);
   });
 
-  test.each([true, false])('defers cortex mint only after its graph refresher installs: %s', async (installed) => {
-    const attachBundle = jest.fn(async () => false);
-    const installRefresher = jest.fn(() => installed);
-    const args = { targetAgent: { id: 'cortex' }, declaredAgent: { id: 'declared' },
-      req: { user: { id: 'owner' } }, capability: { workspace_binding: true },
-      requestBody: { conversationId: 'conversation', messageId: 'message' } };
-    await expect(prepareCortexConversationProviderCapability({ ...args, deferUntilInvocation: true,
-      attachBundle, installRefresher })).resolves.toBe(false);
-    expect(installRefresher).toHaveBeenCalledTimes(1);
-    expect(attachBundle).toHaveBeenCalledWith({ ...args, ...(installed ? { deferUntilInvocation: true } : {}) });
-    expect(installRefresher.mock.invocationCallOrder[0]).toBeLessThan(attachBundle.mock.invocationCallOrder[0]);
-  });
+  test.each([true, false])(
+    'defers cortex mint only after its graph refresher installs: %s',
+    async (installed) => {
+      const attachBundle = jest.fn(async () => false);
+      const installRefresher = jest.fn(() => installed);
+      const args = {
+        targetAgent: { id: 'cortex' },
+        declaredAgent: { id: 'declared' },
+        req: { user: { id: 'owner' } },
+        capability: { workspace_binding: true },
+        requestBody: { conversationId: 'conversation', messageId: 'message' },
+      };
+      await expect(
+        prepareCortexConversationProviderCapability({
+          ...args,
+          deferUntilInvocation: true,
+          attachBundle,
+          installRefresher,
+        }),
+      ).resolves.toBe(false);
+      expect(installRefresher).toHaveBeenCalledTimes(1);
+      expect(attachBundle).toHaveBeenCalledWith({
+        ...args,
+        ...(installed ? { deferUntilInvocation: true } : {}),
+      });
+      expect(installRefresher.mock.invocationCallOrder[0]).toBeLessThan(
+        attachBundle.mock.invocationCallOrder[0],
+      );
+    },
+  );
 
   test('binds exact native release using the initialized attempt configuration split', async () => {
-    const { bindHarnessCancellation } = require('../viventium/GlassHiveConversationProviderService');
+    const {
+      bindHarnessCancellation,
+    } = require('../viventium/GlassHiveConversationProviderService');
     const fetchImpl = jest.fn().mockResolvedValue({
       ok: true,
       json: jest.fn().mockResolvedValue({ capacityReleased: true }),
@@ -1910,12 +2079,16 @@ describe('BackgroundCortexService activation policy helpers', () => {
   });
 
   test('reports a missing native release binding without exporting the initialized config', async () => {
-    const { bindHarnessCancellation } = require('../viventium/GlassHiveConversationProviderService');
+    const {
+      bindHarnessCancellation,
+    } = require('../viventium/GlassHiveConversationProviderService');
     const warn = jest.spyOn(logger, 'warn');
     try {
       const req = { user: { id: 'owner-synthetic' }, body: {} };
       await prepareCortexConversationProviderCapability({
-        targetAgent: { model_parameters: { configuration: { baseURL: 'http://native.example/v1' } } },
+        targetAgent: {
+          model_parameters: { configuration: { baseURL: 'http://native.example/v1' } },
+        },
         req,
         capability: { workspace_binding: true },
         requestBody: { viventiumGlassHiveIdempotencyKey: 'cortex:unbound:attempt-1' },

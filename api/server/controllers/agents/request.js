@@ -66,10 +66,15 @@ const { attachVoiceMessageMetadata } = require('~/server/services/viventium/voic
 function isReleasedNativeRefusal(req, streamId, jobCreatedAt, userId, responseMessageId) {
   const refused = req._viventiumNativeResponseUnaccepted;
   const current = req._viventiumNativeResponseIdentity;
-  return refused?.terminalErrorConfirmed === true &&
-    refused.streamId === streamId && refused.jobCreatedAt === jobCreatedAt &&
-    refused.userId === userId && refused.responseMessageId === responseMessageId &&
-    current?.invocationId === refused.invocationId && current?.bodySha256 === refused.bodySha256;
+  return (
+    refused?.terminalErrorConfirmed === true &&
+    refused.streamId === streamId &&
+    refused.jobCreatedAt === jobCreatedAt &&
+    refused.userId === userId &&
+    refused.responseMessageId === responseMessageId &&
+    current?.invocationId === refused.invocationId &&
+    current?.bodySha256 === refused.bodySha256
+  );
 }
 /* === VIVENTIUM END === */
 
@@ -185,12 +190,15 @@ function scheduleAcceptedMainCompaction(req, client, commitResult) {
  */
 function retainAcceptedMainFollowUps(req, client, userId, responseMessageId) {
   const compactionClient = { options: { agent: client?.options?.agent } };
-  const admitMemory = req._viventiumMemoryWriterAwaitingAcceptance === true
-    ? client.admitMemoryWriter?.bind(client) : null;
+  const admitMemory =
+    req._viventiumMemoryWriterAwaitingAcceptance === true
+      ? client.admitMemoryWriter?.bind(client)
+      : null;
   return retainExternalAcceptanceFollowUps({
     userId,
     responseMessageId,
-    scheduleCompaction: (commitResult) => scheduleAcceptedMainCompaction(req, compactionClient, commitResult),
+    scheduleCompaction: (commitResult) =>
+      scheduleAcceptedMainCompaction(req, compactionClient, commitResult),
     admitMemory,
     onMemoryError: (error) => {
       logger.warn('[VIVENTIUM][memory] Accepted turn writer could not start', {
@@ -205,7 +213,9 @@ async function startPersistedMainMemory(req, client, awaitExternalAcceptance) {
     awaitExternalAcceptance,
     prepare: client.prepareDeferredMemoryWriter?.bind(client),
     start: client.startDeferredMemoryWriter?.bind(client),
-    onPrepared: () => { req._viventiumMemoryWriterAwaitingAcceptance = true; },
+    onPrepared: () => {
+      req._viventiumMemoryWriterAwaitingAcceptance = true;
+    },
   });
 }
 /* === VIVENTIUM END === */
@@ -284,9 +294,8 @@ function attachQaRunReceipt(req, message) {
 const acceptedInteractionInputs = new WeakMap();
 const originalInputReceipts = new WeakMap();
 function stampOriginalInputReceipt(req) {
-  if (req?.user?.id && !originalInputReceipts.has(req)) originalInputReceipts.set(req,Date.now());
+  if (req?.user?.id && !originalInputReceipts.has(req)) originalInputReceipts.set(req, Date.now());
 }
-
 
 function acceptedInteractionSourceId(req) {
   const context = getTrustedInteractionContext(req);
@@ -351,8 +360,14 @@ async function captureAcceptedInteractionInput(
   accepted.source.parentMessageId = parentMessageId || Constants.NO_PARENT;
   context = bindInteractionSourceSegments(req, accepted.originalText, [], accepted.source);
   await GenerationJobManager.retainLogicalTurnInput(req.user.id, context);
-  const originalMessage = await Message.findOne({user:req.user.id,conversationId,
-    messageId:accepted.source.messageId,isCreatedByUser:true}).select('metadata.viventium.originalInputReceipt').lean();
+  const originalMessage = await Message.findOne({
+    user: req.user.id,
+    conversationId,
+    messageId: accepted.source.messageId,
+    isCreatedByUser: true,
+  })
+    .select('metadata.viventium.originalInputReceipt')
+    .lean();
   if (!originalMessage) {
     await timedSaveMessage(
       req,
@@ -363,8 +378,18 @@ async function captureAcceptedInteractionInput(
         text: accepted.originalText,
         sender: 'User',
         isCreatedByUser: true,
-        ...(context.source_received_at ? {metadata:{viventium:{originalInputReceipt:{
-          sourceEventId:context.source_event_id, receivedAt:context.source_received_at}}}} : {}),
+        ...(context.source_received_at
+          ? {
+              metadata: {
+                viventium: {
+                  originalInputReceipt: {
+                    sourceEventId: context.source_event_id,
+                    receivedAt: context.source_received_at,
+                  },
+                },
+              },
+            }
+          : {}),
       },
       { context: 'accepted user source before initialization' },
       'db_save_user',
@@ -372,9 +397,14 @@ async function captureAcceptedInteractionInput(
   }
   if (originalMessage) {
     const receipt = originalMessage.metadata?.viventium?.originalInputReceipt;
-    context = bindOriginalInteractionInputReceipt(req,
-      receipt?.sourceEventId === context.source_event_id && Number.isSafeInteger(receipt.receivedAt) && receipt.receivedAt > 0
-        ? receipt.receivedAt : undefined);
+    context = bindOriginalInteractionInputReceipt(
+      req,
+      receipt?.sourceEventId === context.source_event_id &&
+        Number.isSafeInteger(receipt.receivedAt) &&
+        receipt.receivedAt > 0
+        ? receipt.receivedAt
+        : undefined,
+    );
   }
   accepted.context = context;
   accepted.persisted = true;
@@ -1392,14 +1422,20 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
    * Added: 2026-01-31
    */
   const { streamId, requested: reqStreamId } = await observeVoiceLatencyOperation(
-    logger, req, 'request', 'request_stream_identity',
+    logger,
+    req,
+    'request',
+    'request_stream_identity',
     () => resolveRequestStreamId(req, userId, conversationId),
   );
   req._resumableStreamId = streamId;
   let interactionContext;
   try {
     interactionContext = await observeVoiceLatencyOperation(
-      logger, req, 'request', 'request_interaction_capture',
+      logger,
+      req,
+      'request',
+      'request_interaction_capture',
       () => captureRequestInteractionContext(req, { conversationId, streamId }),
     );
   } catch (error) {
@@ -1425,7 +1461,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     try {
       // Request abort now; overlap cancellation cleanup with job/client preparation.
       interactiveCompactionYield = observeVoiceLatencyOperation(
-        logger, req, 'request', 'request_compaction_yield',
+        logger,
+        req,
+        'request',
+        'request_compaction_yield',
         () => yieldAcceptedMainCompaction(userId),
       );
       // The same Promise is joined before generation; handle an early rejection meanwhile.
@@ -1442,7 +1481,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
   try {
     req._viventiumDeliveryDispositionRequired = await observeVoiceLatencyOperation(
-      logger, req, 'request', 'request_delivery_policy',
+      logger,
+      req,
+      'request',
+      'request_delivery_policy',
       () => resolveDeliveryDispositionRequirement(req, endpointOption),
     );
 
@@ -1898,7 +1940,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   preparationStartedAt,
                   'status=completed',
                 );
-              } catch {}
+              } catch {
+                // Optional timing must not change the persistence result.
+              }
               return value;
             },
             (error) => {
@@ -1909,7 +1953,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   preparationStartedAt,
                   'status=failed',
                 );
-              } catch {}
+              } catch {
+                // Optional timing must not change the persistence result.
+              }
               throw error;
             },
           );
@@ -2143,7 +2189,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           ) {
             /* === VIVENTIUM END === */
             const memoryWriterAdmission = await startPersistedMainMemory(
-              req, client, requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
+              req,
+              client,
+              requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
             );
             if (memoryWriterAdmission) {
               responseForCommit.memoryWriteStatus = 'pending';
@@ -2192,7 +2240,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
              * Capture the completed native answer now; admit its existing detached writer only
              * after presentation acceptance. Graph evidence retrieval must not delay FINAL.
              */
-            if (assistantPersistenceAdmissible && (await startPersistedMainMemory(req, client, true))) {
+            if (
+              assistantPersistenceAdmissible &&
+              (await startPersistedMainMemory(req, client, true))
+            ) {
               responseForCommit.memoryWriteStatus = 'pending';
             }
             /* === VIVENTIUM END === */
@@ -2259,7 +2310,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               !unsupportedPersistence.suppressed &&
               !wasAbortedBeforeComplete &&
               (await startPersistedMainMemory(
-                req, client, requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
+                req,
+                client,
+                requiresExternalDeliveryAcknowledgement && !deliveryWasCommittedBeforePersistence,
               ))
             ) {
               responseForCommit.memoryWriteStatus = 'pending';
@@ -2387,7 +2440,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             title: conversation.title,
             requestMessage: sanitizeMessageForTransmit(userMessage),
             responseMessage: responseMessageForTransmit,
-            memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true ||
+            memoryWriterScheduled:
+              req._viventiumMemoryWriterScheduled === true ||
               req._viventiumMemoryWriterAwaitingAcceptance === true,
             ...(admissionReceipt
               ? { memoryReceipt: memoryReceiptFromAttachments([admissionReceipt]) }
@@ -2413,8 +2467,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
            * Fix: an external adapter accepts this turn later, through its authenticated delivery
            * acknowledgement. Register this turn's compaction schedule before FINAL reaches it.
            * === VIVENTIUM END === */
-          if (getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter' ||
-              req._viventiumMemoryWriterAwaitingAcceptance === true) {
+          if (
+            getTrustedDeliveryPolicy(req)?.commit_authority === 'external_adapter' ||
+            req._viventiumMemoryWriterAwaitingAcceptance === true
+          ) {
             retainAcceptedMainFollowUps(req, client, userId, response?.messageId);
           }
           /* Main is complete even while Phase B continues. Mark the job non-active immediately so
@@ -2713,13 +2769,18 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           try {
             const contentParts = Array.isArray(terminalFailureContent)
               ? terminalFailureContent.filter(Boolean)
-              : Array.isArray(client?.contentParts) ? client.contentParts.filter(Boolean) : [];
+              : Array.isArray(client?.contentParts)
+                ? client.contentParts.filter(Boolean)
+                : [];
             const hasMeaningfulContent =
               contentParts.length > 0 || extractTextFromContentParts(contentParts).length > 0;
             /* === VIVENTIUM START === Preserve the returned failure and partial content once. */
-            const snapshotContent = !contentParts.some((part) =>
-              part.type === ContentTypes.ERROR && part.error_class === failure.error_class,
-            ) ? [...contentParts, failure] : contentParts;
+            const snapshotContent = !contentParts.some(
+              (part) =>
+                part.type === ContentTypes.ERROR && part.error_class === failure.error_class,
+            )
+              ? [...contentParts, failure]
+              : contentParts;
             /* === VIVENTIUM END === */
             const snapshot = await persistAssistantSnapshot({
               req,
@@ -2794,16 +2855,24 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       );
       try {
         const current = await GenerationJobManager.getJob(streamId);
-        const cancelled = job.abortController.signal.aborted ||
+        const cancelled =
+          job.abortController.signal.aborted ||
           (current?.status === 'superseded' && current.createdAt === jobCreatedAt);
-        if (cancelled) { await maybeDecrement(); return; }
+        if (cancelled) {
+          await maybeDecrement();
+          return;
+        }
         const failure = require('./client').createCompletionErrorContentPart(err);
         const contentParts = Array.isArray(terminalFailureContent)
           ? terminalFailureContent.filter(Boolean)
-          : Array.isArray(client?.contentParts) ? client.contentParts.filter(Boolean) : [];
-        const snapshotContent = contentParts.some((part) =>
-          part.type === ContentTypes.ERROR && part.error_class === failure.error_class,
-        ) ? contentParts : [...contentParts, failure];
+          : Array.isArray(client?.contentParts)
+            ? client.contentParts.filter(Boolean)
+            : [];
+        const snapshotContent = contentParts.some(
+          (part) => part.type === ContentTypes.ERROR && part.error_class === failure.error_class,
+        )
+          ? contentParts
+          : [...contentParts, failure];
         await persistAssistantSnapshot({
           req,
           streamId,
@@ -3266,7 +3335,9 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
         );
         if (assistantPersistence && !assistantPersistence.suppressed) {
           const memoryWriterAdmission = await startPersistedMainMemory(
-            req, client, requiresExternalDeliveryAcknowledgement,
+            req,
+            client,
+            requiresExternalDeliveryAcknowledgement,
           );
           if (memoryWriterAdmission) {
             finalResponse.memoryWriteStatus = 'pending';
@@ -3284,7 +3355,8 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
         title: conversation.title,
         requestMessage: sanitizeMessageForTransmit(userMessage),
         responseMessage: finalResponse,
-        memoryWriterScheduled: req._viventiumMemoryWriterScheduled === true ||
+        memoryWriterScheduled:
+          req._viventiumMemoryWriterScheduled === true ||
           req._viventiumMemoryWriterAwaitingAcceptance === true,
       });
       res.end();

@@ -37,6 +37,7 @@ let mockRetainAcceptedInteractionInput;
 let mockLastAdapterCapabilities = null;
 let mockLastDeliveryPolicy = null;
 let mockClaimedLogicalTurn = null;
+let mockAfterAdmission;
 let mockUserFindOne;
 let mockUserCountDocuments;
 let mockSubscribe;
@@ -54,6 +55,8 @@ let mockTelegramMappingFindOne;
 let mockTelegramMappingUpdateOne;
 let mockTelegramLinkTokenCreate;
 let mockTelegramIngressCreate;
+let mockTelegramIngressFindOne;
+let mockTelegramIngressExists;
 let mockTelegramIngressUpdateOne;
 let mockTelegramIngressDeleteOne;
 let mockFileAccess;
@@ -156,6 +159,7 @@ jest.mock('~/server/controllers/agents/request', () => {
     lastMissionAttachments = req._viventiumMissionAttachments || null;
     lastBridgeDocumentImageExtraction = req._viventiumBridgeDocumentImageExtraction;
     await req._viventiumBeforeGenerationReceipt?.({ streamId: 'stream_1' });
+    await mockAfterAdmission?.(req, getTrustedInteractionContext(req));
     res.json({
       streamId: 'stream_1',
       conversationId: mockAgentController.__testables.resolveCanonicalConversationId(
@@ -359,6 +363,8 @@ jest.mock('~/db/models', () => ({
     findOneAndUpdate: jest.fn(),
   },
   ViventiumTelegramIngressEvent: {
+    findOne: (...args) => mockTelegramIngressFindOne(...args),
+    exists: (...args) => mockTelegramIngressExists(...args),
     create: (...args) => mockTelegramIngressCreate(...args),
     updateOne: (...args) => mockTelegramIngressUpdateOne(...args),
     deleteOne: (...args) => mockTelegramIngressDeleteOne(...args),
@@ -619,6 +625,7 @@ describe('/api/viventium/telegram', () => {
     mockLastAdapterCapabilities = null;
     mockLastDeliveryPolicy = null;
     mockClaimedLogicalTurn = null;
+    mockAfterAdmission = undefined;
     mockCaptureAcceptedInteractionInput = jest.fn().mockResolvedValue(undefined);
     mockRetainAcceptedInteractionInput = jest.fn().mockResolvedValue(undefined);
     jest.resetModules();
@@ -766,6 +773,8 @@ describe('/api/viventium/telegram', () => {
     });
     mockTelegramMappingUpdateOne = jest.fn().mockResolvedValue({});
     mockTelegramLinkTokenCreate = jest.fn().mockResolvedValue({});
+    mockTelegramIngressFindOne = jest.fn(() => ({ lean: async () => null }));
+    mockTelegramIngressExists = jest.fn().mockResolvedValue(true);
     mockTelegramIngressCreate = jest.fn().mockResolvedValue({ _id: 'ingress_1' });
     mockTelegramIngressUpdateOne = jest.fn().mockResolvedValue({
       acknowledged: true,
@@ -1421,7 +1430,12 @@ describe('/api/viventium/telegram', () => {
    * === VIVENTIUM END === */
   function continueRetainedInput(
     row,
-    { preparation = { message: { date: 1700000000 } }, body = {}, envelope = {} } = {},
+    {
+      preparation = { message: { date: 1700000000 } },
+      body = {},
+      envelope = {},
+      savedFailure = false,
+    } = {},
   ) {
     mockInputService.read.mockResolvedValue(row);
     mockInputService.ready.mockResolvedValue(row);
@@ -1443,6 +1457,7 @@ describe('/api/viventium/telegram', () => {
     });
     mockGetMessages.mockResolvedValue([]);
     mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => null }) }));
+    if (savedFailure) exactSavedFailure(row);
     const res = createMockRes();
     const done = dispatch(
       createTestApp(require('../telegram')),
@@ -1478,6 +1493,113 @@ describe('/api/viventium/telegram', () => {
     expect(mockInputService.bindStream.mock.invocationCallOrder[0]).toBeLessThan(
       mockTelegramIngressUpdateOne.mock.invocationCallOrder[index],
     );
+  });
+
+  test('first prepared input in a new conversation binds its actual onStart author after admission', async () => {
+    const row = {
+      ...inputIdentity(),
+      libreChatUserId: 'user_1',
+      state: 'ready',
+      conversationId: '11111111-1111-5111-8111-111111111111',
+      requestedConversationId: 'new',
+    };
+    const events = [];
+    const stored = { inputState: 'ready', inputClaimToken: row.claimToken };
+    mockClaimedLogicalTurn = { logical_turn_id: 'new-turn', revision: 1 };
+    mockInputService.bindStream.mockImplementation(async (owner, claim, streamId) => {
+      expect(owner).toBe(row.libreChatUserId);
+      expect(claim).toEqual({ sourceEventId: row.sourceEventId, claimToken: row.claimToken });
+      Object.assign(stored, { inputState: 'admitted', streamId });
+      events.push('admitted');
+    });
+    mockTelegramIngressUpdateOne.mockImplementation(async (filter, update) => {
+      if (Array.isArray(update)) {
+        expect(stored.inputState).toBe('admitted');
+        stored.authorityBoundAt = new Date();
+        events.push('authority');
+      } else if (update.$set?.responseBinding) {
+        expect(stored.authorityBoundAt).toBeInstanceOf(Date);
+        expect(filter).toMatchObject({
+          libreChatUserId: row.libreChatUserId,
+          sourceEventId: row.sourceEventId,
+          sourceMessageId: row.sourceMessageId,
+          conversationId: row.conversationId,
+          streamId: stored.streamId,
+          inputState: stored.inputState,
+          inputClaimToken: stored.inputClaimToken,
+        });
+        stored.responseBinding = update.$set.responseBinding;
+        events.push('author');
+      }
+      return { acknowledged: true, matchedCount: 1 };
+    });
+    mockAfterAdmission = async (req, context) => {
+      const vm = require('vm');
+      const { Constants } = require('librechat-data-provider');
+      const base = fs.readFileSync(require.resolve('~/app/clients/BaseClient'), 'utf8');
+      const normalizeStart = base.indexOf('  processOverideIds() {');
+      const normalizeEnd = base.indexOf('  async setMessageOptions(', normalizeStart);
+      const normalizer = vm.runInNewContext(`({${base.slice(normalizeStart, normalizeEnd)}})`, {
+        Constants,
+      });
+      normalizer.options = { req };
+      const [, sourceMessageId] = normalizer.processOverideIds();
+      const conversationId = req.body.conversationId;
+      expect(conversationId).toBe(row.conversationId);
+      expect(sourceMessageId).toBe(row.sourceMessageId);
+      expect(req.body.overrideUserMessageId).toBe(
+        `${row.sourceMessageId}${Constants.COMMON_DIVIDER}1`,
+      );
+      const controller = fs.readFileSync(
+        require.resolve('~/server/controllers/agents/request'),
+        'utf8',
+      );
+      const start = controller.indexOf(
+        '        const onStart = (userMsg, respMsgId, _isNewConvo) => {',
+      );
+      const end = controller.indexOf('        const startPartialCheckpointing = () => {', start);
+      const sandbox = {
+        req,
+        Date,
+        streamId: 'stream_1',
+        conversationId,
+        userId: row.libreChatUserId,
+        claimedInteractionContext: context,
+        sender: 'AI',
+        voiceLatencyEnabled: false,
+        assistantTerminalPersistenceStarted: false,
+        client: { options: { agent: {} } },
+        logger: { warn: jest.fn() },
+        trackAssistantSnapshot: (work) => work(),
+        ensureUserSourceSegmentPersisted: async () => {
+          events.push('source');
+        },
+        persistAssistantSnapshot: async () => {
+          events.push('placeholder');
+          return { persisted: true };
+        },
+        GenerationJobManager: { updateMetadata: async () => {}, emitChunk: async () => {} },
+      };
+      vm.runInNewContext(
+        `let userMessage,responseMessageId,generationStartedAt,placeholderSnapshotSaved,lastAssistantSnapshotFingerprint;${controller.slice(start, end)};globalThis.start=onStart;`,
+        sandbox,
+      );
+      await sandbox.start(
+        { messageId: sourceMessageId, conversationId, text: 'First input' },
+        'new-assistant',
+        true,
+      );
+    };
+    const { res, done } = continueRetainedInput(row);
+    await done;
+    expect(res.statusCode).toBe(200);
+    expect(stored.responseBinding).toEqual({
+      streamId: 'stream_1',
+      responseMessageId: 'new-assistant',
+      logicalTurnId: 'new-turn',
+      revision: 1,
+    });
+    expect(events).toEqual(['admitted', 'authority', 'source', 'author', 'placeholder']);
   });
 
   test('a retained input whose ingress row is not its source on that stream fails closed', async () => {
@@ -4177,6 +4299,76 @@ describe('/api/viventium/telegram', () => {
     expect(res.statusCode).toBe(200);
     expect(elapsedMs).toBeGreaterThanOrEqual(lingerMs);
     expect(mockSubscribe).toHaveBeenCalled();
+  });
+
+  function exactSavedFailure(row) {
+    const responseBinding = {
+      streamId: row.streamId,
+      responseMessageId: 'saved-error',
+      logicalTurnId: 'saved-turn',
+      revision: 2,
+    };
+    mockTelegramIngressFindOne.mockImplementation(() => ({
+      lean: async () => ({ ...row, responseBinding }),
+    }));
+    mockInputMessageRead.mockImplementation(() => ({
+      lean: async () => ({
+        messageId: 'saved-error',
+        content: [
+          {
+            type: 'error',
+            error_class: 'source_context_unavailable',
+            error: 'Context unavailable.',
+          },
+        ],
+        metadata: {
+          viventium: {
+            interactionContext: {
+              source_event_id: row.sourceEventId,
+              logical_turn_id: 'saved-turn',
+              revision: 2,
+            },
+          },
+        },
+      }),
+    }));
+  }
+  test('missing Redis stream replays only the saved typed terminal through normal SSE', async () => {
+    mockGetJob.mockResolvedValue(null);
+    const row = { ...inputIdentity(), streamId: 'expired-stream' };
+    exactSavedFailure(row);
+    const app = createTestApp(require('../telegram'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        method: 'GET',
+        url: '/api/viventium/telegram/stream/expired-stream?resume=true&telegramUserId=tg-1',
+        query: { resume: 'true', telegramUserId: 'tg-1' },
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.write.mock.calls.map(([text]) => text).join('')).toContain(
+      'source_context_unavailable',
+    );
+    expect(res.write.mock.calls.map(([text]) => text).join('')).toContain('saved-error');
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+  test('retained input continuation with expired Redis returns its existing terminal stream without generation', async () => {
+    mockGetJob.mockResolvedValue(null);
+    const row = { ...inputIdentity(), state: 'admitted', streamId: 'expired-stream' };
+    const { res, done } = continueRetainedInput(row, { savedFailure: true });
+    await done;
+    expect(res.body).toMatchObject({
+      status: 'duplicate',
+      streamId: 'expired-stream',
+      logical_turn_id: 'saved-turn',
+      revision: 2,
+    });
+    expect(lastStreamId).toBeNull();
+    expect(mockInputService.bindStream).not.toHaveBeenCalled();
   });
 
   test('GET stream returns 404 when job is missing (resume not possible)', async () => {

@@ -12,6 +12,7 @@ const {
 } = require('./GlassHiveTerminalCallbackTransaction');
 const { mutateNativeResponseSources } = require('./nativeResponseService');
 const { committedDeliveryFilter } = require('./telegramCommittedDelivery');
+const { readRetainedTelegramTerminal } = require('./TelegramIngressAuthorityService');
 
 const fields = {
   state: 'inputState',
@@ -209,9 +210,9 @@ const service = createTelegramInputService({
           })
         ).matchedCount,
       ),
-    due: async (now, limit) =>
-      (
-        await Ingress.find({
+    due: async (now, limit) => {
+      const [regular, terminal] = await Promise.all([
+        Ingress.find({
           inputState: { $in: ['preparing', 'ready', 'admitted', 'failed'] },
           inputLeaseUntil: { $lte: now },
           inputRetryAt: { $lte: now },
@@ -220,8 +221,98 @@ const service = createTelegramInputService({
         })
           .sort({ updatedAt: 1 })
           .limit(limit)
-          .lean()
-      ).map(decode),
+          .lean(),
+        Ingress.aggregate([
+          {
+            $match: {
+              inputState: 'failed',
+              inputRetryAt: 0,
+              inputLeaseUntil: { $lte: now },
+              inputFailureCode: 'accepted_response_unavailable',
+              authorityBoundAt: { $ne: null },
+              'responseBinding.responseMessageId': { $type: 'string' },
+              $expr: {
+                $and: [
+                  { $eq: ['$inputPrimarySourceEventId', '$sourceEventId'] },
+                  { $eq: ['$streamId', '$responseBinding.streamId'] },
+                ],
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: Message.collection.name,
+              let: {
+                owner: '$libreChatUserId',
+                conversation: '$conversationId',
+                parent: '$sourceMessageId',
+                source: '$sourceEventId',
+                binding: '$responseBinding',
+              },
+              pipeline: [
+                {
+                  $match: {
+                    unfinished: false,
+                    error: true,
+                    isCreatedByUser: false,
+                    'metadata.viventium.deliveryAcknowledgement.state': {
+                      $nin: ['committed', 'committed_effect', 'failed'],
+                    },
+                    content: {
+                      $elemMatch: {
+                        type: 'error',
+                        error_class: { $type: 'string', $ne: '' },
+                        error: { $type: 'string', $ne: '' },
+                      },
+                    },
+                    $expr: {
+                      $and: [
+                        { $eq: ['$user', '$$owner'] },
+                        { $eq: ['$conversationId', '$$conversation'] },
+                        { $eq: ['$messageId', '$$binding.responseMessageId'] },
+                        { $eq: ['$parentMessageId', '$$parent'] },
+                        {
+                          $eq: [
+                            '$metadata.viventium.interactionContext.source_event_id',
+                            '$$source',
+                          ],
+                        },
+                        {
+                          $eq: [
+                            '$metadata.viventium.interactionContext.logical_turn_id',
+                            '$$binding.logicalTurnId',
+                          ],
+                        },
+                        {
+                          $eq: [
+                            '$metadata.viventium.interactionContext.revision',
+                            '$$binding.revision',
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                },
+                { $project: { _id: 1 } },
+                { $limit: 1 },
+              ],
+              as: 'retainedTerminal',
+            },
+          },
+          { $match: { 'retainedTerminal.0': { $exists: true } } },
+          { $sort: { updatedAt: 1 } },
+          { $limit: limit },
+          { $project: { retainedTerminal: 0 } },
+        ]),
+      ]);
+      return regular
+        .concat(terminal)
+        .sort(
+          (left, right) => new Date(left.updatedAt).getTime() - new Date(right.updatedAt).getTime(),
+        )
+        .slice(0, limit)
+        .map(decode);
+    },
     group: async (record) =>
       (
         await Ingress.find({
@@ -293,7 +384,9 @@ const service = createTelegramInputService({
   },
   readStream: async (streamId, ownerId) => {
     const job = await GenerationJobManager.getJob(streamId);
-    if (!job || job.metadata?.userId !== ownerId) return 'missing';
+    if (!job)
+      return (await readRetainedTelegramTerminal({ ownerId, streamId })) ? 'terminal' : 'missing';
+    if (job.metadata?.userId !== ownerId) return 'missing';
     const ack = job.metadata?.deliveryAcknowledgement;
     // VIVENTIUM: a committed durable effect also settles its own accepted source.
     // Reopening that terminal stream would resend its persisted memory receipt.

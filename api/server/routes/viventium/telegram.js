@@ -51,6 +51,8 @@ const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
 const {
   bindRetainedTelegramIngressAuthority,
+  bindRetainedTelegramResponse,
+  readRetainedTelegramTerminal,
 } = require('~/server/services/viventium/TelegramIngressAuthorityService');
 const {
   captureAcceptedInteractionInput,
@@ -1348,9 +1350,16 @@ router.post(
       retainedPreparation = envelope?.preparation;
       retainedQuotedAttachmentTexts = envelope?.quotedAttachmentTexts;
       let job = null;
+      let recoveredTerminal = null;
       if (retainedInput.state === 'admitted' || retainedInput.state === 'completed') {
         job = await GenerationJobManager.getJob(retainedInput.streamId);
-        if (!job || job.metadata?.userId !== req.user.id)
+        if (!job)
+          recoveredTerminal = await readRetainedTelegramTerminal({
+            ownerId: req.user.id,
+            streamId: retainedInput.streamId,
+            telegramUserId: extractTelegramIdentity(req).telegramUserId,
+          });
+        if ((!job && !recoveredTerminal) || (job && job.metadata?.userId !== req.user.id))
           return _res
             .status(503)
             .json({ code: 'source_input_response_unavailable', retryable: true });
@@ -1381,10 +1390,13 @@ router.post(
           prepared: await TelegramInput.readPrepared(retainedInput),
           streamId: retainedInput.streamId,
           conversationId: retainedInput.conversationId,
-          ...attachLogicalTurnMetadata({}, job.metadata.interactionContext),
+          ...attachLogicalTurnMetadata(
+            {},
+            job?.metadata?.interactionContext || recoveredTerminal?.interactionContext,
+          ),
           status: 'duplicate',
           duplicate: true,
-          inputPresentation: job.metadata.interactionContext?.ready_input_continuation
+          inputPresentation: job?.metadata?.interactionContext?.ready_input_continuation
             ? {
                 sourceEventId: retainedInput.sourceEventId,
                 sourceMessageId: retainedInput.sourceMessageId,
@@ -2083,6 +2095,13 @@ router.post(
   validateConvoAccess,
   buildEndpointOption,
   async (req, res, next) => {
+    req._viventiumBindResponseIdentity = async (identity) => {
+      if (!req._viventiumTelegramInput) return;
+      return bindRetainedTelegramResponse({
+        record: { ...req._viventiumTelegramInput, streamId: identity.streamId },
+        ...identity,
+      });
+    };
     req._viventiumBeforeGenerationReceipt = async (payload) => {
       if (!req._viventiumTelegramInput) return;
       const claim = {
@@ -2444,6 +2463,30 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
     return;
   }
   if (!job) {
+    const terminal = await readRetainedTelegramTerminal({
+      ownerId: userId,
+      streamId,
+      telegramUserId: extractTelegramIdentity(req).telegramUserId,
+    });
+    if (requestAbort.signal.aborted) return;
+    if (terminal) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.write(
+        `event: error\ndata: ${JSON.stringify(
+          attachLogicalTurnMetadata(
+            {
+              error: terminal.error,
+              error_class: terminal.error_class,
+              responseMessageId: terminal.responseMessageId,
+            },
+            terminal.interactionContext,
+          ),
+        )}\n\n`,
+      );
+      return res.end();
+    }
     return res.status(404).json({
       error: 'Stream not found',
       message: 'The generation job does not exist or has expired.',

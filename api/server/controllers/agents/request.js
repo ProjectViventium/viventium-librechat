@@ -1822,6 +1822,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           const preparationStartedAt = voiceLatencyEnabled ? voiceLatencyNow() : null;
           const preparation = trackAssistantSnapshot(async () => {
             await ensureUserSourceSegmentPersisted();
+            /* VIVENTIUM: retain the exact assistant identity before preparation can fail. */
+            await req._viventiumBindResponseIdentity?.({
+              streamId,
+              conversationId,
+              sourceMessageId: userMsg.messageId,
+              responseMessageId: respMsgId,
+              interactionContext: claimedInteractionContext,
+            });
 
             if (!assistantTerminalPersistenceStarted) {
               try {

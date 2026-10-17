@@ -39,3 +39,20 @@ test('legacy ingress does not acquire prepared-input authority and still require
   expect(document.inputRelatedSourceEventIds).toBeUndefined();
   expect(document.validateSync().errors.expiresAt).toBeDefined();
 });
+
+test('retains the exact assistant binding on the existing ingress without changing legacy rows', () => {
+  const responseBinding = {
+    streamId: 'stream',
+    responseMessageId: 'reply',
+    logicalTurnId: 'turn',
+    revision: 1,
+  };
+  const document = new Ingress({
+    dedupeKey: 'bound',
+    telegramUserId: '123',
+    inputState: 'admitted',
+    responseBinding,
+  });
+  expect(document.validateSync()).toBeUndefined();
+  expect(document.toObject().responseBinding).toEqual(responseBinding);
+});

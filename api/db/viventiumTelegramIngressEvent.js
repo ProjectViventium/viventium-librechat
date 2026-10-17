@@ -33,6 +33,18 @@ module.exports = function createViventiumTelegramIngressEvent(db) {
       sourceOrderScope: { type: String, default: '' },
       sourceEventId: { type: String, default: '', index: true },
       authorityBoundAt: { type: Date, default: null, index: true },
+      responseBinding: {
+        type: new mongoose.Schema(
+          {
+            streamId: { type: String, required: true },
+            responseMessageId: { type: String, required: true },
+            logicalTurnId: { type: String, required: true },
+            revision: { type: Number, min: 1, required: true },
+          },
+          { _id: false },
+        ),
+        default: undefined,
+      },
       requestedConversationId: { type: String },
       conversationGeneration: { type: String },
       sourceMessageId: { type: String },

@@ -8,7 +8,12 @@ const end = controller.indexOf('        const startPartialCheckpointing = () => 
 if (start < 0 || end <= start) throw new Error('Controller start callback unavailable');
 const startCallback = controller.slice(start, end);
 
-function preparation({ enabled = true, rejectSource = false, throwLogger = false } = {}) {
+function preparation({
+  enabled = true,
+  rejectSource = false,
+  throwLogger = false,
+  bindResponse,
+} = {}) {
   const events = [];
   const lines = [];
   let release;
@@ -31,7 +36,11 @@ function preparation({ enabled = true, rejectSource = false, throwLogger = false
       events.push('placeholder');
       return { persisted: true, fingerprint: 'synthetic-fingerprint' };
     },
-    req: { config: { endpoints: { agents: { providerCapabilities: {} } } } },
+    claimedInteractionContext: { source_event_id: 'source', logical_turn_id: 'turn', revision: 1 },
+    req: {
+      _viventiumBindResponseIdentity: bindResponse,
+      config: { endpoints: { agents: { providerCapabilities: {} } } },
+    },
     streamId: 'synthetic-stream',
     userId: 'synthetic-owner',
     client: { options: { agent: { endpoint: 'synthetic' } } },
@@ -348,3 +357,25 @@ describe('pre-job owner operation spans', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+test('actual onStart awaits exact assistant binding before placeholder or preparation completion', async () => {
+  let release;
+  const bound = new Promise((resolve) => {
+    release = resolve;
+  });
+  const bindResponse = jest.fn(() => bound);
+  const control = preparation({ bindResponse });
+  control.release();
+  await new Promise(setImmediate);
+  expect(bindResponse).toHaveBeenCalledWith({
+    streamId: 'synthetic-stream',
+    conversationId: 'synthetic-conversation',
+    sourceMessageId: 'synthetic-user',
+    responseMessageId: 'synthetic-response',
+    interactionContext: { source_event_id: 'source', logical_turn_id: 'turn', revision: 1 },
+  });
+  expect(control.events).toEqual([]);
+  release();
+  await control.result;
+  expect(control.events).toEqual(['placeholder', 'metadata', 'created']);
+});

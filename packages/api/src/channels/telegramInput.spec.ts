@@ -15,7 +15,7 @@ function fixture() {
   let clock = 1_000_000;
   const rows = new Map<string, TelegramInputRecord>();
   const messages = new Map<string, TelegramPreparedInput>();
-  const streams = new Map<string, 'missing' | 'pending' | 'completed' | 'failed'>();
+  const streams = new Map<string, 'missing' | 'pending' | 'completed' | 'failed' | 'terminal'>();
   let authorized = true;
   const repository = {
     read: async (identity: Pick<TelegramInputIdentity, 'libreChatUserId' | 'sourceEventId'>) => {
@@ -833,3 +833,36 @@ test('original authenticated receipt is first-register immutable through prepara
   f.rows.set(first.sourceEventId, legacy);
   expect((await f.service.register(id(), registration, 7777)).receivedAt).toBeUndefined();
 });
+
+test.each(['admitted', 'failed'] as const)(
+  'an exact durable terminal after %s recovers presentation only, never input preparation',
+  async (state) => {
+    const f = fixture();
+    const identity = id();
+    const registered = await f.service.register(identity, '11111111-1111-4111-8111-111111111111');
+    await f.service.ready(
+      'owner',
+      { sourceEventId: identity.sourceEventId, claimToken: registered.claimToken },
+      { text: 'original', fileIds: [], imageUrls: [] },
+    );
+    const record = f.rows.get(identity.sourceEventId)!;
+    f.rows.set(identity.sourceEventId, {
+      ...record,
+      state,
+      streamId: 'stream',
+      failureCode: 'accepted_response_unavailable',
+      leaseUntil: 0,
+    });
+    f.streams.set('stream', 'terminal');
+    f.deps.repository.due = async () => [structuredClone(f.rows.get(identity.sourceEventId)!)];
+    const result = await f.service.claimPending(1);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      state: 'admitted',
+      streamId: 'stream',
+      sourceMessageId: identity.sourceMessageId,
+      attempts: 0,
+    });
+    expect(f.persistPrepared).toHaveBeenCalledTimes(1);
+  },
+);

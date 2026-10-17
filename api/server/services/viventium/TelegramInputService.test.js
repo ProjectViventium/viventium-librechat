@@ -1,11 +1,14 @@
 /* VIVENTIUM START: persisted input ownership and the existing transaction/source guards. */
 let mockDependencies;
 const mockMessage = {
+  collection: { name: 'messages' },
   exists: jest.fn(),
   findOne: jest.fn(),
   updateOne: jest.fn(),
 };
 const mockIngress = {
+  aggregate: jest.fn(),
+  exists: jest.fn(),
   updateOne: jest.fn(),
   findOne: jest.fn(),
   find: jest.fn(),
@@ -98,6 +101,7 @@ test('coverage recovery binds the exact original owner, conversation, generation
 /* VIVENTIUM: only an input bound to its own started stream accepts another answer's coverage. */
 test('coverage by an answer that did not author the input settles only an admitted input', async () => {
   mockMessage.exists.mockResolvedValue(true);
+  mockIngress.findOne.mockReturnValue({ lean: async () => null });
   await mockDependencies.hasCommittedDelivery({ ...row, state: 'ready' });
   await mockDependencies.hasCommittedDelivery({ ...row, state: 'admitted' });
   const [ready, admitted] = mockMessage.exists.mock.calls.map(
@@ -447,3 +451,293 @@ test('effect-committed input settles once instead of reopening the saved receipt
   expect(writes).toEqual(['completed']);
 });
 /* VIVENTIUM END */
+
+/* VIVENTIUM START: exact durable terminal recovery, with no provider or Redis resurrection. */
+const {
+  bindRetainedTelegramResponse,
+  readRetainedTelegramTerminal,
+  acknowledgeRetainedTelegramFailure,
+} = require('./TelegramIngressAuthorityService');
+function terminalFixture() {
+  const binding = {
+    streamId: 'stream',
+    responseMessageId: 'reply',
+    logicalTurnId: 'turn',
+    revision: 2,
+  };
+  const record = {
+    ...row,
+    streamId: 'stream',
+    inputState: 'admitted',
+    claimToken: 'claim',
+    responseBinding: binding,
+  };
+  const context = { source_event_id: row.sourceEventId, logical_turn_id: 'turn', revision: 2 };
+  const message = {
+    messageId: 'reply',
+    content: [
+      { type: 'error', error_class: 'source_context_unavailable', error: 'Context unavailable.' },
+    ],
+    metadata: { viventium: { interactionContext: context } },
+  };
+  const IngressModel = {
+    findOne: jest.fn(() => ({ lean: async () => record })),
+    exists: jest.fn(async () => true),
+    updateOne: jest.fn(async () => ({ matchedCount: 1 })),
+  };
+  const MessageModel = { findOne: jest.fn(() => ({ lean: async () => message })) };
+  const identity = {
+    record,
+    streamId: 'stream',
+    conversationId: row.conversationId,
+    sourceMessageId: row.sourceMessageId,
+    responseMessageId: 'reply',
+    interactionContext: context,
+    IngressModel,
+  };
+  const read = () =>
+    readRetainedTelegramTerminal({
+      ownerId: 'owner',
+      streamId: 'stream',
+      telegramUserId: 'sender',
+      IngressModel,
+      MessageModel,
+    });
+  return { record, binding, message, IngressModel, MessageModel, identity, read };
+}
+test('binds the actual onStart author with exact source, owner, stream and current claim CAS', async () => {
+  const f = terminalFixture();
+  await bindRetainedTelegramResponse(f.identity);
+  await bindRetainedTelegramResponse(f.identity);
+  expect(f.IngressModel.updateOne).toHaveBeenCalledWith(
+    expect.objectContaining({
+      libreChatUserId: 'owner',
+      sourceEventId: row.sourceEventId,
+      streamId: 'stream',
+      inputClaimToken: 'claim',
+      sourceMessageId: row.sourceMessageId,
+      conversationId: row.conversationId,
+      inputState: 'admitted',
+      $or: [
+        { responseBinding: { $exists: false } },
+        { responseBinding: f.binding },
+        { 'responseBinding.streamId': { $ne: 'stream' } },
+      ],
+    }),
+    { $set: { responseBinding: f.binding } },
+  );
+  f.IngressModel.updateOne.mockResolvedValue({ matchedCount: 0 });
+  await expect(bindRetainedTelegramResponse(f.identity)).rejects.toMatchObject({
+    code: 'TELEGRAM_RESPONSE_IDENTITY_UNAVAILABLE',
+  });
+});
+test.each(['streamId', 'sourceMessageId', 'conversationId'])(
+  'refuses onStart changed %s before persistence',
+  async (field) => {
+    const f = terminalFixture();
+    await expect(
+      bindRetainedTelegramResponse({ ...f.identity, [field]: 'foreign' }),
+    ).rejects.toMatchObject({ code: 'TELEGRAM_RESPONSE_IDENTITY_UNAVAILABLE' });
+    expect(f.IngressModel.updateOne).not.toHaveBeenCalled();
+  },
+);
+test('recovers only the exact bound terminal and preserves its typed class', async () => {
+  const f = terminalFixture();
+  await expect(f.read()).resolves.toMatchObject({
+    error_class: 'source_context_unavailable',
+    responseMessageId: 'reply',
+  });
+  expect(f.MessageModel.findOne).toHaveBeenCalledWith({
+    user: 'owner',
+    conversationId: row.conversationId,
+    messageId: 'reply',
+    parentMessageId: row.sourceMessageId,
+    isCreatedByUser: false,
+    unfinished: false,
+    error: true,
+    'metadata.viventium.interactionContext.source_event_id': row.sourceEventId,
+    'metadata.viventium.interactionContext.logical_turn_id': 'turn',
+    'metadata.viventium.interactionContext.revision': 2,
+  });
+  expect(f.IngressModel.findOne).toHaveBeenCalledWith(
+    expect.objectContaining({
+      libreChatUserId: 'owner',
+      streamId: 'stream',
+      telegramUserId: 'sender',
+    }),
+  );
+});
+test.each(['no-binding', 'wrong-stream', 'empty', 'untyped', 'duplicate-error', 'replaced'])(
+  'does not recover %s terminal evidence',
+  async (kind) => {
+    const f = terminalFixture();
+    if (kind === 'no-binding') delete f.record.responseBinding;
+    if (kind === 'wrong-stream') f.binding.streamId = 'other-stream';
+    if (kind === 'empty') f.message.content = [];
+    if (kind === 'untyped') f.message.content = [{ type: 'text', text: 'A failure happened.' }];
+    if (kind === 'duplicate-error') f.message.content.push({ ...f.message.content[0] });
+    if (kind === 'replaced') f.IngressModel.exists.mockResolvedValue(false);
+    await expect(f.read()).resolves.toBeNull();
+  },
+);
+test('late durable terminal due query joins only failed rows and retains the regular bounded query', async () => {
+  const boundedRead = { lean: async () => [] };
+  const limitRead = jest.fn(() => boundedRead);
+  mockIngress.find.mockReturnValue({ sort: jest.fn(() => ({ limit: limitRead })) });
+  mockIngress.aggregate.mockResolvedValue([]);
+  await mockDependencies.repository.due(123, 5);
+  expect(limitRead).toHaveBeenCalledWith(5);
+  expect(mockIngress.find).toHaveBeenCalledWith(
+    expect.objectContaining({
+      $or: [{ inputState: { $ne: 'failed' } }, { inputRetryAt: { $gt: 0 } }],
+    }),
+  );
+  const pipeline = mockIngress.aggregate.mock.calls[0][0];
+  expect(pipeline[0].$match).toMatchObject({
+    inputState: 'failed',
+    inputRetryAt: 0,
+    inputFailureCode: 'accepted_response_unavailable',
+  });
+  const join = pipeline.find((stage) => stage.$lookup).$lookup;
+  expect(join.from).toBe('messages');
+  expect(join.pipeline[0].$match).toMatchObject({
+    unfinished: false,
+    error: true,
+    isCreatedByUser: false,
+    'metadata.viventium.deliveryAcknowledgement.state': {
+      $nin: ['committed', 'committed_effect', 'failed'],
+    },
+  });
+  expect(join.pipeline[0].$match.$expr.$and).toContainEqual({
+    $eq: ['$messageId', '$$binding.responseMessageId'],
+  });
+  expect(pipeline.at(-2)).toEqual({ $limit: 5 });
+});
+/* VIVENTIUM END */
+
+test('failed terminal ACK settles the existing ingress and Message once, including duplicate replay', async () => {
+  const f = terminalFixture();
+  f.record.inputClaimToken = 'claim';
+  const acknowledgement = {
+    logical_turn_id: 'turn',
+    revision: 2,
+    state: 'failed',
+    presentation_ref: 'telegram:chat',
+  };
+  f.MessageModel.updateOne = jest.fn(async (_filter, update) => {
+    f.message.metadata.viventium.deliveryAcknowledgement =
+      update.$set['metadata.viventium.deliveryAcknowledgement'];
+    return { matchedCount: 1 };
+  });
+  f.IngressModel.updateOne.mockImplementation(async (_filter, update) => {
+    Object.assign(f.record, update.$set);
+    return { matchedCount: 1 };
+  });
+  const models = { IngressModel: f.IngressModel, MessageModel: f.MessageModel };
+  await expect(
+    acknowledgeRetainedTelegramFailure(acknowledgement, 'telegram', models),
+  ).resolves.toMatchObject({ status: 'recorded', idempotent: false, transportOnly: true });
+  expect(f.record).toMatchObject({
+    inputState: 'failed',
+    inputFailureCode: 'source_terminal_presented',
+    inputRetryAt: 0,
+    inputLeaseUntil: 0,
+  });
+  await expect(
+    acknowledgeRetainedTelegramFailure(acknowledgement, 'telegram', models),
+  ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
+  await expect(f.read()).resolves.toBeNull();
+  expect(mockTransaction).toHaveBeenCalled();
+});
+test.each(['voice', 'committed', 'changed-author'])(
+  'terminal fallback refuses %s without accepting or regenerating work',
+  async (kind) => {
+    const f = terminalFixture();
+    const ack = {
+      logical_turn_id: 'turn',
+      revision: 2,
+      state: kind === 'committed' ? 'committed' : 'failed',
+    };
+    f.MessageModel.updateOne = jest.fn();
+    if (kind === 'changed-author') f.IngressModel.exists.mockResolvedValue(false);
+    await expect(
+      acknowledgeRetainedTelegramFailure(ack, kind === 'voice' ? 'voice' : 'telegram', {
+        IngressModel: f.IngressModel,
+        MessageModel: f.MessageModel,
+      }),
+    ).resolves.toMatchObject({ status: 'not_found' });
+    expect(f.MessageModel.updateOne).not.toHaveBeenCalled();
+  },
+);
+test('a raced ingress settlement throws inside the existing transaction instead of leaving a successful ACK', async () => {
+  const f = terminalFixture();
+  f.MessageModel.updateOne = jest.fn(async () => ({ matchedCount: 1 }));
+  f.IngressModel.updateOne.mockResolvedValue({ matchedCount: 0 });
+  await expect(
+    acknowledgeRetainedTelegramFailure(
+      { logical_turn_id: 'turn', revision: 2, state: 'failed' },
+      'telegram',
+      { IngressModel: f.IngressModel, MessageModel: f.MessageModel },
+    ),
+  ).rejects.toMatchObject({ code: 'telegram_terminal_ack_conflict' });
+});
+
+test('a removed preview still permits one exact typed terminal and its failed ACK', async () => {
+  const f = terminalFixture();
+  const removed = { logical_turn_id: 'turn', revision: 2, state: 'partial_removed' };
+  f.message.metadata.viventium.deliveryAcknowledgement = removed;
+  await expect(f.read()).resolves.toMatchObject({ error_class: 'source_context_unavailable' });
+  f.MessageModel.updateOne = jest.fn(async (_filter, update) => {
+    f.message.metadata.viventium.deliveryAcknowledgement =
+      update.$set['metadata.viventium.deliveryAcknowledgement'];
+    return { matchedCount: 1 };
+  });
+  const ack = { logical_turn_id: 'turn', revision: 2, state: 'failed' };
+  await expect(
+    acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+      IngressModel: f.IngressModel,
+      MessageModel: f.MessageModel,
+    }),
+  ).resolves.toMatchObject({ status: 'recorded', idempotent: false });
+  expect(f.MessageModel.updateOne.mock.calls[0][0].$or).toContainEqual({
+    'metadata.viventium.deliveryAcknowledgement': removed,
+  });
+  await expect(f.read()).resolves.toBeNull();
+});
+test('a conflicting terminal presentation ACK is not replaced', async () => {
+  const f = terminalFixture();
+  f.message.metadata.viventium.deliveryAcknowledgement = {
+    logical_turn_id: 'turn',
+    revision: 2,
+    state: 'failed',
+    presentation_ref: 'telegram:other',
+  };
+  f.MessageModel.updateOne = jest.fn();
+  await expect(
+    acknowledgeRetainedTelegramFailure(
+      { logical_turn_id: 'turn', revision: 2, state: 'failed' },
+      'telegram',
+      { IngressModel: f.IngressModel, MessageModel: f.MessageModel },
+    ),
+  ).resolves.toEqual({ status: 'conflict' });
+  expect(f.MessageModel.updateOne).not.toHaveBeenCalled();
+});
+
+test('regular and late terminal candidates keep one globally oldest bounded batch', async () => {
+  const candidate = (sourceEventId, updatedAt) => ({
+    ...row,
+    sourceEventId,
+    inputState: 'admitted',
+    updatedAt: new Date(updatedAt),
+  });
+  mockIngress.find.mockReturnValue({
+    sort: () => ({
+      limit: () => ({
+        lean: async () => [candidate('regular-old', 10), candidate('regular-new', 30)],
+      }),
+    }),
+  });
+  mockIngress.aggregate.mockResolvedValue([candidate('terminal-middle', 20)]);
+  const result = await mockDependencies.repository.due(100, 2);
+  expect(result.map((record) => record.sourceEventId)).toEqual(['regular-old', 'terminal-middle']);
+});

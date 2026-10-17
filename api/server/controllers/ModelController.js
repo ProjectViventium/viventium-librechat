@@ -32,6 +32,8 @@ const getModelsConfig = async (req) => {
     return loadModels(req);
   }
 
+  /* VIVENTIUM: A fixed menu is not proof that native discovery succeeded. */
+  await loadConfigModels(req, { nativeDiscoveryOnly: true });
   return withConfiguredAgentModels(modelsConfig, req);
 };
 
@@ -44,6 +46,7 @@ async function loadModels(req) {
   const cache = getLogStores(CacheKeys.CONFIG_STORE);
   const cachedModelsConfig = await cache.get(CacheKeys.MODELS_CONFIG);
   if (cachedModelsConfig) {
+    await loadConfigModels(req, { nativeDiscoveryOnly: true });
     return withConfiguredAgentModels(cachedModelsConfig, req);
   }
   const defaultModelsConfig = await loadDefaultModels(req);

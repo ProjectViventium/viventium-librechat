@@ -279,24 +279,26 @@ router.post('/chat/abort', async (req, res) => {
   const { streamId, conversationId, abortKey } = req.body;
   const userId = req.user?.id;
 
-  // streamId === conversationId, so try any of the provided IDs
-  // Skip "new" as it's a placeholder for new conversations, not an actual ID
-  let jobStreamId =
-    streamId || (conversationId !== 'new' ? conversationId : null) || abortKey?.split(':')[0];
+  /* === VIVENTIUM START ===
+   * Purpose: An exact Stop key must never roll over to a replacement or unrelated generation.
+   * Conversation-only clients may resolve their own stream; only an unidentified new-chat Stop
+   * may use the legacy newest-owned-job fallback.
+   */
+  const exactStreamId = streamId || abortKey?.split(':')[0];
+  const targetConversationId = conversationId !== 'new' ? conversationId : null;
+  let jobStreamId = exactStreamId || targetConversationId;
   let job = jobStreamId ? await GenerationJobManager.getJob(jobStreamId) : null;
 
-  if (!job && conversationId && conversationId !== 'new' && userId) {
+  if (!job && !exactStreamId && targetConversationId && userId) {
     const activeConversationStreamId =
-      await GenerationJobManager.getActiveStreamIdForConversation?.(userId, conversationId);
+      await GenerationJobManager.getActiveStreamIdForConversation?.(userId, targetConversationId);
     if (activeConversationStreamId) {
       jobStreamId = activeConversationStreamId;
     }
     job = jobStreamId ? await GenerationJobManager.getJob(jobStreamId) : null;
   }
 
-  // Fallback: if job not found and we have a userId, look up active jobs for user
-  // This handles the case where frontend sends "new" but job was created with a UUID
-  if (!job && userId) {
+  if (!job && !exactStreamId && !targetConversationId && userId) {
     logger.debug(`[AgentStream] Job not found by ID, checking active jobs for user: ${userId}`);
     const activeJobIds = await GenerationJobManager.getActiveJobIdsForUser(userId);
     if (activeJobIds.length > 0) {
@@ -323,6 +325,7 @@ router.post('/chat/abort', async (req, res) => {
       }
     }
   }
+  /* === VIVENTIUM END === */
 
   logger.debug(`[AgentStream] Computed jobStreamId: ${jobStreamId}`);
 

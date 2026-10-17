@@ -92,6 +92,134 @@ describe('RedisJobStore Integration Tests', () => {
   });
 
   describe('Job CRUD Operations', () => {
+    /* === VIVENTIUM START === Real Redis expiry and authority checks for preparation retention. */
+    describe('running request retention', () => {
+      async function fixture() {
+        if (!ioredisClient) throw new Error('Redis is required for retention proof');
+        const { RedisJobStore } = await import('../implementations/RedisJobStore');
+        const { createHash } = await import('crypto');
+        const store = new RedisJobStore(ioredisClient);
+        const streamId = `retention-${Date.now()}`;
+        const sourceScope = createHash('sha256').update(streamId).digest('hex');
+        const context: InteractionContext = {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface: 'telegram',
+          conversation_id: streamId,
+          revision: 1,
+          source_event_id: streamId,
+          source_order_scope: sourceScope,
+          source_sequence: 1,
+        };
+        await store.observeSourceOrder({ source_order_scope: sourceScope, source_sequence: 1 });
+        const claim = await store.claimLogicalTurn(streamId, 'retention-owner', context);
+        const job = await store.createJob(streamId, 'retention-owner', streamId, {
+          interactionContext: claim.interactionContext,
+        });
+        const logicalId = claim.interactionContext.logical_turn_id!;
+        const scope = logicalId.split('.')[0];
+        const keys = [
+          `stream:{${streamId}}:job`,
+          `stream:{${streamId}}:owner`,
+          `stream:logical:{${scope}}`,
+          `stream:source-order:{${scope}}`,
+          `stream:logical-author:{${scope}}:${createHash('sha256').update(logicalId).digest('hex').slice(0, 32)}`,
+        ];
+        return { store, streamId, job, keys };
+      }
+
+      test('renews the existing job, claim and author keys before expiry', async () => {
+        const { store, streamId, job, keys } = await fixture();
+        for (const key of keys) await ioredisClient!.pexpire(key, 200);
+        expect(await store.renewRunningJob(streamId, job.createdAt)).toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        for (const key of keys) expect(await ioredisClient!.pttl(key)).toBeGreaterThan(1_190_000);
+        expect(await store.isCurrentLogicalTurn(streamId)).toBe(true);
+      });
+
+      test.each(['complete', 'aborted', 'superseded'] as const)(
+        'does not renew a %s request',
+        async (status) => {
+          const { store, streamId, job, keys } = await fixture();
+          await store.updateJob(streamId, { status });
+          await ioredisClient!.pexpire(keys[0], 200);
+          expect(await store.renewRunningJob(streamId, job.createdAt)).toBe(false);
+          expect(await ioredisClient!.pttl(keys[0])).toBeLessThanOrEqual(200);
+        },
+      );
+
+      test('refuses a replacement creation, retired turn and deleted job without resurrection', async () => {
+        const { store, streamId, job, keys } = await fixture();
+        expect(await store.renewRunningJob(streamId, job.createdAt + 1)).toBe(false);
+        await ioredisClient!.hset(keys[2], 'currentStreamId', 'replacement-stream');
+        await ioredisClient!.pexpire(keys[0], 200);
+        expect(await store.renewRunningJob(streamId, job.createdAt)).toBe(false);
+        expect(await ioredisClient!.pttl(keys[0])).toBeLessThanOrEqual(200);
+        await ioredisClient!.del(keys[0]);
+        expect(await store.renewRunningJob(streamId, job.createdAt)).toBe(false);
+        expect(await ioredisClient!.exists(keys[0])).toBe(0);
+      });
+
+      test.each(['revision', 'author', 'source-order', 'stream-owner', 'dispatch-owner'])(
+        'refuses changed %s authority',
+        async (changed) => {
+          const { store, streamId, job, keys } = await fixture();
+          if (changed === 'revision') await ioredisClient!.hset(keys[2], 'revision', '2');
+          if (changed === 'author')
+            await ioredisClient!.hset(keys[4], 'reservation:1', 'other-author');
+          if (changed === 'source-order')
+            await ioredisClient!.hset(keys[3], 'latestSourceSequence', '2');
+          if (changed === 'stream-owner') await ioredisClient!.set(keys[1], 'other-owner');
+          if (changed === 'dispatch-owner')
+            await ioredisClient!.hset(keys[0], 'nativeDispatchOwner', 'other-dispatch');
+          await ioredisClient!.pexpire(keys[0], 200);
+          expect(await store.renewRunningJob(streamId, job.createdAt, 'local-dispatch')).toBe(
+            false,
+          );
+          expect(await ioredisClient!.pttl(keys[0])).toBeLessThanOrEqual(200);
+        },
+      );
+
+      test.each(['terminal', 'native-bind'])(
+        'does not change authority when %s occurs between hash-slot renewals',
+        async (transition) => {
+          const { store, streamId, job, keys } = await fixture();
+          const nativeResponse = JSON.stringify({ recoverUntil: Date.now() + 100 });
+          const originalEval = ioredisClient!.eval.bind(ioredisClient!);
+          const evaluate = jest.spyOn(ioredisClient!, 'eval');
+          evaluate.mockImplementationOnce(async (...args) => {
+            const result = await originalEval(...args);
+            await ioredisClient!.hset(
+              keys[0],
+              transition === 'terminal' ? { status: 'error' } : { nativeResponse },
+            );
+            await ioredisClient!.pexpire(keys[0], 200);
+            return result;
+          });
+          try {
+            expect(await store.renewRunningJob(streamId, job.createdAt)).toBe(false);
+            expect(await ioredisClient!.pttl(keys[0])).toBeLessThanOrEqual(200);
+            if (transition === 'terminal') {
+              expect((await store.getJob(streamId))?.status).toBe('error');
+            } else {
+              expect(await ioredisClient!.hget(keys[0], 'nativeResponse')).toBe(nativeResponse);
+            }
+          } finally {
+            evaluate.mockRestore();
+          }
+        },
+      );
+
+      test('does not replace native admission retention with the running TTL', async () => {
+        const { store, streamId, job, keys } = await fixture();
+        await ioredisClient!.hset(keys[0], 'nativeResponse', '{}');
+        await ioredisClient!.pexpire(keys[0], 200);
+        expect(await store.renewRunningJob(streamId, job.createdAt)).toBe(false);
+        expect(await ioredisClient!.pttl(keys[0])).toBeLessThanOrEqual(200);
+      });
+    });
+    /* === VIVENTIUM END === */
+
     test('should create and retrieve a job', async () => {
       if (!ioredisClient) {
         return;
@@ -392,7 +520,10 @@ describe('RedisJobStore Integration Tests', () => {
       ).resolves.toMatchObject({
         status: 'recorded',
         idempotent: false,
-        acknowledgement: { ...cortexAcknowledgement, presentation_committed_at: expect.any(Number) },
+        acknowledgement: {
+          ...cortexAcknowledgement,
+          presentation_committed_at: expect.any(Number),
+        },
         cortexPresentation: binding,
       });
       await expect(
@@ -462,14 +593,8 @@ describe('RedisJobStore Integration Tests', () => {
 
     test('input newer than its turn withdraws a late Cortex addition before the receipt commits', async () => {
       if (!ioredisClient) return;
-      const {
-        store,
-        streamId,
-        mainAcknowledgement,
-        binding,
-        cortexAcknowledgement,
-        newerInput,
-      } = await claimedLogicalTurn('newer-input', { ordered: true });
+      const { store, streamId, mainAcknowledgement, binding, cortexAcknowledgement, newerInput } =
+        await claimedLogicalTurn('newer-input', { ordered: true });
       await expect(
         store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null),
       ).resolves.toMatchObject({ status: 'recorded' });
@@ -500,14 +625,8 @@ describe('RedisJobStore Integration Tests', () => {
 
     test('a committed Cortex receipt stays replayable after newer input', async () => {
       if (!ioredisClient) return;
-      const {
-        store,
-        streamId,
-        mainAcknowledgement,
-        binding,
-        cortexAcknowledgement,
-        newerInput,
-      } = await claimedLogicalTurn('replay-after-input', { ordered: true });
+      const { store, streamId, mainAcknowledgement, binding, cortexAcknowledgement, newerInput } =
+        await claimedLogicalTurn('replay-after-input', { ordered: true });
       await store.bindDeliveryAcknowledgement(streamId, mainAcknowledgement, null);
       await store.bindCortexPresentation(streamId, binding);
       const first = await store.bindDeliveryAcknowledgement(

@@ -1769,6 +1769,206 @@ describe('initializeClient handoff capability projection', () => {
     expect(lazyHandoff.additional_instructions).toBe('');
   });
 
+  test.each([false, true])(
+    'retains the admitted native context allocation when a lazy handoff materializes (fallback=%s)',
+    async (withFallback) => {
+      const { createMainContinuityFetch, encodeMainContextStateBlock } =
+        jest.requireActual('@librechat/api');
+      const {
+        captureMainContextSnapshot,
+        bindMainContextSnapshot,
+      } = require('~/server/services/viventium/ViventiumMainContextService');
+      const activeWork = '{"active_work":[]}';
+      const context = 'Complete accepted context. '.repeat(6000) + activeWork;
+      expect(Buffer.byteLength(context)).toBeGreaterThan(128 * 1024);
+      const nativeHeaders = {
+        'X-GlassHive-Agent-Id': 'handoff-agent',
+        'X-GlassHive-Stable-Authority-SHA256': 'b'.repeat(64),
+        'X-Viventium-Memory-Eligible': 'false',
+        'X-GlassHive-Turn-Context-B64': Buffer.from(context).toString('base64'),
+        'X-Synthetic-Route': 'specialist',
+      };
+      const handoffAgent = {
+        id: 'handoff-agent',
+        provider: 'openAI',
+        model: 'synthetic-native-model',
+        instructions: 'Specialist authority.',
+        model_parameters: { configuration: { defaultHeaders: nativeHeaders } },
+        edges: [],
+      };
+      const specialistAuthority = conversationProviderStableAuthorityDigest(handoffAgent);
+      const req = makeRequest();
+      mockGetAgent.mockResolvedValue(handoffAgent);
+      mockInitializeAgent.mockImplementation(async ({ agent }) => {
+        const config = makeInitializedConfig(agent);
+        if (agent.id === handoffAgent.id) {
+          config.model_parameters = {
+            model: agent.model,
+            configuration: { defaultHeaders: { ...nativeHeaders } },
+          };
+          if (withFallback) {
+            config.viventiumGraphLlmFallbacks = [
+              {
+                id: handoffAgent.id,
+                provider: 'openAI',
+                model_parameters: {
+                  model: 'synthetic-native-fallback',
+                  configuration: { defaultHeaders: { ...nativeHeaders } },
+                },
+              },
+            ];
+          }
+        }
+        return config;
+      });
+      const { client } = await initializeClient({
+        req,
+        res: {},
+        signal: null,
+        endpointOption: {
+          agent: Promise.resolve({ ...primaryAgent }),
+          model_parameters: { model: primaryAgent.model },
+        },
+      });
+      const lazyHandoff = client.options.agentConfigs.get(handoffAgent.id);
+      const { HumanMessage } = jest.requireActual('@langchain/core/messages');
+      const snapshot = captureMainContextSnapshot(req, {
+        agent: { id: primaryAgent.id, instructions: 'Main authority.' },
+        messages: [new HumanMessage({ id: 'main-source', content: 'Main accepted input.' })],
+        visibleMessages: [
+          {
+            messageId: 'main-source',
+            parentMessageId: null,
+            user: req.user.id,
+            conversationId: req.body.conversationId,
+            isCreatedByUser: true,
+            text: 'Main accepted input.',
+          },
+        ],
+        attemptState: { turnContextMaximumBytes: 200000 },
+      });
+      const stateBlocks = encodeMainContextStateBlock(context, activeWork);
+      bindMainContextSnapshot(lazyHandoff, snapshot, stateBlocks);
+      expect(snapshot.visibleMessageChain).toHaveLength(1);
+      expect(lazyHandoff.model_parameters.configuration.defaultHeaders).toHaveProperty(
+        'X-Viventium-Visible-Message-Chain-B64',
+      );
+      const hydrated = await lazyHandoff.viventiumConnectedAgentInitializer();
+      const headers = hydrated.model_parameters.configuration.defaultHeaders;
+      const send = jest.fn(async () => new Response('{}'));
+      const dispatch = createMainContinuityFetch(send);
+      await expect(
+        dispatch('https://provider.invalid/v1/chat/completions', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ messages: [{ role: 'user', content: 'Current input.' }] }),
+        }),
+      ).resolves.toBeInstanceOf(Response);
+      expect(headers['X-Viventium-Turn-Context-Max-Bytes']).toBe('200000');
+      expect(headers).not.toHaveProperty('X-Viventium-Main-Context-State-Blocks-B64');
+      expect(headers['X-GlassHive-Stable-Authority-SHA256']).toBe(specialistAuthority);
+      expect(specialistAuthority).not.toBe(snapshot.stableAuthoritySha256);
+      expect(headers['X-Viventium-Memory-Eligible']).toBe('false');
+      for (const key of [
+        'X-Viventium-Main-Context-Snapshot-SHA256',
+        'X-Viventium-Main-Context-Protocol',
+        'X-Viventium-Main-Context-Owner',
+        'X-Viventium-Continuity-Domain-Id',
+        'X-Viventium-Continuity-Agent-Id',
+        'X-Viventium-Visible-Message-Chain-B64',
+      ])
+        expect(headers).not.toHaveProperty(key);
+      expect(headers['X-Synthetic-Route']).toBe('specialist');
+      expect(JSON.parse(send.mock.calls[0][1].body).metadata.turn_context).toBe(context);
+      expect(JSON.parse(send.mock.calls[0][1].body).metadata).not.toHaveProperty(
+        'visible_message_chain',
+      );
+      expect(new Headers(send.mock.calls[0][1].headers).get('X-GlassHive-Agent-Id')).toBe(
+        'handoff-agent',
+      );
+      expect(
+        new Headers(send.mock.calls[0][1].headers).get('X-GlassHive-Stable-Authority-SHA256'),
+      ).toBe(specialistAuthority);
+      expect(JSON.parse(send.mock.calls[0][1].body).metadata).not.toHaveProperty(
+        'main_context_state_blocks',
+      );
+      expect(hydrated.model_parameters.model).toBe(handoffAgent.model);
+      if (withFallback) {
+        const fallback = hydrated.viventiumGraphLlmFallbacks[0];
+        expect(fallback.model_parameters.model).toBe('synthetic-native-fallback');
+        const fallbackHeaders = fallback.model_parameters.configuration.defaultHeaders;
+        expect(fallbackHeaders['X-Viventium-Turn-Context-Max-Bytes']).toBe('200000');
+        expect(fallbackHeaders).not.toHaveProperty('X-Viventium-Main-Context-State-Blocks-B64');
+        expect(fallbackHeaders['X-GlassHive-Stable-Authority-SHA256']).toBe('b'.repeat(64));
+        expect(fallbackHeaders).not.toHaveProperty('X-Viventium-Main-Context-Owner');
+        expect(fallbackHeaders).not.toHaveProperty('X-Viventium-Visible-Message-Chain-B64');
+        await expect(
+          dispatch('https://provider.invalid/v1/chat/completions', {
+            method: 'POST',
+            headers: fallback.model_parameters.configuration.defaultHeaders,
+            body: JSON.stringify({ messages: [{ role: 'user', content: 'Current input.' }] }),
+          }),
+        ).resolves.toBeInstanceOf(Response);
+        const fallbackMetadata = JSON.parse(send.mock.calls.at(-1)[1].body).metadata;
+        expect(fallbackMetadata.turn_context).toBe(context);
+        expect(fallbackMetadata).not.toHaveProperty('main_context_state_blocks');
+        expect(fallbackMetadata).not.toHaveProperty('visible_message_chain');
+      }
+      const calls = send.mock.calls.length;
+      await expect(
+        dispatch('https://provider.invalid/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            ...headers,
+            'X-GlassHive-Turn-Context-B64': Buffer.from('x'.repeat(200001)).toString('base64'),
+          },
+          body: JSON.stringify({ messages: [{ role: 'user', content: 'Current input.' }] }),
+        }),
+      ).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+      expect(send).toHaveBeenCalledTimes(calls);
+    },
+  );
+
+  test('does not add a native carrier descriptor to a direct lazy participant', async () => {
+    const {
+      captureMainContextSnapshot,
+      bindMainContextSnapshot,
+    } = require('~/server/services/viventium/ViventiumMainContextService');
+    const handoffAgent = {
+      id: 'handoff-agent',
+      provider: 'openAI',
+      model: 'synthetic-direct-model',
+      instructions: 'Direct specialist authority.',
+      edges: [],
+    };
+    mockGetAgent.mockResolvedValue(handoffAgent);
+    mockInitializeAgent.mockImplementation(async ({ agent }) => makeInitializedConfig(agent));
+    const req = makeRequest();
+    const { client } = await initializeClient({
+      req,
+      res: {},
+      signal: null,
+      endpointOption: {
+        agent: Promise.resolve({ ...primaryAgent }),
+        model_parameters: { model: primaryAgent.model },
+      },
+    });
+    const lazyHandoff = client.options.agentConfigs.get(handoffAgent.id);
+    const snapshot = captureMainContextSnapshot(req, {
+      agent: { id: primaryAgent.id, instructions: 'Main authority.' },
+      messages: [],
+      visibleMessages: [],
+      attemptState: { turnContextMaximumBytes: 200000 },
+    });
+    bindMainContextSnapshot(lazyHandoff, snapshot, 'captured-descriptor');
+    const hydrated = await lazyHandoff.viventiumConnectedAgentInitializer();
+    expect(hydrated.model_parameters.configuration.defaultHeaders).toEqual({
+      'X-Existing': 'kept',
+    });
+    expect(hydrated.id).toBe(handoffAgent.id);
+    expect(hydrated.model).toBe(handoffAgent.model);
+  });
+
   describe('request-owned model catalog overlap', () => {
     function plainMain() {
       return { ...primaryAgent, edges: [] };

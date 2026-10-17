@@ -1,5 +1,9 @@
 const { VOICE_TASK_TOOL_NAME } = require('./VoiceTaskManagementTool');
-const { backgroundWorkerResources } = require('@librechat/api');
+const {
+  backgroundWorkerResources,
+  createNativeToolCatalog,
+  nativeToolCatalogFitsBootstrap,
+} = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive capability broker bootstrap injection
  * Purpose:
@@ -27,6 +31,7 @@ const {
   BROKER_AUTHORITY_KINDS,
   mintBrokerGrant,
   persistBrokerGrantResources,
+  hydrateBrokerGrantResources,
   revokeBrokerGrant,
   resolveBrokerTenantId,
 } = require('./GlassHiveCapabilityBrokerAuth');
@@ -1730,6 +1735,48 @@ async function buildConversationProviderBootstrapBundle({
     allowedHostTools: allProviderHostTools,
     contentReadScope,
   });
+  /* === VIVENTIUM START === Reuse the current authorized MCP catalog as bounded factual data. === */
+  const catalogStartedAt = Date.now();
+  try {
+    // This lazy import avoids the broker's existing bootstrap dependency cycle.
+    const {
+      buildCapabilityCatalog,
+      toolDefinitionsForMcp,
+    } = require('./GlassHiveCapabilityBrokerService');
+    const grant = await hydrateBrokerGrantResources(mintedGrant.payload);
+    const catalog = await buildCapabilityCatalog({ grant, metadataOnly: true });
+    const definitions = toolDefinitionsForMcp(catalog);
+    let toolCatalog = createNativeToolCatalog({
+      grantId: grant.grant_id,
+      expiresAt: grant.exp,
+      serverName: bundle.glasshive_capability_broker.name,
+      brokerUrl: bundle.glasshive_capability_broker.url,
+      tools: definitions,
+    });
+    if (toolCatalog && !nativeToolCatalogFitsBootstrap(bundle, toolCatalog)) toolCatalog = null;
+    if (toolCatalog) bundle.glasshive_capability_broker.tool_catalog = toolCatalog;
+    logger.info(
+      JSON.stringify({
+        event: 'glasshive_native_tool_catalog',
+        included: Boolean(toolCatalog),
+        toolCount: definitions.length,
+        metadataBytes: toolCatalog ? Buffer.byteLength(JSON.stringify(toolCatalog), 'utf8') : 0,
+        durationMs: Date.now() - catalogStartedAt,
+      }),
+    );
+  } catch {
+    // Advisory metadata cannot disable ordinary native discovery or change the grant.
+    logger.info(
+      JSON.stringify({
+        event: 'glasshive_native_tool_catalog_unavailable',
+        included: false,
+        toolCount: 0,
+        metadataBytes: 0,
+        durationMs: Date.now() - catalogStartedAt,
+      }),
+    );
+  }
+  /* === VIVENTIUM END === */
   if (!capabilityResolutionStatus) {
     return bundle;
   }

@@ -455,8 +455,21 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
       const prepared = inspectMainCompactionCandidate(draft, before);
       if (!prepared.ok && (prepared.issue.constraint !== 'max_bytes' ||
           !['', 'summary'].includes(prepared.issue.path))) return null;
-      if (path === '$carrier' && (!prepared.ok ||
-          mainCompactionRenderedBytes(prepared.candidate, before) !== issue.actual)) return null;
+      if (path === '$carrier') {
+        if (!prepared.ok) return null;
+        const currentBytes = mainCompactionRenderedBytes(prepared.candidate, before);
+        // Retained process feedback may describe the previous attribute-escaped text spelling.
+        // Verify that exact historical measurement; it never authorizes current output/promotion.
+        const previousBytes =
+          before.consumer === 'accepted_core'
+            ? before.reservedUtf8Bytes +
+              Buffer.byteLength(
+                escapeEvidenceAttribute(mainCompactionCarrierJson(prepared.candidate, before)),
+                'utf8',
+              )
+            : currentBytes;
+        if (issue.actual !== currentBytes && issue.actual !== previousBytes) return null;
+      }
       const boundedWholeJsonDraft = path === '' && !prepared.ok &&
         prepared.issue.constraint === 'max_bytes' && prepared.issue.path === '' &&
         Buffer.byteLength(serialized, 'utf8') <= Math.min(before.carrierMaxUtf8Bytes, after.carrierMaxUtf8Bytes);
@@ -480,12 +493,19 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
       converging: true } };
 }
 
-/** Exact escaping cost, including Core's stored server provenance. */
-export function mainCompactionRenderedBytes(candidate: MainSemanticCompaction,
-  contract: MainCompactionOutputContract): number {
-  const json = contract.consumer === 'accepted_core'
+function mainCompactionCarrierJson(
+  candidate: MainSemanticCompaction,
+  contract: MainCompactionOutputContract,
+): string {
+  return contract.consumer === 'accepted_core'
     ? JSON.stringify({ ...candidate, sourceDigest: '0'.repeat(64), generatedAt: new Date(0) })
     : JSON.stringify(candidate);
+}
+
+/** Exact element-text escaping cost, including Core's stored server provenance. */
+export function mainCompactionRenderedBytes(candidate: MainSemanticCompaction,
+  contract: MainCompactionOutputContract): number {
+  const json = mainCompactionCarrierJson(candidate, contract);
   const encoded = contract.consumer === 'accepted_core' ? escapeEvidence(json) : json.replace(/</g, '\\u003c');
   return contract.reservedUtf8Bytes + Buffer.byteLength(encoded, 'utf8');
 }
@@ -628,9 +648,11 @@ function escapeEvidence(value: unknown): string {
   return String(value || '')
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
+    .replaceAll('>', '&gt;');
+}
+
+function escapeEvidenceAttribute(value: unknown): string {
+  return escapeEvidence(value).replaceAll('"', '&quot;').replaceAll("'", '&apos;');
 }
 
 function normalizeSummaryItems(values: unknown): string[] {
@@ -719,7 +741,7 @@ function acceptedTurnsFrom(value: unknown): AcceptedMainTurn[] {
 
 function buildAcceptedTurnBlock(turn: AcceptedMainTurn, pending: boolean): string {
   const tag = pending ? 'pending_compaction_turn' : 'accepted_turn';
-  const attributes = `logical_turn_id="${escapeEvidence(turn.logicalTurnId)}" revision="${turn.revision}" origin="${escapeEvidence(turn.origin || 'interactive')}"${turn.scheduleId ? ` schedule_id="${escapeEvidence(turn.scheduleId)}"` : ''}${turn.scheduleRunId ? ` schedule_run_id="${escapeEvidence(turn.scheduleRunId)}"` : ''}`;
+  const attributes = `logical_turn_id="${escapeEvidenceAttribute(turn.logicalTurnId)}" revision="${turn.revision}" origin="${escapeEvidenceAttribute(turn.origin || 'interactive')}"${turn.scheduleId ? ` schedule_id="${escapeEvidenceAttribute(turn.scheduleId)}"` : ''}${turn.scheduleRunId ? ` schedule_run_id="${escapeEvidenceAttribute(turn.scheduleRunId)}"` : ''}`;
   return [
     `<${tag} ${attributes}>`,
     turn.userText ? `<user_text>${escapeEvidence(turn.userText)}</user_text>` : '',
@@ -2308,12 +2330,16 @@ export function createMainContinuityService(
       const currentOutputContract = acceptedMainCompactionOutputContract(acceptedTurns, input.outputCarrier);
       if (!currentOutputContract) return { status: 'degraded', reason: 'context_budget' };
       const repairContract = normalizeMainCompactionOutputContract(repairSource?.outputContract);
-      // A fidelity repair uses the tighter current allocation, without widening its old ceiling
-      // when capacity becomes available. Completion still checks all current recent turns.
-      const outputContract = repairSource?.sourceDigest === sourceDigest && repairContract &&
-        compatibleMainCompactionSizeAllocation(currentOutputContract, repairContract)
-        && repairSource?.correction?.code === 'semantic_fidelity'
-        ? repairContract : currentOutputContract;
+      // Retain the old repair ceiling when capacity becomes available, including size progress.
+      // Current recent turns and exact rendered bytes remain authoritative at completion.
+      const outputContract =
+        repairSource?.sourceDigest === sourceDigest &&
+        repairContract &&
+        compatibleMainCompactionSizeAllocation(currentOutputContract, repairContract) &&
+        (repairSource?.correction?.code === 'semantic_fidelity' ||
+          normalizeMainCompactionSizeRepair(repairSource, repairContract))
+          ? repairContract
+          : currentOutputContract;
       const smallerTarget = Math.max(1, Math.floor(bytes / 2));
       const smallerLegacy = await legacySource(identity, cache, undefined, smallerTarget);
       const smallerTurns: AcceptedMainTurn[] = [];

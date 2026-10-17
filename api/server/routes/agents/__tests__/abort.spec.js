@@ -22,6 +22,7 @@ const mockGenerationJobManager = {
   abortJob: jest.fn(),
   getActiveJobIdsForUser: jest.fn(),
   getActiveStreamsForUser: jest.fn(),
+  getActiveStreamIdForConversation: jest.fn(),
 };
 
 const mockSaveMessage = jest.fn();
@@ -77,6 +78,7 @@ describe('Agent Abort Endpoint', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGenerationJobManager.getActiveStreamIdForConversation.mockReset();
   });
 
   it.each(['committed', 'pending', 'unavailable'])(
@@ -452,6 +454,100 @@ describe('Agent Abort Endpoint', () => {
     });
 
     describe('Job Not Found', () => {
+      /* === VIVENTIUM START ===
+       * Purpose: A delayed Stop must retain its supplied identity when another job is active.
+       */
+      describe('Exact Stop identity', () => {
+        const activeJob = {
+          status: 'running',
+          createdAt: 20,
+          metadata: { userId: 'test-user-123' },
+        };
+
+        beforeEach(() => {
+          mockGenerationJobManager.getJob.mockImplementation(async (key) =>
+            ['replacement-stream', 'unrelated-stream'].includes(key) ? activeJob : null,
+          );
+          mockGenerationJobManager.getActiveJobIdsForUser.mockResolvedValue(['unrelated-stream']);
+          mockGenerationJobManager.getActiveStreamIdForConversation.mockResolvedValue(
+            'replacement-stream',
+          );
+          mockGenerationJobManager.abortJob.mockResolvedValue({ success: true, jobData: null });
+        });
+
+        it.each([
+          ['stream', { streamId: 'expired-stream' }, 'expired-stream'],
+          [
+            'stream with conversation',
+            { streamId: 'expired-stream', conversationId: 'conversation-1' },
+            'expired-stream',
+          ],
+          ['abort key', { abortKey: 'expired-stream:response-1' }, 'expired-stream'],
+          [
+            'abort key with conversation',
+            { abortKey: 'expired-stream:response-1', conversationId: 'conversation-1' },
+            'expired-stream',
+          ],
+        ])('does not retarget a missing %s', async (_label, body, expectedKey) => {
+          const response = await request(app).post('/api/agents/chat/abort').send(body);
+
+          expect(response.status).toBe(404);
+          expect(response.body).toEqual({ error: 'Job not found', streamId: expectedKey });
+          expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
+          expect(mockGenerationJobManager.getActiveStreamIdForConversation).not.toHaveBeenCalled();
+          expect(mockGenerationJobManager.getActiveJobIdsForUser).not.toHaveBeenCalled();
+          expect(mockSaveMessage).not.toHaveBeenCalled();
+        });
+
+        it('does not retarget a missing conversation to another conversation', async () => {
+          mockGenerationJobManager.getActiveStreamIdForConversation.mockResolvedValue(null);
+
+          const response = await request(app)
+            .post('/api/agents/chat/abort')
+            .send({ conversationId: 'expired-conversation' });
+
+          expect(response.status).toBe(404);
+          expect(mockGenerationJobManager.getActiveStreamIdForConversation).toHaveBeenCalledWith(
+            'test-user-123',
+            'expired-conversation',
+          );
+          expect(mockGenerationJobManager.getActiveJobIdsForUser).not.toHaveBeenCalled();
+          expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
+          expect(mockSaveMessage).not.toHaveBeenCalled();
+        });
+
+        it.each([
+          { streamId: 'unrelated-stream', conversationId: 'conversation-1' },
+          { abortKey: 'unrelated-stream:response-1', conversationId: 'conversation-1' },
+        ])('honors the exact key before the conversation alias: %j', async (body) => {
+          const response = await request(app).post('/api/agents/chat/abort').send(body);
+
+          expect(response.body).toEqual({ success: true, aborted: 'unrelated-stream' });
+          expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(
+            'unrelated-stream',
+            'user_cancelled',
+            'test-user-123',
+          );
+          expect(mockGenerationJobManager.getActiveStreamIdForConversation).not.toHaveBeenCalled();
+          expect(mockGenerationJobManager.getActiveJobIdsForUser).not.toHaveBeenCalled();
+        });
+
+        it('resolves the active stream for a conversation-only Stop', async () => {
+          const response = await request(app)
+            .post('/api/agents/chat/abort')
+            .send({ conversationId: 'conversation-1' });
+
+          expect(response.body).toEqual({ success: true, aborted: 'replacement-stream' });
+          expect(mockGenerationJobManager.abortJob).toHaveBeenCalledWith(
+            'replacement-stream',
+            'user_cancelled',
+            'test-user-123',
+          );
+          expect(mockGenerationJobManager.getActiveJobIdsForUser).not.toHaveBeenCalled();
+        });
+      });
+      /* === VIVENTIUM END === */
+
       /* === VIVENTIUM START ===
        * Feature: Exact Stop rollover.
        * Purpose: A placeholder route must select the newest owned job, never array order.

@@ -63,80 +63,10 @@ const COMPACTOR_TIMEOUT_MS = 240 * 1000;
 const MAX_TRANSPORT_RETRIES = MAIN_COMPACTION_MAX_TRANSPORT_RETRIES;
 const TRANSIENT_RETRY_DELAY_MS = 5 * 1000;
 const MAX_TRANSIENT_RETRY_DELAY_MS = 30 * 1000;
-const INTERACTIVE_YIELD_WAIT_MS = 6 * 1000;
 const activeCompactionsByOwnerId = new Map();
-const interactiveAdmissionFencesByOwnerId = new Map();
-
-function acquireInteractiveMainAdmissionFence(ownerId) {
-  const normalizedOwnerId = String(ownerId || '').trim();
-  if (!normalizedOwnerId) return () => {};
-  const token = {};
-  const ownerFences = interactiveAdmissionFencesByOwnerId.get(normalizedOwnerId) || new Set();
-  ownerFences.add(token);
-  interactiveAdmissionFencesByOwnerId.set(normalizedOwnerId, ownerFences);
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    ownerFences.delete(token);
-    if (
-      ownerFences.size === 0 &&
-      interactiveAdmissionFencesByOwnerId.get(normalizedOwnerId) === ownerFences
-    ) {
-      interactiveAdmissionFencesByOwnerId.delete(normalizedOwnerId);
-    }
-  };
-}
-
-function yieldToInteractiveMainAdmission(ownerId, controller) {
-  const ownerFences = interactiveAdmissionFencesByOwnerId.get(ownerId);
-  if (!ownerFences || ownerFences.size === 0) return false;
-  if (!controller.signal.aborted) controller.abort('maintenance_yield');
-  return true;
-}
 
 function sleep(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
-}
-
-function waitWithin(promise, timeoutMs) {
-  let timer;
-  const timeout = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(false), timeoutMs);
-    timer.unref?.();
-  });
-  return Promise.race([Promise.resolve(promise).then(() => true), timeout]).finally(() => {
-    clearTimeout(timer);
-  });
-}
-
-async function yieldAcceptedMainCompaction(ownerId, options = {}) {
-  const normalizedOwnerId = String(ownerId || '').trim();
-  const activeCompactions = Array.from(activeCompactionsByOwnerId.get(normalizedOwnerId) || []);
-  if (activeCompactions.length === 0) return { status: 'idle', count: 0 };
-  for (const active of activeCompactions) {
-    if (!active.controller.signal.aborted) {
-      active.controller.abort('maintenance_yield');
-    }
-  }
-  const configuredTimeoutMs = Number(options.timeoutMs);
-  const timeoutMs = Number.isFinite(configuredTimeoutMs)
-    ? Math.max(0, configuredTimeoutMs)
-    : INTERACTIVE_YIELD_WAIT_MS;
-  const settled = await waitWithin(
-    Promise.all(activeCompactions.map((active) => active.settled)),
-    timeoutMs,
-  );
-  const capacityReleaseAcknowledged = activeCompactions.every(
-    (active) => active.capacityReleaseAcknowledged === true,
-  );
-  let status = 'yield_pending';
-  if (settled) status = capacityReleaseAcknowledged ? 'yielded' : 'yield_unconfirmed';
-  return {
-    status,
-    count: activeCompactions.length,
-    capacityReleaseAcknowledged: settled && capacityReleaseAcknowledged,
-  };
 }
 
 function providerErrorStatus(error) {
@@ -425,7 +355,7 @@ function ensureAcceptedMainCompaction(input = {}) {
     : runAcceptedMainCompaction(input);
 }
 
-/** Thin binding to the existing bounded per-domain idle owner and foreground fence. */
+/** Thin binding to the existing bounded per-domain idle owner. */
 function scheduleMainContinuityMaintenance(input = {}) {
   if (typeof input.schedule !== 'function') return false;
   const ownerId = String(input.ownerId || '').trim();
@@ -433,7 +363,7 @@ function scheduleMainContinuityMaintenance(input = {}) {
     ownerId,
     domainKey: compactionEpochKey(input),
     schedule: input.schedule,
-    shouldYield: () => (interactiveAdmissionFencesByOwnerId.get(ownerId)?.size || 0) > 0,
+    shouldYield: () => input.signal?.aborted === true,
     onError: (error) =>
       logger.warn('[VIVENTIUM][main-continuity] Deferred maintenance unavailable', {
         errorClass: String(error?.name || 'PersistenceError').slice(0, 80),
@@ -446,7 +376,7 @@ async function runBackgroundMainCompaction(input) {
   const domainKey = compactionEpochKey(input);
   discardDeferredMainCompaction(domainKey);
   const executionBudget = input.executionBudget || { completionReserveMs: 0 };
-  const shouldYield = () => (interactiveAdmissionFencesByOwnerId.get(ownerId)?.size || 0) > 0;
+  const shouldYield = () => input.signal?.aborted === true;
   const result = await runMainCompactionIdleBatch({
     run: (deadlineAt, previousSourceClaim) =>
       runAcceptedMainCompaction({
@@ -455,7 +385,7 @@ async function runBackgroundMainCompaction(input) {
         executionBudget,
         previousSourceClaim,
       }),
-    shouldYield: () => input.signal?.aborted || shouldYield(),
+    shouldYield,
     deadlineAt: input.deadlineAt,
     now: input.now,
   });
@@ -497,7 +427,12 @@ async function runAcceptedMainCompaction(input = {}) {
   });
   // A reservation or continuity-store claim does not own provider capacity. Mark it releasable
   // until the compactor invocation starts, then require an explicit native release outcome.
-  const active = { controller, settled, capacityReleaseAcknowledged: true };
+  const active = {
+    domainKey: compactionEpochKey(input),
+    controller,
+    settled,
+    capacityReleaseAcknowledged: true,
+  };
   const ownerCompactions = activeCompactionsByOwnerId.get(ownerId) || new Set();
   ownerCompactions.add(active);
   activeCompactionsByOwnerId.set(ownerId, ownerCompactions);
@@ -512,16 +447,14 @@ async function runAcceptedMainCompaction(input = {}) {
   /* === VIVENTIUM START ===
    * Feature: One compaction runner for accepted Main turns and legacy conversation source.
    * Purpose: A caller may supply its own claim/complete/reject store; attempts, repair, fidelity
-   * review and failure memory stay identical. A foreground claim runs inside the owner's own turn,
-   * which is waiting on it, so it does not yield to that turn's interactive admission fence.
+   * review and failure memory stay identical. Native admission owns actual execution capacity;
+   * independent maintenance keeps its own signal, lease and finite budget during ordinary use.
    * === VIVENTIUM END === */
   const claimCompaction = input.claimCompaction || claimAcceptedMainCompaction;
   const completeCompaction = input.completeCompaction || completeAcceptedMainCompaction;
   const rejectCompaction = input.rejectCompaction || rejectAcceptedMainCompaction;
   const renewCompaction =
     input.renewCompaction || (input.claimCompaction ? null : renewAcceptedMainCompaction);
-  const yieldToInteractive = () =>
-    input.foreground !== true && yieldToInteractiveMainAdmission(ownerId, controller);
   const retrySleep = typeof input.sleep === 'function' ? input.sleep : sleep;
   const configuredRetryDelayMs = Number(input.retryDelayMs);
   const retryDelayMs = Number.isFinite(configuredRetryDelayMs)
@@ -552,7 +485,6 @@ async function runAcceptedMainCompaction(input = {}) {
   const providerId = input.agent?.endpoint || input.agent?.provider;
   const capability = input.req?.config?.endpoints?.agents?.providerCapabilities?.[providerId];
   const nativeStageDeadline =
-    input.foreground !== true &&
     typeof renewCompaction === 'function' &&
     capability?.workspace_binding === true &&
     capability?.conversation_session === true;
@@ -566,9 +498,6 @@ async function runAcceptedMainCompaction(input = {}) {
       settled,
       capacityReleased: () => active.capacityReleaseAcknowledged === true,
     });
-    if (yieldToInteractive()) {
-      return { status: 'degraded', attempts: 0, reason: 'interactive_priority' };
-    }
     const epochKey = compactionEpochKey(input);
     if (
       Number.isFinite(deadlineMs) &&
@@ -740,7 +669,7 @@ async function runAcceptedMainCompaction(input = {}) {
       ? deadlineMs - Math.max(0, executionBudget.completionReserveMs || 0)
       : Infinity;
     const nativeResponseDeadlineForStage = (stage) =>
-      nativeStageDeadline && Number.isFinite(deadlineMs)
+      nativeStageDeadline && input.foreground !== true && Number.isFinite(deadlineMs)
         ? nativeDeadlineLimit -
           nativeGraceMs -
           (stage === 'review' ? 0 : Math.max(slowestReviewCallMs, COMPACTOR_TIMEOUT_MS))
@@ -865,9 +794,6 @@ async function runAcceptedMainCompaction(input = {}) {
         now: now(),
       });
     };
-    if (yieldToInteractive()) {
-      terminalReason = 'interactive_priority';
-    }
     while (
       !terminalReason &&
       (semanticAttempts < MAX_ATTEMPTS || mayRepairSize() || mayRepairFidelity())
@@ -885,10 +811,6 @@ async function runAcceptedMainCompaction(input = {}) {
       let callStartedMs;
       try {
         const prompt = buildCompactionPrompt(claim, correctionReason);
-        if (yieldToInteractive()) {
-          terminalReason = 'interactive_priority';
-          break;
-        }
         const budget = await stageBudget('compaction');
         if (controller.signal.aborted) {
           terminalReason =
@@ -1032,7 +954,6 @@ async function runAcceptedMainCompaction(input = {}) {
       let reviewStartedMs;
       try {
         const reviewPrompt = buildCompactionPrompt(claim, '', parsed);
-        if (yieldToInteractive()) continue;
         const reviewBudget = await stageBudget('review');
         if (controller.signal.aborted) {
           terminalReason =
@@ -1271,6 +1192,20 @@ function loadAcceptedMainContextForAdmission(input = {}) {
   return recoverMainContinuityCarrierForAdmission({
     request: input.req,
     identityKey: `${input.agentId}:${input.stableAuthoritySha256}`,
+    signal: input.signal,
+    getActiveCompactions: () => {
+      const domainKey = compactionEpochKey(input);
+      discardDeferredMainCompaction(domainKey);
+      return Array.from(activeCompactionsByOwnerId.get(String(input.ownerId || '').trim()) || [])
+        .filter((active) => active.domainKey === domainKey)
+        .map(async (active) => {
+          await active.settled;
+          if (active.capacityReleaseAcknowledged !== true)
+            throw Object.assign(new Error('Native memory capacity release is unconfirmed.'), {
+              code: 'main_compaction_native_release_unconfirmed',
+            });
+        });
+    },
     load: () => {
       if (usePinned) {
         usePinned = false;
@@ -1291,7 +1226,6 @@ function loadAcceptedMainContextForAdmission(input = {}) {
 }
 
 module.exports = {
-  acquireInteractiveMainAdmissionFence,
   buildCompactionPrompt,
   compactorAgent,
   ensureAcceptedMainCompaction,
@@ -1299,5 +1233,4 @@ module.exports = {
   loadAcceptedMainContextForAdmission,
   parseSemanticCompactionOutput,
   scheduleMainContinuityMaintenance,
-  yieldAcceptedMainCompaction,
 };

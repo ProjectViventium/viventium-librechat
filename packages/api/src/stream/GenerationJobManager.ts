@@ -4797,6 +4797,20 @@ class GenerationJobManagerClass {
   private async cleanup(): Promise<void> {
     const services = this.captureServices();
     const { generation, jobStore, eventTransport } = services;
+    /* === VIVENTIUM START ===
+     * Preparation can outlive Redis's crash-cleanup TTL before native admission exists. The
+     * existing local producer owns renewal; reconnect-only runtimes never keep a job alive.
+     */
+    if (jobStore.renewRunningJob) {
+      for (const [streamId, runtime] of this.runtimeState) {
+        const producer = runtime.nativeProducer;
+        if (!producer || runtime.abortController.signal.aborted || runtime.presentationOnly)
+          continue;
+        await jobStore.renewRunningJob(streamId, producer.createdAt, runtime.nativeDispatchOwner);
+        this.assertServiceGeneration(generation);
+      }
+    }
+    /* === VIVENTIUM END === */
     const count = await jobStore.cleanup();
     this.assertServiceGeneration(generation);
 

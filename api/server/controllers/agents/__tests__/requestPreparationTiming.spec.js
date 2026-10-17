@@ -8,7 +8,12 @@ const end = controller.indexOf('        const startPartialCheckpointing = () => 
 if (start < 0 || end <= start) throw new Error('Controller start callback unavailable');
 const startCallback = controller.slice(start, end);
 
-function preparation({ enabled = true, rejectSource = false, throwLogger = false } = {}) {
+function preparation({
+  enabled = true,
+  rejectSource = false,
+  throwLogger = false,
+  bindResponse,
+} = {}) {
   const events = [];
   const lines = [];
   let release;
@@ -31,7 +36,11 @@ function preparation({ enabled = true, rejectSource = false, throwLogger = false
       events.push('placeholder');
       return { persisted: true, fingerprint: 'synthetic-fingerprint' };
     },
-    req: { config: { endpoints: { agents: { providerCapabilities: {} } } } },
+    claimedInteractionContext: { source_event_id: 'source', logical_turn_id: 'turn', revision: 1 },
+    req: {
+      _viventiumBindResponseIdentity: bindResponse,
+      config: { endpoints: { agents: { providerCapabilities: {} } } },
+    },
     streamId: 'synthetic-stream',
     userId: 'synthetic-owner',
     client: { options: { agent: { endpoint: 'synthetic' } } },
@@ -103,7 +112,7 @@ describe('awaited start preparation timing', () => {
   );
 });
 
-/* === VIVENTIUM START === Pre-job timing and compaction cleanup retain admission/error semantics. === */
+/* === VIVENTIUM START === Pre-job timing retains admission and error semantics. === */
 const {
   observeVoiceLatencyOperation,
   markVoiceLatencyStart,
@@ -122,15 +131,13 @@ const jobStart = controller.indexOf(
 const jobEnd = controller.indexOf('    if (job.duplicateOfStreamId)', jobStart);
 const initializeStart = controller.indexOf('    const result = await initializeClient({', jobEnd);
 const initializeEnd = controller.indexOf('    recordPassiveTextTurnBoundary', initializeStart);
-const joinStart = controller.indexOf('    await interactiveCompactionYield;', initializeEnd);
-const generationStart = controller.indexOf('    startGeneration().catch', joinStart);
+const generationStart = controller.indexOf('    startGeneration().catch', initializeEnd);
 if (!(
   ownerEnd < jobStart &&
   jobStart < jobEnd &&
   jobEnd < initializeStart &&
   initializeStart < initializeEnd &&
-  initializeEnd < joinStart &&
-  joinStart < generationStart
+  initializeEnd < generationStart
 )) {
   throw new Error('Compaction preparation/join/generation boundaries unavailable');
 }
@@ -145,10 +152,6 @@ const actualPreparation =
   controller.slice(policyStart, policyEnd) +
   controller.slice(jobStart, jobEnd) +
   controller.slice(initializeStart, initializeEnd);
-const actualJoin = controller.slice(
-  joinStart,
-  joinStart + '    await interactiveCompactionYield;'.length,
-);
 
 function preJobOwners({
   enabled = true,
@@ -238,11 +241,9 @@ function preJobOwners({
     `(async () => {${ownerSource}
     try {
       ${actualPreparation}
-      ${actualJoin}
       startGeneration();
       return { streamId, interactionContext, required: req._viventiumDeliveryDispositionRequired };
     } catch (error) {
-      completeInteractiveMainAdmission();
       await maybeDecrement();
       throw error;
     }
@@ -267,7 +268,6 @@ describe('pre-job owner operation spans', () => {
       expect(probe.calls).toEqual([
         'stream',
         'interaction',
-        'compaction',
         'delivery',
         'job',
         'initialize',
@@ -279,7 +279,6 @@ describe('pre-job owner operation spans', () => {
           ? [
               'request_stream_identity_completed',
               'request_interaction_capture_completed',
-              'request_compaction_yield_completed',
               'request_delivery_policy_completed',
             ]
           : [],
@@ -288,18 +287,14 @@ describe('pre-job owner operation spans', () => {
     },
   );
 
-  test.each(['stream', 'interaction', 'compaction'])(
-    'preserves exact %s failure and existing capacity/fence cleanup',
+  test.each(['stream', 'interaction'])(
+    'preserves exact %s failure and existing preparation cleanup',
     async (failedOwner) => {
       const probe = preJobOwners({ failedOwner });
       probe.release();
       await expect(probe.result).rejects.toBe(probe.error);
-      if (failedOwner !== 'compaction') expect(probe.calls).not.toContain('delivery');
+      expect(probe.calls).not.toContain('delivery');
       expect(probe.calls).not.toContain('generation');
-      if (failedOwner === 'compaction') {
-        expect(probe.calls).toContain('release-fence');
-        expect(probe.calls).toContain('decrement');
-      }
       if (failedOwner === 'interaction') expect(probe.calls).toContain('decrement');
       expect(JSON.stringify(probe.context.logger.debug.mock.calls)).not.toContain(
         probe.error.message,
@@ -307,54 +302,37 @@ describe('pre-job owner operation spans', () => {
     },
   );
 
-  test('job/client preparation overlaps pending compaction but generation does not', async () => {
+  test('real preparation and generation never cancel or join unrelated pending memory', async () => {
     const probe = preJobOwners({ pendingCompaction: true });
     probe.release();
-    await new Promise(setImmediate);
-    expect(probe.calls).toEqual([
-      'stream',
-      'interaction',
-      'compaction',
-      'delivery',
-      'job',
-      'initialize',
-    ]);
-    expect(probe.context.startGeneration).not.toHaveBeenCalled();
+    await probe.result;
+    expect(probe.context.yieldAcceptedMainCompaction).not.toHaveBeenCalled();
+    expect(probe.context.acquireInteractiveMainAdmissionFence).not.toHaveBeenCalled();
+    expect(probe.context.startGeneration).toHaveBeenCalledTimes(1);
     expect(probe.calls).not.toContain('release-fence');
     probe.releaseCompaction();
-    await probe.result;
-    expect(probe.context.startGeneration).toHaveBeenCalledTimes(1);
-    // Original fence remains held until the existing generation completion/error owners release it.
-    expect(probe.calls).not.toContain('release-fence');
   });
 
-  test('early compaction rejection is handled during pending preparation and rethrown exactly at join', async () => {
-    const probe = preJobOwners({
-      failedOwner: 'compaction',
-      pendingCompaction: true,
-      pendingInitialization: true,
-    });
+  test('generation still waits for its own client initialization', async () => {
+    const probe = preJobOwners({ pendingInitialization: true, pendingCompaction: true });
     probe.release();
     await new Promise(setImmediate);
-    probe.releaseCompaction();
-    await new Promise(setImmediate);
-    expect(probe.context.initializeClient).toHaveBeenCalledTimes(1);
-    expect(probe.calls).not.toContain('release-fence');
     expect(probe.context.startGeneration).not.toHaveBeenCalled();
     probe.releaseInitialization();
-    await expect(probe.result).rejects.toBe(probe.error);
-    expect(probe.calls.slice(-2)).toEqual(['release-fence', 'decrement']);
-    expect(probe.context.startGeneration).not.toHaveBeenCalled();
+    await probe.result;
+    expect(probe.context.startGeneration).toHaveBeenCalledTimes(1);
+    expect(probe.context.yieldAcceptedMainCompaction).not.toHaveBeenCalled();
+    probe.releaseCompaction();
   });
 
   test.each(['delivery', 'job', 'initialize'])(
-    'preserves %s failure and fence cleanup with yield pending',
+    'preserves %s failure cleanup with unrelated memory pending',
     async (failedOwner) => {
       const probe = preJobOwners({ failedOwner, pendingCompaction: true });
       probe.release();
       await expect(probe.result).rejects.toBe(probe.error);
       expect(probe.context.startGeneration).not.toHaveBeenCalled();
-      expect(probe.calls.slice(-2)).toEqual(['release-fence', 'decrement']);
+      expect(probe.calls.at(-1)).toBe('decrement');
       if (failedOwner === 'delivery') {
         expect(probe.context.GenerationJobManager.createJob).not.toHaveBeenCalled();
         expect(probe.context.initializeClient).not.toHaveBeenCalled();
@@ -371,7 +349,6 @@ describe('pre-job owner operation spans', () => {
     expect(probe.calls).toEqual([
       'stream',
       'interaction',
-      'compaction',
       'delivery',
       'job',
       'initialize',
@@ -380,3 +357,25 @@ describe('pre-job owner operation spans', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+test('actual onStart awaits exact assistant binding before placeholder or preparation completion', async () => {
+  let release;
+  const bound = new Promise((resolve) => {
+    release = resolve;
+  });
+  const bindResponse = jest.fn(() => bound);
+  const control = preparation({ bindResponse });
+  control.release();
+  await new Promise(setImmediate);
+  expect(bindResponse).toHaveBeenCalledWith({
+    streamId: 'synthetic-stream',
+    conversationId: 'synthetic-conversation',
+    sourceMessageId: 'synthetic-user',
+    responseMessageId: 'synthetic-response',
+    interactionContext: { source_event_id: 'source', logical_turn_id: 'turn', revision: 1 },
+  });
+  expect(control.events).toEqual([]);
+  release();
+  await control.result;
+  expect(control.events).toEqual(['placeholder', 'metadata', 'created']);
+});

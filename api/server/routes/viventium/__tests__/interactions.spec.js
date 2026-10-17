@@ -17,6 +17,10 @@ const mockMarkCortexTelegramPresentationFailed = jest.fn();
 const mockConsumeLocalQaCortexFault = jest.fn();
 const mockTelegramInputDeliveryCoverage = jest.fn(() => null);
 const mockAcknowledgeMongoDurableEffectDelivery = jest.fn();
+const mockAcknowledgeRetainedTelegramFailure = jest.fn();
+jest.mock('~/server/services/viventium/TelegramIngressAuthorityService', () => ({
+  acknowledgeRetainedTelegramFailure: (...args) => mockAcknowledgeRetainedTelegramFailure(...args),
+}));
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: { error: jest.fn(), warn: jest.fn() },
@@ -147,6 +151,7 @@ async function dispatch(app, req, res) {
 describe('POST /api/viventium/interactions/delivery-ack', () => {
   beforeEach(() => {
     mockTelegramInputDeliveryCoverage.mockReset().mockReturnValue(null);
+    mockAcknowledgeRetainedTelegramFailure.mockReset().mockResolvedValue({ status: 'not_found' });
     mockAcknowledgeMongoDurableEffectDelivery.mockReset().mockResolvedValue({ status: 'conflict' });
     jest.resetModules();
     mockMessageUpdateOne.mockReset().mockResolvedValue({ modifiedCount: 1 });
@@ -197,6 +202,36 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
   afterEach(() => {
     delete process.env.VIVENTIUM_TELEGRAM_INTERACTION_ADAPTER_SECRET;
     delete process.env.VIVENTIUM_VOICE_INTERACTION_ADAPTER_SECRET;
+  });
+
+  test('missing Redis failed Telegram ACK settles its exact durable terminal without Main acceptance', async () => {
+    mockAcknowledgeDelivery.mockResolvedValue({ status: 'not_found' });
+    mockAcknowledgeRetainedTelegramFailure.mockResolvedValue({
+      status: 'recorded',
+      idempotent: true,
+      transportOnly: true,
+    });
+    const res = response();
+    await dispatch(
+      createApp(require('../interactions')),
+      request({
+        headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+        body: {
+          logical_turn_id: 'turn-1',
+          revision: 2,
+          state: 'failed',
+          presentation_ref: 'telegram:chat',
+        },
+      }),
+      res,
+    );
+    expect(res.body).toEqual({ acknowledged: true, idempotent: true });
+    expect(mockAcknowledgeRetainedTelegramFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ logical_turn_id: 'turn-1', revision: 2, state: 'failed' }),
+      'telegram',
+    );
+    expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    expect(mockScheduleExternallyAcceptedMainCompaction).not.toHaveBeenCalled();
   });
 
   test('refreshes the Voice snapshot after Message persistence, Main acceptance and compaction', async () => {

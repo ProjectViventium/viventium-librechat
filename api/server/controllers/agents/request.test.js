@@ -23,8 +23,6 @@ const mockGetNativeResponse = jest.fn(async () => ({ nativeResponse: { status: '
 const mockRecoverNativeResponse = jest.fn(async () => true);
 const mockMarkNativeReplayStored = jest.fn();
 const mockEnsureAcceptedMainCompaction = jest.fn(async () => ({ status: 'empty' }));
-const mockYieldAcceptedMainCompaction = jest.fn(async () => ({ status: 'idle', count: 0 }));
-const mockReleaseInteractiveMainAdmissionFence = jest.fn();
 
 const mockGenerationJobManager = {
   retainLogicalTurnInput: jest.fn(async (_user, context) => context),
@@ -150,9 +148,7 @@ jest.mock('~/server/services/viventium/ViventiumMainContinuityService', () => ({
 }));
 
 jest.mock('~/server/services/viventium/ViventiumMainCompactionService', () => ({
-  acquireInteractiveMainAdmissionFence: jest.fn(() => mockReleaseInteractiveMainAdmissionFence),
   ensureAcceptedMainCompaction: (...args) => mockEnsureAcceptedMainCompaction(...args),
-  yieldAcceptedMainCompaction: (...args) => mockYieldAcceptedMainCompaction(...args),
 }));
 
 const AgentController = require('./request');

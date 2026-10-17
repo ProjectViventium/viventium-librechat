@@ -45,6 +45,10 @@ const {
   refreshVoiceTaskCommittedPresentation,
 } = require('~/server/services/viventium/VoiceTaskService');
 
+const {
+  acknowledgeRetainedTelegramFailure,
+} = require('~/server/services/viventium/TelegramIngressAuthorityService');
+
 const router = express.Router();
 
 async function persistPresentationOutcome(result) {
@@ -367,6 +371,14 @@ router.post('/delivery-ack', async (req, res) => {
       }
     }
     /* === VIVENTIUM END === */
+    if (
+      result.status === 'not_found' &&
+      !parsed.cortexPresentation &&
+      adapterSurface === 'telegram' &&
+      parsed.acknowledgement.state === 'failed'
+    ) {
+      result = await acknowledgeRetainedTelegramFailure(parsed.acknowledgement, adapterSurface);
+    }
     if (result.status === 'recorded') {
       const committed = ['committed', 'committed_effect'].includes(result.acknowledgement?.state);
       // A Cortex receipt settles only the message it presented. A separate addition, or any

@@ -147,7 +147,7 @@ export interface TelegramInputDependencies {
   readStream(
     streamId: string,
     ownerId: string,
-  ): Promise<'missing' | 'pending' | 'completed' | 'failed'>;
+  ): Promise<'missing' | 'pending' | 'completed' | 'failed' | 'terminal'>;
   now?: () => number;
 }
 export const TELEGRAM_INPUT_LEASE_MS = 120_000;
@@ -466,13 +466,20 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
       const claimed: TelegramInputRecord[] = [];
       for (const record of await repository.due(now(), Math.max(1, Math.min(25, limit)))) {
         if (!(await deps.verifyOwner(record))) continue;
-        if (record.state === 'ready' || record.state === 'admitted') {
+        let terminalRecovery = false;
+        if (
+          record.state === 'ready' ||
+          record.state === 'admitted' ||
+          (record.state === 'failed' && record.failureCode === 'accepted_response_unavailable')
+        ) {
           const committed = await deps.hasCommittedDelivery(record);
           let stream: Awaited<ReturnType<typeof deps.readStream>> = committed
             ? 'completed'
             : 'pending';
-          if (!committed && record.state === 'admitted')
+          if (!committed && record.state !== 'ready')
             stream = await deps.readStream(record.streamId, record.libreChatUserId);
+          terminalRecovery = stream === 'terminal';
+          if (record.state === 'failed' && !terminalRecovery && stream !== 'completed') continue;
           if (stream === 'completed') {
             await deps.transaction(async () => {
               for (const sourceEventId of record.relatedSourceEventIds) {
@@ -503,7 +510,11 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
             continue;
           }
         }
-        if (record.state === 'failed' && (!record.retryAt || record.attempts >= 3)) {
+        if (
+          !terminalRecovery &&
+          record.state === 'failed' &&
+          (!record.retryAt || record.attempts >= 3)
+        ) {
           if (record.mediaGroupId && terminalPreparationFailure(record))
             await reconcileFailedGroup(record);
           continue;
@@ -519,7 +530,7 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
           continue;
         }
         const group =
-          record.mediaGroupId && ['preparing', 'failed'].includes(record.state)
+          !terminalRecovery && record.mediaGroupId && ['preparing', 'failed'].includes(record.state)
             ? await repository.group(record)
             : [record];
         if (
@@ -533,7 +544,7 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
             (row) =>
               row.leaseUntil > now() ||
               row.retryAt > now() ||
-              (row.state === 'failed' && (!row.retryAt || row.attempts >= 3)),
+              (!terminalRecovery && row.state === 'failed' && (!row.retryAt || row.attempts >= 3)),
           ) ||
           claimed.some((row) => group.some((member) => member.sourceEventId === row.sourceEventId))
         )
@@ -547,9 +558,10 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
               claimToken: randomUUID(),
               registrationId: randomUUID(),
               leaseUntil: now() + TELEGRAM_INPUT_LEASE_MS,
-              attempts: row.attempts + (row.state === 'failed' ? 1 : 0),
+              attempts: row.attempts + (!terminalRecovery && row.state === 'failed' ? 1 : 0),
               state: row.state === 'failed' ? ('preparing' as const) : row.state,
             };
+            if (terminalRecovery) next.state = 'admitted';
             if (!(await repository.replace(row, next)))
               throw inputConflict('source_input_claim_conflict');
             acquired.push(next);

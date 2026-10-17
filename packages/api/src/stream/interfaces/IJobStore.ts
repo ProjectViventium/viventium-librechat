@@ -486,6 +486,9 @@ export interface IJobStore {
     claim: { createdAt: number; owner: string; leaseMs: number; mode: 'renew' | 'takeover' },
   ): Promise<boolean>;
 
+  /** Keep an exact local generator's existing pre-native job and turn alive during preparation. */
+  renewRunningJob?(streamId: string, createdAt: number, dispatchOwner?: string): Promise<boolean>;
+
   /** Remove only a source-event receipt that points at a confirmed missing owner job. */
   forgetMissingSourceEventReceipt(
     interactionContext: InteractionContext,

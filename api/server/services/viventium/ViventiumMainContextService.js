@@ -1615,7 +1615,7 @@ function applyMainContextAttempt({
   return true;
 }
 
-function bindMainContextSnapshot(targetAgent, snapshot, stateBlocks = '') {
+function bindMainContextCarrier(targetAgent, snapshot) {
   if (!snapshot || !targetAgent || typeof targetAgent !== 'object') return false;
   const modelParameters =
     targetAgent.model_parameters && typeof targetAgent.model_parameters === 'object'
@@ -1659,8 +1659,24 @@ function bindMainContextSnapshot(targetAgent, snapshot, stateBlocks = '') {
               ),
             }
           : {}),
-        'X-Viventium-Main-Context-Protocol': 'main_context_v1',
+      },
+    },
+  };
+  return true;
+}
+
+function bindMainContextSnapshot(targetAgent, snapshot, stateBlocks = '') {
+  if (!bindMainContextCarrier(targetAgent, snapshot)) return false;
+  const modelParameters = targetAgent.model_parameters;
+  const configuration = modelParameters.configuration;
+  targetAgent.model_parameters = {
+    ...modelParameters,
+    configuration: {
+      ...configuration,
+      defaultHeaders: {
+        ...configuration.defaultHeaders,
         'X-Viventium-Main-Context-State-Blocks-B64': stateBlocks,
+        'X-Viventium-Main-Context-Protocol': 'main_context_v1',
         'X-Viventium-Main-Context-Owner': 'core',
         'X-GlassHive-Stable-Authority-SHA256': snapshot.stableAuthoritySha256,
         'X-Viventium-Main-Context-Snapshot-SHA256': snapshot.snapshotSha256,
@@ -1729,6 +1745,7 @@ module.exports = {
   mainHistoryFitsNativeBody,
   attachMainContextSnapshotMetadata,
   bindMainContextSnapshot,
+  bindMainContextCarrier,
   buildMainAttemptFactsForAgent,
   captureMainContextSnapshot,
   createMainAttemptFacts,

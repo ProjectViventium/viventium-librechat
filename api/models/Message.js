@@ -163,9 +163,13 @@ function sanitizeMessageForPersistence(message, { purpose = 'update' } = {}) {
   for (const key of Object.keys(sanitizedMessage)) {
     // Admission and recovery are internal store operations, never user/message-authored metadata.
     if (
-      ['savedMemoryWrite', 'nativeResponse', 'hostFinal', 'memoryWriteStatus', 'acceptedMainContext'].includes(
-        key.split('.')[0],
-      )
+      [
+        'savedMemoryWrite',
+        'nativeResponse',
+        'hostFinal',
+        'memoryWriteStatus',
+        'acceptedMainContext',
+      ].includes(key.split('.')[0])
     ) {
       delete sanitizedMessage[key];
       continue;
@@ -182,14 +186,16 @@ function sanitizeMessageForPersistence(message, { purpose = 'update' } = {}) {
         if (
           [
             'savedMemoryWrite',
-            'nativeResponse', 'hostFinal',
+            'nativeResponse',
+            'hostFinal',
             'memoryWriteStatus',
             'acceptedMainContext',
           ].includes(pathSegments[0]) ||
           (key === '$rename' &&
             [
               'savedMemoryWrite',
-              'nativeResponse', 'hostFinal',
+              'nativeResponse',
+              'hostFinal',
               'memoryWriteStatus',
               'acceptedMainContext',
             ].includes(String(value).split('.')[0]))
@@ -605,10 +611,13 @@ async function saveMessage(req, params, metadata) {
       await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
         sourceFilter,
         metadata?.hostGenerationComplete === true && req._viventiumHostResponseIdentity
-          ? () => require('~/models').saveHostResponseFinal(
-              req._viventiumHostResponseIdentity, persist, req._viventiumHostResponseIsCurrent,
-              (operation) => mongoose.connection.transaction(operation),
-            )
+          ? () =>
+              require('~/models').saveHostResponseFinal(
+                req._viventiumHostResponseIdentity,
+                persist,
+                req._viventiumHostResponseIsCurrent,
+                (operation) => mongoose.connection.transaction(operation),
+              )
           : persist,
         operationKind,
       );

@@ -357,42 +357,98 @@ test.each(['source', 'receipt', 'presentation', 'cortex'])(
 
 /* VIVENTIUM: the actual canonical writer owns Direct and released native finals identically. */
 describe.each(['direct', 'native-host'])('shared host final Message writer %s', (path) => {
-  const context = { conversation_id: conversationId, logical_turn_id: 'logical', revision: 1, surface: 'telegram' };
+  const context = {
+    conversation_id: conversationId,
+    logical_turn_id: 'logical',
+    revision: 1,
+    surface: 'telegram',
+  };
   beforeEach(async () => {
     if (path === 'direct') {
       await Message.updateOne({ user, messageId: 'answer' }, { $unset: { nativeResponse: 1 } });
       delete req._viventiumNativeResponseIdentity;
     }
-    const { userId, conversationId: convo, responseMessageId, streamId, jobCreatedAt, logicalTurnId, revision, source } = identity;
-    req._viventiumHostResponseIdentity = { userId, conversationId: convo, responseMessageId, streamId,
-      jobCreatedAt, logicalTurnId, revision, source, surface: 'telegram' };
+    const {
+      userId,
+      conversationId: convo,
+      responseMessageId,
+      streamId,
+      jobCreatedAt,
+      logicalTurnId,
+      revision,
+      source,
+    } = identity;
+    req._viventiumHostResponseIdentity = {
+      userId,
+      conversationId: convo,
+      responseMessageId,
+      streamId,
+      jobCreatedAt,
+      logicalTurnId,
+      revision,
+      source,
+      surface: 'telegram',
+    };
     req._viventiumHostResponseIsCurrent = jest.fn().mockResolvedValue(true);
   });
-  const finish = (final = true) => saveMessage(req, {
-    messageId: 'answer', conversationId, parentMessageId: 'question', isCreatedByUser: false,
-    unfinished: true, error: false, text: '', content: [], attachments: [{ file_id: 'output-file', filename: 'result.txt' }],
-    metadata: { viventium: { interactionContext: context } },
-  }, { operationKind: 'system', hostGenerationComplete: final });
+  const finish = (final = true) =>
+    saveMessage(
+      req,
+      {
+        messageId: 'answer',
+        conversationId,
+        parentMessageId: 'question',
+        isCreatedByUser: false,
+        unfinished: true,
+        error: false,
+        text: '',
+        content: [],
+        attachments: [{ file_id: 'output-file', filename: 'result.txt' }],
+        metadata: { viventium: { interactionContext: context } },
+      },
+      { operationKind: 'system', hostGenerationComplete: final },
+    );
   test('stamps actual file-only final and keeps its proof private', async () => {
     const saved = await finish();
     expect(saved.hostFinal).toBeUndefined();
-    const row = await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal +nativeResponse').lean();
-    expect(row.hostFinal).toMatchObject({ version: 1, source: identity.source, streamId: 'stream' });
-    expect(path === 'direct' ? row.nativeResponse : row.nativeResponse.status).toBe(path === 'direct' ? undefined : 'unsupported');
-    expect(await db.readHostResponseFinal({ userId: user, streamId: 'stream' })).toMatchObject({ text: '', attachments: [{ file_id: 'output-file' }] });
+    const row = await Message.findOne({ user, messageId: 'answer' })
+      .select('+hostFinal +nativeResponse')
+      .lean();
+    expect(row.hostFinal).toMatchObject({
+      version: 1,
+      source: identity.source,
+      streamId: 'stream',
+    });
+    expect(path === 'direct' ? row.nativeResponse : row.nativeResponse.status).toBe(
+      path === 'direct' ? undefined : 'unsupported',
+    );
+    expect(await db.readHostResponseFinal({ userId: user, streamId: 'stream' })).toMatchObject({
+      text: '',
+      attachments: [{ file_id: 'output-file' }],
+    });
     expect((await db.getMessages({ user, messageId: 'answer' }))[0].hostFinal).toBeUndefined();
   });
   test('does not stamp partial or grant replay when Stop wins at final save', async () => {
     await finish(false);
     expect(await db.readHostResponseFinal({ userId: user, streamId: 'stream' })).toBeNull();
     req._viventiumHostResponseIsCurrent.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
-    await expect(finish()).resolves.toMatchObject({ text: '', attachments: [{ file_id: 'output-file' }] });
-    expect((await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean()).hostFinal).toBeUndefined();
+    await expect(finish()).resolves.toMatchObject({
+      text: '',
+      attachments: [{ file_id: 'output-file' }],
+    });
+    expect(
+      (await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean()).hostFinal,
+    ).toBeUndefined();
   });
   test('keeps the actual ordinary final when the optional author lookup fails', async () => {
     req._viventiumHostResponseIsCurrent.mockRejectedValue(new Error('job_store_unavailable'));
-    await expect(finish()).resolves.toMatchObject({ text: '', attachments: [{ file_id: 'output-file' }] });
-    expect((await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean()).hostFinal).toBeUndefined();
+    await expect(finish()).resolves.toMatchObject({
+      text: '',
+      attachments: [{ file_id: 'output-file' }],
+    });
+    expect(
+      (await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean()).hostFinal,
+    ).toBeUndefined();
     expect(await db.readHostResponseFinal({ userId: user, streamId: 'stream' })).toBeNull();
   });
   test('preserves the actual native snapshot guard rejection without retry', async () => {
@@ -401,20 +457,40 @@ describe.each(['direct', 'native-host'])('shared host final Message writer %s', 
     try {
       await expect(finish()).rejects.toBe(error);
       expect(guard).toHaveBeenCalledTimes(1);
-      expect((await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean()).hostFinal).toBeUndefined();
+      expect(
+        (await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean())
+          .hostFinal,
+      ).toBeUndefined();
     } finally {
       guard.mockRestore();
     }
   });
   test('client save, update and import cannot forge, clear or expose the private receipt', async () => {
     await finish();
-    const prior = (await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean()).hostFinal;
-    await saveMessage(req, { messageId: 'answer', conversationId, hostFinal: { version: 99 }, text: 'edited' });
-    await updateMessage(req, { messageId: 'answer', $unset: { hostFinal: 1 }, $set: { 'hostFinal.streamId': 'forged' } });
-    const after = (await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean()).hostFinal;
+    const prior = (await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean())
+      .hostFinal;
+    await saveMessage(req, {
+      messageId: 'answer',
+      conversationId,
+      hostFinal: { version: 99 },
+      text: 'edited',
+    });
+    await updateMessage(req, {
+      messageId: 'answer',
+      $unset: { hostFinal: 1 },
+      $set: { 'hostFinal.streamId': 'forged' },
+    });
+    const after = (await Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean())
+      .hostFinal;
     expect(after).toEqual(prior);
     expect(await db.readHostResponseFinal({ userId: user, streamId: 'stream' })).toBeNull();
     const { sanitizeMessageForPersistence } = require('./Message').__testables;
-    expect(sanitizeMessageForPersistence({ hostFinal: prior, $setOnInsert: { hostFinal: prior }, text: 'safe' })).toEqual({ $setOnInsert: {}, text: 'safe' });
+    expect(
+      sanitizeMessageForPersistence({
+        hostFinal: prior,
+        $setOnInsert: { hostFinal: prior },
+        text: 'safe',
+      }),
+    ).toEqual({ $setOnInsert: {}, text: 'safe' });
   });
 });

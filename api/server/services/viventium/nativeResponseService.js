@@ -602,7 +602,8 @@ async function hostResponseAuthorIsCurrent(identity) {
   if (await store.resolveDeliveryOwner(identity.logicalTurnId, identity.revision + 1)) return false;
   if (identity.sourceOrderScope && identity.sourceSequence != null) {
     const observed = await GenerationJobManager.observeSourceOrder({
-      source_order_scope: identity.sourceOrderScope, source_sequence: identity.sourceSequence,
+      source_order_scope: identity.sourceOrderScope,
+      source_sequence: identity.sourceSequence,
     });
     if (observed.stale) return false;
   }
@@ -614,25 +615,42 @@ async function readRetainedHostFinal(query) {
   if (!response) return null;
   const identity = response.hostFinal;
   if (!(await hostResponseAuthorIsCurrent(identity))) return null;
-  const requestMessage = await db.getMessage({ user: identity.userId,
-    conversationId: identity.conversationId, messageId: identity.source.messageId });
-  const [publicResponse] = await db.getMessages({ user: identity.userId,
-    conversationId: identity.conversationId, messageId: identity.responseMessageId });
-  if (!requestMessage || !publicResponse || !(await db.readHostResponseFinal(query)) ||
-    !(await hostResponseAuthorIsCurrent(identity))) return null;
+  const requestMessage = await db.getMessage({
+    user: identity.userId,
+    conversationId: identity.conversationId,
+    messageId: identity.source.messageId,
+  });
+  const [publicResponse] = await db.getMessages({
+    user: identity.userId,
+    conversationId: identity.conversationId,
+    messageId: identity.responseMessageId,
+  });
+  if (
+    !requestMessage ||
+    !publicResponse ||
+    !(await db.readHostResponseFinal(query)) ||
+    !(await hostResponseAuthorIsCurrent(identity))
+  )
+    return null;
   return {
     responseMessageId: response.messageId,
     conversationId: response.conversationId,
     interactionContext: response.metadata?.viventium?.interactionContext,
     acknowledgement: response.metadata?.viventium?.deliveryAcknowledgement,
-    finalEvent: { final: true, conversation: { conversationId: response.conversationId },
+    finalEvent: {
+      final: true,
+      conversation: { conversationId: response.conversationId },
       requestMessage: sanitizeMessageForTransmit(requestMessage),
-      responseMessage: { ...sanitizeMessageForTransmit(publicResponse), unfinished: false } },
+      responseMessage: { ...sanitizeMessageForTransmit(publicResponse), unfinished: false },
+    },
   };
 }
 async function acknowledgeRetainedHostFinal(acknowledgement, surface) {
   return require('~/models').acknowledgeHostResponseFinal(
-    acknowledgement, surface, runNativeResponseTransaction, hostResponseAuthorIsCurrent,
+    acknowledgement,
+    surface,
+    runNativeResponseTransaction,
+    hostResponseAuthorIsCurrent,
   );
 }
 

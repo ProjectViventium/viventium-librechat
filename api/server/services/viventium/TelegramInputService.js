@@ -259,10 +259,17 @@ const service = createTelegramInputService({
                     // Candidate discovery only; the shared exact reader validates the receipt.
                     $or: [
                       { 'hostFinal.version': 1, error: { $ne: true } },
-                      { unfinished: false, error: true, content: { $elemMatch: {
-                        type: 'error', error_class: { $type: 'string', $ne: '' },
-                        error: { $type: 'string', $ne: '' },
-                      } } },
+                      {
+                        unfinished: false,
+                        error: true,
+                        content: {
+                          $elemMatch: {
+                            type: 'error',
+                            error_class: { $type: 'string', $ne: '' },
+                            error: { $type: 'string', $ne: '' },
+                          },
+                        },
+                      },
                     ],
                     $expr: {
                       $and: [
@@ -384,8 +391,13 @@ const service = createTelegramInputService({
   readStream: async (streamId, ownerId) => {
     const job = await GenerationJobManager.getJob(streamId);
     if (!job) {
-      const terminal = await readRetainedTelegramTerminal({ ownerId, streamId, includeSettled: true });
-      if (['committed', 'committed_effect'].includes(terminal?.acknowledgement?.state)) return 'completed';
+      const terminal = await readRetainedTelegramTerminal({
+        ownerId,
+        streamId,
+        includeSettled: true,
+      });
+      if (['committed', 'committed_effect'].includes(terminal?.acknowledgement?.state))
+        return 'completed';
       if (terminal?.acknowledgement?.state === 'failed') return 'failed';
       return terminal ? 'terminal' : 'missing';
     }

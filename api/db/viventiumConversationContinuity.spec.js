@@ -285,7 +285,9 @@ describe('Conversation legacy continuity', () => {
     expect(outcome).toEqual({ status: 'degraded', reason: 'context_budget' });
     expect(execute).not.toHaveBeenCalled();
     expect(record).toBeNull();
-    expect(await Continuity.countDocuments({ ownerId: OWNER, conversationId: CONVERSATION })).toBe(0);
+    expect(await Continuity.countDocuments({ ownerId: OWNER, conversationId: CONVERSATION })).toBe(
+      0,
+    );
     expect(await Message.countDocuments({ user: OWNER, conversationId: CONVERSATION })).toBe(
       rows.length,
     );

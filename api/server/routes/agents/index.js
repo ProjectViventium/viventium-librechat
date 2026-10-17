@@ -88,8 +88,13 @@ router.get('/chat/stream/:streamId', async (req, res) => {
   }
   /* VIVENTIUM: exact persisted host final is independent of expired transport storage. */
   if (!job) {
-    const terminal = await require('~/server/services/viventium/nativeResponseService')
-      .readRetainedHostFinal({ userId: req.user.id, streamId, surface: 'web', includeSettled: true });
+    const terminal =
+      await require('~/server/services/viventium/nativeResponseService').readRetainedHostFinal({
+        userId: req.user.id,
+        streamId,
+        surface: 'web',
+        includeSettled: true,
+      });
     if (requestAbort.signal.aborted) return;
     if (terminal) {
       res.setHeader('Content-Type', 'text/event-stream');

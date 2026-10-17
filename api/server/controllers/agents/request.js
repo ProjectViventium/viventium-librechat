@@ -1884,35 +1884,61 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               // The awaited canonical save already supplies the source bytes and Mongo identity.
               // Existing-message continuations alone require the existing exact source reader.
               const proof = savedSource?._id
-                ? { ...nativeResponseSource(savedSource),
-                    ...(client.nativeResponseParentSource ? { parent: { ...client.nativeResponseParentSource } } : {}) }
+                ? {
+                    ...nativeResponseSource(savedSource),
+                    ...(client.nativeResponseParentSource
+                      ? { parent: { ...client.nativeResponseParentSource } }
+                      : {}),
+                  }
                 : await require('~/models').captureNativeResponseSource(
-                    userId, conversationId, userMsg.messageId, client.nativeResponseParentSource ?? null,
+                    userId,
+                    conversationId,
+                    userMsg.messageId,
+                    client.nativeResponseParentSource ?? null,
                   );
               req._viventiumHostResponseIdentity = {
-                userId, conversationId, responseMessageId: respMsgId, streamId, jobCreatedAt,
-                logicalTurnId: context.logical_turn_id, revision: context.revision,
+                userId,
+                conversationId,
+                responseMessageId: respMsgId,
+                streamId,
+                jobCreatedAt,
+                logicalTurnId: context.logical_turn_id,
+                revision: context.revision,
                 sourceOrderScope: context.source_order_scope,
                 sourceSequence: require('@librechat/api').interactionPresentationSequence(context),
                 surface: context.surface,
-                ...(req.body?.viventiumCallSessionId ? { callSessionId: req.body.viventiumCallSessionId } : {}),
+                ...(req.body?.viventiumCallSessionId
+                  ? { callSessionId: req.body.viventiumCallSessionId }
+                  : {}),
                 source: proof,
               };
               req._viventiumHostResponseIsCurrent = async () => {
                 if (job.abortController.signal.aborted) return false;
                 const store = GenerationJobManager.getJobStore();
                 const current = await store.getJob(streamId);
-                return current?.createdAt === jobCreatedAt && current.userId === userId &&
-                  current.conversationId === conversationId && current.status === 'running' &&
+                return (
+                  current?.createdAt === jobCreatedAt &&
+                  current.userId === userId &&
+                  current.conversationId === conversationId &&
+                  current.status === 'running' &&
                   current.interactionContext?.logical_turn_id === context.logical_turn_id &&
                   current.interactionContext?.revision === context.revision &&
-                  await store.isCurrentLogicalTurn(streamId);
+                  (await store.isCurrentLogicalTurn(streamId))
+                );
               };
-              const nativeCapability = req.config?.endpoints?.agents?.providerCapabilities?.[
-                client.options?.agent?.endpoint || client.options?.agent?.provider
-              ];
-              if (nativeCapability?.conversation_session === true && nativeCapability?.workspace_binding === true) {
-                req._viventiumNativeResponseSource = { conversationId, responseMessageId: respMsgId, proof };
+              const nativeCapability =
+                req.config?.endpoints?.agents?.providerCapabilities?.[
+                  client.options?.agent?.endpoint || client.options?.agent?.provider
+                ];
+              if (
+                nativeCapability?.conversation_session === true &&
+                nativeCapability?.workspace_binding === true
+              ) {
+                req._viventiumNativeResponseSource = {
+                  conversationId,
+                  responseMessageId: respMsgId,
+                  proof,
+                };
               }
             }
 
@@ -2163,8 +2189,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           const assistantPersistence = await timedSaveMessage(
             req,
             persistedResponse,
-            { context: 'api/server/controllers/agents/request.js - resumable response end',
-              hostGenerationComplete: !wasAbortedBeforeComplete && !req._viventiumNativeResponseIdentity },
+            {
+              context: 'api/server/controllers/agents/request.js - resumable response end',
+              hostGenerationComplete:
+                !wasAbortedBeforeComplete && !req._viventiumNativeResponseIdentity,
+            },
             'db_save_response',
           );
           /* === VIVENTIUM START ===

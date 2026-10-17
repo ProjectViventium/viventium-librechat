@@ -50,7 +50,15 @@ function preparation({
     claimedInteractionContext: { source_event_id: 'source', logical_turn_id: 'turn', revision: 1 },
     req: {
       _viventiumBindResponseIdentity: bindResponse,
-      config: { endpoints: { agents: { providerCapabilities: native ? { synthetic: { conversation_session: true, workspace_binding: true } } : {} } } },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: native
+              ? { synthetic: { conversation_session: true, workspace_binding: true } }
+              : {},
+          },
+        },
+      },
     },
     streamId: 'synthetic-stream',
     userId: 'synthetic-owner',
@@ -58,9 +66,16 @@ function preparation({
     conversationId: 'synthetic-conversation',
     sender: 'AI',
     GenerationJobManager: {
-      getJobStore: () => ({ getJob: async () => ({ createdAt: 1, userId: 'synthetic-owner',
-        conversationId: 'synthetic-conversation', status: 'running', interactionContext: hostContext }),
-        isCurrentLogicalTurn: async () => true }),
+      getJobStore: () => ({
+        getJob: async () => ({
+          createdAt: 1,
+          userId: 'synthetic-owner',
+          conversationId: 'synthetic-conversation',
+          status: 'running',
+          interactionContext: hostContext,
+        }),
+        isCurrentLogicalTurn: async () => true,
+      }),
       updateMetadata: async () => events.push('metadata'),
       emitChunk: async () => events.push('created'),
     },
@@ -394,21 +409,46 @@ test('actual onStart awaits exact assistant binding before placeholder or prepar
   expect(control.events).toEqual(['placeholder', 'metadata', 'created']);
 });
 
-test.each([false, true])('actual onStart shares saved source proof without a second read (native=%s)', async (native) => {
-  const sourceRow = { _id: 'synthetic-mongo-source', messageId: 'synthetic-user',
-    parentMessageId: null, text: 'Source', content: [], files: ['owned-file'] };
-  const hostContext = { origin: 'interactive', actor_kind: 'external_user', surface: 'web',
-    conversation_id: 'synthetic-conversation', logical_turn_id: 'turn', revision: 1 };
-  const control = preparation({ sourceRow, hostContext, native });
-  control.release();
-  await control.result;
-  expect(control.context.req._viventiumHostResponseIdentity).toMatchObject({
-    userId: 'synthetic-owner', conversationId: 'synthetic-conversation', responseMessageId: 'synthetic-response',
-    streamId: 'synthetic-stream', jobCreatedAt: 1, logicalTurnId: 'turn', revision: 1, surface: 'web',
-    source: { id: 'synthetic-mongo-source', messageId: 'synthetic-user', digest: expect.stringMatching(/^[a-f0-9]{64}$/) },
-  });
-  expect(await control.context.req._viventiumHostResponseIsCurrent()).toBe(true);
-  control.context.job.abortController.abort();
-  expect(await control.context.req._viventiumHostResponseIsCurrent()).toBe(false);
-  expect(Boolean(control.context.req._viventiumNativeResponseSource)).toBe(native);
-});
+test.each([false, true])(
+  'actual onStart shares saved source proof without a second read (native=%s)',
+  async (native) => {
+    const sourceRow = {
+      _id: 'synthetic-mongo-source',
+      messageId: 'synthetic-user',
+      parentMessageId: null,
+      text: 'Source',
+      content: [],
+      files: ['owned-file'],
+    };
+    const hostContext = {
+      origin: 'interactive',
+      actor_kind: 'external_user',
+      surface: 'web',
+      conversation_id: 'synthetic-conversation',
+      logical_turn_id: 'turn',
+      revision: 1,
+    };
+    const control = preparation({ sourceRow, hostContext, native });
+    control.release();
+    await control.result;
+    expect(control.context.req._viventiumHostResponseIdentity).toMatchObject({
+      userId: 'synthetic-owner',
+      conversationId: 'synthetic-conversation',
+      responseMessageId: 'synthetic-response',
+      streamId: 'synthetic-stream',
+      jobCreatedAt: 1,
+      logicalTurnId: 'turn',
+      revision: 1,
+      surface: 'web',
+      source: {
+        id: 'synthetic-mongo-source',
+        messageId: 'synthetic-user',
+        digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+    expect(await control.context.req._viventiumHostResponseIsCurrent()).toBe(true);
+    control.context.job.abortController.abort();
+    expect(await control.context.req._viventiumHostResponseIsCurrent()).toBe(false);
+    expect(Boolean(control.context.req._viventiumNativeResponseSource)).toBe(native);
+  },
+);

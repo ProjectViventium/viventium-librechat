@@ -4340,15 +4340,36 @@ describe('/api/viventium/telegram', () => {
     mockGetJob.mockResolvedValue(null);
     const row = { ...inputIdentity(), streamId: 'expired-stream' };
     exactSavedFailure(row);
-    const finalEvent = { final: true, requestMessage: { messageId: row.sourceMessageId },
-      responseMessage: { messageId: 'saved-error', text: 'Saved final', attachments: [{ file_id: 'output' }] } };
-    mockReadHostFinal.mockResolvedValue({ responseMessageId: 'saved-error', conversationId: row.conversationId,
-      interactionContext: { source_event_id: row.sourceEventId, logical_turn_id: 'saved-turn', revision: 2 }, finalEvent });
+    const finalEvent = {
+      final: true,
+      requestMessage: { messageId: row.sourceMessageId },
+      responseMessage: {
+        messageId: 'saved-error',
+        text: 'Saved final',
+        attachments: [{ file_id: 'output' }],
+      },
+    };
+    mockReadHostFinal.mockResolvedValue({
+      responseMessageId: 'saved-error',
+      conversationId: row.conversationId,
+      interactionContext: {
+        source_event_id: row.sourceEventId,
+        logical_turn_id: 'saved-turn',
+        revision: 2,
+      },
+      finalEvent,
+    });
     const res = createMockRes();
-    await dispatch(createTestApp(require('../telegram')), createMockReq({ method: 'GET',
-      url: '/api/viventium/telegram/stream/expired-stream?resume=true&telegramUserId=tg-1',
-      query: { resume: 'true', telegramUserId: 'tg-1' }, headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
-    }), res);
+    await dispatch(
+      createTestApp(require('../telegram')),
+      createMockReq({
+        method: 'GET',
+        url: '/api/viventium/telegram/stream/expired-stream?resume=true&telegramUserId=tg-1',
+        query: { resume: 'true', telegramUserId: 'tg-1' },
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      }),
+      res,
+    );
     const wire = res.write.mock.calls.map(([text]) => text).join('');
     expect(wire).toContain('event: message');
     expect(wire).toContain('Saved final');
@@ -4359,9 +4380,20 @@ describe('/api/viventium/telegram', () => {
   test('retained input continuation finds the same host-final stream without generation', async () => {
     mockGetJob.mockResolvedValue(null);
     const row = { ...inputIdentity(), state: 'admitted', streamId: 'expired-stream' };
-    const terminal = { responseMessageId: 'saved-error', conversationId: row.conversationId,
-      interactionContext: { source_event_id: row.sourceEventId, logical_turn_id: 'saved-turn', revision: 2 },
-      finalEvent: { final: true, requestMessage: { messageId: row.sourceMessageId }, responseMessage: { text: 'Saved final' } } };
+    const terminal = {
+      responseMessageId: 'saved-error',
+      conversationId: row.conversationId,
+      interactionContext: {
+        source_event_id: row.sourceEventId,
+        logical_turn_id: 'saved-turn',
+        revision: 2,
+      },
+      finalEvent: {
+        final: true,
+        requestMessage: { messageId: row.sourceMessageId },
+        responseMessage: { text: 'Saved final' },
+      },
+    };
     mockReadHostFinal.mockResolvedValue(terminal);
     const { res, done } = continueRetainedInput(row, { savedFailure: true });
     await done;

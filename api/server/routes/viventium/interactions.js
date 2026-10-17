@@ -372,8 +372,11 @@ router.post('/delivery-ack', async (req, res) => {
     }
     /* === VIVENTIUM END === */
     if (result.status === 'not_found' && !parsed.cortexPresentation) {
-      result = await require('~/server/services/viventium/nativeResponseService')
-        .acknowledgeRetainedHostFinal(parsed.acknowledgement, adapterSurface);
+      result =
+        await require('~/server/services/viventium/nativeResponseService').acknowledgeRetainedHostFinal(
+          parsed.acknowledgement,
+          adapterSurface,
+        );
     }
     if (
       result.status === 'not_found' &&

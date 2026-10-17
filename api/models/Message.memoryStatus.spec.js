@@ -82,7 +82,7 @@ test.each(['pending', 'running', 'completed', 'failed'])(
       messageId: 'answer',
       conversationId: 'conversation',
       text: 'Visible answer',
-    hostFinal: { source: 'PRIVATE_HOST_FINAL' },
+      hostFinal: { source: 'PRIVATE_HOST_FINAL' },
       savedMemoryWrite: {
         owner: 'PRIVATE_RUNTIME',
         status,

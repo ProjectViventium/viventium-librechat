@@ -132,15 +132,21 @@ async function readRetainedTelegramTerminal({
   )
     return null;
   const hostFinal = await require('./nativeResponseService').readRetainedHostFinal({
-    userId: ownerId, streamId, surface: 'telegram', includeSettled,
+    userId: ownerId,
+    streamId,
+    surface: 'telegram',
+    includeSettled,
   });
-  if (hostFinal?.responseMessageId === binding.responseMessageId &&
+  if (
+    hostFinal?.responseMessageId === binding.responseMessageId &&
     hostFinal.conversationId === record.conversationId &&
     hostFinal.finalEvent?.requestMessage?.messageId === record.sourceMessageId &&
     hostFinal.interactionContext?.source_event_id === record.sourceEventId &&
     hostFinal.interactionContext?.logical_turn_id === binding.logicalTurnId &&
     hostFinal.interactionContext?.revision === binding.revision &&
-    await IngressModel.exists({ ...filter, responseBinding: binding })) return hostFinal;
+    (await IngressModel.exists({ ...filter, responseBinding: binding }))
+  )
+    return hostFinal;
   const message = await MessageModel.findOne({
     user: ownerId,
     conversationId: record.conversationId,

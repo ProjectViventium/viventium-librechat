@@ -745,9 +745,16 @@ test('regular and late terminal candidates keep one globally oldest bounded batc
 
 test('the same exact ingress reader accepts host final and rejects replaced or mismatched binding', async () => {
   const f = terminalFixture();
-  const terminal = { responseMessageId: 'reply', conversationId: row.conversationId,
+  const terminal = {
+    responseMessageId: 'reply',
+    conversationId: row.conversationId,
     interactionContext: f.message.metadata.viventium.interactionContext,
-    finalEvent: { final: true, requestMessage: { messageId: row.sourceMessageId }, responseMessage: { messageId: 'reply', text: 'Final' } } };
+    finalEvent: {
+      final: true,
+      requestMessage: { messageId: row.sourceMessageId },
+      responseMessage: { messageId: 'reply', text: 'Final' },
+    },
+  };
   mockReadHostFinal.mockResolvedValue(terminal);
   expect(await f.read()).toEqual(terminal);
   f.MessageModel.findOne.mockReturnValue({ lean: async () => null });

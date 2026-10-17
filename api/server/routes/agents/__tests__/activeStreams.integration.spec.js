@@ -152,13 +152,20 @@ describe('actual agent route with native active stream owner', () => {
   );
   /* === VIVENTIUM END === */
   it('replays the exact durable host final after job expiry without new generation', async () => {
-    const finalEvent = { final: true, responseMessage: { messageId: 'answer', text: 'Saved final' } };
+    const finalEvent = {
+      final: true,
+      responseMessage: { messageId: 'answer', text: 'Saved final' },
+    };
     mockReadHostFinal.mockResolvedValue({ finalEvent });
     const response = await request(app).get('/chat/stream/expired');
     expect(response.status).toBe(200);
     expect(response.text).toContain(JSON.stringify(finalEvent));
-    expect(mockReadHostFinal).toHaveBeenCalledWith({ userId: 'owner-a', streamId: 'expired', surface: 'web', includeSettled: true });
+    expect(mockReadHostFinal).toHaveBeenCalledWith({
+      userId: 'owner-a',
+      streamId: 'expired',
+      surface: 'web',
+      includeSettled: true,
+    });
     expect(await store.getJob('expired')).toBeNull();
   });
-
 });

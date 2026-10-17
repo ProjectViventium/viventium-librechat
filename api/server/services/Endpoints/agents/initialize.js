@@ -101,6 +101,10 @@ const {
   markOptionalAgentInitializationFailed,
 } = require('~/server/services/viventium/agentGraphResilience');
 const {
+  getMainContextSnapshot,
+  bindMainContextCarrier,
+} = require('~/server/services/viventium/ViventiumMainContextService');
+const {
   attachDeclaredConversationProviderCapabilityBundle,
   attachConversationProviderCapabilityBundle,
   bindConversationProviderStableAuthorityDigest,
@@ -1434,6 +1438,20 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       );
     }
     if (materializeInto) {
+      /* === VIVENTIUM START ===
+       * Hydration replaces route parameters after Main admitted its context. Rebind that same
+       * snapshot and allocation; a native specialist must not fall back to the legacy byte cap.
+       * === VIVENTIUM END === */
+      const snapshot = getMainContextSnapshot(req);
+      if (snapshot) {
+        for (const participant of [config, ...(config.viventiumGraphLlmFallbacks || [])]) {
+          if (
+            participant.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']
+          ) {
+            bindMainContextCarrier(participant, snapshot);
+          }
+        }
+      }
       Object.defineProperties(materializeInto, Object.getOwnPropertyDescriptors(config));
       config = materializeInto;
     }

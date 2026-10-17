@@ -29,6 +29,7 @@ import type { TAskFunction, ExtendedFile } from '~/common';
 import useSetFilesToDelete from '~/hooks/Files/useSetFilesToDelete';
 import useGetSender from '~/hooks/Conversations/useGetSender';
 import { logger, createDualMessageContent } from '~/utils';
+import { canSubmitMessage } from '~/utils/messages';
 import store, { useGetEphemeralAgent } from '~/store';
 import useUserKey from '~/hooks/Input/useUserKey';
 import { useAuthContext } from '~/hooks';
@@ -95,13 +96,7 @@ export default function useChatFunctions({
       addedConvo,
     } = {},
   ) => {
-    setShowStopButton(false);
-    resetLatestMultiMessage();
-
     text = text.trim();
-    if (text === '') {
-      return;
-    }
 
     const conversation = cloneDeep(immutableConversation);
 
@@ -137,6 +132,26 @@ export default function useChatFunctions({
     const isEditOrContinue = isEdited || isContinued;
 
     let currentMessages: TMessage[] | null = overrideMessages ?? getMessages() ?? [];
+    /* === VIVENTIUM START === Validate the same file selection that the submission will carry. === */
+    const targetParentMessageId = isRegenerate ? messageId : latestMessage?.parentMessageId;
+    const targetParentMessage =
+      conversationId === Constants.NEW_CONVO
+        ? undefined
+        : currentMessages.find((msg) => msg.messageId === targetParentMessageId);
+    const submissionFiles = overrideFiles ?? targetParentMessage?.files;
+    const reuseFiles =
+      (isRegenerate || (overrideFiles != null && overrideFiles.length)) &&
+      submissionFiles &&
+      submissionFiles.length > 0;
+    const currentFiles = Array.from(files?.values() ?? []);
+    const inputFiles = reuseFiles === true ? submissionFiles : currentFiles;
+    if (!canSubmitMessage(text, setFiles ? inputFiles : [])) {
+      return;
+    }
+    setShowStopButton(false);
+    resetLatestMultiMessage();
+    /* === VIVENTIUM END === */
+
     const supersededAssistant =
       isSubmitting && latestMessage?.isCreatedByUser === false ? latestMessage : null;
     if (supersededAssistant) {
@@ -174,16 +189,6 @@ export default function useChatFunctions({
       conversationId = null;
       navigate('/c/new', { state: { focusChat: true } });
     }
-
-    const targetParentMessageId = isRegenerate ? messageId : latestMessage?.parentMessageId;
-    /**
-     * If the user regenerated or resubmitted the message, the current parent is technically
-     * the latest user message, which is passed into `ask`; otherwise, we can rely on the
-     * latestMessage to find the parent.
-     */
-    const targetParentMessage = currentMessages.find(
-      (msg) => msg.messageId === targetParentMessageId,
-    );
 
     let thread_id = targetParentMessage?.thread_id ?? latestMessage?.thread_id;
     if (thread_id == null) {
@@ -241,18 +246,12 @@ export default function useChatFunctions({
       error: false,
     };
 
-    const submissionFiles = overrideFiles ?? targetParentMessage?.files;
-    const reuseFiles =
-      (isRegenerate || (overrideFiles != null && overrideFiles.length)) &&
-      submissionFiles &&
-      submissionFiles.length > 0;
-
     if (setFiles && reuseFiles === true) {
       currentMsg.files = [...submissionFiles];
       setFiles(new Map());
       setFilesToDelete({});
     } else if (setFiles && files && files.size > 0) {
-      currentMsg.files = Array.from(files.values()).map((file) => ({
+      currentMsg.files = currentFiles.map((file) => ({
         file_id: file.file_id,
         filepath: file.filepath,
         type: file.type ?? '', // Ensure type is not undefined

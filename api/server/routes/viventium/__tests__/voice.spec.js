@@ -5,6 +5,10 @@
 
 const express = require('express');
 const { EventEmitter } = require('events');
+const mockReadHostFinal = jest.fn(async () => null);
+jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  readRetainedHostFinal: (...args) => mockReadHostFinal(...args),
+}));
 
 let mockCallPreparationWait;
 jest.mock('~/server/services/viventium/CallPreparationService', () => ({
@@ -663,6 +667,7 @@ describe('/api/viventium/voice/chat', () => {
   });
 
   beforeEach(() => {
+    mockReadHostFinal.mockReset().mockResolvedValue(null);
     jest.resetModules();
     mockCallPreparationWait = jest.fn(async (session) => session);
     mockBackgroundActivationPolicy = null;
@@ -8524,6 +8529,45 @@ describe('/api/viventium/voice/chat', () => {
   );
   /* === VIVENTIUM START: Preserve the shared public stream failure contract. === */
 
+  test.each([false, true])('missing-job host final retains durable Voice suppression=%s', async (suppressed) => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { GenerationJobManager } = require('@librechat/api');
+    GenerationJobManager.getJob.mockResolvedValue(null);
+    jest.spyOn(taskService, 'hydrateVoiceTaskByStreamId').mockResolvedValue({ taskId: 'task' });
+    jest.spyOn(taskService, 'isVoiceTaskSuppressedDurably').mockResolvedValue(suppressed);
+    const finalEvent = { final: true, responseMessage: { messageId: 'answer', text: 'Saved final' } };
+    mockReadHostFinal.mockResolvedValue({ finalEvent });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../voice')), createMockReq({ method: 'GET',
+      url: '/api/viventium/voice/stream/expired-host-final', headers: { 'x-viventium-call-secret': 'secret' },
+    }), res);
+    expect(res.statusCode).toBe(200);
+    const wire = res.write.mock.calls.map(([text]) => text).join('');
+    expect(wire.includes('Saved final')).toBe(!suppressed);
+    expect(mockReadHostFinal).toHaveBeenCalledWith({ userId: 'user_1', streamId: 'expired-host-final', surface: 'voice', callSessionId: 'call_session_1' });
+    expect(GenerationJobManager.subscribe).not.toHaveBeenCalled();
+  });
+  test.each([false, true])('missing-job host final distinguishes absent task from hydration failure=%s', async (throws) => {
+    const taskService = require('~/server/services/viventium/VoiceTaskService');
+    const { GenerationJobManager } = require('@librechat/api');
+    GenerationJobManager.getJob.mockResolvedValue(null);
+    const hydrate = jest.spyOn(taskService, 'hydrateVoiceTaskByStreamId');
+    if (throws) hydrate.mockRejectedValue(new Error('durable_store_unavailable'));
+    else hydrate.mockResolvedValue(null);
+    const suppression = jest.spyOn(taskService, 'isVoiceTaskSuppressedDurably');
+    mockReadHostFinal.mockResolvedValue({ finalEvent: { final: true, responseMessage: { text: 'Saved final' } } });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../voice')), createMockReq({ method: 'GET',
+      url: '/api/viventium/voice/stream/expired-host-final', headers: { 'x-viventium-call-secret': 'secret' },
+    }), res);
+    expect(res.statusCode).toBe(throws ? 503 : 404);
+    expect(res.body).toEqual(throws ? { code: 'gateway_down', retryable: true } : {
+      error: 'Stream not found', message: 'The generation job does not exist or has expired.',
+    });
+    expect(suppression).not.toHaveBeenCalled();
+    expect(res.write).not.toHaveBeenCalled();
+    expect(GenerationJobManager.subscribe).not.toHaveBeenCalled();
+  });
   test.each(['source_context_unavailable', undefined])(
     'Voice SSE preserves optional typed generation failure %s',
     async (errorClass) => {

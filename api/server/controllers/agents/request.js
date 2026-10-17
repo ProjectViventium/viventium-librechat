@@ -17,7 +17,7 @@
  * Updated: 2026-01-31, 2026-02-07
  */
 const crypto = require('crypto');
-const { logger } = require('@librechat/data-schemas');
+const { logger, nativeResponseSource } = require('@librechat/data-schemas');
 const { Constants, ContentTypes, ViolationTypes } = require('librechat-data-provider');
 const {
   sendEvent,
@@ -1654,7 +1654,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           'db_save_user',
         );
       }
-      await userMessageSavePromise;
+      return userMessageSavePromise;
     };
 
     job.emitter.on('allSubscribersLeft', async (aggregatedContent) => {
@@ -1821,7 +1821,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           // without awaiting it, so terminal persistence must still see and drain this work.
           const preparationStartedAt = voiceLatencyEnabled ? voiceLatencyNow() : null;
           const preparation = trackAssistantSnapshot(async () => {
-            await ensureUserSourceSegmentPersisted();
+            const savedSource = await ensureUserSourceSegmentPersisted();
             /* VIVENTIUM: retain the exact assistant identity before preparation can fail. */
             await req._viventiumBindResponseIdentity?.({
               streamId,
@@ -1879,24 +1879,41 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               },
             });
 
-            const nativeCapability =
-              req.config?.endpoints?.agents?.providerCapabilities?.[
+            const context = getTrustedInteractionContext(req);
+            if (context?.origin === 'interactive' && context.actor_kind === 'external_user') {
+              // The awaited canonical save already supplies the source bytes and Mongo identity.
+              // Existing-message continuations alone require the existing exact source reader.
+              const proof = savedSource?._id
+                ? { ...nativeResponseSource(savedSource),
+                    ...(client.nativeResponseParentSource ? { parent: { ...client.nativeResponseParentSource } } : {}) }
+                : await require('~/models').captureNativeResponseSource(
+                    userId, conversationId, userMsg.messageId, client.nativeResponseParentSource ?? null,
+                  );
+              req._viventiumHostResponseIdentity = {
+                userId, conversationId, responseMessageId: respMsgId, streamId, jobCreatedAt,
+                logicalTurnId: context.logical_turn_id, revision: context.revision,
+                sourceOrderScope: context.source_order_scope,
+                sourceSequence: require('@librechat/api').interactionPresentationSequence(context),
+                surface: context.surface,
+                ...(req.body?.viventiumCallSessionId ? { callSessionId: req.body.viventiumCallSessionId } : {}),
+                source: proof,
+              };
+              req._viventiumHostResponseIsCurrent = async () => {
+                if (job.abortController.signal.aborted) return false;
+                const store = GenerationJobManager.getJobStore();
+                const current = await store.getJob(streamId);
+                return current?.createdAt === jobCreatedAt && current.userId === userId &&
+                  current.conversationId === conversationId && current.status === 'running' &&
+                  current.interactionContext?.logical_turn_id === context.logical_turn_id &&
+                  current.interactionContext?.revision === context.revision &&
+                  await store.isCurrentLogicalTurn(streamId);
+              };
+              const nativeCapability = req.config?.endpoints?.agents?.providerCapabilities?.[
                 client.options?.agent?.endpoint || client.options?.agent?.provider
               ];
-            if (
-              nativeCapability?.conversation_session === true &&
-              nativeCapability?.workspace_binding === true
-            ) {
-              req._viventiumNativeResponseSource = {
-                conversationId,
-                responseMessageId: respMsgId,
-                proof: await require('~/models').captureNativeResponseSource(
-                  userId,
-                  conversationId,
-                  userMsg.messageId,
-                  client.nativeResponseParentSource ?? null,
-                ),
-              };
+              if (nativeCapability?.conversation_session === true && nativeCapability?.workspace_binding === true) {
+                req._viventiumNativeResponseSource = { conversationId, responseMessageId: respMsgId, proof };
+              }
             }
 
             await GenerationJobManager.emitChunk(streamId, {
@@ -2146,7 +2163,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           const assistantPersistence = await timedSaveMessage(
             req,
             persistedResponse,
-            { context: 'api/server/controllers/agents/request.js - resumable response end' },
+            { context: 'api/server/controllers/agents/request.js - resumable response end',
+              hostGenerationComplete: !wasAbortedBeforeComplete && !req._viventiumNativeResponseIdentity },
             'db_save_response',
           );
           /* === VIVENTIUM START ===
@@ -2275,7 +2293,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                 }),
                 preCommitJob,
               ),
-              { context: 'native graph continuation owned by the host' },
+              {
+                context: 'native graph continuation owned by the host',
+                hostGenerationComplete: !wasAbortedBeforeComplete,
+              },
               'db_save_response',
             );
             /* === VIVENTIUM START === An unsupported native route persists as ordinary Main. === */

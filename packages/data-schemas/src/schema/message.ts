@@ -135,6 +135,7 @@ const messageSchema: Schema<IMessage> = new Schema(
       default: undefined,
     },
     nativeResponse: { type: Schema.Types.Mixed, select: false, default: undefined },
+    hostFinal: { type: Schema.Types.Mixed, select: false, default: undefined },
     acceptedMainContext: {
       type: new Schema<IAcceptedMainContext>({
         continuityDomainId: { type: String, required: true },
@@ -197,6 +198,13 @@ const messageSchema: Schema<IMessage> = new Schema(
 applyPersonalAccountCleanupVisibility(messageSchema);
 /* === VIVENTIUM END === */
 
+/* VIVENTIUM: exact host-final recovery uses the existing Message, without a second queue. */
+messageSchema.index({ 'hostFinal.streamId': 1, user: 1 }, { sparse: true });
+messageSchema.index({ 'hostFinal.logicalTurnId': 1, 'hostFinal.revision': 1 }, { sparse: true });
+messageSchema.index({ user: 1, 'metadata.viventium.interactionContext.logical_turn_id': 1,
+  'metadata.viventium.interactionContext.revision': -1 }, { sparse: true });
+messageSchema.index({ user: 1, 'metadata.viventium.interactionContext.source_order_scope': 1,
+  'metadata.viventium.interactionContext.source_sequence': -1 }, { sparse: true });
 messageSchema.index({ expiredAt: 1 }, { expireAfterSeconds: 0 });
 messageSchema.index({ createdAt: 1 });
 messageSchema.index({ messageId: 1, user: 1 }, { unique: true });

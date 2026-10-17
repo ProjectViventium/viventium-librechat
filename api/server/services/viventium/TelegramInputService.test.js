@@ -39,7 +39,9 @@ jest.mock('../TelegramLinkService', () => ({
 jest.mock('./GlassHiveTerminalCallbackTransaction', () => ({
   runGlassHiveTerminalCallbackTransaction: (...args) => mockTransaction(...args),
 }));
+const mockReadHostFinal = jest.fn(async () => null);
 jest.mock('./nativeResponseService', () => ({
+  readRetainedHostFinal: (...args) => mockReadHostFinal(...args),
   mutateNativeResponseSources: (...args) => mockSourceMutation(...args),
 }));
 const inputService = require('./TelegramInputService');
@@ -601,8 +603,7 @@ test('late durable terminal due query joins only failed rows and retains the reg
   const join = pipeline.find((stage) => stage.$lookup).$lookup;
   expect(join.from).toBe('messages');
   expect(join.pipeline[0].$match).toMatchObject({
-    unfinished: false,
-    error: true,
+    $or: expect.arrayContaining([{ 'hostFinal.version': 1, error: { $ne: true } }]),
     isCreatedByUser: false,
     'metadata.viventium.deliveryAcknowledgement.state': {
       $nin: ['committed', 'committed_effect', 'failed'],
@@ -740,4 +741,20 @@ test('regular and late terminal candidates keep one globally oldest bounded batc
   mockIngress.aggregate.mockResolvedValue([candidate('terminal-middle', 20)]);
   const result = await mockDependencies.repository.due(100, 2);
   expect(result.map((record) => record.sourceEventId)).toEqual(['regular-old', 'terminal-middle']);
+});
+
+test('the same exact ingress reader accepts host final and rejects replaced or mismatched binding', async () => {
+  const f = terminalFixture();
+  const terminal = { responseMessageId: 'reply', conversationId: row.conversationId,
+    interactionContext: f.message.metadata.viventium.interactionContext,
+    finalEvent: { final: true, requestMessage: { messageId: row.sourceMessageId }, responseMessage: { messageId: 'reply', text: 'Final' } } };
+  mockReadHostFinal.mockResolvedValue(terminal);
+  expect(await f.read()).toEqual(terminal);
+  f.MessageModel.findOne.mockReturnValue({ lean: async () => null });
+  mockReadHostFinal.mockResolvedValue({ ...terminal, conversationId: 'foreign' });
+  expect(await f.read()).toBeNull();
+  mockReadHostFinal.mockResolvedValue(terminal);
+  f.IngressModel.exists.mockResolvedValue(false);
+  expect(await f.read()).toBeNull();
+  mockReadHostFinal.mockResolvedValue(null);
 });

@@ -163,7 +163,7 @@ function sanitizeMessageForPersistence(message, { purpose = 'update' } = {}) {
   for (const key of Object.keys(sanitizedMessage)) {
     // Admission and recovery are internal store operations, never user/message-authored metadata.
     if (
-      ['savedMemoryWrite', 'nativeResponse', 'memoryWriteStatus', 'acceptedMainContext'].includes(
+      ['savedMemoryWrite', 'nativeResponse', 'hostFinal', 'memoryWriteStatus', 'acceptedMainContext'].includes(
         key.split('.')[0],
       )
     ) {
@@ -182,14 +182,14 @@ function sanitizeMessageForPersistence(message, { purpose = 'update' } = {}) {
         if (
           [
             'savedMemoryWrite',
-            'nativeResponse',
+            'nativeResponse', 'hostFinal',
             'memoryWriteStatus',
             'acceptedMainContext',
           ].includes(pathSegments[0]) ||
           (key === '$rename' &&
             [
               'savedMemoryWrite',
-              'nativeResponse',
+              'nativeResponse', 'hostFinal',
               'memoryWriteStatus',
               'acceptedMainContext',
             ].includes(String(value).split('.')[0]))
@@ -583,6 +583,7 @@ async function saveMessage(req, params, metadata) {
           req.user.id,
           protectedUpdate,
           req._viventiumNativeResponseIdentity,
+          'snapshot',
         );
         if (guarded !== undefined) return guarded;
       }
@@ -603,7 +604,12 @@ async function saveMessage(req, params, metadata) {
     const message =
       await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
         sourceFilter,
-        persist,
+        metadata?.hostGenerationComplete === true && req._viventiumHostResponseIdentity
+          ? () => require('~/models').saveHostResponseFinal(
+              req._viventiumHostResponseIdentity, persist, req._viventiumHostResponseIsCurrent,
+              (operation) => mongoose.connection.transaction(operation),
+            )
+          : persist,
         operationKind,
       );
     if (!message) {

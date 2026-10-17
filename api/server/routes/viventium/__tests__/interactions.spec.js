@@ -1,4 +1,8 @@
 const express = require('express');
+const mockAcknowledgeHostFinal = jest.fn();
+jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  acknowledgeRetainedHostFinal: (...args) => mockAcknowledgeHostFinal(...args),
+}));
 
 let mockAcknowledgeDelivery;
 let mockAcknowledgeDurableEffectDelivery;
@@ -150,6 +154,7 @@ async function dispatch(app, req, res) {
 
 describe('POST /api/viventium/interactions/delivery-ack', () => {
   beforeEach(() => {
+    mockAcknowledgeHostFinal.mockReset().mockResolvedValue({ status: 'not_found' });
     mockTelegramInputDeliveryCoverage.mockReset().mockReturnValue(null);
     mockAcknowledgeRetainedTelegramFailure.mockReset().mockResolvedValue({ status: 'not_found' });
     mockAcknowledgeMongoDurableEffectDelivery.mockReset().mockResolvedValue({ status: 'conflict' });
@@ -202,6 +207,22 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
   afterEach(() => {
     delete process.env.VIVENTIUM_TELEGRAM_INTERACTION_ADAPTER_SECRET;
     delete process.env.VIVENTIUM_VOICE_INTERACTION_ADAPTER_SECRET;
+  });
+
+  test.each(['telegram', 'voice'])('missing-job %s final ACK uses the same canonical completion and acceptance owners', async (surface) => {
+    const result = await mockAcknowledgeDelivery();
+    mockAcknowledgeDelivery.mockClear().mockResolvedValue({ status: 'not_found' });
+    mockAcknowledgeHostFinal.mockResolvedValue(result);
+    const res = response();
+    await dispatch(createApp(require('../interactions')), request({
+      headers: { 'x-viventium-adapter-secret': surface === 'voice' ? 'voice-adapter-secret' : 'adapter-secret' },
+      body: { logical_turn_id: 'turn-1', revision: 2, state: 'committed', presentation_ref: 'message-1' },
+    }), res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.acknowledged).toBe(true);
+    expect(mockAcknowledgeHostFinal).toHaveBeenCalledWith(expect.objectContaining({ state: 'committed', logical_turn_id: 'turn-1' }), surface);
+    expect(mockCommitAcceptedMainTurnFromPresentation).toHaveBeenCalled();
+    expect(mockAcknowledgeRetainedTelegramFailure).not.toHaveBeenCalled();
   });
 
   test('missing Redis failed Telegram ACK settles its exact durable terminal without Main acceptance', async () => {

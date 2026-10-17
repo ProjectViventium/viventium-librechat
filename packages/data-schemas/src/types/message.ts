@@ -56,6 +56,7 @@ export interface IMessage extends Document {
   metadata?: Record<string, unknown>;
   savedMemoryWrite?: SavedMemoryWrite;
   nativeResponse?: NativeResponseAdmission;
+  hostFinal?: import('./nativeResponse').HostResponseFinal;
   acceptedMainContext?: IAcceptedMainContext;
   attachments?: unknown[];
   expiredAt?: Date;

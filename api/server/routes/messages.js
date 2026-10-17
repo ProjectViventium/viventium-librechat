@@ -111,6 +111,7 @@ const sanitizeMessageForPublicResponse = (message) => {
     user: _user,
     savedMemoryWrite: _savedMemoryWrite,
     nativeResponse: _nativeResponse,
+    hostFinal: _hostFinal,
     ...publicMessage
   } = message;
   return {

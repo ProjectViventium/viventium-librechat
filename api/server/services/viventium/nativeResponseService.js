@@ -596,6 +596,46 @@ async function recoverSavedNativeResponse(identity, onTerminal) {
   return response ? getService().projectForTransmit(identity, response) : null;
 }
 
+/* VIVENTIUM: a released host graph replays its canonical final, without reviving a native job. */
+async function hostResponseAuthorIsCurrent(identity) {
+  const store = GenerationJobManager.getJobStore();
+  if (await store.resolveDeliveryOwner(identity.logicalTurnId, identity.revision + 1)) return false;
+  if (identity.sourceOrderScope && identity.sourceSequence != null) {
+    const observed = await GenerationJobManager.observeSourceOrder({
+      source_order_scope: identity.sourceOrderScope, source_sequence: identity.sourceSequence,
+    });
+    if (observed.stale) return false;
+  }
+  return true;
+}
+async function readRetainedHostFinal(query) {
+  const db = require('~/models');
+  const response = await db.readHostResponseFinal(query);
+  if (!response) return null;
+  const identity = response.hostFinal;
+  if (!(await hostResponseAuthorIsCurrent(identity))) return null;
+  const requestMessage = await db.getMessage({ user: identity.userId,
+    conversationId: identity.conversationId, messageId: identity.source.messageId });
+  const [publicResponse] = await db.getMessages({ user: identity.userId,
+    conversationId: identity.conversationId, messageId: identity.responseMessageId });
+  if (!requestMessage || !publicResponse || !(await db.readHostResponseFinal(query)) ||
+    !(await hostResponseAuthorIsCurrent(identity))) return null;
+  return {
+    responseMessageId: response.messageId,
+    conversationId: response.conversationId,
+    interactionContext: response.metadata?.viventium?.interactionContext,
+    acknowledgement: response.metadata?.viventium?.deliveryAcknowledgement,
+    finalEvent: { final: true, conversation: { conversationId: response.conversationId },
+      requestMessage: sanitizeMessageForTransmit(requestMessage),
+      responseMessage: { ...sanitizeMessageForTransmit(publicResponse), unfinished: false } },
+  };
+}
+async function acknowledgeRetainedHostFinal(acknowledgement, surface) {
+  return require('~/models').acknowledgeHostResponseFinal(
+    acknowledgement, surface, runNativeResponseTransaction, hostResponseAuthorIsCurrent,
+  );
+}
+
 async function markNativeResponseReplayStored(identity, mode) {
   const marked = await require('~/models').markNativeResponseReplayStored(identity);
   if (!marked) return false;
@@ -972,6 +1012,8 @@ module.exports = {
   createNativeResponseRelease,
   wrapNativeResponseFetch,
   recoverSavedNativeResponse,
+  readRetainedHostFinal,
+  acknowledgeRetainedHostFinal,
   markNativeResponseReplayStored,
   recoverNativeResponse,
   recoverNativeResponses,

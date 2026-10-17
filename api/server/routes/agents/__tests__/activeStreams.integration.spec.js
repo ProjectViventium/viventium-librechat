@@ -4,6 +4,10 @@ const request = require('supertest');
 const { GenerationJobManagerClass, InMemoryJobStore, InMemoryEventTransport } =
   jest.requireActual('@librechat/api');
 let mockManager;
+const mockReadHostFinal = jest.fn(async () => null);
+jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  readRetainedHostFinal: (...args) => mockReadHostFinal(...args),
+}));
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   isEnabled: () => false,
@@ -31,6 +35,7 @@ describe('actual agent route with native active stream owner', () => {
   let store;
   let app;
   beforeEach(async () => {
+    mockReadHostFinal.mockReset().mockResolvedValue(null);
     store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
     mockManager = new GenerationJobManagerClass({
       jobStore: store,
@@ -146,4 +151,14 @@ describe('actual agent route with native active stream owner', () => {
     },
   );
   /* === VIVENTIUM END === */
+  it('replays the exact durable host final after job expiry without new generation', async () => {
+    const finalEvent = { final: true, responseMessage: { messageId: 'answer', text: 'Saved final' } };
+    mockReadHostFinal.mockResolvedValue({ finalEvent });
+    const response = await request(app).get('/chat/stream/expired');
+    expect(response.status).toBe(200);
+    expect(response.text).toContain(JSON.stringify(finalEvent));
+    expect(mockReadHostFinal).toHaveBeenCalledWith({ userId: 'owner-a', streamId: 'expired', surface: 'web', includeSettled: true });
+    expect(await store.getJob('expired')).toBeNull();
+  });
+
 });

@@ -82,12 +82,13 @@ router.get(
           models: [],
         });
       }
-      const response = await fetch(`${baseURL}/models`, {
+      const response = await fetch(`${baseURL}/models?check_readiness=true`, {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'X-Viventium-User-Id': String(req.user?.id || ''),
         },
-        signal: AbortSignal.timeout(5000),
+        // Explicit account checks may start native harnesses; ordinary model discovery does not.
+        signal: AbortSignal.timeout(30_000),
       });
       if (!response.ok) {
         return res.json({

@@ -664,3 +664,196 @@ describe('saved assistant text with an explicitly empty content array', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+describe('native output attachment history DATA', () => {
+  function source() {
+    return {
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: 'result',
+      isCreatedByUser: false,
+      error: false,
+      unfinished: false,
+      text: '',
+      content: null,
+      attachments: [
+        {
+          filename: 'result.txt',
+          messageId: 'result',
+          nativeOutputFile: {
+            version: 1,
+            status: 'unavailable',
+            code: 'native_output_file_unavailable',
+          },
+        },
+      ],
+    };
+  }
+  test('safe serialization retains exact filename/status/code without changing saved output', () => {
+    const row = source();
+    row.attachments[0].filename = 'a"</data>&\nresult.txt';
+    const before = JSON.stringify(row);
+    const normalized = normalizeUserMessageContent(row);
+    const rendered = formatMessage({ message: normalized });
+    const text = require('../ViventiumMainContextService').messageContentText(
+      formatAgentMessages([{ ...rendered, messageId: row.messageId }]).messages[0],
+    );
+    expect(JSON.parse(text)).toEqual({
+      native_output_file_history: [
+        {
+          filename: row.attachments[0].filename,
+          recorded_status: 'unavailable',
+          code: 'native_output_file_unavailable',
+        },
+      ],
+    });
+    expect(normalized.attachments).toBe(row.attachments);
+    expect(JSON.stringify(row)).toBe(before);
+    expect(normalized.text).toBe('');
+    expect(normalizeUserMessageContent(normalized)).toBe(normalized);
+    expect(normalized.attachments[0]).not.toHaveProperty('file_id');
+  });
+  test('mixed statuses keep their original file references and both historical receipts become DATA', () => {
+    const row = source();
+    const available = {
+      file_id: 'native-file',
+      filename: 'kept.txt',
+      type: 'text/plain',
+      nativeOutputFile: { version: 1, status: 'available', messageId: row.messageId },
+    };
+    row.attachments.push(available);
+    row.files = [{ file_id: 'prior-file', type: 'text/plain' }];
+    const normalized = normalizeUserMessageContent(row);
+    expect(normalized).not.toBe(row);
+    expect(normalized.attachments).toBe(row.attachments);
+    expect(normalized.files).toBe(row.files);
+    expect(normalized.attachments[1]).toBe(available);
+    expect(JSON.parse(normalized.content.at(-1).text).native_output_file_history).toHaveLength(2);
+  });
+  test.each(['text/plain', 'image/png', 'audio/wav', 'video/mp4', 'application/pdf'])(
+    'historical available %s stays assistant DATA while its File reference remains separate',
+    (type) => {
+      const row = source();
+      row.attachments = [
+        {
+          filename: 'result.bin',
+          file_id: 'native-file',
+          type,
+          nativeOutputFile: { version: 1, status: 'available', messageId: row.messageId },
+        },
+      ];
+      row.files = [{ file_id: 'native-file', type }];
+      const normalized = normalizeUserMessageContent(row);
+      expect(JSON.parse(normalized.content.at(-1).text)).toEqual({
+        native_output_file_history: [
+          {
+            filename: 'result.bin',
+            recorded_status: 'available',
+            file_id: 'native-file',
+            type,
+          },
+        ],
+      });
+      expect(normalized.attachments).toBe(row.attachments);
+      expect(normalized.files).toBe(row.files);
+      expect(normalizeUserMessageContent(normalized)).toBe(normalized);
+    },
+  );
+  test.each([
+    [
+      'user source',
+      (row) => {
+        row.isCreatedByUser = true;
+      },
+    ],
+    [
+      'unfinished source',
+      (row) => {
+        row.unfinished = true;
+      },
+    ],
+    [
+      'authored words',
+      (row) => {
+        row.text = row.content = 'Original words.';
+      },
+    ],
+    [
+      'wrong source message',
+      (row) => {
+        row.attachments[0].messageId = 'another-result';
+      },
+    ],
+    [
+      'unknown version',
+      (row) => {
+        row.attachments[0].nativeOutputFile.version = 2;
+      },
+    ],
+    [
+      'unknown status',
+      (row) => {
+        row.attachments[0].nativeOutputFile.status = 'unknown';
+      },
+    ],
+    [
+      'missing code',
+      (row) => {
+        delete row.attachments[0].nativeOutputFile.code;
+      },
+    ],
+    [
+      'wrong available message binding',
+      (row) => {
+        row.attachments = [
+          {
+            filename: 'result.txt',
+            file_id: 'native-file',
+            type: 'text/plain',
+            nativeOutputFile: { version: 1, status: 'available', messageId: 'another-result' },
+          },
+        ];
+      },
+    ],
+    [
+      'unknown content',
+      (row) => {
+        row.content = [{ type: 'unknown', value: 'Keep this.' }];
+      },
+    ],
+    [
+      'malformed descriptor',
+      (row) => {
+        row.attachments.push(null);
+      },
+    ],
+    ...['image_urls', 'documents', 'audios', 'videos'].map((field) => [
+      `hydrated ${field}`,
+      (row) => {
+        row[field] = [{ type: 'retained-media', data: 'Original bytes' }];
+      },
+    ]),
+    [
+      'parallel invalid file',
+      (row) => {
+        row.files = [{ filename: 'missing-id.txt' }];
+      },
+    ],
+    [
+      'parallel invalid file container',
+      (row) => {
+        row.files = 'invalid';
+      },
+    ],
+    [
+      'parallel image file',
+      (row) => {
+        row.files = [{ file_id: 'image', type: 'image/png' }];
+      },
+    ],
+  ])('does not invent projection for %s', (_label, mutate) => {
+    const row = source();
+    mutate(row);
+    expect(normalizeUserMessageContent(row)).toBe(row);
+  });
+});

@@ -198,8 +198,12 @@ describe('ViventiumMainContextService', () => {
           rapid: false,
           modifyRaw: assistantFile,
         });
-        expect(messages.map((message) => message.id)).toEqual(['prior', 'current']);
-        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['prior', 'current']);
+        expect(messages.map((message) => message.id)).toEqual(['prior', 'file-source', 'current']);
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual([
+          'prior',
+          'file-source',
+          'current',
+        ]);
         expect(snapshot.visibleMessageChain.at(-1).parentId).toBe('file-source');
         expect(raw[1].attachments).toEqual([
           expect.objectContaining({
@@ -208,6 +212,120 @@ describe('ViventiumMainContextService', () => {
           }),
         ]);
         expect(raw[1].text).toBe('');
+      },
+    );
+    test.each(['web', 'voice', 'telegram'])(
+      '%s carries unavailable file-only assistant truth as DATA without a file grant',
+      (surface) => {
+        const { raw, messages, snapshot } = capture({
+          surface,
+          rapid: false,
+          modifyRaw: (rows) => {
+            assistantFile(rows);
+            rows[1].attachments = [
+              {
+                filename: 'result.txt',
+                messageId: 'file-source',
+                nativeOutputFile: {
+                  version: 1,
+                  status: 'unavailable',
+                  code: 'native_output_file_unavailable',
+                },
+              },
+            ];
+          },
+        });
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toContain('file-source');
+        const carried = messages.find((message) => message.id === 'file-source');
+        expect(
+          JSON.parse(require('../ViventiumMainContextService').messageContentText(carried)),
+        ).toEqual({
+          native_output_file_history: [
+            {
+              filename: 'result.txt',
+              recorded_status: 'unavailable',
+              code: 'native_output_file_unavailable',
+            },
+          ],
+        });
+        expect(raw[1].attachments[0]).not.toHaveProperty('file_id');
+        expect(raw[1].text).toBe('');
+      },
+    );
+    test.each(['image/png', 'audio/wav', 'video/mp4'])(
+      'native file-only assistant %s keeps recorded provenance and separate media file references',
+      (type) => {
+        const { snapshot, messages, raw } = capture({
+          rapid: false,
+          modifyRaw: (rows) => {
+            assistantFile(rows);
+            rows[1].attachments[0].type = type;
+            rows[1].files = [{ file_id: 'native-file', type }];
+          },
+        });
+        const text = require('../ViventiumMainContextService').messageContentText(
+          messages.find((message) => message.id === 'file-source'),
+        );
+        expect(JSON.parse(text).native_output_file_history[0]).toMatchObject({
+          file_id: 'native-file',
+          recorded_status: 'available',
+          type,
+        });
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toContain('file-source');
+        expect(raw[1].attachments[0].file_id).toBe('native-file');
+      },
+    );
+    test('mixed native file statuses preserve both historical facts in the same snapshot', () => {
+      const { snapshot, messages } = capture({
+        rapid: false,
+        modifyRaw: (rows) => {
+          assistantFile(rows);
+          rows[1].attachments.push({
+            filename: 'missing.txt',
+            messageId: 'file-source',
+            nativeOutputFile: {
+              version: 1,
+              status: 'unavailable',
+              code: 'native_output_file_unavailable',
+            },
+          });
+        },
+      });
+      const text = require('../ViventiumMainContextService').messageContentText(
+        messages.find((message) => message.id === 'file-source'),
+      );
+      expect(
+        JSON.parse(text).native_output_file_history.map((file) => file.recorded_status),
+      ).toEqual(['available', 'unavailable']);
+      expect(snapshot.visibleMessageChain.map((row) => row.id)).toContain('file-source');
+    });
+    test.each(['available', 'unavailable'])(
+      'blank text normalization keeps %s native receipt digest identical to the formatter',
+      (status) => {
+        const { snapshot, messages } = capture({
+          rapid: false,
+          modifyRaw: (rows) => {
+            assistantFile(rows);
+            if (status === 'unavailable')
+              rows[1].attachments = [
+                {
+                  filename: 'result.txt',
+                  messageId: 'file-source',
+                  nativeOutputFile: { version: 1, status, code: 'native_output_file_unavailable' },
+                },
+              ];
+            rows[1].content = [
+              { type: 'text', text: ' \n ' },
+              { type: 'text', text: '' },
+            ];
+          },
+        });
+        const text = require('../ViventiumMainContextService').messageContentText(
+          messages.find((message) => message.id === 'file-source'),
+        );
+        expect(text.startsWith('{')).toBe(true);
+        expect(JSON.parse(text).native_output_file_history[0].recorded_status).toBe(status);
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toContain('file-source');
       },
     );
     test.each([

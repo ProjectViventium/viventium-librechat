@@ -113,8 +113,109 @@ function coerceTextToString(text) {
   return '';
 }
 
+/** Historical native file DATA is not evidence of current availability or a file grant. */
+function nativeOutputHistoryData(message) {
+  if (
+    message?.isCreatedByUser !== false ||
+    message.unfinished === true ||
+    message.error === true ||
+    typeof message.messageId !== 'string' ||
+    !message.messageId ||
+    message.text !== '' ||
+    !Array.isArray(message.attachments) ||
+    !message.attachments.length ||
+    !(
+      message.content == null ||
+      (Array.isArray(message.content) &&
+        message.content.every(
+          (part) =>
+            part != null &&
+            typeof part === 'object' &&
+            (INTERNAL_CONTENT_TYPES.has(part.type) ||
+              (['text', 'input_text', 'output_text'].includes(part.type) &&
+                !coerceTextToString(part.text ?? part.input_text ?? part.output_text).trim())),
+        ))
+    ) ||
+    [message.image_urls, message.documents, message.audios, message.videos].some(
+      (value) => value != null && (!Array.isArray(value) || value.length !== 0),
+    )
+  )
+    return '';
+  const receipts = [];
+  const nativeIds = new Set();
+  for (const attachment of message.attachments) {
+    const native = attachment?.nativeOutputFile;
+    if (
+      native?.version !== 1 ||
+      typeof attachment.filename !== 'string' ||
+      !attachment.filename.trim()
+    )
+      return '';
+    if (
+      native.status === 'available' &&
+      native.messageId === message.messageId &&
+      typeof attachment.file_id === 'string' &&
+      attachment.file_id.trim()
+    ) {
+      nativeIds.add(attachment.file_id);
+      receipts.push({
+        filename: attachment.filename,
+        recorded_status: 'available',
+        file_id: attachment.file_id,
+        ...(typeof attachment.type === 'string' ? { type: attachment.type } : {}),
+      });
+    } else if (
+      native.status === 'unavailable' &&
+      attachment.messageId === message.messageId &&
+      typeof native.code === 'string' &&
+      native.code.trim()
+    ) {
+      receipts.push({
+        filename: attachment.filename,
+        recorded_status: 'unavailable',
+        code: native.code,
+      });
+    } else return '';
+  }
+  // Native artifact refs of any MIME retain their separate current-owned File authority. An
+  // unrelated media/body reference cannot be reconciled by adding a receipt about another file.
+  if (
+    message.files != null &&
+    (!Array.isArray(message.files) ||
+      !message.files.every(
+        (file) =>
+          file &&
+          typeof file === 'object' &&
+          typeof file.file_id === 'string' &&
+          file.file_id.trim() &&
+          (nativeIds.has(file.file_id) ||
+            !['image/', 'audio/', 'video/'].some((prefix) =>
+              String(file.type || '')
+                .toLowerCase()
+                .startsWith(prefix),
+            )),
+      ))
+  )
+    return '';
+  return JSON.stringify({ native_output_file_history: receipts });
+}
+
 /** Preserve saved plain text when the provider formatter has no authored text block. */
 function normalizeUserMessageContent(message) {
+  // Shared by history formatting and its source digest. Persistence, UI and speech keep the
+  // original attachment receipt; only the model's historical content gains its truthful DATA.
+  const nativeFiles = nativeOutputHistoryData(message);
+  if (nativeFiles) {
+    return {
+      ...message,
+      content: [
+        ...(Array.isArray(message.content)
+          ? message.content.filter((part) => INTERNAL_CONTENT_TYPES.has(part.type))
+          : []),
+        { type: ContentTypes.TEXT, text: nativeFiles },
+      ],
+    };
+  }
   if (
     !(
       message?.isCreatedByUser === true ||

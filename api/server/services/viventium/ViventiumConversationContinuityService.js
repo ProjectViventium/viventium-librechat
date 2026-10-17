@@ -430,8 +430,9 @@ async function ensureConversationLegacyContinuity({
   const executionBudget = {};
   const contractFor = async (plan) => {
     const carrier = resolveOutputCarrier
-      ? await resolveOutputCarrier()
+      ? await resolveOutputCarrier(plan)
       : { carrierMaxUtf8Bytes: 16 * 1024, reservedContextUtf8Bytes: 0 };
+    if (!carrier) return null;
     return conversationMainCompactionOutputContract({
       ...carrier,
       coveredRows: plan.coveredSource.length,
@@ -528,12 +529,12 @@ async function ensureConversationLegacyContinuity({
         store.reject({ ownerId, conversationId, leaseId: input.leaseId, reason: input.reason }),
     });
     record = await store.load(ownerId, conversationId);
-    if (!foreground) break;
     if (result?.status !== 'compacted') {
       logger.warn('[VIVENTIUM][conversation-continuity] Legacy history not reconciled', {
         status: String(result?.status || 'unknown').slice(0, 80),
         reason: String(result?.reason || '').slice(0, 160),
       });
+      if (!foreground) break;
       // A model-owned rejection may shrink the next whole-turn prefix within this same bounded
       // wake. Transport, lease and unchanged indivisible-source failures do not start another claim.
       const nextTarget = result?.nextSourceTargetBytes;
@@ -554,6 +555,7 @@ async function ensureConversationLegacyContinuity({
       sourceTargetBytes = nextTarget;
       continue;
     }
+    if (!foreground) break;
     sourceTargetBytes = MAIN_COMPACTION_SOURCE_TARGET_BYTES;
   }
   return record;

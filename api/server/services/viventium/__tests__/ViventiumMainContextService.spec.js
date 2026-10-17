@@ -4987,6 +4987,146 @@ describe('native whole-source courier admission', () => {
     expect(result.compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
   });
 
+  function allocationOwner(usesNative, fits) {
+    const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const fn = ast.statements.find(
+      (node) =>
+        ts.isFunctionDeclaration(node) && node.name?.text === 'nativeMainContinuityAllocation',
+    );
+    const scope = {
+      module: { exports: {} },
+      Number,
+      Math,
+      conversationProviderUsesNativeBody: usesNative,
+      nativeWholeHistoryFits: fits,
+      NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES: 512 * 1024,
+    };
+    vm.runInNewContext(fn.getText(ast) + ';module.exports=nativeMainContinuityAllocation;', scope);
+    return scope.module.exports;
+  }
+
+  test.each([
+    { budget: 250000, native: true, fit: true, capacity: 185108, expected: 185108 },
+    { budget: 250000, native: true, fit: true, capacity: 100000, expected: 131072 },
+    { budget: 250000, native: true, fit: false, capacity: 185108, expected: 131072 },
+    { budget: 250000, native: true, fit: null, capacity: 185108, expected: 131072 },
+    { budget: null, native: true, fit: true, capacity: 185108, expected: 131072 },
+    { budget: 250000, native: false, fit: true, capacity: 185108, expected: 131072 },
+    { budget: 250000, native: true, fit: true, capacity: 900000, expected: 524288 },
+  ])('shared current-carrier allocation is positive-only (%j)', (row) => {
+    const fits = jest.fn((...args) => {
+      args[4].sizingReceipt.contextBudgetBytes = row.capacity;
+      return row.fit;
+    });
+    const usesNative = jest.fn((req, selected, options) =>
+      options.requireTransport ? true : row.native,
+    );
+    const allocate = allocationOwner(usesNative, fits);
+    const selected = { ...agent, viventiumFallbackLlm: { provider: 'fallback', model: 'other' } };
+    expect(allocate(request(), selected, rows(), {}, row.budget, 131072).carrierMaxUtf8Bytes).toBe(
+      row.expected,
+    );
+    if (row.budget === null || !row.native) expect(fits).not.toHaveBeenCalled();
+    else {
+      expect(fits.mock.calls[0][3]).toBe(0);
+      expect(fits.mock.calls[0][5]).toBe(row.budget);
+      expect(usesNative.mock.calls[1][2].alternates).toEqual([selected.viventiumFallbackLlm]);
+    }
+  });
+
+  test('legacy allocation prices the exact planned tail before loading Core and keeps source-specific reserves', async () => {
+    const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    let initializer;
+    const visit = (node) => {
+      if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'resolveLegacyOutputCarrier')
+        initializer = node.initializer;
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    const source = rows(130),
+      order = [];
+    const fits = jest.fn((...args) => {
+      order.push('estimate');
+      args[4].sizingReceipt.contextBudgetBytes = 185108;
+      return true;
+    });
+    const allocate = allocationOwner(() => true, fits);
+    const load = jest.fn(async (input) => {
+      order.push('load');
+      expect(input.outputCarrier.carrierMaxUtf8Bytes).toBe(185108);
+      return { status: 'available', capsule: 'Reviewed Core source.' };
+    });
+    const scope = {
+      module: { exports: {} },
+      Buffer,
+      Object,
+      req: request(),
+      orderedMessages: source,
+      nativeReplayBudget: 250000,
+      resolveActiveWorkTurnContext: async () => 'Active work.',
+      mainAttemptFactsAuthorityReserveBytes: () => 123,
+      conversationProviderUsesInvocationLocalTime: () => true,
+      NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES: 131072,
+      MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES: 16384,
+      resolveConversationProviderHistoryAttachments: async () => [],
+      nativeMainContinuityAllocation: allocate,
+      mainContinuityCarrierPeerParts: () => ['Peers'],
+      getCurrentCallContext: () => null,
+      buildTurnReplyContextCapsules: () => '',
+      getTrustedInteractionContext: () => null,
+      getTrustedAdapterCapabilities: () => null,
+      buildSavedMemoryWriterTurnContext: () => '',
+      buildRecurrenceStateCapsule: () => '',
+      buildTimeContextInstructions: () => '',
+      sourceSelectionTurnContext: () => '',
+      stableAuthorityDigest: () => 'a'.repeat(64),
+      loadAcceptedMainContext: load,
+      mainContinuityOutputCarrier: (parts, reserve, carrier) => ({ carrierMaxUtf8Bytes: carrier }),
+      conversationContinuityContextReserveBytes: () => 64042,
+      isAgentsEndpoint: () => true,
+    };
+    vm.runInNewContext(
+      'module.exports=function(){let legacyOutputCarrier;let legacyOutputCarrierSourceDigest;return (' +
+        initializer.getText(ast) +
+        ');};',
+      scope,
+    );
+    const resolveCarrier = scope.module.exports.call({ options: { agent, endpoint: 'agents' } });
+    const plan = { throughMessageId: source[99].messageId, sourceDigest: 'first-source' };
+    expect(await resolveCarrier(plan)).toEqual({
+      carrierMaxUtf8Bytes: 185108,
+      reservedContextUtf8Bytes: 64042,
+    });
+    expect(order).toEqual(['estimate', 'load']);
+    expect(fits.mock.calls[0][2]).toEqual(source.slice(100));
+    await resolveCarrier(plan);
+    expect(load).toHaveBeenCalledTimes(1);
+    await resolveCarrier({
+      ...plan,
+      throughMessageId: source[109].messageId,
+      sourceDigest: 'next-source',
+    });
+    expect(fits.mock.calls[1][2]).toEqual(source.slice(110));
+    expect(load).toHaveBeenCalledTimes(2);
+    load.mockResolvedValue({ status: 'context_budget' });
+    expect(await resolveCarrier({ ...plan, sourceDigest: 'unavailable' })).toBeNull();
+    expect(
+      await resolveCarrier({ throughMessageId: 'missing', sourceDigest: 'invalid' }),
+    ).toBeNull();
+  });
+
   test('the actual native callback reserves the final context cap, including later dynamic growth', async () => {
     const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
     const ast = ts.createSourceFile(

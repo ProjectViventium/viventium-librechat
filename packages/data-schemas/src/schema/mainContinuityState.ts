@@ -115,10 +115,17 @@ const outputContractSchema = new Schema<IMainCompactionOutputContract>(
   {
     version: { type: Number, required: true, enum: [1] },
     consumer: { type: String, required: true, enum: ['accepted_core', 'conversation_legacy'] },
-    carrierMaxUtf8Bytes: { type: Number, required: true, enum: [12 * 1024, 16 * 1024, 128 * 1024] },
+    carrierMaxUtf8Bytes: {
+      type: Number,
+      required: true,
+      validate: (bytes: number) =>
+        Number.isSafeInteger(bytes) &&
+        ([12 * 1024, 16 * 1024, 128 * 1024].includes(bytes) ||
+          (bytes > 128 * 1024 && bytes <= 512 * 1024)),
+    },
     reservedUtf8Bytes: { type: Number, required: true, min: 0 },
-    maxJsonUtf8Bytes: { type: Number, required: true, min: 1 },
-    maxSummaryUtf8Bytes: { type: Number, required: true, min: 1 },
+    maxJsonUtf8Bytes: { type: Number, required: true, min: 1, max: 128 * 1024 },
+    maxSummaryUtf8Bytes: { type: Number, required: true, min: 1, max: 128 * 1024 },
     maxItemsPerArray: { type: Number, required: true, enum: [32] },
     maxStringItemUtf8Bytes: { type: Number, required: true, enum: [1024] },
     maxToolIdentityCharacters: { type: Number, required: true, enum: [256] },

@@ -89,14 +89,15 @@ export default function MultiMessage({
       const message = visibleMessage;
       const isSelected = message.messageId === selectedMessage.messageId;
       let MessageComponent = Message;
-      /* === VIVENTIUM START === Captions stored beside files use the existing text-field editor. === */
-      const isUserCaptionEdit =
+      /* === VIVENTIUM START === Canonical user text/files need no empty parts renderer. === */
+      const usesUserMessageFields =
         message.isCreatedByUser === true &&
         typeof message.text === 'string' &&
-        message.messageId === currentEditId &&
         Array.isArray(message.content) &&
-        !message.content.some((part) => part?.type === ContentTypes.TEXT);
-      if (message.content && !isUserCaptionEdit) {
+        (message.content.length === 0 ||
+          (message.messageId === currentEditId &&
+            !message.content.some((part) => part?.type === ContentTypes.TEXT)));
+      if (message.content && !usesUserMessageFields) {
         MessageComponent = isAssistantsEndpoint(message.endpoint) ? MessageParts : MessageContent;
       }
       /* === VIVENTIUM END === */

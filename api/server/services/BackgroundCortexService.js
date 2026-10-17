@@ -1125,7 +1125,7 @@ function cloneLangChainMessageWithContent(msg, content) {
 }
 /* === VIVENTIUM NOTE === */
 
-function filterCortexContentFromLangChainMessages(messages) {
+function filterCortexContentFromLangChainMessages(messages, sourceMessageIds = new Set()) {
   if (!Array.isArray(messages)) {
     return messages;
   }
@@ -1194,7 +1194,7 @@ function filterCortexContentFromLangChainMessages(messages) {
       const isEmptyString = typeof msg.content === 'string' && msg.content === '';
       const isEmptyArray = Array.isArray(msg.content) && msg.content.length === 0;
       if (isEmptyString || isEmptyArray) {
-        return hasToolContext(msg);
+        return sourceMessageIds.has(msg.id) || hasToolContext(msg);
       }
       return true;
     });
@@ -4376,10 +4376,11 @@ async function runCortexAttempt(
      * carrier. Binding the triggering Main turn's snapshot would forward that turn's visible chain
      * and logical-turn identity for a different carrier, which the native provider rejects.
      * === VIVENTIUM END === */
+    let inheritedMainSnapshot = null;
     if (mainContextBinding === 'inherited') {
-      bindCortexMainContextSnapshot(safeReq, initializedAgent, {
+      inheritedMainSnapshot = bindCortexMainContextSnapshot(safeReq, initializedAgent, {
         required: cortexCapability?.workspace_binding === true,
-      });
+      }).snapshot;
     }
 
     const backgroundFeelingTail = feelingTailForBackgroundAgent(safeReq._viventiumFeelingSnapshot);
@@ -4515,9 +4516,13 @@ async function runCortexAttempt(
     /* === VIVENTIUM NOTE ===
      * Ensure background agents keep full message metadata and never receive empty input.
      */
+    // Preserve the exact accepted source ledger, including authored file-only rows.
+    const sourceMessageIds = new Set(
+      inheritedMainSnapshot?.visibleMessageChain.map((row) => row.id) || [],
+    );
     const filteredMessages =
       Array.isArray(messages) && messages.length > 0
-        ? filterCortexContentFromLangChainMessages(messages)
+        ? filterCortexContentFromLangChainMessages(messages, sourceMessageIds)
         : [];
     const scopedMessages = filteredMessages;
     const inputMessages =
@@ -4723,6 +4728,13 @@ async function runCortexAttempt(
       customHandlers: eventHandlers,
       requestBody: cortexRequestBody,
       user: safeReq.user,
+      // Reuse Main's existing checked body transport instead of forwarding its chain as a header.
+      ...(inheritedMainSnapshot &&
+      initializedAgent.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']
+        ? {
+            mainContinuityHeaders: initializedAgent.model_parameters?.configuration?.defaultHeaders,
+          }
+        : {}),
       /* Provide token counter/context map for context window management. */
       tokenCounter,
       indexTokenCountMap,

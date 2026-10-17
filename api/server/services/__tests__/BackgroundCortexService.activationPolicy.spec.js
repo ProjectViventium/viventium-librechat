@@ -407,6 +407,248 @@ describe('BackgroundCortexService activation policy helpers', () => {
     };
   }
 
+  async function runBoundFileOnlyCortex({
+    rows = 1,
+    inspect,
+    native = true,
+    isolated = false,
+    realRun = false,
+  }) {
+    const { createMainContinuityFetch, createRun: createActualRun } = require('@librechat/api');
+    const req = {
+      user: { id: 'c43-owner', role: 'USER' },
+      body: { conversationId: 'c43-conversation' },
+      config: { endpoints: { agents: { allowedProviders: ['openai'], providerCapabilities: {} } } },
+    };
+    const messages = Array.from({ length: rows }, (_, index) => ({
+      id: `c43-original-file-${index}${index < rows - 1 ? '-' + 'h'.repeat(100) : ''}`,
+      role: 'user',
+      content: index === rows - 1 ? '' : `Historical source ${index}.`,
+    }));
+    setTrustedInteractionContext(req, {
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'web',
+      conversation_id: 'c43-conversation',
+      logical_turn_id: 'c43-turn',
+      revision: 1,
+      source_event_id: 'c43-file-source',
+      source_segments: [
+        {
+          source_event_id: 'c43-file-source',
+          source_index: 0,
+          source_message_id: messages.at(-1).id,
+          text: '',
+          source_files: [{ file_id: 'c43-owned-file', filename: 'source.bin' }],
+        },
+      ],
+    });
+    captureMainContextSnapshot(req, {
+      agent: {
+        id: 'main-agent',
+        instructions: 'Main policy.',
+        tools: [],
+        model_parameters: {
+          configuration: {
+            defaultHeaders: {
+              'X-GlassHive-Agent-Id': 'main-agent',
+              'X-GlassHive-Stable-Authority-SHA256': 'a'.repeat(64),
+            },
+          },
+        },
+      },
+      messages,
+      visibleMessages: messages.map((message, index) => ({
+        messageId: message.id,
+        parentMessageId: index ? messages[index - 1].id : 'root',
+        isCreatedByUser: true,
+        text: message.content,
+        ...(index === rows - 1 ? { files: [{ file_id: 'c43-owned-file' }] } : {}),
+      })),
+      nativeBodyCarrier: true,
+    });
+    let observed;
+    let inspected = false;
+    let inspectionFailure;
+    const result = await executeCortexOnce(
+      {
+        agent: {
+          id: 'c43-cortex',
+          provider: native ? 'openai' : 'anthropic',
+          model: 'test-model',
+          tools: [],
+        },
+        messages: [
+          ...messages,
+          { id: 'c43-subject', role: 'user', content: 'Analyze the accepted evidence.' },
+        ],
+        req,
+        runId: 'c43-file-cortex',
+        conversationId: 'c43-conversation',
+        contextMode: 'minimal',
+        completedResultPolicy: 'internal',
+        ...(isolated ? { mainContextBinding: 'isolated' } : {}),
+      },
+      {
+        initializeAgentFn: jest.fn(async ({ agent }) => ({
+          ...agent,
+          model_parameters: {
+            model: 'test-model',
+            configuration: {
+              defaultHeaders: {
+                ...(native ? { 'X-GlassHive-Agent-Id': agent.id } : {}),
+                'X-GlassHive-Turn-Context-B64': Buffer.from('Factual context.').toString('base64'),
+              },
+            },
+          },
+        })),
+        prepareCapabilityFn: jest.fn(async () => true),
+        createRunFn: jest.fn(async (options) => {
+          const { agents, mainContinuityHeaders } = options;
+          let graphConfig;
+          const testRun = {
+            processStream: async ({ messages: input }) => {
+              const headers = agents[0].model_parameters.configuration.defaultHeaders;
+              const baseFetch = jest.fn(async (_url, init) => {
+                observed = { headers: new Headers(init.headers), body: JSON.parse(init.body) };
+                return new Response('{}', { status: 200 });
+              });
+              const fetch = createMainContinuityFetch(
+                baseFetch,
+                mainContinuityHeaders?.['X-Viventium-Visible-Message-Chain-B64'],
+                mainContinuityHeaders,
+              );
+              inspected = true;
+              try {
+                await inspect({
+                  input,
+                  headers,
+                  fetch,
+                  baseFetch,
+                  mainContinuityHeaders,
+                  graphConfig,
+                  readObserved: () => observed,
+                });
+              } catch (error) {
+                inspectionFailure = error;
+                throw error;
+              }
+              return [{ type: 'text', text: 'A bounded specialist result.' }];
+            },
+          };
+          if (!realRun) return testRun;
+          const { Run } = require('@librechat/agents');
+          const createSpy = jest.spyOn(Run, 'create').mockImplementation(async (config) => {
+            graphConfig = config.graphConfig;
+            return testRun;
+          });
+          try {
+            return await createActualRun(options);
+          } finally {
+            createSpy.mockRestore();
+          }
+        }),
+      },
+    );
+    expect(inspected).toBe(true);
+    if (inspectionFailure) throw inspectionFailure;
+    return result;
+  }
+
+  test('keeps the exact empty authored file source in a bound cortex carrier', async () => {
+    await runBoundFileOnlyCortex({
+      inspect: async ({ input }) => {
+        expect(input).toContainEqual(
+          expect.objectContaining({ id: 'c43-original-file-0', content: '' }),
+        );
+      },
+    });
+  });
+
+  test('uses the existing native body transport for a large bound cortex source chain', async () => {
+    await runBoundFileOnlyCortex({
+      rows: 110,
+      inspect: async ({ input, headers, fetch, readObserved }) => {
+        expect(Buffer.byteLength(headers['X-Viventium-Visible-Message-Chain-B64'])).toBeGreaterThan(
+          32 * 1024,
+        );
+        await fetch('http://native.invalid/v1/chat/completions', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ messages: input }),
+        });
+        const sent = readObserved();
+        expect(sent.headers.has('X-Viventium-Visible-Message-Chain-B64')).toBe(false);
+        expect(sent.body.metadata.visible_message_chain).toHaveLength(110);
+        expect(sent.body.messages).toContainEqual(
+          expect.objectContaining({ id: 'c43-original-file-109', content: '' }),
+        );
+        expect(sent.body.messages.at(-1).content).toBe('Analyze the accepted evidence.');
+      },
+    });
+  });
+
+  test('refuses a changed protected cortex source before native dispatch', async () => {
+    await runBoundFileOnlyCortex({
+      inspect: async ({ input, headers, fetch, baseFetch }) => {
+        const changed = input.map((message) =>
+          message.id === 'c43-original-file-0'
+            ? { ...message, content: 'Changed authored content.' }
+            : message,
+        );
+        await expect(
+          fetch('http://native.invalid/v1/chat/completions', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ messages: changed }),
+          }),
+        ).rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+        expect(baseFetch).not.toHaveBeenCalled();
+      },
+    });
+  });
+
+  test('keeps direct Anthropic sanitation outside native source callbacks at the real run boundary', async () => {
+    await runBoundFileOnlyCortex({
+      native: false,
+      realRun: true,
+      inspect: async ({ input, mainContinuityHeaders, graphConfig }) => {
+        expect(input).toContainEqual(
+          expect.objectContaining({ id: 'c43-original-file-0', content: 'Context message.' }),
+        );
+        expect(mainContinuityHeaders).toBeUndefined();
+        expect(graphConfig.agents[0].clientOptions.callbacks).toBeUndefined();
+      },
+    });
+  });
+
+  test('keeps an isolated native cortex outside inherited Main source transport', async () => {
+    await runBoundFileOnlyCortex({
+      isolated: true,
+      realRun: true,
+      inspect: async ({ headers, mainContinuityHeaders, graphConfig }) => {
+        expect(mainContinuityHeaders).toBeUndefined();
+        expect(headers['X-Viventium-Visible-Message-Chain-B64']).toBeUndefined();
+        expect(graphConfig.agents[0].clientOptions.callbacks).toBeUndefined();
+      },
+    });
+  });
+
+  test('installs the inherited native source callback at the real run boundary', async () => {
+    await runBoundFileOnlyCortex({
+      realRun: true,
+      inspect: async ({ input, mainContinuityHeaders, graphConfig }) => {
+        expect(mainContinuityHeaders['X-Viventium-Visible-Message-Chain-B64']).toBeTruthy();
+        expect(input).toContainEqual(
+          expect.objectContaining({ id: 'c43-original-file-0', content: '' }),
+        );
+        expect(graphConfig.agents[0].clientOptions.callbacks).toEqual([
+          expect.objectContaining({ raiseError: true, awaitHandlers: true }),
+        ]);
+      },
+    });
+  });
+
   test('binds the accepted snapshot and carries the triggering current input', () => {
     const req = requestWithMainSnapshot();
     const target = cortexRuntimeAgent();

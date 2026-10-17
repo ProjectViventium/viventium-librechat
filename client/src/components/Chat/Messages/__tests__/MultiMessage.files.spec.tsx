@@ -71,12 +71,11 @@ jest.mock('@librechat/client', () => {
     DelayedRender: ({ children }: { children: React.ReactNode }) => children,
   };
 });
-jest.mock(
-  '../Content/Container',
-  () =>
-    ({ children }: { children: React.ReactNode }) =>
-      children,
-);
+jest.mock('~/components/Chat/Input/Files/FileContainer', () => ({
+  __esModule: true,
+  default: ({ file }: { file: { filename: string } }) => <button>{file.filename}</button>,
+}));
+jest.mock('../Content/Image', () => () => null);
 jest.mock('../Content/Markdown', () => ({ content }: { content: string }) => (
   <span>{content}</span>
 ));
@@ -103,7 +102,14 @@ beforeEach(() => {
     text: '',
     content: [],
     depth: 1,
-    files: [{ file_id: 'saved-file', filepath: '/uploads/input.txt', type: 'text/plain' }],
+    files: [
+      {
+        file_id: 'saved-file',
+        filepath: '/uploads/input.txt',
+        filename: 'input.txt',
+        type: 'text/plain',
+      },
+    ],
   };
 });
 
@@ -167,10 +173,23 @@ test.each(['agents', 'assistants'])(
 );
 
 test('ordinary saved user display keeps its existing content renderer', () => {
+  mockMessage.content = [{ type: ContentTypes.TEXT, text: 'Structured caption.' }];
   show(false);
   expect(screen.getByTestId('content-parts')).toHaveAttribute('data-edit', 'false');
   expect(screen.queryByTestId('message-text-editor')).not.toBeInTheDocument();
 });
+
+test.each(['agents', 'assistants'])(
+  'saved empty content[] user display keeps the canonical file visible: %s',
+  (endpoint) => {
+    mockMessage.endpoint = endpoint;
+    const before = JSON.stringify(mockMessage);
+    show(false);
+    expect(screen.getAllByRole('button', { name: 'input.txt' })).toHaveLength(1);
+    expect(screen.queryByTestId('message-text-editor')).not.toBeInTheDocument();
+    expect(JSON.stringify(mockMessage)).toBe(before);
+  },
+);
 
 test('legacy structured-only user text keeps its existing route', () => {
   delete (mockMessage as Partial<TMessage>).text;

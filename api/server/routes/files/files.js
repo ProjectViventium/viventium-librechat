@@ -13,6 +13,9 @@ const {
   PermissionBits,
   checkOpenAIStorage,
   isAssistantsEndpoint,
+  /* === VIVENTIUM START: Match the stored file representation on download. === */
+  getFileDownloadName,
+  /* === VIVENTIUM END === */
 } = require('librechat-data-provider');
 const {
   filterFile,
@@ -307,6 +310,24 @@ router.get('/download/:userId/:file_id', fileAccess, async (req, res) => {
 
     // Access already validated by fileAccess middleware
     const file = req.fileAccess.file;
+
+    /* === VIVENTIUM START: Upload as Text retains extracted text, not its temporary original. === */
+    if (file.source === FileSources.text) {
+      const [storedFile] = await getFiles(
+        { file_id: file.file_id, user: file.user, source: FileSources.text },
+        undefined,
+        { text: 1 },
+      );
+      if (typeof storedFile?.text !== 'string') {
+        return res.status(404).send('File content is not available');
+      }
+      const filename = cleanFileName(getFileDownloadName(file.filename, file.source));
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('X-File-Metadata', JSON.stringify(file));
+      return Readable.from([storedFile.text]).pipe(res);
+    }
+    /* === VIVENTIUM END === */
 
     if (checkOpenAIStorage(file.source) && !file.model) {
       logger.warn(`File download requested by user ${userId} has no associated model: ${file_id}`);

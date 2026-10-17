@@ -75,7 +75,11 @@ export function trustedUploadedFilesFromRequestBody(
       ...(typeof candidate.text === 'string' ? { text: candidate.text.slice(0, 256 * 1024) } : {}),
     };
 
-    return [Object.fromEntries(Object.entries(safe).filter(([, item]) => item !== ''))];
+    return [
+      Object.fromEntries(
+        Object.entries(safe).filter(([key, item]) => key === 'text' || item !== ''),
+      ),
+    ];
   });
 }
 

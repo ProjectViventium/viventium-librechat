@@ -267,4 +267,61 @@ test.each([{ filename: 'brief.txt' }, { file_id: '', filename: 'brief.txt' }])(
   },
 );
 
+test.each(['', 'Read the selected source.'])(
+  'keeps canonical authored source text through registration and final attachment (%j)',
+  async (text) => {
+    const { dependencies } = fixture();
+    dependencies.buildTrustedDelegationIdentity = () => ({
+      idempotencyKey: 'a'.repeat(64),
+      goalDigest: 'b'.repeat(64),
+    });
+    const service = createGlassHiveCallbackBindingService(dependencies);
+    const args = {
+      instruction: 'Complete the objective supplied in the selected file.',
+      uploaded_files: [{ file_id: 'owned-file-a', filename: 'source.bin' }],
+    };
+    const launch = await service.registerGlassHiveLaunchContext({
+      user: { id: 'owner' },
+      requestBody: {
+        conversationId: 'conversation',
+        messageId: 'assistant',
+        parentMessageId: 'user',
+        viventiumSourceEventId: 'source',
+        viventiumTriggeringSourceSegments: [
+          {
+            source_event_id: 'source',
+            source_index: 0,
+            text,
+            source_files: [{ file_id: 'owned-file-a', filename: 'source.bin' }],
+          },
+        ],
+      },
+      toolName: 'worker_delegate_once',
+      toolArguments: args,
+      toolCall: { id: 'call' },
+    });
+    expect(launch).not.toBeNull();
+    const attached = service.attachGlassHiveTrustedLaunchMetadata(args, launch!);
+    expect(attached).toMatchObject({
+      uploaded_files: args.uploaded_files,
+      bootstrap_bundle_json: {
+        viventium_delegation_context: {
+          triggering_source_segments: [
+            {
+              ordinal: 0,
+              source_event_id: 'source',
+              source_index: 0,
+              text,
+            },
+          ],
+        },
+        viventium_delegation_packet: {
+          task: { instruction: args.instruction, source_segments: [{ ordinal: 0, text }] },
+          selected_files: [{ ordinal: 0, ref: 'owned-file-a' }],
+        },
+      },
+    });
+  },
+);
+
 /* === VIVENTIUM END === */

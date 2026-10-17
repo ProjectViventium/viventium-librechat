@@ -23,6 +23,7 @@ import { mainTextareaId, BadgeItem } from '~/common';
 import AttachFileChat from './Files/AttachFileChat';
 import FileFormChat from './Files/FileFormChat';
 import { cn, removeFocusRings } from '~/utils';
+import { canSubmitMessage } from '~/utils/messages';
 import TextareaHeader from './TextareaHeader';
 import PromptsCommand from './PromptsCommand';
 import AudioRecorder from './AudioRecorder';
@@ -151,14 +152,17 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
 
   useQueryParams({ textAreaRef });
 
+  /* === VIVENTIUM START === The selected completed files satisfy input without caption text. === */
+  const inputFiles = useMemo(() => Array.from(files.values()), [files]);
   const { ref, ...registerProps } = methods.register('text', {
-    required: true,
+    validate: (text) => canSubmitMessage(text, inputFiles),
     onChange: useCallback(
       (e: React.ChangeEvent<HTMLTextAreaElement>) =>
         methods.setValue('text', e.target.value, { shouldValidate: true }),
       [methods],
     ),
   });
+  /* === VIVENTIUM END === */
 
   const textValue = useWatch({ control: methods.control, name: 'text' });
 
@@ -352,6 +356,7 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
                   <SendButton
                     ref={submitButtonRef}
                     control={methods.control}
+                    files={inputFiles}
                     disabled={filesLoading || disableInputs || isNotAppendable}
                   />
                 )}

@@ -1,13 +1,16 @@
 import React, { forwardRef } from 'react';
 import { useWatch } from 'react-hook-form';
 import type { Control } from 'react-hook-form';
+import type { ExtendedFile } from '~/common';
 import { SendIcon, TooltipAnchor } from '@librechat/client';
+import { canSubmitMessage } from '~/utils/messages';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 
 type SendButtonProps = {
   disabled: boolean;
   control: Control<{ text: string }>;
+  files?: ExtendedFile[];
 };
 
 const SubmitButton = React.memo(
@@ -41,8 +44,14 @@ const SubmitButton = React.memo(
 const SendButton = React.memo(
   forwardRef((props: SendButtonProps, ref: React.ForwardedRef<HTMLButtonElement>) => {
     const data = useWatch({ control: props.control });
-    const content = data?.text?.trim();
-    return <SubmitButton ref={ref} disabled={props.disabled || !content} />;
+    /* === VIVENTIUM START === Match form and submission admission for completed file-only input. === */
+    return (
+      <SubmitButton
+        ref={ref}
+        disabled={props.disabled || !canSubmitMessage(data?.text, props.files)}
+      />
+    );
+    /* === VIVENTIUM END === */
   }),
 );
 

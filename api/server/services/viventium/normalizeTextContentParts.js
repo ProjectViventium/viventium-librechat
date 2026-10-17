@@ -51,15 +51,27 @@ function isRuntimeOnlyAssistantMessage(message) {
   return (
     message?.isCreatedByUser === false &&
     message.unfinished !== true &&
-    !message.files?.length &&
-    !message.image_urls?.length &&
+    [
+      'files',
+      'image_urls',
+      'documents',
+      'audios',
+      'videos',
+      'tool_calls',
+      'invalid_tool_calls',
+    ].every(
+      (key) => message[key] == null || (Array.isArray(message[key]) && message[key].length === 0),
+    ) &&
+    !message.tool_call_id &&
     // A memory status receipt is not a user file or model answer. Unknown and
     // file-bearing attachment types stay in history under the existing guard.
-    !message.attachments?.some((attachment) => attachment?.type !== Tools.memory) &&
+    (message.attachments == null ||
+      (Array.isArray(message.attachments) &&
+        !message.attachments.some((attachment) => attachment?.type !== Tools.memory))) &&
     (internalWorkerStatus ||
       (!message.text &&
+        // Zero parts carry the same authored text as an empty text part.
         Array.isArray(message.content) &&
-        message.content.length > 0 &&
         message.content.every(
           (part) =>
             part &&
@@ -372,7 +384,29 @@ function normalizeTextPartsInPayload(payload) {
  * hydrated media payload. Unknown/non-text array content stays intact for validation.
  */
 function normalizeMediaTextForFormatter(message) {
-  return normalizeHydratedMediaText(message, coerceTextToString);
+  const normalized = normalizeHydratedMediaText(message, coerceTextToString);
+  const references = [normalized?.files, normalized?.attachments];
+  const files = references.flatMap((value) => (Array.isArray(value) ? value : []));
+  if (
+    normalized?.isCreatedByUser !== true ||
+    (normalized.role != null && normalized.role !== 'user') ||
+    normalized.error === true ||
+    normalized.unfinished === true ||
+    normalized.text !== '' ||
+    !Array.isArray(normalized.content) ||
+    normalized.content.length !== 0 ||
+    !references.every((value) => value == null || Array.isArray(value)) ||
+    files.length === 0 ||
+    !files.every(
+      (file) =>
+        file && typeof file === 'object' && typeof file.file_id === 'string' && file.file_id.trim(),
+    )
+  ) {
+    return normalized;
+  }
+  // The formatter drops [], but retains the exact same empty authored text as ''.
+  // File identity and current access remain with the existing upload owners.
+  return { ...normalized, content: '' };
 }
 /* === VIVENTIUM END === */
 

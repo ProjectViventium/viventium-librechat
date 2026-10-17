@@ -146,7 +146,7 @@ const {
   configuredBrokerHostTools,
   conversationProviderUsesInvocationLocalTime,
   conversationProviderUsesNativeBody,
-  resolveConversationProviderHistoryAttachments,
+  resolveConversationProviderUploadedFiles,
   conversationProviderUsesLocalVisibleAccounting,
   resolveHostToolCapabilityState,
   resolveConversationProviderId,
@@ -364,16 +364,23 @@ function nativeWholeHistoryFits(
     ...(agent?.viventiumGraphLlmFallbacks || []),
   ].filter(Boolean);
   if (!conversationProviderUsesNativeBody(req, agent, { alternates })) return null;
-  // BaseClient.loadHistory has already awaited historical attachment hydration.
-  // The current upload, gateway images or RAG context can still enlarge this invocation.
-  // Only their owning caller can prove that no such preparation remains.
+  // BaseClient hydrates history; buildMessages proves completed current media preparation.
+  // A retained raw upload is not pending hydration. Later RAG remains unknown.
   const empty = (value) => value == null || (Array.isArray(value) && value.length === 0);
+  const currentMessage = Array.isArray(rows) ? rows[rows.length - 1] : null;
+  const preparation = pendingHydration?.currentAttachmentPreparation;
+  const prepared = Boolean(
+    currentMessage?.messageId &&
+    preparation?.message === currentMessage &&
+    preparation.messageId === currentMessage.messageId,
+  );
+  const incomplete = (value) => !empty(value) && (!prepared || !Array.isArray(value));
   if (
     !pendingHydration ||
     typeof pendingHydration !== 'object' ||
-    !empty(pendingHydration.attachments) ||
-    !empty(req?._telegramImages) ||
-    !empty(req?._gatewayImages) ||
+    incomplete(pendingHydration.attachments) ||
+    incomplete(req?._telegramImages) ||
+    incomplete(req?._gatewayImages) ||
     pendingHydration.contextHandlers ||
     !Array.isArray(rows) ||
     rows.some(
@@ -384,6 +391,7 @@ function nativeWholeHistoryFits(
           (key) => row[key] != null && !Array.isArray(row[key]),
         ) ||
         (row.fileContext != null && typeof row.fileContext !== 'string') ||
+        ['documents', 'audios', 'videos'].some((key) => !empty(row[key])) ||
         ['image_urls', 'documents', 'audios', 'videos'].some((key) =>
           row[key]?.some(
             (part) =>
@@ -457,14 +465,18 @@ function nativeWholeHistoryFits(
             }),
             'utf8',
           );
-    return mainHistoryFitsNativeBody(
+    const sizingReceipt = pendingHydration.sizingReceipt || {};
+    const fits = mainHistoryFitsNativeBody(
       messages,
       preparedAgent,
       reservedContextUtf8Bytes,
       nativeReplayBudget,
       sourceMetadataBytes,
-      pendingHydration.sizingReceipt,
+      sizingReceipt,
     );
+    return nativeReplayBudget !== null && !Number.isSafeInteger(sizingReceipt.contextBudgetBytes)
+      ? null
+      : fits;
   } catch {
     return null;
   }
@@ -4924,6 +4936,77 @@ class AgentClient extends BaseClient {
         isSchedulerTransportRow(message),
     });
     /* === VIVENTIUM START ===
+     * Prepare current media once before continuity sizing; retain original file authority.
+     */
+    this._viventiumCurrentAttachmentPreparation = null;
+    if (this.options.attachments) {
+      const attachmentsStart = startDeepTiming(req);
+      const attachments = await this.options.attachments;
+      const latestMessage = orderedMessages[orderedMessages.length - 1];
+
+      if (this.message_file_map) {
+        this.message_file_map[latestMessage.messageId] = attachments;
+      } else {
+        this.message_file_map = {
+          [latestMessage.messageId]: attachments,
+        };
+      }
+
+      await this.addFileContextToMessage(latestMessage, attachments);
+      const files = await this.processAttachments(latestMessage, attachments);
+
+      this.options.attachments = files;
+      if (isDeepTimingEnabled(req)) {
+        logDeepTiming(
+          req,
+          'build_messages_attachments',
+          attachmentsStart,
+          `files=${attachments?.length ?? 0}`,
+        );
+      }
+    }
+
+    /* === VIVENTIUM NOTE ===
+     * Feature: Gateway image upload injection (Telegram + generic channel gateway).
+     * Purpose: Allow gateway images to bypass MongoFile system and go directly to vision models.
+     * Added: 2026-01-31 (Telegram), expanded 2026-02-19 (generic gateway)
+     * === VIVENTIUM NOTE END === */
+    const telegramImages = this.options.req?._telegramImages;
+    const gatewayImages = this.options.req?._gatewayImages;
+    const injectedImages = [
+      ...(Array.isArray(telegramImages) ? telegramImages : []),
+      ...(Array.isArray(gatewayImages) ? gatewayImages : []),
+    ];
+    if (injectedImages.length > 0) {
+      const latestMessage = orderedMessages[orderedMessages.length - 1];
+      if (latestMessage) {
+        // Merge gateway images with any existing image_urls.
+        latestMessage.image_urls = [...(latestMessage.image_urls || []), ...injectedImages];
+        logger.info(
+          '[VIVENTIUM][AgentClient] Injected %d gateway image(s) into message',
+          injectedImages.length,
+        );
+      }
+    }
+    /* === VIVENTIUM NOTE END === */
+
+    const preparedCurrentMessage = orderedMessages[orderedMessages.length - 1];
+    this._viventiumCurrentAttachmentPreparation = Object.freeze({
+      message: preparedCurrentMessage,
+      messageId: preparedCurrentMessage?.messageId,
+    });
+    const nativeUploadRequestBody = buildViventiumMcpRequestBody({
+      agentId: this.options.agent?.id,
+      messageId: this.responseMessageId,
+      conversationId: this.conversationId,
+      parentMessageId: this.parentMessageId,
+      req,
+      attachments: this.options.attachments,
+      toolResources: this.options.agent?.tool_resources,
+    });
+    /* === VIVENTIUM END === */
+
+    /* === VIVENTIUM START ===
      * Feature: Conversation legacy continuity.
      * Purpose: When unstamped legacy history cannot fit the protected carrier, its oldest
      * whole-turn prefix is carried as an exact reviewed summary and the newer rows intact.
@@ -4954,13 +5037,16 @@ class AgentClient extends BaseClient {
       const nativeHistoryUploads =
         nativeReplayBudget === null
           ? undefined
-          : await resolveConversationProviderHistoryAttachments(req).catch(() => null);
+          : await resolveConversationProviderUploadedFiles(req, nativeUploadRequestBody).catch(
+              () => null,
+            );
       const allocation = nativeMainContinuityAllocation(
         req,
         agent,
         plan ? orderedMessages.slice(through + 1) : orderedMessages,
         {
           attachments: this.options.attachments,
+          currentAttachmentPreparation: this._viventiumCurrentAttachmentPreparation,
           nativeHistoryUploads,
           contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
           userName: this.options.name,
@@ -5058,7 +5144,9 @@ class AgentClient extends BaseClient {
         const nativeHistoryUploads =
           nativeReplayBudget === null
             ? undefined
-            : await resolveConversationProviderHistoryAttachments(req).catch(() => null);
+            : await resolveConversationProviderUploadedFiles(req, nativeUploadRequestBody).catch(
+                () => null,
+              );
         // The final native producer enforces this whole turn_context cap, including every
         // summary and later dynamic section; a forecast cannot under-reserve later growth.
         let turnContextReserveBytes = NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES;
@@ -5079,6 +5167,7 @@ class AgentClient extends BaseClient {
           turnContextReserveBytes,
           {
             attachments: this.options.attachments,
+            currentAttachmentPreparation: this._viventiumCurrentAttachmentPreparation,
             nativeHistoryUploads,
             sizingReceipt,
             contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
@@ -5296,57 +5385,6 @@ class AgentClient extends BaseClient {
       }
     }
 
-    if (this.options.attachments) {
-      const attachmentsStart = startDeepTiming(req);
-      const attachments = await this.options.attachments;
-      const latestMessage = orderedMessages[orderedMessages.length - 1];
-
-      if (this.message_file_map) {
-        this.message_file_map[latestMessage.messageId] = attachments;
-      } else {
-        this.message_file_map = {
-          [latestMessage.messageId]: attachments,
-        };
-      }
-
-      await this.addFileContextToMessage(latestMessage, attachments);
-      const files = await this.processAttachments(latestMessage, attachments);
-
-      this.options.attachments = files;
-      if (isDeepTimingEnabled(req)) {
-        logDeepTiming(
-          req,
-          'build_messages_attachments',
-          attachmentsStart,
-          `files=${attachments?.length ?? 0}`,
-        );
-      }
-    }
-
-    /* === VIVENTIUM NOTE ===
-     * Feature: Gateway image upload injection (Telegram + generic channel gateway).
-     * Purpose: Allow gateway images to bypass MongoFile system and go directly to vision models.
-     * Added: 2026-01-31 (Telegram), expanded 2026-02-19 (generic gateway)
-     * === VIVENTIUM NOTE END === */
-    const telegramImages = this.options.req?._telegramImages;
-    const gatewayImages = this.options.req?._gatewayImages;
-    const injectedImages = [
-      ...(Array.isArray(telegramImages) ? telegramImages : []),
-      ...(Array.isArray(gatewayImages) ? gatewayImages : []),
-    ];
-    if (injectedImages.length > 0) {
-      const latestMessage = orderedMessages[orderedMessages.length - 1];
-      if (latestMessage) {
-        // Merge gateway images with any existing image_urls.
-        latestMessage.image_urls = [...(latestMessage.image_urls || []), ...injectedImages];
-        logger.info(
-          '[VIVENTIUM][AgentClient] Injected %d gateway image(s) into message',
-          injectedImages.length,
-        );
-      }
-    }
-    /* === VIVENTIUM NOTE END === */
-
     /** Note: Bedrock uses legacy RAG API handling */
     if (this.message_file_map && !isAgentsEndpoint(this.options.endpoint)) {
       this.contextHandlers = createContextHandlers(
@@ -5360,6 +5398,16 @@ class AgentClient extends BaseClient {
     this._viventiumVisibleMessagesV1 = orderedMessages.map(
       ({ fileContext, ...message }) => message,
     );
+    if (
+      this._viventiumCurrentAttachmentPreparation?.message ===
+        orderedMessages[orderedMessages.length - 1] &&
+      this._viventiumCurrentAttachmentPreparation.messageId === preparedCurrentMessage?.messageId
+    ) {
+      this._viventiumCurrentAttachmentPreparation = Object.freeze({
+        message: this._viventiumVisibleMessagesV1[this._viventiumVisibleMessagesV1.length - 1],
+        messageId: preparedCurrentMessage?.messageId,
+      });
+    }
     const voiceFormatStartedAt = isVoiceLatencyEnabled(req) ? voiceLatencyNow() : null;
     const formattedMessages = orderedMessages.map((message, i) => {
       const formattedMessage = formatMessage({
@@ -8478,8 +8526,9 @@ class AgentClient extends BaseClient {
           req?.config?.endpoints?.custom,
         ).catch(() => null);
         if (replayBudget !== null) {
-          const nativeHistoryUploads = await resolveConversationProviderHistoryAttachments(
+          const nativeHistoryUploads = await resolveConversationProviderUploadedFiles(
             req,
+            config?.configurable?.requestBody,
           ).catch(() => null);
           const allocation = nativeMainContinuityAllocation(
             req,
@@ -8487,6 +8536,7 @@ class AgentClient extends BaseClient {
             this._viventiumVisibleMessagesV1,
             {
               attachments: this.options.attachments,
+              currentAttachmentPreparation: this._viventiumCurrentAttachmentPreparation,
               nativeHistoryUploads,
               contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
               userName: this.options.name,

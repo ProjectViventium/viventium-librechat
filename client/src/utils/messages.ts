@@ -13,10 +13,24 @@ import type {
   TMessageContentParts,
 } from 'librechat-data-provider';
 import type { QueryClient } from '@tanstack/react-query';
-import type { LocalizeFunction } from '~/common';
+import type { ExtendedFile, LocalizeFunction } from '~/common';
 import _ from 'lodash';
 
 export const TEXT_KEY_DIVIDER = '|||';
+
+/* === VIVENTIUM START === Completed files are message input without an invented caption. === */
+export const canSubmitMessage = (
+  text: string | undefined,
+  files: readonly (Pick<ExtendedFile, 'file_id'> & Partial<Pick<ExtendedFile, 'progress'>>)[] = [],
+): boolean =>
+  files.every(
+    (file) =>
+      typeof file.file_id === 'string' &&
+      file.file_id.trim().length > 0 &&
+      (!('progress' in file) || file.progress === 1),
+  ) &&
+  (Boolean(text?.trim()) || files.length > 0);
+/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START === Preserve typed call transcript provenance in message headers. === */
 export const getVoiceTranscriptLabel = (

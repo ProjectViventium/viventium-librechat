@@ -1125,7 +1125,7 @@ function cloneLangChainMessageWithContent(msg, content) {
 }
 /* === VIVENTIUM NOTE === */
 
-function filterCortexContentFromLangChainMessages(messages) {
+function filterCortexContentFromLangChainMessages(messages, sourceMessageIds = new Set()) {
   if (!Array.isArray(messages)) {
     return messages;
   }
@@ -1194,7 +1194,7 @@ function filterCortexContentFromLangChainMessages(messages) {
       const isEmptyString = typeof msg.content === 'string' && msg.content === '';
       const isEmptyArray = Array.isArray(msg.content) && msg.content.length === 0;
       if (isEmptyString || isEmptyArray) {
-        return hasToolContext(msg);
+        return sourceMessageIds.has(msg.id) || hasToolContext(msg);
       }
       return true;
     });
@@ -3752,19 +3752,50 @@ function buildCortexRequestBody({
   runId,
   conversationId = null,
   idempotencyKey = '',
+  activeMessageId = null,
+  attachments = [],
+  ownerId = '',
 } = {}) {
   const resolvedConversationId =
     String(conversationId || '').trim() ||
     String(requestBody?.conversationId || '').trim() ||
     String(runId || '').trim();
   const cortexRequestBody = { ...(requestBody || {}) };
+  // Reuse prepared current files; this body must not revert to the browser's thin references.
+  const preparedById = new Map(
+    (attachments || [])
+      .filter((file) => ownerId && String(file?.user || '') === String(ownerId))
+      .map((file) => [file.file_id, file]),
+  );
+  if (Array.isArray(cortexRequestBody.files)) {
+    cortexRequestBody.files = cortexRequestBody.files.map((file) => {
+      const prepared = file?.file_id && preparedById.get(file.file_id);
+      if (!prepared || (file.source && file.source !== prepared.source)) return file;
+      const hydrated = { ...file };
+      for (const field of [
+        'filename',
+        'source',
+        'context',
+        'type',
+        'bytes',
+        'width',
+        'height',
+        'text',
+      ]) {
+        if (hydrated[field] === undefined && prepared[field] !== undefined) {
+          hydrated[field] = prepared[field];
+        }
+      }
+      return hydrated;
+    });
+  }
   // Main owns this mutable carrier; cortices assemble their own time, memory and file context.
   delete cortexRequestBody.viventiumGlassHiveTurnContextB64;
   return {
     ...cortexRequestBody,
     messageId: runId,
     conversationId: resolvedConversationId,
-    parentMessageId: requestBody?.parentMessageId,
+    parentMessageId: String(activeMessageId || '').trim() || requestBody?.parentMessageId,
     viventiumGlassHiveIdempotencyKey: idempotencyKey,
   };
 }
@@ -4376,10 +4407,11 @@ async function runCortexAttempt(
      * carrier. Binding the triggering Main turn's snapshot would forward that turn's visible chain
      * and logical-turn identity for a different carrier, which the native provider rejects.
      * === VIVENTIUM END === */
+    let inheritedMainSnapshot = null;
     if (mainContextBinding === 'inherited') {
-      bindCortexMainContextSnapshot(safeReq, initializedAgent, {
+      inheritedMainSnapshot = bindCortexMainContextSnapshot(safeReq, initializedAgent, {
         required: cortexCapability?.workspace_binding === true,
-      });
+      }).snapshot;
     }
 
     const backgroundFeelingTail = feelingTailForBackgroundAgent(safeReq._viventiumFeelingSnapshot);
@@ -4515,9 +4547,13 @@ async function runCortexAttempt(
     /* === VIVENTIUM NOTE ===
      * Ensure background agents keep full message metadata and never receive empty input.
      */
+    // Preserve the exact accepted source ledger, including authored file-only rows.
+    const sourceMessageIds = new Set(
+      inheritedMainSnapshot?.visibleMessageChain.map((row) => row.id) || [],
+    );
     const filteredMessages =
       Array.isArray(messages) && messages.length > 0
-        ? filterCortexContentFromLangChainMessages(messages)
+        ? filterCortexContentFromLangChainMessages(messages, sourceMessageIds)
         : [];
     const scopedMessages = filteredMessages;
     const inputMessages =
@@ -4628,6 +4664,9 @@ async function runCortexAttempt(
       runId,
       conversationId,
       idempotencyKey: cortexIdempotencyKey,
+      activeMessageId,
+      attachments: initializedAgent.attachments,
+      ownerId: safeReq.user?.id || safeReq.user?._id,
     });
     cortexCancellationReq = harnessInvocationReq;
     cortexCancellationReq.body = cortexRequestBody;
@@ -4723,6 +4762,13 @@ async function runCortexAttempt(
       customHandlers: eventHandlers,
       requestBody: cortexRequestBody,
       user: safeReq.user,
+      // Reuse Main's existing checked body transport instead of forwarding its chain as a header.
+      ...(inheritedMainSnapshot &&
+      initializedAgent.model_parameters?.configuration?.defaultHeaders?.['X-GlassHive-Agent-Id']
+        ? {
+            mainContinuityHeaders: initializedAgent.model_parameters?.configuration?.defaultHeaders,
+          }
+        : {}),
       /* Provide token counter/context map for context window management. */
       tokenCounter,
       indexTokenCountMap,

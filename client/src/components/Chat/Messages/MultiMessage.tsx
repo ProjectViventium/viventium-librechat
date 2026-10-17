@@ -1,6 +1,6 @@
 import { useRecoilState } from 'recoil';
 import { Fragment, useRef, useEffect, useCallback, useContext } from 'react';
-import { isAssistantsEndpoint } from 'librechat-data-provider';
+import { ContentTypes, isAssistantsEndpoint } from 'librechat-data-provider';
 import type { TMessage } from 'librechat-data-provider';
 import type { TMessageProps } from '~/common';
 import MessageContent from '~/components/Messages/MessageContent';
@@ -89,9 +89,18 @@ export default function MultiMessage({
       const message = visibleMessage;
       const isSelected = message.messageId === selectedMessage.messageId;
       let MessageComponent = Message;
-      if (message.content) {
+      /* === VIVENTIUM START === Canonical user text/files need no empty parts renderer. === */
+      const usesUserMessageFields =
+        message.isCreatedByUser === true &&
+        typeof message.text === 'string' &&
+        Array.isArray(message.content) &&
+        (message.content.length === 0 ||
+          (message.messageId === currentEditId &&
+            !message.content.some((part) => part?.type === ContentTypes.TEXT)));
+      if (message.content && !usesUserMessageFields) {
         MessageComponent = isAssistantsEndpoint(message.endpoint) ? MessageParts : MessageContent;
       }
+      /* === VIVENTIUM END === */
       return (
         <MessageInputBranchContext.Provider key={message.messageId} value={ownsInput && isSelected}>
           <MessageComponent

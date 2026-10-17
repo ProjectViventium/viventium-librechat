@@ -7,6 +7,7 @@ import type { TEditProps } from '~/common';
 import { useMessagesOperations, useMessagesConversation } from '~/Providers';
 import { useGetAddedConvo } from '~/hooks/Chat';
 import { cn, removeFocusRings } from '~/utils';
+import { canSubmitMessage } from '~/utils/messages';
 import { useLocalize } from '~/hooks';
 import Container from './Container';
 import store from '~/store';
@@ -140,7 +141,10 @@ const EditMessage = ({
   );
 
   const { ref, ...registerProps } = register('text', {
-    required: true,
+    /* === VIVENTIUM START === A saved user file remains valid input when its caption is empty. === */
+    validate: (text) =>
+      message.isCreatedByUser ? canSubmitMessage(text, message.files) : Boolean(text),
+    /* === VIVENTIUM END === */
     onChange: (e) => {
       setValue('text', e.target.value, { shouldValidate: true });
     },

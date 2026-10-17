@@ -4551,7 +4551,11 @@ describe('native whole-source courier admission', () => {
   function capture(source, { native = true, alter } = {}) {
     const messages = formatAgentMessages(
       source.map((message) => ({
-        ...formatMessage({ message: normalizer.normalizeUserMessageContent(message) }),
+        ...formatMessage({
+          message: normalizer.normalizeMediaTextForFormatter(
+            normalizer.normalizeUserMessageContent(message),
+          ),
+        }),
         messageId: message.messageId,
       })),
     ).messages;
@@ -4740,6 +4744,215 @@ describe('native whole-source courier admission', () => {
     expect(caller()(request(), agent, source, 0, { sizingReceipt: unprepared }, 196608)).toBeNull();
     expect(unprepared.contextBudgetBytes).toBeUndefined();
   });
+  test('prepared current uploads use the native ledger bound without losing file context', () => {
+    const source = rows(2);
+    const file = {
+      file_id: '11111111-1111-4111-8111-111111111111',
+      filename: 'input.wav',
+      type: 'audio/wav',
+      bytes: 554998,
+      source: 'local',
+    };
+    source[1].files = [file];
+    source[1].fileContext = 'Complete extracted context.';
+    const before = JSON.stringify(source);
+    const sizingReceipt = {};
+    const hydration = {
+      attachments: [file],
+      currentAttachmentPreparation: { message: source.at(-1), messageId: source.at(-1).messageId },
+      nativeHistoryUploads: [file],
+      sizingReceipt,
+    };
+    expect(caller()(request(), agent, source, 131072, hydration, 237500)).toBe(true);
+    expect(sizingReceipt.attachmentBoundBytes).toBe(
+      require('@librechat/api').nativeHistoryAttachmentContextBytes([file]),
+    );
+    expect(sizingReceipt.attachmentBoundBytes).toBeLessThan(file.bytes);
+    expect(JSON.stringify(source)).toBe(before);
+    expect(
+      caller()(
+        request(),
+        agent,
+        source,
+        131072,
+        {
+          ...hydration,
+          currentAttachmentPreparation: {
+            message: { ...source.at(-1) },
+            messageId: source.at(-1).messageId,
+          },
+        },
+        237500,
+      ),
+    ).toBeNull();
+    expect(
+      caller()(
+        request(),
+        agent,
+        source,
+        131072,
+        {
+          ...hydration,
+          currentAttachmentPreparation: { message: source.at(-1), messageId: 'other-input' },
+        },
+        237500,
+      ),
+    ).toBeNull();
+    expect(
+      caller()(
+        request(),
+        agent,
+        source,
+        131072,
+        { ...hydration, currentAttachmentPreparation: undefined },
+        237500,
+      ),
+    ).toBeNull();
+    expect(
+      caller()(
+        request(),
+        agent,
+        source,
+        131072,
+        { ...hydration, attachments: Promise.resolve([file]) },
+        237500,
+      ),
+    ).toBeNull();
+    expect(
+      caller()(request(), agent, source, 131072, { ...hydration, contextHandlers: {} }, 237500),
+    ).toBeNull();
+    source[1].fileContext = 'Retained file context.'.repeat(20000);
+    expect(caller()(request(), agent, source, 0, hydration)).toBe(false);
+    source[1].text = source[1].content = 'Retained visible source.'.repeat(20000);
+    expect(caller()(request(), agent, source, 131072, hydration, 237500)).toBe(false);
+  });
+
+  test('completed gateway injection still costs media and rejects malformed or pending images', () => {
+    const source = rows(2);
+    const image = {
+      type: 'image_url',
+      image_url: {
+        url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJfcAAAAASUVORK5CYII=',
+      },
+    };
+    source[1].image_urls = [image];
+    const req = request();
+    req._gatewayImages = [image];
+    const hydration = {
+      currentAttachmentPreparation: { message: source.at(-1), messageId: source.at(-1).messageId },
+      nativeHistoryUploads: [],
+    };
+    expect(caller()(req, agent, source, 131072, hydration, 237500)).toBe(true);
+    expect(
+      caller()(
+        req,
+        agent,
+        source,
+        131072,
+        { ...hydration, currentAttachmentPreparation: undefined },
+        237500,
+      ),
+    ).toBeNull();
+    req._gatewayImages = 'unresolved';
+    expect(caller()(req, agent, source, 131072, hydration, 237500)).toBeNull();
+    req._gatewayImages = [image];
+    source[1].image_urls = [{ type: 'image_url', image_url: {} }];
+    expect(caller()(req, agent, source, 131072, hydration, 237500)).toBeNull();
+    source[1].image_urls = Array.from(
+      { length: require('@librechat/api').GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES + 1 },
+      () => image,
+    );
+    expect(caller()(req, agent, source, 131072, hydration, 237500)).toBeNull();
+  });
+
+  test.each(['audios', 'videos', 'documents'])(
+    'prepared inline %s remain unknown instead of acquiring a ledger-only fit',
+    (field) => {
+      const source = rows(2);
+      source[1][field] = [{ type: 'media', data: 'Retained inline media bytes.' }];
+      const hydration = {
+        currentAttachmentPreparation: {
+          message: source.at(-1),
+          messageId: source.at(-1).messageId,
+        },
+        nativeHistoryUploads: [],
+      };
+      expect(caller()(request(), agent, source, 131072, hydration, 237500)).toBeNull();
+    },
+  );
+
+  test('final Main allocation uses the same prepared row and invocation upload projection', async () => {
+    const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      file,
+      fs.readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    let finalCall;
+    const visit = (node) => {
+      if (
+        ts.isCallExpression(node) &&
+        node.expression.getText(ast) === 'nativeMainContinuityAllocation'
+      )
+        finalCall = node;
+      ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    let block = finalCall.parent;
+    while (!ts.isBlock(block)) block = block.parent;
+    const source = rows(2);
+    const upload = {
+      file_id: '11111111-1111-4111-8111-111111111111',
+      filename: 'input.wav',
+      type: 'audio/wav',
+      source: 'local',
+      bytes: 554998,
+    };
+    source[1].files = [upload];
+    const body = { files: [upload], parentMessageId: source[1].messageId };
+    const merge = jest.fn(async () => [upload]);
+    const logger = { info: jest.fn() };
+    const req = request();
+    const scope = {
+      module: { exports: {} },
+      req,
+      replayBudget: 237500,
+      config: { configurable: { requestBody: body } },
+      resolveConversationProviderUploadedFiles: merge,
+      nativeMainContinuityAllocation: allocationOwner(
+        provider.conversationProviderUsesNativeBody,
+        caller(),
+      ),
+      isAgentsEndpoint: () => true,
+      logger,
+    };
+    vm.runInNewContext(
+      'module.exports=async function(){let selectedCarrierBytes=131072;' +
+        block.getText(ast) +
+        ';return selectedCarrierBytes;};',
+      scope,
+    );
+    const client = {
+      options: { req, agent, endpoint: 'agents', attachments: [upload] },
+      _viventiumVisibleMessagesV1: source,
+      _viventiumCurrentAttachmentPreparation: {
+        message: source.at(-1),
+        messageId: source.at(-1).messageId,
+      },
+    };
+    expect(await scope.module.exports.call(client)).toBeGreaterThan(131072);
+    expect(merge).toHaveBeenCalledWith(req, body);
+    const receipt = JSON.parse(
+      logger.info.mock.calls[0][0].slice('[VIVENTIUM][main-context-allocation] '.length),
+    );
+    expect(receipt.fitOutcome).toBe('fit');
+    expect(receipt.authorizedAttachmentBoundBytes).toBe(
+      require('@librechat/api').nativeHistoryAttachmentContextBytes([upload]),
+    );
+    expect(client.options.attachments).toEqual([upload]);
+  });
+
   test('actual caller costs all tool arguments and keeps adjacency and source unchanged', () => {
     const source = rows();
     source[1].content = [
@@ -4840,6 +5053,74 @@ describe('native whole-source courier admission', () => {
     }
     return { result, error, Model, compaction };
   }
+  test('current raw WAV keeps the reviewed prefix and memory digests without foreground reconciliation', async () => {
+    const source = rows(252);
+    const file = {
+      file_id: '11111111-1111-4111-8111-111111111111',
+      filename: 'input.wav',
+      type: 'audio/wav',
+      source: 'local',
+      bytes: 554998,
+    };
+    source.at(-1).text = '';
+    source.at(-1).content = [];
+    source.at(-1).files = [file];
+    const filePath = path.resolve(__dirname, '../../../controllers/agents/client.js');
+    const ast = ts.createSourceFile(
+      filePath,
+      fs.readFileSync(filePath, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const digestOwner = ast.statements.find(
+      (node) => ts.isFunctionDeclaration(node) && node.name?.text === 'memoryWriterSourceDigest',
+    );
+    const scope = { module: { exports: {} }, crypto, ContentTypes };
+    vm.runInNewContext(
+      digestOwner.getText(ast) + ';module.exports=memoryWriterSourceDigest;',
+      scope,
+    );
+    const before = source.map((row) => [row.messageId, scope.module.exports(row)]);
+    const record = recordFor(source, 152);
+    const recordBefore = JSON.stringify(record);
+    // These are the derived fields owned by the moved preparation, never authored text.
+    source.at(-1).fileContext = 'Complete attachment-derived context.';
+    source.at(-1).audios = undefined;
+    const check = async (selected) =>
+      caller()(
+        request(),
+        agent,
+        selected,
+        131072,
+        {
+          attachments: [file],
+          currentAttachmentPreparation: {
+            message: source.at(-1),
+            messageId: source.at(-1).messageId,
+          },
+          nativeHistoryUploads: [file],
+        },
+        237500,
+      );
+    const compaction = {
+      ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })),
+      scheduleMainContinuityMaintenance: jest.fn(),
+    };
+    const outcome = await resolve(source, record, check, compaction, true);
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.result.messages).toEqual(source.slice(153));
+    expect(outcome.result.messages.at(-1)).toBe(source.at(-1));
+    expect(outcome.result.messages.at(-1).files).toEqual([file]);
+    expect(outcome.result.coveredIds).toEqual(source.slice(0, 153).map((row) => row.messageId));
+    expect(JSON.stringify(record)).toBe(recordBefore);
+    expect(source.map((row) => [row.messageId, scope.module.exports(row)])).toEqual(before);
+    expect(compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+    expect(compaction.scheduleMainContinuityMaintenance).toHaveBeenCalledTimes(1);
+    expect(
+      capture(source.map(({ fileContext: _fileContext, ...row }) => row)).visibleMessageChain,
+    ).toHaveLength(source.length);
+  });
+
   test('reuses valid reviewed prefix rather than expanding full source', async () => {
     const source = rows(130);
     const bypass = jest.fn(async () => true);
@@ -5080,7 +5361,8 @@ describe('native whole-source courier admission', () => {
       conversationProviderUsesInvocationLocalTime: () => true,
       NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES: 131072,
       MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES: 16384,
-      resolveConversationProviderHistoryAttachments: async () => [],
+      nativeUploadRequestBody: request().body,
+      resolveConversationProviderUploadedFiles: async () => [],
       nativeMainContinuityAllocation: allocate,
       mainContinuityCarrierPeerParts: () => ['Peers'],
       getCurrentCallContext: () => null,
@@ -5158,7 +5440,8 @@ describe('native whole-source courier admission', () => {
           status: 413,
         });
       }),
-      resolveConversationProviderHistoryAttachments: async () => uploads,
+      nativeUploadRequestBody: request().body,
+      resolveConversationProviderUploadedFiles: async () => uploads,
       nativeWholeHistoryFits: fits,
       nativeReplayBudget: 196608,
       logger,
@@ -5235,7 +5518,8 @@ describe('native whole-source courier admission', () => {
         Buffer,
         conversationProviderUsesNativeBody: () => true,
         resolveLegacyOutputCarrier: reserve,
-        resolveConversationProviderHistoryAttachments: uploads,
+        nativeUploadRequestBody: request().body,
+        resolveConversationProviderUploadedFiles: uploads,
         nativeWholeHistoryFits: fits,
         nativeReplayBudget: budget,
         NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES: 131072,
@@ -5399,3 +5683,74 @@ describe('native whole-source courier admission', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+// VIVENTIUM: preserve raw ancestry while excluding the existing zero-text runtime carrier.
+test('zero-part assistant bookkeeping cannot poison later Main source admission', () => {
+  const { formatAgentMessages, formatMessage } = require('@librechat/agents');
+  const { isRuntimeOnlyAssistantMessage } = require('../normalizeTextContentParts');
+  const raw = [
+    {
+      messageId: 'prior',
+      parentMessageId: '',
+      user: 'owner',
+      conversationId: 'conversation',
+      role: 'user',
+      isCreatedByUser: true,
+      text: 'Keep this source.',
+    },
+    {
+      messageId: 'empty-assistant',
+      parentMessageId: 'prior',
+      user: 'owner',
+      conversationId: 'conversation',
+      role: 'assistant',
+      isCreatedByUser: false,
+      text: '',
+      content: [],
+      unfinished: false,
+      error: false,
+      attachments: [],
+    },
+    {
+      messageId: 'current',
+      parentMessageId: 'empty-assistant',
+      user: 'owner',
+      conversationId: 'conversation',
+      role: 'user',
+      isCreatedByUser: true,
+      text: 'Continue.',
+    },
+  ];
+  const before = JSON.stringify(raw);
+  const proof = traceMainHistoryAncestry({
+    messages: raw,
+    headId: 'empty-assistant',
+    ownerId: 'owner',
+    conversationId: 'conversation',
+  });
+  expect(proof.skippedMessageIds).toContain('empty-assistant');
+  const selected = raw.filter((message) => !isRuntimeOnlyAssistantMessage(message));
+  const messages = formatAgentMessages(
+    selected.map((message) => ({ ...formatMessage({ message }), messageId: message.messageId })),
+  ).messages;
+  for (const native of [true, false]) {
+    const snapshot = captureMainContextSnapshot(
+      { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+      {
+        agent: {
+          id: 'main',
+          model_parameters: {
+            configuration: { defaultHeaders: native ? { 'X-GlassHive-Agent-Id': 'main' } : {} },
+          },
+        },
+        messages,
+        visibleMessages: selected,
+        historyAncestry: proof,
+        nativeBodyCarrier: native,
+        protectUnreconciledHistory: true,
+      },
+    );
+    expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['prior', 'current']);
+  }
+  expect(JSON.stringify(raw)).toBe(before);
+});

@@ -9,6 +9,7 @@
  * === VIVENTIUM END === */
 
 const {
+  isRuntimeOnlyAssistantMessage,
   coerceTextToString,
   normalizeUserMessageContent,
   normalizeTextContentParts,
@@ -25,6 +26,64 @@ const { filterMalformedContentParts, buildMainContinuityHeaders } = require('@li
 const { ContentTypes } = require('librechat-data-provider');
 
 describe('normalizeTextContentParts', () => {
+  describe('file-only authored user formatting', () => {
+    function source() {
+      return {
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'input',
+        role: 'user',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: '',
+        content: [],
+        files: [
+          { file_id: 'selected-file', filename: 'input.bin', type: 'application/octet-stream' },
+        ],
+      };
+    }
+    test.each(['audio/wav', 'image/png', 'video/mp4', 'application/pdf', 'text/plain'])(
+      'retains zero authored text and original %s references through both native formatters',
+      (type) => {
+        const row = source();
+        row.files[0].type = type;
+        const before = JSON.stringify(row);
+        const normalized = normalizeMediaTextForFormatter(normalizeUserMessageContent(row));
+        expect(normalized.content).toBe('');
+        expect(normalized.files).toBe(row.files);
+        const wire = formatAgentMessages([
+          { ...formatMessage({ message: normalized }), messageId: row.messageId },
+        ]).messages;
+        expect(wire).toHaveLength(1);
+        expect(wire[0]._getType()).toBe('human');
+        expect(wire[0].content).toEqual([{ type: 'text', text: '' }]);
+        expect(JSON.stringify(row)).toBe(before);
+        expect(normalizeMediaTextForFormatter(normalized)).toBe(normalized);
+      },
+    );
+    test.each([
+      'no_files',
+      'malformed_files',
+      'missing_id',
+      'unknown_content',
+      'caption',
+      'assistant',
+      'error',
+      'unfinished',
+    ])('does not reinterpret %s as an empty file-only source', (mode) => {
+      const row = source();
+      if (mode === 'no_files') row.files = [];
+      if (mode === 'malformed_files') row.files = 'unresolved';
+      if (mode === 'missing_id') row.files = [{ filename: 'input.bin' }];
+      if (mode === 'unknown_content') row.content = [{ type: 'unknown' }];
+      if (mode === 'caption') row.text = 'Exact authored caption.';
+      if (mode === 'assistant') row.isCreatedByUser = false;
+      if (mode === 'error') row.error = true;
+      if (mode === 'unfinished') row.unfinished = true;
+      expect(normalizeMediaTextForFormatter(row)).toBe(row);
+    });
+  });
+
   describe('authored text with hydrated native media', () => {
     const {
       messageContentText,
@@ -855,5 +914,47 @@ describe('native output attachment history DATA', () => {
     const row = source();
     mutate(row);
     expect(normalizeUserMessageContent(row)).toBe(row);
+  });
+});
+
+// VIVENTIUM: zero-parts and empty-text runtime carriers have the same structural meaning.
+describe('empty assistant runtime-only parity', () => {
+  const empty = () => ({
+    isCreatedByUser: false,
+    text: '',
+    content: [],
+    unfinished: false,
+    error: false,
+    attachments: [],
+  });
+  test('classifies zero parts exactly like the existing empty text part', () => {
+    expect(isRuntimeOnlyAssistantMessage(empty())).toBe(true);
+    expect(
+      isRuntimeOnlyAssistantMessage({ ...empty(), content: [{ type: 'text', text: '' }] }),
+    ).toBe(true);
+  });
+  test.each([
+    ['authored user', { isCreatedByUser: true }],
+    ['unfinished assistant', { unfinished: true }],
+    ['authored text', { text: 'Preserve these words.' }],
+    ['structured text', { content: [{ type: 'text', text: 'Preserve these words.' }] }],
+    ['unknown part', { content: [{ type: 'unknown', value: 'Evidence.' }] }],
+    ['native file', { attachments: [{ file_id: 'file', type: 'text/plain' }] }],
+    ['unknown attachment', { attachments: [{ type: 'unknown' }] }],
+    ['malformed attachment', { attachments: {} }],
+    ['ordinary file', { files: [{ file_id: 'file' }] }],
+    ['malformed file', { files: {} }],
+    [
+      'image',
+      { image_urls: [{ type: 'image_url', image_url: { url: 'https://example.invalid/image' } }] },
+    ],
+    ['document', { documents: [{ type: 'document' }] }],
+    ['audio', { audios: [{ type: 'input_audio' }] }],
+    ['video', { videos: [{ type: 'video' }] }],
+    ['tool calls', { tool_calls: [{ id: 'call' }] }],
+    ['invalid tool calls', { invalid_tool_calls: [{ id: 'call' }] }],
+    ['tool result identity', { tool_call_id: 'call' }],
+  ])('retains %s in the existing source lane', (_label, changes) => {
+    expect(isRuntimeOnlyAssistantMessage({ ...empty(), ...changes })).toBe(false);
   });
 });

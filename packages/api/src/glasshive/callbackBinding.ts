@@ -904,6 +904,25 @@ function resolveTrustedGlassHiveCallIdentity(
   };
 }
 
+  function projectTriggeringTextSegments(
+    segments: readonly RuntimeRecord[],
+    fallbackSourceEventId: string,
+  ): RuntimeRecord[] {
+    return segments.map((segment: RuntimeRecord, ordinal: number) => ({
+      // Text provenance is separate from the trusted uploaded_files authority projection.
+      ordinal,
+      source_event_id: normalizeText(segment.source_event_id, 160) || fallbackSourceEventId,
+      source_index: Number.isInteger(Number(segment.source_index))
+        ? Number(segment.source_index)
+        : ordinal,
+      text: segment.text,
+      ...(segment.truncated === true ? { truncated: true } : {}),
+      ...(normalizeText(segment.original_sha256, 64)
+        ? { original_sha256: normalizeText(segment.original_sha256, 64).toLowerCase() }
+        : {}),
+    }));
+  }
+
 function trustedTriggeringSourceSegments(requestBody: RuntimeRecord = {}): RuntimeRecord {
   const candidates = Array.isArray(requestBody.viventiumTriggeringSourceSegments)
     ? requestBody.viventiumTriggeringSourceSegments
@@ -922,18 +941,7 @@ function trustedTriggeringSourceSegments(requestBody: RuntimeRecord = {}): Runti
     requestBody.viventiumTriggeringSourceSegmentsOverflowCount,
   );
   return {
-    segments: normalized.segments.map((segment: RuntimeRecord) => ({
-      // GlassHive treats this as a strict text-provenance contract. Attachment descriptors cross
-      // the launch boundary separately through the trusted `uploaded_files` projection.
-      ordinal: segment.ordinal,
-      source_event_id: segment.source_event_id,
-      source_index: segment.source_index,
-      text: segment.text,
-      ...(segment.truncated === true ? { truncated: true } : {}),
-      ...(normalizeText(segment.original_sha256, 64)
-        ? { original_sha256: normalizeText(segment.original_sha256, 64).toLowerCase() }
-        : {}),
-    })),
+      segments: projectTriggeringTextSegments(normalized.segments, fallbackSourceEventId),
     overflowCount: normalized.overflowCount,
   };
 }
@@ -1498,11 +1506,8 @@ function attachGlassHiveTrustedLaunchMetadata(
   // The model-supplied bundle is never a prompt authority. The caller must pass the exact
   // server-built capability/Feelings bundle separately after trusted projection is complete.
   const bundle = parseJsonObject(trustedBootstrapBundle) || {};
-  const triggeringSources = trustedTriggeringSourceSegments({
-    viventiumSourceEventId: context.source_event_id,
-    viventiumTriggeringSourceSegments: context.triggering_source_segments,
-    viventiumTriggeringSourceSegmentsOverflowCount: context.source_segments_overflow_count,
-  });
+    // Registration already bounded these text-only segments before building the matching packet.
+    // Re-normalizing without their separate file descriptors would drop file-only authored sources.
   const cleanBundle = stripMissionRoutingIdentity(bundle) as RuntimeRecord;
   const packetBase = launchContext.delegationPacket || buildTrustedDelegationPacket(args, context);
   const trustedIdentity = {
@@ -1530,10 +1535,13 @@ function attachGlassHiveTrustedLaunchMetadata(
       ...(DESTINATION_SURFACES.has(normalizeText(context.surface, 32).toLowerCase())
         ? { surface: normalizeText(context.surface, 32).toLowerCase() }
         : {}),
-      triggering_source_segments: triggeringSources.segments,
-      ...(triggeringSources.overflowCount > 0
-        ? { source_segments_overflow_count: triggeringSources.overflowCount }
-        : {}),
+        triggering_source_segments: projectTriggeringTextSegments(
+          context.triggering_source_segments,
+          normalizeText(context.source_event_id, 160),
+        ),
+        ...(context.source_segments_overflow_count > 0
+          ? { source_segments_overflow_count: context.source_segments_overflow_count }
+          : {}),
     },
     viventium_delegation_packet: finalizeTrustedDelegationPacket(
       packetBase as RuntimeRecord,

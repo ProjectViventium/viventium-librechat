@@ -3,6 +3,7 @@ import React, { useRef } from 'react';
 import { useForm } from 'react-hook-form';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { TMessage } from 'librechat-data-provider';
+import type { ExtendedFile } from '~/common';
 import useTextarea from '../useTextarea';
 import SendButton from '~/components/Chat/Input/SendButton';
 
@@ -66,9 +67,11 @@ jest.mock('@librechat/client', () => ({
 function Composer({
   disabled = false,
   text = 'Next ordinary request.',
+  files = [],
 }: {
   disabled?: boolean;
   text?: string;
+  files?: ExtendedFile[];
 }) {
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
   const submitButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -96,6 +99,7 @@ function Composer({
       <SendButton
         ref={submitButtonRef}
         control={methods.control}
+        files={files}
         disabled={mockFilesLoading || disabled || isNotAppendable}
       />
     </form>
@@ -182,5 +186,16 @@ test('blank input still cannot be sent after a settled failure', () => {
   render(<Composer text=" " />);
   expect(screen.getByRole('textbox')).toBeEnabled();
   expect(screen.getByTestId('send-button')).toBeDisabled();
+});
+
+test('Enter sends completed file-only input through the same Send control', async () => {
+  render(
+    <Composer
+      text=""
+      files={[{ file_id: 'uploaded-file', filepath: '/uploads/input.txt', size: 12, progress: 1 }]}
+    />,
+  );
+  fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', code: 'Enter' });
+  await waitFor(() => expect(mockSubmit).toHaveBeenCalledWith({ text: '' }, expect.anything()));
 });
 /* === VIVENTIUM END === */

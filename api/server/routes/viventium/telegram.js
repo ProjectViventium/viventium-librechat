@@ -2474,9 +2474,9 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('X-Accel-Buffering', 'no');
       res.write(
-        `event: error\ndata: ${JSON.stringify(
+        `event: ${terminal.finalEvent ? 'message' : 'error'}\ndata: ${JSON.stringify(
           attachLogicalTurnMetadata(
-            {
+            terminal.finalEvent || {
               error: terminal.error,
               error_class: terminal.error_class,
               responseMessageId: terminal.responseMessageId,

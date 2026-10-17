@@ -222,6 +222,77 @@ describe('Conversation legacy continuity', () => {
     });
   }
 
+  test('current-carrier legacy claims pass their exact plan through review and completion', async () => {
+    const rows = await seed(140),
+      carried = carriedChain(rows),
+      calls = [];
+    const resolver = jest.fn(async (plan) => {
+      expect(plan.coveredSource.length).toBeGreaterThan(0);
+      expect(plan.throughMessageId).toBe(plan.coveredSource.at(-1).id);
+      return { carrierMaxUtf8Bytes: 185108, reservedContextUtf8Bytes: 64042 };
+    });
+    const record = await ensureConversationLegacyContinuity({
+      req: schedulerRequest(),
+      agent: AGENT,
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      orderedMessages: carried,
+      Model: Continuity,
+      MessageModel: Message,
+      executeCompactor: compactor(calls),
+      resolveOutputCarrier: resolver,
+      maxClaims: 1,
+    });
+    expect(record.status).toBe('ready');
+    expect(calls.map((call) => call.stage || 'compaction')).toEqual(['compaction', 'review']);
+    expect(calls[0].claim.outputContract).toMatchObject({
+      consumer: 'conversation_legacy',
+      carrierMaxUtf8Bytes: 185108,
+      reservedUtf8Bytes: expect.any(Number),
+    });
+    expect(calls[0].claim.outputContract.maxJsonUtf8Bytes).toBeGreaterThan(67030);
+    expect(resolver.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(resolver.mock.calls.map(([plan]) => plan.sourceDigest)).size).toBe(1);
+    expect(await Message.countDocuments({ user: OWNER, conversationId: CONVERSATION })).toBe(
+      rows.length,
+    );
+  });
+
+  test('unavailable legacy peer allocation is typed degradation without provider or source loss', async () => {
+    const rows = await seed(140),
+      carried = carriedChain(rows),
+      execute = jest.fn();
+    let outcome;
+    const compaction = {
+      ensureAcceptedMainCompaction: async (input) => {
+        outcome = await input.claimCompaction({});
+        return outcome;
+      },
+    };
+    const record = await ensureConversationLegacyContinuity({
+      req: schedulerRequest(),
+      agent: AGENT,
+      ownerId: OWNER,
+      conversationId: CONVERSATION,
+      orderedMessages: carried,
+      Model: Continuity,
+      MessageModel: Message,
+      executeCompactor: execute,
+      resolveOutputCarrier: async () => null,
+      foreground: false,
+      compaction,
+    });
+    expect(outcome).toEqual({ status: 'degraded', reason: 'context_budget' });
+    expect(execute).not.toHaveBeenCalled();
+    expect(record).toBeNull();
+    expect(await Continuity.countDocuments({ ownerId: OWNER, conversationId: CONVERSATION })).toBe(
+      0,
+    );
+    expect(await Message.countDocuments({ user: OWNER, conversationId: CONVERSATION })).toBe(
+      rows.length,
+    );
+  });
+
   test('background native migration reloads each committed prefix and preserves original rows', async () => {
     const rows = legacyThread(200);
     for (const row of rows)

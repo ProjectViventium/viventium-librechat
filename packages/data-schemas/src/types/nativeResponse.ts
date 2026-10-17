@@ -80,3 +80,47 @@ export interface NativeResponseCommit {
   candidateSha256?: string;
 }
 /* === VIVENTIUM END === */
+
+export type DeliveryAcknowledgementState =
+  'committed' | 'committed_effect' | 'partial_removed' | 'failed';
+
+export interface InteractionDeliveryAck {
+  logical_turn_id: string;
+  revision: number;
+  state: DeliveryAcknowledgementState;
+  /** Exact server-persisted durable provider receipt; never inferred from presentation text. */
+  effect_ref?: string;
+  presentation_ref?: string;
+  presentation_refs?: string[];
+  /** Store-authored visible-presentation time. Adapter input is never authoritative. */
+  presentation_committed_at?: number;
+  source_kind?: 'assistant_message' | 'schedule_result' | 'callback';
+  schedule_id?: string;
+  schedule_run_id?: string;
+}
+
+/** Existing host generation identity; no native admission or publication is implied. */
+export type HostResponseIdentity = Pick<
+  NativeResponseIdentity,
+  | 'userId'
+  | 'conversationId'
+  | 'responseMessageId'
+  | 'streamId'
+  | 'jobCreatedAt'
+  | 'logicalTurnId'
+  | 'revision'
+  | 'sourceOrderScope'
+  | 'sourceSequence'
+  | 'source'
+> & {
+  surface: 'web' | 'telegram' | 'voice';
+  callSessionId?: string;
+};
+
+/** Private canonical Message completion, separate from presentation acknowledgement. */
+export interface HostResponseFinal extends HostResponseIdentity {
+  version: 1;
+  storedAt: number;
+  payloadSha256: string;
+  contextSha256: string;
+}

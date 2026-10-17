@@ -20,6 +20,8 @@ const mockModels = {
   ensureNativeResponseIndexes: jest.fn(),
   findUser: jest.fn(),
   getNativeResponse: jest.fn(),
+  readHostResponseFinal: jest.fn(),
+  acknowledgeHostResponseFinal: jest.fn(),
   nativeResponseSourceMatches: jest.fn(),
   getMessages: jest.fn(),
   getMessage: jest.fn(),
@@ -2045,4 +2047,114 @@ describe('passive native response phase timing', () => {
       else await expect(response).resolves.toBe(result);
     },
   );
+});
+
+describe('durable host final replay', () => {
+  const {
+    readRetainedHostFinal,
+    acknowledgeRetainedHostFinal,
+  } = require('../nativeResponseService');
+  const query = { userId: 'owner', streamId: 'stream', surface: 'telegram' };
+  beforeEach(() => {
+    mockJobs.getJobStore.mockReturnValue({
+      resolveDeliveryOwner: jest.fn().mockResolvedValue(null),
+    });
+  });
+  test('uses public Message projection and exact final proof without provider or job replay', async () => {
+    const identity = {
+      userId: 'owner',
+      conversationId: 'conversation',
+      responseMessageId: 'answer',
+      source: { messageId: 'question' },
+    };
+    const row = {
+      messageId: 'answer',
+      conversationId: 'conversation',
+      hostFinal: identity,
+      metadata: { viventium: { interactionContext: { logical_turn_id: 'turn', revision: 1 } } },
+    };
+    mockModels.readHostResponseFinal.mockResolvedValue(row);
+    mockModels.getMessage.mockResolvedValue({ messageId: 'question' });
+    mockModels.getMessages.mockResolvedValue([
+      { messageId: 'answer', text: 'Saved final.', attachments: [{ file_id: 'file' }] },
+    ]);
+    const result = await readRetainedHostFinal(query);
+    expect(result.finalEvent.responseMessage).toEqual({
+      messageId: 'answer',
+      text: 'Saved final.',
+      unfinished: false,
+      attachments: [{ file_id: 'file' }],
+    });
+    expect(result.finalEvent.responseMessage).not.toHaveProperty('nativeResponse');
+    expect(mockModels.readHostResponseFinal).toHaveBeenLastCalledWith(query);
+  });
+  test('rechecks the exact proof after public projection before replay', async () => {
+    mockModels.readHostResponseFinal
+      .mockReset()
+      .mockResolvedValueOnce({
+        hostFinal: {
+          userId: 'owner',
+          conversationId: 'conversation',
+          responseMessageId: 'answer',
+          source: { messageId: 'question' },
+        },
+      })
+      .mockResolvedValueOnce(null);
+    mockModels.getMessage.mockResolvedValue({ messageId: 'question' });
+    mockModels.getMessages.mockResolvedValue([{ messageId: 'answer' }]);
+    expect(await readRetainedHostFinal(query)).toBeNull();
+  });
+  test('rejects a replacement admitted in the existing owner before its Message is saved', async () => {
+    mockModels.readHostResponseFinal.mockResolvedValue({
+      hostFinal: { logicalTurnId: 'turn', revision: 1 },
+    });
+    mockJobs.getJobStore.mockReturnValue({
+      resolveDeliveryOwner: jest.fn().mockResolvedValue('replacement'),
+    });
+    expect(await readRetainedHostFinal(query)).toBeNull();
+  });
+  test('rejects a newer source already observed by the existing source-order owner', async () => {
+    mockModels.readHostResponseFinal.mockResolvedValue({
+      hostFinal: {
+        logicalTurnId: 'turn',
+        revision: 1,
+        sourceOrderScope: 'a'.repeat(64),
+        sourceSequence: 1,
+      },
+    });
+    mockJobs.observeSourceOrder.mockResolvedValue({ stale: true });
+    expect(await readRetainedHostFinal(query)).toBeNull();
+  });
+  test('rejects a replacement admitted while the public final is being read', async () => {
+    mockModels.readHostResponseFinal.mockResolvedValue({
+      hostFinal: {
+        userId: 'owner',
+        conversationId: 'conversation',
+        responseMessageId: 'answer',
+        logicalTurnId: 'turn',
+        revision: 1,
+        source: { messageId: 'question' },
+      },
+    });
+    mockModels.getMessage.mockResolvedValue({ messageId: 'question' });
+    mockModels.getMessages.mockResolvedValue([{ messageId: 'answer' }]);
+    mockJobs.getJobStore.mockReturnValue({
+      resolveDeliveryOwner: jest
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce('new-author'),
+    });
+    expect(await readRetainedHostFinal(query)).toBeNull();
+  });
+  test('settles through the existing canonical transaction', async () => {
+    const ack = { logical_turn_id: 'turn', revision: 1, state: 'committed' };
+    mockModels.acknowledgeHostResponseFinal.mockImplementation(
+      async (_ack, _surface, transaction) =>
+        transaction(async () => {
+          expect(mockTransactionDepth).toBe(1);
+          return { status: 'recorded' };
+        }),
+    );
+    expect(await acknowledgeRetainedHostFinal(ack, 'telegram')).toEqual({ status: 'recorded' });
+  });
 });

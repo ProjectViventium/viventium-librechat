@@ -204,7 +204,9 @@ jest.mock(
       },
     ),
 );
+const mockReadHostFinal = jest.fn(async () => null);
 jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  readRetainedHostFinal: (...args) => mockReadHostFinal(...args),
   mutateNativeResponseSources: (...args) => mockMutateNativeResponseSources(...args),
 }));
 
@@ -586,6 +588,7 @@ function trustedTelegramSourceEventId({
 
 describe('/api/viventium/telegram', () => {
   beforeEach(() => {
+    mockReadHostFinal.mockReset().mockResolvedValue(null);
     mockInputService = {
       resolvePendingConversation: jest.fn().mockResolvedValue(null),
       read: jest.fn(),
@@ -1558,9 +1561,24 @@ describe('/api/viventium/telegram', () => {
         '        const onStart = (userMsg, respMsgId, _isNewConvo) => {',
       );
       const end = controller.indexOf('        const startPartialCheckpointing = () => {', start);
+      const source = {
+        _id: 'synthetic-source-row',
+        messageId: sourceMessageId,
+        conversationId,
+        text: 'First input',
+      };
+      const { nativeResponseSource } = jest.requireActual('@librechat/data-schemas');
       const sandbox = {
         req,
         Date,
+        getTrustedInteractionContext: require('~/server/services/viventium/interactionContext')
+          .getTrustedInteractionContext,
+        nativeResponseSource,
+        require: (name) => {
+          if (name === '@librechat/api') return jest.requireActual(name);
+          throw new Error(`Unexpected source reread: ${name}`);
+        },
+        jobCreatedAt: 1,
         streamId: 'stream_1',
         conversationId,
         userId: row.libreChatUserId,
@@ -1573,6 +1591,7 @@ describe('/api/viventium/telegram', () => {
         trackAssistantSnapshot: (work) => work(),
         ensureUserSourceSegmentPersisted: async () => {
           events.push('source');
+          return source;
         },
         persistAssistantSnapshot: async () => {
           events.push('placeholder');
@@ -1589,6 +1608,16 @@ describe('/api/viventium/telegram', () => {
         'new-assistant',
         true,
       );
+      expect(req._viventiumHostResponseIdentity).toMatchObject({
+        userId: row.libreChatUserId,
+        conversationId,
+        responseMessageId: 'new-assistant',
+        streamId: 'stream_1',
+        jobCreatedAt: 1,
+        logicalTurnId: 'new-turn',
+        revision: 1,
+        source: nativeResponseSource(source),
+      });
     };
     const { res, done } = continueRetainedInput(row);
     await done;
@@ -4333,6 +4362,71 @@ describe('/api/viventium/telegram', () => {
       }),
     }));
   }
+  test('missing Redis host final uses normal terminal SSE and exact retained source without generation', async () => {
+    mockGetJob.mockResolvedValue(null);
+    const row = { ...inputIdentity(), streamId: 'expired-stream' };
+    exactSavedFailure(row);
+    const finalEvent = {
+      final: true,
+      requestMessage: { messageId: row.sourceMessageId },
+      responseMessage: {
+        messageId: 'saved-error',
+        text: 'Saved final',
+        attachments: [{ file_id: 'output' }],
+      },
+    };
+    mockReadHostFinal.mockResolvedValue({
+      responseMessageId: 'saved-error',
+      conversationId: row.conversationId,
+      interactionContext: {
+        source_event_id: row.sourceEventId,
+        logical_turn_id: 'saved-turn',
+        revision: 2,
+      },
+      finalEvent,
+    });
+    const res = createMockRes();
+    await dispatch(
+      createTestApp(require('../telegram')),
+      createMockReq({
+        method: 'GET',
+        url: '/api/viventium/telegram/stream/expired-stream?resume=true&telegramUserId=tg-1',
+        query: { resume: 'true', telegramUserId: 'tg-1' },
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      }),
+      res,
+    );
+    const wire = res.write.mock.calls.map(([text]) => text).join('');
+    expect(wire).toContain('event: message');
+    expect(wire).toContain('Saved final');
+    expect(wire).toContain('output');
+    expect(wire).not.toContain('event: error');
+    expect(mockSubscribe).not.toHaveBeenCalled();
+  });
+  test('retained input continuation finds the same host-final stream without generation', async () => {
+    mockGetJob.mockResolvedValue(null);
+    const row = { ...inputIdentity(), state: 'admitted', streamId: 'expired-stream' };
+    const terminal = {
+      responseMessageId: 'saved-error',
+      conversationId: row.conversationId,
+      interactionContext: {
+        source_event_id: row.sourceEventId,
+        logical_turn_id: 'saved-turn',
+        revision: 2,
+      },
+      finalEvent: {
+        final: true,
+        requestMessage: { messageId: row.sourceMessageId },
+        responseMessage: { text: 'Saved final' },
+      },
+    };
+    mockReadHostFinal.mockResolvedValue(terminal);
+    const { res, done } = continueRetainedInput(row, { savedFailure: true });
+    await done;
+    expect(res.body).toMatchObject({ status: 'duplicate', streamId: 'expired-stream' });
+    expect(lastStreamId).toBeNull();
+  });
+
   test('missing Redis stream replays only the saved typed terminal through normal SSE', async () => {
     mockGetJob.mockResolvedValue(null);
     const row = { ...inputIdentity(), streamId: 'expired-stream' };

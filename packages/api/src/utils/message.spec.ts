@@ -49,6 +49,11 @@ describe('sanitizeFileForTransmit', () => {
 });
 
 describe('sanitizeMessageForTransmit', () => {
+  it('keeps the host completion receipt private without changing the caller', () => {
+    const message = { messageId: 'answer', text: 'Final', hostFinal: { source: 'private' } };
+    expect(sanitizeMessageForTransmit(message)).toEqual({ messageId: 'answer', text: 'Final' });
+    expect(message.hostFinal).toEqual({ source: 'private' });
+  });
   it('should remove fileContext from message', () => {
     const message = {
       messageId: 'msg-123',

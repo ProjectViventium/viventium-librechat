@@ -11,6 +11,7 @@ import {
   prepareMainCompactionCandidate,
   inspectMainCompactionCandidate,
   normalizeMainCompactionSizeRepair,
+  normalizeMainCompactionOutputContract,
   canContinueMainCompactionRepair,
   compatibleMainCompactionSizeContract,
   compareMainCompactionToolIdentities,
@@ -30,6 +31,11 @@ import {
   MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER,
 } from './mainContinuity';
 import type { AcceptedMainTurn, MainContinuityState } from './mainContinuity';
+import {
+  rememberFailedMainCompaction,
+  repeatedFailedMainCompaction,
+  forgetFailedMainCompaction,
+} from './mainCompactionScheduling';
 import { isContextOnlyMainHistory } from './mainContext';
 import { ChatOpenAI } from '@langchain/openai';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
@@ -622,7 +628,7 @@ function fixture(sourceRecords?: Map<string, Record<string, unknown>>) {
     stableAuthoritySha256: 'a'.repeat(64),
   };
   const sourceText = 'Prepare the Harbor Studio draft. Never publish before my written approval.';
-  async function seed() {
+  async function seed(outputCarrier?: unknown) {
     for (let index = 0; index < 4; index += 1) {
       await service.commitAcceptedMainTurn({
         ...identity,
@@ -637,7 +643,7 @@ function fixture(sourceRecords?: Map<string, Record<string, unknown>>) {
         origin: 'interactive',
       });
     }
-    return service.claimAcceptedMainCompaction(identity);
+    return service.claimAcceptedMainCompaction({ ...identity, ...(outputCarrier ? { outputCarrier } : {}) });
   }
   return { service, identity, seed, sourceText, states, accepted };
 }
@@ -2206,39 +2212,87 @@ describe('typed Main compaction tool identity evidence', () => {
 
 /* === VIVENTIUM START === Preserve accepted and conversation summaries in the native body. === */
 test('an actual native allocation carries unchanged summaries that overflow the old fixed partition', () => {
-  const contract = createMainCompactionOutputContract({ consumer: 'accepted_core',
-    carrierMaxUtf8Bytes: 128 * 1024, reservedUtf8Bytes: 21034 })!;
-  const summary = { version: 1, summary: 'Exact quoted state. '.repeat(4200).trim(), pendingAsks: [],
-    commitments: [], corrections: [], decisions: [], durableIdentifiers: [], recurrenceOutcomes: [], toolPairs: [] };
-  const context = { status: 'available', turns: [], pendingCompactionTurns: [],
-    semanticCompaction: summary, semanticCompactionContract: contract };
+  const contract = createMainCompactionOutputContract({
+    consumer: 'accepted_core',
+    carrierMaxUtf8Bytes: 128 * 1024,
+    reservedUtf8Bytes: 21034,
+  })!;
+  const summary = {
+    version: 1,
+    summary: 'Exact quoted state. '.repeat(4200).trim(),
+    pendingAsks: [],
+    commitments: [],
+    corrections: [],
+    decisions: [],
+    durableIdentifiers: [],
+    recurrenceOutcomes: [],
+    toolPairs: [],
+  };
+  const context = {
+    status: 'available',
+    turns: [],
+    pendingCompactionTurns: [],
+    semanticCompaction: summary,
+    semanticCompactionContract: contract,
+  };
   const peers = 54000;
   const before = JSON.stringify(context);
-  expect(renderAcceptedMainContextForCarrier(context,
-    { carrierMaxUtf8Bytes: 128 * 1024, reservedContextUtf8Bytes: peers }).status).toBe('context_budget');
-  const admitted = renderAcceptedMainContextForCarrier(context,
-    { carrierMaxUtf8Bytes: 170003, reservedContextUtf8Bytes: peers });
+  expect(
+    renderAcceptedMainContextForCarrier(context, {
+      carrierMaxUtf8Bytes: 128 * 1024,
+      reservedContextUtf8Bytes: peers,
+    }).status,
+  ).toBe('context_budget');
+  const admitted = renderAcceptedMainContextForCarrier(context, {
+    carrierMaxUtf8Bytes: 170003,
+    reservedContextUtf8Bytes: peers,
+  });
   expect(admitted.status).toBe('available');
   expect(admitted.capsule).toContain(summary.summary);
   expect(Buffer.byteLength(String(admitted.capsule)) + peers).toBeLessThanOrEqual(170003);
   expect(JSON.stringify(context)).toBe(before);
-  expect(createMainCompactionOutputContract({ consumer: 'accepted_core',
-    carrierMaxUtf8Bytes: 512 * 1024 + 1, reservedUtf8Bytes: 0 })).toBeNull();
-  expect(createMainCompactionOutputContract({ consumer: 'accepted_core',
-    carrierMaxUtf8Bytes: 196608, reservedUtf8Bytes: 1000 })).toMatchObject({
-      carrierMaxUtf8Bytes: 128 * 1024, maxSummaryUtf8Bytes: 128 * 1024 - 1000 });
+  expect(
+    createMainCompactionOutputContract({
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 512 * 1024 + 1,
+      reservedUtf8Bytes: 0,
+    }),
+  ).toBeNull();
+  expect(
+    createMainCompactionOutputContract({
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 196608,
+      reservedUtf8Bytes: 1000,
+    }),
+  ).toMatchObject({
+    carrierMaxUtf8Bytes: 196608,
+    maxSummaryUtf8Bytes: 128 * 1024,
+  });
 });
 /* === VIVENTIUM END === */
 
 test.each(['accepted_core', 'conversation_legacy'] as const)(
-  '%s compaction output stays stable when a turn has more native spare capacity', consumer => {
-    const contract = createMainCompactionOutputContract({ consumer,
-      carrierMaxUtf8Bytes: 170003, reservedUtf8Bytes: 21034 });
-    expect(contract).toMatchObject({ carrierMaxUtf8Bytes: 131072,
-      maxJsonUtf8Bytes: 110038, maxSummaryUtf8Bytes: 110038 });
-    expect(createMainCompactionOutputContract({ consumer,
-      carrierMaxUtf8Bytes: 170003, reservedUtf8Bytes: 140000 })).toBeNull();
-  });
+  '%s semantic JSON keeps its ceiling under actual current carrier capacity',
+  (consumer) => {
+    const contract = createMainCompactionOutputContract({
+      consumer,
+      carrierMaxUtf8Bytes: 170003,
+      reservedUtf8Bytes: 21034,
+    });
+    expect(contract).toMatchObject({
+      carrierMaxUtf8Bytes: 170003,
+      maxJsonUtf8Bytes: 131072,
+      maxSummaryUtf8Bytes: 131072,
+    });
+    expect(
+      createMainCompactionOutputContract({
+        consumer,
+        carrierMaxUtf8Bytes: 170003,
+        reservedUtf8Bytes: 140000,
+      }),
+    ).toMatchObject({ maxJsonUtf8Bytes: 30003 });
+  },
+);
 
 
 describe('durable same-source fidelity continuation', () => {
@@ -2958,4 +3012,270 @@ describe('XML element text carrier encoding', () => {
       inspectMainCompactionCarrier({ ...candidate, summary: '&'.repeat(3000) }, contract).ok,
     ).toBe(false);
   });
+});
+
+describe('current-carrier semantic output policy', () => {
+  const candidate = { ...faithful, summary: 's'.repeat(105000) };
+  const key = (constraints: unknown) =>
+    JSON.stringify({ provider: 'native', model: 'synthetic', effort: 'high', constraints });
+  test.each(['accepted_core', 'conversation_legacy'] as const)(
+    '%s reserves actual peer bytes without shrinking a fitting semantic object to the fixed partition',
+    (consumer) => {
+      const contract = createMainCompactionOutputContract({
+        consumer,
+        carrierMaxUtf8Bytes: 185108,
+        reservedUtf8Bytes: 64042,
+      })!;
+      expect(contract).toMatchObject({
+        carrierMaxUtf8Bytes: 185108,
+        maxJsonUtf8Bytes: 121066,
+        maxSummaryUtf8Bytes: 121066,
+      });
+      expect(inspectMainCompactionCandidate(candidate, contract).ok).toBe(true);
+      expect(inspectMainCompactionCarrier(candidate, contract).ok).toBe(true);
+      const small = createMainCompactionOutputContract({
+        consumer,
+        carrierMaxUtf8Bytes: 131072,
+        reservedUtf8Bytes: 64042,
+      })!;
+      expect(small.maxJsonUtf8Bytes).toBe(67030);
+      expect(inspectMainCompactionCandidate(candidate, small).ok).toBe(false);
+      const escaped = { ...faithful, summary: '<'.repeat(35000) };
+      expect(inspectMainCompactionCandidate(escaped, contract).ok).toBe(true);
+      expect(inspectMainCompactionCarrier(escaped, contract)).toMatchObject({
+        ok: false,
+        issue: { path: '$carrier', constraint: 'max_bytes' },
+      });
+      const roomy = createMainCompactionOutputContract({
+        consumer,
+        carrierMaxUtf8Bytes: 512 * 1024,
+        reservedUtf8Bytes: 0,
+      })!;
+      expect(roomy.maxJsonUtf8Bytes).toBe(128 * 1024);
+      expect(
+        inspectMainCompactionCandidate({ ...faithful, summary: 'x'.repeat(128 * 1024) }, roomy).ok,
+      ).toBe(false);
+    },
+  );
+  test.each([131073.5, 512 * 1024 + 1, 65536, NaN, Infinity])(
+    'rejects a carrier outside the existing bounded domain (%s)',
+    (carrierMaxUtf8Bytes) => {
+      expect(
+        createMainCompactionOutputContract({
+          consumer: 'accepted_core',
+          carrierMaxUtf8Bytes,
+          reservedUtf8Bytes: 0,
+        }),
+      ).toBeNull();
+    },
+  );
+  test('normalizes old contracts identically and rejects modified ceilings', () => {
+    for (const carrierMaxUtf8Bytes of [12288, 16384, 131072]) {
+      const old = {
+        version: 1,
+        consumer: 'accepted_core',
+        carrierMaxUtf8Bytes,
+        reservedUtf8Bytes: 1000,
+        maxJsonUtf8Bytes: carrierMaxUtf8Bytes - 1000,
+        maxSummaryUtf8Bytes: carrierMaxUtf8Bytes - 1000,
+        maxItemsPerArray: 32,
+        maxStringItemUtf8Bytes: 1024,
+        maxToolIdentityCharacters: 256,
+      };
+      expect(normalizeMainCompactionOutputContract(old)).toEqual(old);
+      expect(
+        normalizeMainCompactionOutputContract({
+          ...old,
+          maxJsonUtf8Bytes: old.maxJsonUtf8Bytes + 1,
+        }),
+      ).toBeNull();
+      expect(
+        createMainCompactionOutputContract({
+          consumer: 'accepted_core',
+          carrierMaxUtf8Bytes,
+          reservedUtf8Bytes: carrierMaxUtf8Bytes,
+        }),
+      ).toBeNull();
+    }
+  });
+  test('uses one no-more-room relation for shrinking carriers and exhausted-source suppression', () => {
+    const contract = (carrierMaxUtf8Bytes: number, reservedUtf8Bytes = 64042) =>
+      createMainCompactionOutputContract({
+        consumer: 'accepted_core',
+        carrierMaxUtf8Bytes,
+        reservedUtf8Bytes,
+      })!;
+    const before = contract(244422),
+      domainEpochKey = 'current-carrier-monotone';
+    rememberFailedMainCompaction({
+      domainEpochKey,
+      sourceDigest: 'same-source',
+      contractKey: key(before),
+      reason: 'schema_invalid',
+      sizeExhausted: true,
+    });
+    try {
+      for (const bytes of [243937, 242232]) {
+        const after = contract(bytes);
+        expect(compatibleMainCompactionSizeContract(key(before), key(after))).toBe(true);
+        expect(
+          repeatedFailedMainCompaction({
+            domainEpochKey,
+            sourceDigest: 'same-source',
+            contractKey: key(after),
+          }),
+        ).toBe('schema_invalid');
+      }
+      expect(compatibleMainCompactionSizeContract(key(before), key(contract(244423)))).toBe(false);
+      expect(
+        compatibleMainCompactionSizeContract(key(contract(185108)), key(contract(184000, 60000))),
+      ).toBe(false);
+      expect(
+        compatibleMainCompactionSizeContract(key(contract(185108)), key(contract(186000, 66000))),
+      ).toBe(true);
+      expect(
+        compatibleMainCompactionSizeContract(
+          key(contract(131072, 1000)),
+          key(contract(131072, 2000)),
+        ),
+      ).toBe(true);
+      expect(
+        compatibleMainCompactionSizeContract(
+          key(contract(131072, 2000)),
+          key(contract(131072, 1000)),
+        ),
+      ).toBe(false);
+    } finally {
+      forgetFailedMainCompaction(domainEpochKey);
+    }
+  });
+  test('keeps a same-source released checkpoint and counters as carrier capacity decreases', async () => {
+    const { service, identity, seed, states } = fixture();
+    const claim = await seed({ carrierMaxUtf8Bytes: 185108, reservedContextUtf8Bytes: 60000 });
+    const before = claim.outputContract as Record<string, number>;
+    const draft = { ...faithful, summary: 's'.repeat(before.maxJsonUtf8Bytes + 1000) };
+    const result = inspectMainCompactionCandidate(draft, before);
+    if (result.ok) throw new Error('Expected size rejection');
+    const bytes = Buffer.byteLength(JSON.stringify(draft));
+    const repair = {
+      version: 1,
+      sourceDigest: claim.sourceDigest,
+      contractKey: key(before),
+      semanticAttempts: 2,
+      fidelityRepairAttempts: 0,
+      transportRetries: 0,
+      correction: { code: 'schema_invalid', issue: result.issue },
+      sizeRepair: { proposalBytes: bytes, previousProposalBytes: bytes + 2000, converging: true },
+    };
+    expect(
+      await service.rejectAcceptedMainCompaction({
+        ...identity,
+        leaseId: claim.leaseId,
+        reason: 'compaction_enclosing_deadline',
+        capacityReleaseAcknowledged: true,
+        pendingCompactionRepair: repair,
+      }),
+    ).toMatchObject({ repairPending: true });
+    const next = await service.claimAcceptedMainCompaction({
+      ...identity,
+      outputCarrier: { carrierMaxUtf8Bytes: 184623, reservedContextUtf8Bytes: 60000 },
+    });
+    expect(next.sourceDigest).toBe(claim.sourceDigest);
+    expect(next.pendingCompactionRepair).toMatchObject({
+      semanticAttempts: 2,
+      sizeRepair: repair.sizeRepair,
+    });
+    const saved = states.get(String(claim.domainEpochKey))!.pendingCompactionRepair!;
+    expect(
+      normalizeMainCompactionSizeRepair(saved, saved.outputContract, next.outputContract),
+    ).not.toBeNull();
+    expect(
+      await service.completeAcceptedMainCompaction({
+        ...identity,
+        ...next,
+        outputCarrier: { carrierMaxUtf8Bytes: 184623, reservedContextUtf8Bytes: 60000 },
+        semanticCompaction: faithful,
+        semanticReview: {
+          version: 1,
+          approved: true,
+          sourceDigest: next.sourceDigest,
+          candidateDigest: mainCompactionCandidateDigest(faithful),
+          outputContractDigest: mainCompactionOutputContractDigest(next.outputContract),
+        },
+      }),
+    ).toMatchObject({ status: 'compacted' });
+  });
+  test('correction drafts retain the independent semantic ceiling on a larger carrier', () => {
+    const contract = createMainCompactionOutputContract({
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes: 512 * 1024,
+      reservedUtf8Bytes: 0,
+    })!;
+    const draft = {
+      ...faithful,
+      summary: 's'.repeat(110000),
+      pendingAsks: Array.from({ length: 32 }, (_, index) => String(index) + 'x'.repeat(998)),
+    };
+    const raw = JSON.stringify(draft),
+      result = inspectMainCompactionCandidate(draft, contract);
+    if (result.ok) throw new Error('Expected whole JSON overflow');
+    expect(result.issue.path).toBe('');
+    const repair = {
+      version: 1,
+      sourceDigest: 'same-source',
+      semanticAttempts: 1,
+      fidelityRepairAttempts: 0,
+      transportRetries: 0,
+      correction: { code: 'schema_invalid', candidate: raw, issue: result.issue },
+      sizeRepair: { proposalBytes: Buffer.byteLength(raw), converging: true },
+    };
+    expect(Buffer.byteLength(raw)).toBeGreaterThan(128 * 1024);
+    expect(Buffer.byteLength(raw)).toBeLessThan(contract.carrierMaxUtf8Bytes);
+    const normalized = normalizeMainCompactionSizeRepair(repair, contract)!;
+    expect(normalized).not.toBeNull();
+    expect(normalized.sizeRepair.proposalBytes).toBe(Buffer.byteLength(raw));
+    expect(normalized.correction).not.toHaveProperty('candidate');
+  });
+  test.each([131072, 185108])(
+    'a later peer promotion is rechecked before admission without deleting accepted state (%s)',
+    async (carrier) => {
+      const { service, identity, seed, states } = fixture();
+      const initialReserve = 30000;
+      const claim = await seed({
+        carrierMaxUtf8Bytes: carrier,
+        reservedContextUtf8Bytes: initialReserve,
+      });
+      const candidate = { ...faithful, summary: 's'.repeat(carrier === 131072 ? 70000 : 100000) };
+      const semanticReview = {
+        version: 1,
+        approved: true,
+        sourceDigest: claim.sourceDigest,
+        candidateDigest: mainCompactionCandidateDigest(candidate),
+        outputContractDigest: mainCompactionOutputContractDigest(claim.outputContract),
+      };
+      expect(
+        await service.completeAcceptedMainCompaction({
+          ...identity,
+          ...claim,
+          outputCarrier: { carrierMaxUtf8Bytes: carrier, reservedContextUtf8Bytes: initialReserve },
+          semanticCompaction: candidate,
+          semanticReview,
+        }),
+      ).toMatchObject({ status: 'compacted' });
+      // The independent legacy owner can replace an earlier peer snapshot after this review.
+      const before = JSON.stringify(states.get(String(claim.domainEpochKey)));
+      const later = await service.loadAcceptedMainContext({
+        ...identity,
+        outputCarrier: { carrierMaxUtf8Bytes: carrier, reservedContextUtf8Bytes: carrier - 50000 },
+      });
+      expect(later.status).toBe('context_budget');
+      expect(later.semanticCompaction?.summary).toBe(candidate.summary);
+      expect(JSON.stringify(states.get(String(claim.domainEpochKey)))).toBe(before);
+      const fitsAgain = await service.loadAcceptedMainContext({
+        ...identity,
+        outputCarrier: { carrierMaxUtf8Bytes: carrier, reservedContextUtf8Bytes: initialReserve },
+      });
+      expect(fitsAgain.status).toBe('available');
+    },
+  );
 });

@@ -470,6 +470,46 @@ function nativeWholeHistoryFits(
   }
 }
 
+/** Use the same positive-only native allocation for Core and legacy summary consumers. */
+function nativeMainContinuityAllocation(
+  req,
+  agent,
+  rows,
+  pendingHydration,
+  nativeReplayBudget,
+  defaultCarrierBytes,
+) {
+  const sizingReceipt = {};
+  const alternates = [
+    agent?.viventiumFallbackLlm || agent?.viventiumFallbackLlmAssignment,
+    ...(agent?.viventiumGraphLlmFallbacks || []),
+  ].filter(Boolean);
+  if (
+    !Number.isSafeInteger(nativeReplayBudget) ||
+    nativeReplayBudget <= 0 ||
+    !conversationProviderUsesNativeBody(req, agent, { requireTransport: true }) ||
+    !conversationProviderUsesNativeBody(req, agent, { alternates })
+  )
+    return { carrierMaxUtf8Bytes: defaultCarrierBytes, fits: null, sizingReceipt };
+  const fits = nativeWholeHistoryFits(
+    req,
+    agent,
+    rows,
+    0,
+    { ...pendingHydration, sizingReceipt },
+    nativeReplayBudget,
+  );
+  const capacity = sizingReceipt.contextBudgetBytes;
+  return {
+    carrierMaxUtf8Bytes:
+      fits === true && Number.isSafeInteger(capacity) && capacity > defaultCarrierBytes
+        ? Math.min(capacity, NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES)
+        : defaultCarrierBytes,
+    fits,
+    sizingReceipt,
+  };
+}
+
 function combineTurnContextInstructions(
   timeContext,
   activeWorkContext,
@@ -4891,17 +4931,45 @@ class AgentClient extends BaseClient {
     this._viventiumConversationContinuityCapsule = '';
     // The compactor runs isolated on a background response, never on this turn's live stream.
     let legacyOutputCarrier;
-    const resolveLegacyOutputCarrier = async () => {
-      if (legacyOutputCarrier) return legacyOutputCarrier;
+    let legacyOutputCarrierSourceDigest;
+    const resolveLegacyOutputCarrier = async (plan) => {
+      const sourceDigest = String(plan?.sourceDigest || '');
+      if (legacyOutputCarrier && legacyOutputCarrierSourceDigest === sourceDigest)
+        return legacyOutputCarrier;
       const agent = this.options.agent;
       const activeWork = await resolveActiveWorkTurnContext(req);
       // Pin the already bounded projection for this invocation so a later cold-cache completion
       // cannot enlarge the reserved section after this claim was reviewed.
       req._viventiumContinuityActiveWorkContext = activeWork;
       const authorityReserve = mainAttemptFactsAuthorityReserveBytes(req, agent);
-      const carrierMaxUtf8Bytes = conversationProviderUsesInvocationLocalTime(req, agent)
+      const defaultCarrierBytes = conversationProviderUsesInvocationLocalTime(req, agent)
         ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
         : MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES;
+      const through = plan
+        ? orderedMessages.findIndex(
+            (message) => String(message?.messageId || '') === plan.throughMessageId,
+          )
+        : -1;
+      if (plan && (through < 0 || through >= orderedMessages.length - 1)) return null;
+      const nativeHistoryUploads =
+        nativeReplayBudget === null
+          ? undefined
+          : await resolveConversationProviderHistoryAttachments(req).catch(() => null);
+      const allocation = nativeMainContinuityAllocation(
+        req,
+        agent,
+        plan ? orderedMessages.slice(through + 1) : orderedMessages,
+        {
+          attachments: this.options.attachments,
+          nativeHistoryUploads,
+          contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
+          userName: this.options.name,
+          assistantName: this.options.modelLabel,
+        },
+        nativeReplayBudget,
+        defaultCarrierBytes,
+      );
+      const carrierMaxUtf8Bytes = allocation.carrierMaxUtf8Bytes;
       const parts = mainContinuityCarrierPeerParts({
         currentCallContext: getCurrentCallContext(req),
         optionalContexts: [
@@ -4930,16 +4998,13 @@ class AgentClient extends BaseClient {
         identity: Object.freeze(identity),
         context: Object.freeze(context),
       });
-      if (context.status === 'context_budget')
-        throw Object.assign(new Error('Accepted Core cannot fit the selected carrier'), {
-          code: 'source_context_unavailable',
-          status: 413,
-        });
+      if (context.status === 'context_budget') return null;
       const reservedContextUtf8Bytes = conversationContinuityContextReserveBytes(
         parts,
         authorityReserve,
         Buffer.byteLength(String(context.capsule || ''), 'utf8'),
       );
+      legacyOutputCarrierSourceDigest = sourceDigest;
       return (legacyOutputCarrier = {
         carrierMaxUtf8Bytes,
         reservedContextUtf8Bytes,
@@ -4996,13 +5061,16 @@ class AgentClient extends BaseClient {
             : await resolveConversationProviderHistoryAttachments(req).catch(() => null);
         // The final native producer enforces this whole turn_context cap, including every
         // summary and later dynamic section; a forecast cannot under-reserve later growth.
-        const turnContextReserveBytes =
-          nativeReplayBudget !== null
-            ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
-            : (await resolveLegacyOutputCarrier()).reservedContextUtf8Bytes +
-              (capsule
-                ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
-                : 0);
+        let turnContextReserveBytes = NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES;
+        if (nativeReplayBudget === null) {
+          const legacyCarrier = await resolveLegacyOutputCarrier();
+          if (!legacyCarrier) return false;
+          turnContextReserveBytes =
+            legacyCarrier.reservedContextUtf8Bytes +
+            (capsule
+              ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
+              : 0);
+        }
         const sizingReceipt = {};
         const fit = nativeWholeHistoryFits(
           req,
@@ -8413,32 +8481,22 @@ class AgentClient extends BaseClient {
           const nativeHistoryUploads = await resolveConversationProviderHistoryAttachments(
             req,
           ).catch(() => null);
-          const sizingReceipt = {};
-          const fits = nativeWholeHistoryFits(
+          const allocation = nativeMainContinuityAllocation(
             req,
             this.options.agent,
             this._viventiumVisibleMessagesV1,
-            0,
             {
               attachments: this.options.attachments,
               nativeHistoryUploads,
-              sizingReceipt,
               contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
               userName: this.options.name,
               assistantName: this.options.modelLabel,
             },
             replayBudget,
+            selectedCarrierBytes,
           );
-          if (
-            fits === true &&
-            Number.isSafeInteger(sizingReceipt.contextBudgetBytes) &&
-            sizingReceipt.contextBudgetBytes > selectedCarrierBytes
-          ) {
-            selectedCarrierBytes = Math.min(
-              sizingReceipt.contextBudgetBytes,
-              NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
-            );
-          }
+          selectedCarrierBytes = allocation.carrierMaxUtf8Bytes;
+          const { sizingReceipt, fits } = allocation;
           logger.info(
             '[VIVENTIUM][main-context-allocation] ' +
               JSON.stringify({

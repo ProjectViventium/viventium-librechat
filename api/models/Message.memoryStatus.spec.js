@@ -50,6 +50,7 @@ test.each([
     messageId: 'answer',
     conversationId: 'conversation',
     text: 'Visible answer',
+    hostFinal: { source: 'PRIVATE_HOST_FINAL' },
     savedMemoryWrite: {
       status: 'pending',
       owner: 'PRIVATE_OWNER',
@@ -65,7 +66,7 @@ test.each([
     const response = await request(app).get(route).expect(200);
     expect(response.body).toHaveLength(1);
     expect(response.body[0]).toMatchObject({ memoryWriteStatus: status, attachments });
-    for (const key of ['_id', '__v', 'user', 'savedMemoryWrite', 'nativeResponse']) {
+    for (const key of ['_id', '__v', 'user', 'savedMemoryWrite', 'nativeResponse', 'hostFinal']) {
       expect(response.body[0]).not.toHaveProperty(key);
     }
     expect(JSON.stringify(response.body)).not.toContain('PRIVATE_');
@@ -81,6 +82,7 @@ test.each(['pending', 'running', 'completed', 'failed'])(
       messageId: 'answer',
       conversationId: 'conversation',
       text: 'Visible answer',
+      hostFinal: { source: 'PRIVATE_HOST_FINAL' },
       savedMemoryWrite: {
         owner: 'PRIVATE_RUNTIME',
         status,

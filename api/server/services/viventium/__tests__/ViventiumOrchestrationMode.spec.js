@@ -935,6 +935,138 @@ describe('ViventiumOrchestrationMode', () => {
     process.env = ORIGINAL_ENV;
   });
 
+  test.each(['isolated', 'compat'])(
+    'uses the source release owner for explicit %s profile with native install mode',
+    async (profile) => {
+      process.env.VIVENTIUM_INSTALL_MODE = 'native';
+      process.env.VIVENTIUM_RUNTIME_PROFILE = profile;
+      delete process.env.VIVENTIUM_NATIVE_RELEASE_ROOT;
+      writeLocalQaSnapshot();
+      const {
+        parallelWorkReleaseGateSnapshot,
+        parallelWorkReleaseGateSnapshotAsync,
+        orchestrationRuntimeTraceBinding,
+      } = require('../ViventiumOrchestrationMode');
+      try {
+        expect(parallelWorkReleaseGateSnapshot()).toMatchObject({
+          available: true,
+          releaseReady: false,
+          label: 'PRE-GATE / NOT READY',
+        });
+        expect(orchestrationRuntimeTraceBinding()).not.toBeNull();
+        await expect(parallelWorkReleaseGateSnapshotAsync()).resolves.toMatchObject({
+          available: true,
+          releaseReady: false,
+          label: 'PRE-GATE / NOT READY',
+        });
+      } finally {
+        delete process.env.VIVENTIUM_INSTALL_MODE;
+        delete process.env.VIVENTIUM_RUNTIME_PROFILE;
+      }
+    },
+  );
+
+  test.each(['native', '', undefined, 'unknown'])(
+    'keeps packaged or unrecognized native profile fail-closed (%s)',
+    async (profile) => {
+      process.env.VIVENTIUM_INSTALL_MODE = 'native';
+      if (profile === undefined) delete process.env.VIVENTIUM_RUNTIME_PROFILE;
+      else process.env.VIVENTIUM_RUNTIME_PROFILE = profile;
+      delete process.env.VIVENTIUM_NATIVE_RELEASE_ROOT;
+      writeLocalQaSnapshot();
+      const {
+        parallelWorkReleaseGateSnapshot,
+        parallelWorkReleaseGateSnapshotAsync,
+        orchestrationRuntimeTraceBinding,
+      } = require('../ViventiumOrchestrationMode');
+      try {
+        const unavailable = { available: false, blockers: ['release_owner_unavailable'] };
+        expect(parallelWorkReleaseGateSnapshot()).toMatchObject(unavailable);
+        await expect(parallelWorkReleaseGateSnapshotAsync()).resolves.toMatchObject(unavailable);
+        expect(orchestrationRuntimeTraceBinding()).toBeNull();
+      } finally {
+        delete process.env.VIVENTIUM_INSTALL_MODE;
+        delete process.env.VIVENTIUM_RUNTIME_PROFILE;
+      }
+    },
+  );
+
+  test('source release workers retain mode and profile and invalidate proof after a profile change', async () => {
+    const { EventEmitter } = require('events');
+    const constructions = [];
+    jest.doMock('worker_threads', () => ({
+      ...jest.requireActual('worker_threads'),
+      Worker: class SourceReleaseWorker extends EventEmitter {
+        constructor(_filename, options) {
+          super();
+          constructions.push(options.env);
+          this.threadId = constructions.length;
+          queueMicrotask(() =>
+            this.emit('message', {
+              available: true,
+              releaseReady: false,
+              label: 'PRE-GATE / NOT READY',
+              blockers: ['local_qa_override_active'],
+            }),
+          );
+        }
+        terminate() {
+          this.threadId = -1;
+          return Promise.resolve(0);
+        }
+      },
+    }));
+    process.env.VIVENTIUM_INSTALL_MODE = 'native';
+    process.env.VIVENTIUM_RUNTIME_PROFILE = 'isolated';
+    writeLocalQaSnapshot();
+    try {
+      const { parallelWorkReleaseGateSnapshotAsync } = require('../ViventiumOrchestrationMode');
+      await expect(parallelWorkReleaseGateSnapshotAsync()).resolves.toMatchObject({
+        available: true,
+      });
+      await expect(parallelWorkReleaseGateSnapshotAsync()).resolves.toMatchObject({
+        available: true,
+      });
+      expect(constructions).toHaveLength(1);
+      process.env.VIVENTIUM_RUNTIME_PROFILE = 'compat';
+      await expect(parallelWorkReleaseGateSnapshotAsync()).resolves.toMatchObject({
+        available: true,
+      });
+      expect(constructions).toHaveLength(2);
+      expect(
+        constructions.map((env) => [env.VIVENTIUM_INSTALL_MODE, env.VIVENTIUM_RUNTIME_PROFILE]),
+      ).toEqual([
+        ['native', 'isolated'],
+        ['native', 'compat'],
+      ]);
+    } finally {
+      delete process.env.VIVENTIUM_INSTALL_MODE;
+      delete process.env.VIVENTIUM_RUNTIME_PROFILE;
+      jest.dontMock('worker_threads');
+      jest.resetModules();
+    }
+  });
+
+  test('source profile selection cannot reuse a changed bound release owner', () => {
+    process.env.VIVENTIUM_INSTALL_MODE = 'native';
+    process.env.VIVENTIUM_RUNTIME_PROFILE = 'isolated';
+    writeLocalQaSnapshot();
+    const ownerPath = path.join(releaseRoot, 'state', 'runtime', 'isolated', 'stack-owner.json');
+    const ownerBytes = fs.readFileSync(ownerPath);
+    try {
+      fs.appendFileSync(ownerPath, '\n');
+      const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
+      expect(parallelWorkReleaseGateSnapshot()).toMatchObject({
+        available: false,
+        blockers: ['release_owner_unavailable'],
+      });
+    } finally {
+      fs.writeFileSync(ownerPath, ownerBytes);
+      delete process.env.VIVENTIUM_INSTALL_MODE;
+      delete process.env.VIVENTIUM_RUNTIME_PROFILE;
+    }
+  });
+
   test('new accounts use automatic work while an explicit focused preference survives', () => {
     delete process.env.VIVENTIUM_PARALLEL_WORK_DEFAULT_MODE;
     const { preferredOrchestrationMode } = require('../ViventiumOrchestrationMode');

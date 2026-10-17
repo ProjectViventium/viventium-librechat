@@ -131,6 +131,8 @@ const RELEASE_GATE_WORKER_ENVIRONMENT_KEYS = Object.freeze([
   'VIVENTIUM_PARALLEL_WORK_LOCAL_QA_OVERRIDE',
   'VIVENTIUM_PARALLEL_WORK_RELEASE_GATE_FILE',
   'VIVENTIUM_RUNTIME_DIR',
+  'VIVENTIUM_INSTALL_MODE',
+  'VIVENTIUM_RUNTIME_PROFILE',
 ]);
 const releaseGateReusePermits = new WeakMap<object, ParallelWorkReleaseGate>();
 const ownerClaimReusePermits = new WeakMap<object, string>();
@@ -1668,7 +1670,12 @@ let nativeIdentityCache: {
 let nativeIdentityInFlight: Promise<NativeParallelWorkIdentity | null> | null = null;
 
 function nativeRuntimeRequested(): boolean {
-  return process.env.VIVENTIUM_INSTALL_MODE === 'native';
+  const profile = process.env.VIVENTIUM_RUNTIME_PROFILE;
+  return (
+    process.env.VIVENTIUM_INSTALL_MODE === 'native' &&
+    profile !== 'isolated' &&
+    profile !== 'compat'
+  );
 }
 
 function nativeRuntimeInputs(): { root: string; support: string; fingerprint: string } | null {

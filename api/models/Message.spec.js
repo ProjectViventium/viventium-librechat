@@ -87,6 +87,19 @@ test('ordinary message edits cannot forge or erase native response admission', (
     }),
   ).toEqual({ text: 'safe', $set: { text: 'safe' }, $unset: {}, $rename: {} });
 });
+test('ordinary message edits cannot forge or erase host final receipt', () => {
+  const { sanitizeMessageForPersistence } = require('./Message').__testables;
+  expect(
+    sanitizeMessageForPersistence({
+      text: 'safe',
+      hostFinal: { status: 'completed' },
+      'hostFinal.invocationId': 'forged',
+      $set: { 'hostFinal.status': 'completed', text: 'safe' },
+      $unset: { hostFinal: 1 },
+      $rename: { content: 'hostFinal' },
+    }),
+  ).toEqual({ text: 'safe', $set: { text: 'safe' }, $unset: {}, $rename: {} });
+});
 
 test('ordinary message edits cannot forge or erase accepted Main projection identity', () => {
   const { sanitizeMessageForPersistence } = require('./Message').__testables;

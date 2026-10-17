@@ -8,7 +8,7 @@ type RequestFile = { file_id?: string };
 const FILE_STRIP_FIELDS = ['text', '_id', '__v'] as const;
 
 /** Fields to strip from messages before client transmission */
-const MESSAGE_STRIP_FIELDS = ['fileContext'] as const;
+const MESSAGE_STRIP_FIELDS = ['fileContext', 'hostFinal'] as const;
 
 /**
  * Strips large/unnecessary fields from a file object before transmitting to client.

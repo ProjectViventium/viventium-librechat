@@ -117,23 +117,9 @@ export interface SourceOrderObservationResult {
   stale: boolean;
 }
 
-export type DeliveryAcknowledgementState =
-  'committed' | 'committed_effect' | 'partial_removed' | 'failed';
-
-export interface InteractionDeliveryAck {
-  logical_turn_id: string;
-  revision: number;
-  state: DeliveryAcknowledgementState;
-  /** Exact server-persisted durable provider receipt; never inferred from presentation text. */
-  effect_ref?: string;
-  presentation_ref?: string;
-  presentation_refs?: string[];
-  /** Store-authored visible-presentation time. Adapter input is never authoritative. */
-  presentation_committed_at?: number;
-  source_kind?: 'assistant_message' | 'schedule_result' | 'callback';
-  schedule_id?: string;
-  schedule_run_id?: string;
-}
+/* VIVENTIUM: the existing ACK type is shared with durable Message recovery. */
+export type { DeliveryAcknowledgementState, InteractionDeliveryAck } from '@librechat/data-schemas';
+import type { InteractionDeliveryAck } from '@librechat/data-schemas';
 
 export interface CortexPresentationBinding {
   ownerId: string;

@@ -235,6 +235,7 @@ jest.mock('../GlassHiveConversationOrchestration', () => {
         title: { type: 'string' },
         instruction: { type: 'string' },
         resourceClass: { type: 'string', enum: ['standard', 'light'] },
+        workspaceRoot: { type: 'string' },
       },
       required: ['title', 'instruction', 'resourceClass'],
       additionalProperties: false,
@@ -1470,6 +1471,83 @@ describe('GlassHive capability broker', () => {
       );
     },
   );
+
+  test.each([
+    ['host', undefined],
+    ['host', '/workspaces/Shared Project/資料'],
+    ['docker', undefined],
+    ['docker', '/workspaces/Shared Project/資料'],
+  ])(
+    'keeps explicit workspace placement separate from launch authority (%s, %s)',
+    async (executionMode, workspaceRoot) => {
+      process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = executionMode;
+      const callTool = jest.fn().mockResolvedValue({
+        structuredContent: { status: 'accepted', work_ref: 'work-root-1' },
+      });
+      mockGetMCPManager.mockReturnValue({ callTool });
+      mockGetMCPServersRegistry.mockReturnValue({
+        getAllServerConfigs: jest.fn().mockResolvedValue({}),
+      });
+      mockReconcileGlassHiveLaunchResult.mockResolvedValue({ workRef: 'work-root-1' });
+      const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+      await executeMainDelegation({
+        user: { id: 'user-1', role: 'USER' },
+        requestBody: { conversationId: 'conv-1', messageId: 'msg-1' },
+        args: {
+          title: 'Workspace selection',
+          instruction: 'Keep /workspaces/Other Project intact.',
+          resourceClass: 'standard',
+          ...(workspaceRoot === undefined ? {} : { workspaceRoot }),
+        },
+        invocationId: 'root-selection-1',
+      });
+      const launch = callTool.mock.calls[0][0];
+      if (workspaceRoot === undefined)
+        expect(launch.toolArguments).not.toHaveProperty('workspace_root');
+      else expect(launch.toolArguments.workspace_root).toBe(workspaceRoot);
+      expect(launch.toolArguments).toMatchObject({
+        execution_mode: executionMode,
+        require_callback: true,
+        reuse_existing_workspace: false,
+      });
+      expect(mockRegisterGlassHiveLaunchContext).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user: expect.objectContaining({ id: 'user-1' }),
+          toolArguments: expect.objectContaining(
+            workspaceRoot === undefined ? {} : { workspace_root: workspaceRoot },
+          ),
+        }),
+      );
+      expect(mockAssertCurrentGlassHiveSourceAuthor).toHaveBeenCalled();
+      delete process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE;
+    },
+  );
+
+  test('an explicit workspace root cannot bypass a superseded source author', async () => {
+    const reason = Object.assign(new Error('superseded'), { code: 'source_order_superseded' });
+    mockAssertCurrentGlassHiveSourceAuthor.mockRejectedValueOnce(reason);
+    const callTool = jest.fn();
+    mockGetMCPManager.mockReturnValue({ callTool });
+    mockGetMCPServersRegistry.mockReturnValue({
+      getAllServerConfigs: jest.fn().mockResolvedValue({}),
+    });
+    const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+    await expect(
+      executeMainDelegation({
+        user: { id: 'user-1', role: 'USER' },
+        requestBody: { conversationId: 'conv-1', messageId: 'msg-1' },
+        args: {
+          title: 'Workspace selection',
+          instruction: 'Complete the objective.',
+          resourceClass: 'standard',
+          workspaceRoot: '/workspaces/Shared Project',
+        },
+        invocationId: 'stale-root-selection',
+      }),
+    ).resolves.toMatchObject({ status: 'blocked' });
+    expect(callTool).not.toHaveBeenCalled();
+    expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
+  });
 
   test.each(['docker', 'host'])(
     'runs executeMainDelegation through the authorized %s worker launch path',

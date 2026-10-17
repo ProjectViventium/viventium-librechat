@@ -89,6 +89,11 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
         'Optional exact worker profile. Omit it to use the server-owned primary/fallback route; select one only when the user or task genuinely requires that worker runtime.',
     },
     effort: { type: 'string', minLength: 1, maxLength: MAIN_DELEGATION_STRING_LIMITS.effort },
+    workspaceRoot: {
+      type: 'string',
+      description:
+        'Optional workspace parent root. Each mission gets its own subfolder under this root. Omit to retain the configured worker root. Native access and execution-mode constraints still apply; this selects placement, not permissions.',
+    },
     resourceClass: {
       type: 'string',
       enum: MAIN_DELEGATION_RESOURCE_CLASSES,
@@ -333,6 +338,12 @@ export function canonicalConversationOrchestrationArguments(
     for (const [key, maxLength] of optionalStrings) {
       const value = boundedString(input[key], maxLength);
       if (value) output[key] = value;
+    }
+    if (input.workspaceRoot !== undefined) {
+      if (typeof input.workspaceRoot !== 'string') {
+        throw new TypeError('workspaceRoot must be a string');
+      }
+      output.workspaceRoot = input.workspaceRoot;
     }
     if (input.requiresHostAccess === true) output.requiresHostAccess = true;
     if (input.longMission === true) output.longMission = true;

@@ -6,6 +6,7 @@ import {
   useUpdateOrchestrationMutation,
 } from '~/data-provider/ViventiumOrchestration';
 import ParallelWork from '../ParallelWork';
+import Account from '../Account';
 
 jest.mock('~/data-provider/ViventiumOrchestration', () => ({
   useActiveWorkQuery: jest.fn(),
@@ -32,7 +33,20 @@ jest.mock('@librechat/client', () => ({
 }));
 jest.mock('~/hooks', () => ({
   useLocalize: () => (key: string) => key,
+  useAuthContext: () => ({ user: { role: 'USER', provider: 'external' } }),
 }));
+jest.mock('~/data-provider', () => ({
+  useGetStartupConfig: () => ({ data: mockStartupConfig }),
+}));
+jest.mock('../ConnectedAccounts', () => () => null);
+jest.mock('../WhoopConnection', () => () => null);
+jest.mock('../DisplayUsernameMessages', () => () => null);
+jest.mock('../DeleteAccount', () => () => null);
+jest.mock('../Avatar', () => () => null);
+jest.mock('../TwoFactorAuthentication', () => () => null);
+jest.mock('../BackupCodesItem', () => () => null);
+
+const mockStartupConfig = { viventiumParallelWorkAvailable: false };
 
 const preferenceMutation = { mutate: jest.fn(), isLoading: false };
 
@@ -48,8 +62,19 @@ describe('Parallel work account preference', () => {
     (useToastContext as jest.Mock).mockReturnValue({ showToast: jest.fn() });
   });
 
+  test.each([false, true])(
+    'Account uses current owner readiness when startup release availability is %s',
+    (available) => {
+      mockStartupConfig.viventiumParallelWorkAvailable = available;
+      render(<Account />);
+      expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).toBeEnabled();
+      expect(useOrchestrationPreferenceQuery).toHaveBeenCalled();
+      expect(useActiveWorkQuery).not.toHaveBeenCalled();
+    },
+  );
+
   test('uses owner readiness without a deployment release flag', () => {
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).toBeEnabled();
     expect(useOrchestrationPreferenceQuery).toHaveBeenCalled();
@@ -62,7 +87,7 @@ describe('Parallel work account preference', () => {
       isLoading: false,
       isError: false,
     });
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     const toggle = screen.getByRole('checkbox', { name: 'com_ui_parallel_work' });
     expect(toggle).toBeChecked();
@@ -72,16 +97,29 @@ describe('Parallel work account preference', () => {
     );
   });
 
-  test('keeps unavailable configuration dark without querying the preference', () => {
-    render(<ParallelWork featureAvailable={false} />);
+  test('recovers the same owner control when operational readiness becomes available', () => {
+    (useOrchestrationPreferenceQuery as jest.Mock).mockReturnValue({
+      data: { available: false, mode: 'focused' },
+      isLoading: false,
+      isError: false,
+    });
+    const { rerender } = render(<ParallelWork />);
+    expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).toBeDisabled();
+    expect(screen.getByText('com_ui_parallel_work_toggle_unavailable')).toBeVisible();
 
-    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
-    expect(useOrchestrationPreferenceQuery).not.toHaveBeenCalled();
+    (useOrchestrationPreferenceQuery as jest.Mock).mockReturnValue({
+      data: { available: true, mode: 'focused' },
+      isLoading: false,
+      isError: false,
+    });
+    rerender(<ParallelWork />);
+    expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).toBeEnabled();
+    expect(screen.queryByText('com_ui_parallel_work_toggle_unavailable')).not.toBeInTheDocument();
     expect(useActiveWorkQuery).not.toHaveBeenCalled();
   });
 
   test('shows only the account preference and updates it', () => {
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     const toggle = screen.getByRole('checkbox', { name: 'com_ui_parallel_work' });
     expect(toggle).not.toBeChecked();
@@ -102,7 +140,7 @@ describe('Parallel work account preference', () => {
       isError: false,
     });
 
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).toBeDisabled();
     expect(screen.getByText('com_ui_parallel_work_toggle_unavailable')).toBeVisible();
@@ -123,7 +161,7 @@ describe('Parallel work account preference', () => {
       isError: false,
     });
 
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByText('NOT READY')).toBeVisible();
     expect(screen.getByText('isolation_unavailable')).toBeVisible();
@@ -137,7 +175,7 @@ describe('Parallel work account preference', () => {
       isError: false,
     });
 
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByTestId('spinner')).toBeVisible();
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
@@ -151,7 +189,7 @@ describe('Parallel work account preference', () => {
       isError: true,
     });
 
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).toBeDisabled();
     expect(screen.getByText('com_ui_parallel_work_toggle_unavailable')).toBeVisible();
@@ -165,7 +203,7 @@ describe('Parallel work account preference', () => {
         isLoading: false,
         isError,
       });
-      render(<ParallelWork featureAvailable />);
+      render(<ParallelWork />);
       const toggle = screen.getByRole('checkbox', { name: 'com_ui_parallel_work' });
       expect(toggle).toBeChecked();
       expect(toggle).toBeEnabled();
@@ -189,7 +227,7 @@ describe('Parallel work account preference', () => {
       isError: false,
     });
 
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'com_ui_parallel_work' })).toBeDisabled();
@@ -209,7 +247,7 @@ describe('Parallel work account preference', () => {
       isError: false,
     });
 
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByText('com_ui_glasshive_checking')).toBeVisible();
     expect(screen.queryByText('NOT READY')).not.toBeInTheDocument();
@@ -231,7 +269,7 @@ describe('Parallel work account preference', () => {
       isError: false,
     });
 
-    render(<ParallelWork featureAvailable />);
+    render(<ParallelWork />);
 
     expect(screen.getByText('PRE-GATE / NOT READY')).toBeVisible();
     expect(screen.getByText('PWK-UC-014, STORAGE-PRESSURE')).toBeVisible();

@@ -13,17 +13,28 @@ function preparation({
   rejectSource = false,
   throwLogger = false,
   bindResponse,
+  sourceRow,
+  hostContext,
+  native = false,
 } = {}) {
   const events = [];
   const lines = [];
   let release;
   const originalError = new Error('Synthetic private persistence failure');
   const source = new Promise((resolve, reject) => {
-    release = () => (rejectSource ? reject(originalError) : resolve());
+    release = () => (rejectSource ? reject(originalError) : resolve(sourceRow));
   });
   let registered;
   const context = {
     Date,
+    getTrustedInteractionContext: () => hostContext,
+    nativeResponseSource: jest.requireActual('@librechat/data-schemas').nativeResponseSource,
+    require: (name) => {
+      if (name === '@librechat/api') return jest.requireActual(name);
+      throw new Error(`Unexpected source reread: ${name}`);
+    },
+    jobCreatedAt: 1,
+    job: { abortController: new AbortController() },
     voiceLatencyEnabled: enabled,
     voiceLatencyNow: () => 100,
     trackAssistantSnapshot: (work) => {
@@ -39,7 +50,15 @@ function preparation({
     claimedInteractionContext: { source_event_id: 'source', logical_turn_id: 'turn', revision: 1 },
     req: {
       _viventiumBindResponseIdentity: bindResponse,
-      config: { endpoints: { agents: { providerCapabilities: {} } } },
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: native
+              ? { synthetic: { conversation_session: true, workspace_binding: true } }
+              : {},
+          },
+        },
+      },
     },
     streamId: 'synthetic-stream',
     userId: 'synthetic-owner',
@@ -47,6 +66,16 @@ function preparation({
     conversationId: 'synthetic-conversation',
     sender: 'AI',
     GenerationJobManager: {
+      getJobStore: () => ({
+        getJob: async () => ({
+          createdAt: 1,
+          userId: 'synthetic-owner',
+          conversationId: 'synthetic-conversation',
+          status: 'running',
+          interactionContext: hostContext,
+        }),
+        isCurrentLogicalTurn: async () => true,
+      }),
       updateMetadata: async () => events.push('metadata'),
       emitChunk: async () => events.push('created'),
     },
@@ -65,7 +94,7 @@ function preparation({
     'synthetic-response',
     false,
   );
-  return { events, lines, release, result, originalError, registered };
+  return { events, lines, release, result, originalError, registered, context };
 }
 
 describe('awaited start preparation timing', () => {
@@ -379,3 +408,47 @@ test('actual onStart awaits exact assistant binding before placeholder or prepar
   await control.result;
   expect(control.events).toEqual(['placeholder', 'metadata', 'created']);
 });
+
+test.each([false, true])(
+  'actual onStart shares saved source proof without a second read (native=%s)',
+  async (native) => {
+    const sourceRow = {
+      _id: 'synthetic-mongo-source',
+      messageId: 'synthetic-user',
+      parentMessageId: null,
+      text: 'Source',
+      content: [],
+      files: ['owned-file'],
+    };
+    const hostContext = {
+      origin: 'interactive',
+      actor_kind: 'external_user',
+      surface: 'web',
+      conversation_id: 'synthetic-conversation',
+      logical_turn_id: 'turn',
+      revision: 1,
+    };
+    const control = preparation({ sourceRow, hostContext, native });
+    control.release();
+    await control.result;
+    expect(control.context.req._viventiumHostResponseIdentity).toMatchObject({
+      userId: 'synthetic-owner',
+      conversationId: 'synthetic-conversation',
+      responseMessageId: 'synthetic-response',
+      streamId: 'synthetic-stream',
+      jobCreatedAt: 1,
+      logicalTurnId: 'turn',
+      revision: 1,
+      surface: 'web',
+      source: {
+        id: 'synthetic-mongo-source',
+        messageId: 'synthetic-user',
+        digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+    expect(await control.context.req._viventiumHostResponseIsCurrent()).toBe(true);
+    control.context.job.abortController.abort();
+    expect(await control.context.req._viventiumHostResponseIsCurrent()).toBe(false);
+    expect(Boolean(control.context.req._viventiumNativeResponseSource)).toBe(native);
+  },
+);

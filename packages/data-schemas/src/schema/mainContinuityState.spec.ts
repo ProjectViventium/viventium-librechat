@@ -201,3 +201,66 @@ test('round-trips an owner-validated bounded size draft without promoting it', a
   expect(document.toObject().pendingCompactionRepair).toEqual(pendingCompactionRepair);
   expect(document.toObject().semanticCompaction).toBeNull();
 });
+
+// VIVENTIUM: actual current carrier is bounded independently from semantic JSON storage.
+test.each([12288, 16384, 131072, 185108, 512 * 1024])(
+  'round-trips a bounded actual carrier (%s) without enlarging semantic JSON',
+  async (carrierMaxUtf8Bytes) => {
+    const room = Math.min(128 * 1024, carrierMaxUtf8Bytes - 1000);
+    const contract = {
+      version: 1,
+      consumer: 'accepted_core',
+      carrierMaxUtf8Bytes,
+      reservedUtf8Bytes: 1000,
+      maxJsonUtf8Bytes: room,
+      maxSummaryUtf8Bytes: room,
+      maxItemsPerArray: 32,
+      maxStringItemUtf8Bytes: 1024,
+      maxToolIdentityCharacters: 256,
+    };
+    const document = new ContinuityState({ ...validState, semanticCompactionContract: contract });
+    await expect(document.validate()).resolves.toBeUndefined();
+    expect(document.toObject().semanticCompactionContract).toEqual(contract);
+  },
+);
+test.each([65536, 131072.5, 512 * 1024 + 1, Infinity, -1])(
+  'rejects a carrier outside the existing domain (%s)',
+  async (carrierMaxUtf8Bytes) => {
+    const document = new ContinuityState({
+      ...validState,
+      semanticCompactionContract: {
+        version: 1,
+        consumer: 'accepted_core',
+        carrierMaxUtf8Bytes,
+        reservedUtf8Bytes: 1000,
+        maxJsonUtf8Bytes: 1000,
+        maxSummaryUtf8Bytes: 1000,
+        maxItemsPerArray: 32,
+        maxStringItemUtf8Bytes: 1024,
+        maxToolIdentityCharacters: 256,
+      },
+    });
+    await expect(document.validate()).rejects.toThrow();
+  },
+);
+test.each(['maxJsonUtf8Bytes', 'maxSummaryUtf8Bytes'])(
+  'rejects an enlarged persisted semantic ceiling (%s)',
+  async (field) => {
+    const document = new ContinuityState({
+      ...validState,
+      semanticCompactionContract: {
+        version: 1,
+        consumer: 'accepted_core',
+        carrierMaxUtf8Bytes: 512 * 1024,
+        reservedUtf8Bytes: 1000,
+        maxJsonUtf8Bytes: 128 * 1024,
+        maxSummaryUtf8Bytes: 128 * 1024,
+        maxItemsPerArray: 32,
+        maxStringItemUtf8Bytes: 1024,
+        maxToolIdentityCharacters: 256,
+        [field]: 128 * 1024 + 1,
+      },
+    });
+    await expect(document.validate()).rejects.toThrow();
+  },
+);

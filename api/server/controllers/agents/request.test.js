@@ -4,7 +4,10 @@ const mockIsNativeCapacityRefusal = jest.fn();
 const mockSettleVoiceTaskGeneration = jest.fn(async () => null);
 const mockDisposeClient = jest.fn();
 const mockGetFiles = jest.fn(async () => []);
-const mockSaveMessage = jest.fn(async () => ({}));
+const mockSaveMessage = jest.fn(async (_req, message) => ({
+  ...message,
+  _id: `saved-${message.messageId}`,
+}));
 const mockDecrementPendingRequest = jest.fn(async () => undefined);
 const mockCheckAndIncrementPendingRequest = jest.fn(async () => ({
   allowed: true,
@@ -3014,7 +3017,12 @@ describe('voice task cancellation persistence barrier', () => {
     );
 
     expect(suppressed).toEqual({ suppressed: true, taskId: 'voice-task-cancelled' });
-    expect(preserved).toEqual({});
+    expect(preserved).toEqual({
+      _id: 'saved-owner-turn',
+      messageId: 'owner-turn',
+      text: 'please research this',
+      isCreatedByUser: true,
+    });
     expect(mockSaveMessage).toHaveBeenCalledTimes(1);
     expect(mockSaveMessage.mock.calls[0][1].messageId).toBe('owner-turn');
   });

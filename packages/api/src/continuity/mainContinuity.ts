@@ -340,10 +340,9 @@ export function createMainCompactionOutputContract(input: {
 }): MainCompactionOutputContract | null {
   const { consumer, reservedUtf8Bytes } = input;
   if (!['accepted_core', 'conversation_legacy'].includes(consumer)) return null;
-  // Per-turn native spare capacity carries existing evidence; it must not ratchet the size
-  // of newly stored summaries. Both compaction consumers keep their stable output ceiling.
+  // The current consumer owns rendered capacity; stored semantic JSON keeps its fixed ceiling.
   const selectedCarrierBytes = input.carrierMaxUtf8Bytes;
-  const carrierMaxUtf8Bytes = Math.min(selectedCarrierBytes, NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES);
+  const carrierMaxUtf8Bytes = selectedCarrierBytes;
   const ceilings = consumer === 'accepted_core' ? [MAX_CAPSULE_BYTES, 16 * 1024, 128 * 1024] : [16 * 1024, 128 * 1024];
   if (!(ceilings.includes(selectedCarrierBytes) || isNativeBodyContextAllocation(selectedCarrierBytes)) || !Number.isSafeInteger(reservedUtf8Bytes) ||
       reservedUtf8Bytes < 0 || reservedUtf8Bytes >= carrierMaxUtf8Bytes) return null;
@@ -352,7 +351,8 @@ export function createMainCompactionOutputContract(input: {
     version: 1, consumer, carrierMaxUtf8Bytes, reservedUtf8Bytes,
     // The native body can be larger than the persisted semantic-summary field. Keep its
     // existing storage ceiling while allocating the complete structured candidate.
-    maxJsonUtf8Bytes: available, maxSummaryUtf8Bytes: Math.min(available, 128 * 1024),
+    maxJsonUtf8Bytes: Math.min(available, NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES),
+    maxSummaryUtf8Bytes: Math.min(available, NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES),
     maxItemsPerArray: MAX_SUMMARY_ITEMS,
     maxStringItemUtf8Bytes: MAX_SUMMARY_ITEM_BYTES,
     maxToolIdentityCharacters: MAX_TOOL_IDENTITY_CHARACTERS,
@@ -399,7 +399,8 @@ export function compatibleMainCompactionSizeContract(previousKey: unknown, curre
 
 function compatibleMainCompactionSizeAllocation(before: MainCompactionOutputContract,
   after: MainCompactionOutputContract): boolean {
-  return before.consumer === after.consumer && before.carrierMaxUtf8Bytes === after.carrierMaxUtf8Bytes &&
+  return before.consumer === after.consumer &&
+    after.carrierMaxUtf8Bytes - after.reservedUtf8Bytes <= before.carrierMaxUtf8Bytes - before.reservedUtf8Bytes &&
     before.maxItemsPerArray === after.maxItemsPerArray &&
     before.maxStringItemUtf8Bytes === after.maxStringItemUtf8Bytes &&
     before.maxToolIdentityCharacters === after.maxToolIdentityCharacters &&
@@ -472,7 +473,7 @@ export function normalizeMainCompactionSizeRepair(value: unknown, previousContra
       }
       const boundedWholeJsonDraft = path === '' && !prepared.ok &&
         prepared.issue.constraint === 'max_bytes' && prepared.issue.path === '' &&
-        Buffer.byteLength(serialized, 'utf8') <= Math.min(before.carrierMaxUtf8Bytes, after.carrierMaxUtf8Bytes);
+        Buffer.byteLength(serialized, 'utf8') <= Math.min(before.carrierMaxUtf8Bytes, after.carrierMaxUtf8Bytes, NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES);
       if (boundedWholeJsonDraft || (path !== '' && prepared.ok &&
           Buffer.byteLength(serialized, 'utf8') <= after.maxJsonUtf8Bytes &&
           inspectMainCompactionCandidate(draft, after).ok)) candidate = serialized;

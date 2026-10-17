@@ -916,6 +916,7 @@ function delegationToolArguments(args = {}) {
     effort: canonical.effort,
     resource_class: canonical.resourceClass,
     long_mission: canonical.longMission,
+    workspace_root: canonical.workspaceRoot,
   };
   return {
     title: canonical.title,

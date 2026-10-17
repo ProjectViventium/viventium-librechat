@@ -252,19 +252,25 @@ const service = createTelegramInputService({
               pipeline: [
                 {
                   $match: {
-                    unfinished: false,
-                    error: true,
                     isCreatedByUser: false,
                     'metadata.viventium.deliveryAcknowledgement.state': {
                       $nin: ['committed', 'committed_effect', 'failed'],
                     },
-                    content: {
-                      $elemMatch: {
-                        type: 'error',
-                        error_class: { $type: 'string', $ne: '' },
-                        error: { $type: 'string', $ne: '' },
+                    // Candidate discovery only; the shared exact reader validates the receipt.
+                    $or: [
+                      { 'hostFinal.version': 1, error: { $ne: true } },
+                      {
+                        unfinished: false,
+                        error: true,
+                        content: {
+                          $elemMatch: {
+                            type: 'error',
+                            error_class: { $type: 'string', $ne: '' },
+                            error: { $type: 'string', $ne: '' },
+                          },
+                        },
                       },
-                    },
+                    ],
                     $expr: {
                       $and: [
                         { $eq: ['$user', '$$owner'] },
@@ -384,8 +390,17 @@ const service = createTelegramInputService({
   },
   readStream: async (streamId, ownerId) => {
     const job = await GenerationJobManager.getJob(streamId);
-    if (!job)
-      return (await readRetainedTelegramTerminal({ ownerId, streamId })) ? 'terminal' : 'missing';
+    if (!job) {
+      const terminal = await readRetainedTelegramTerminal({
+        ownerId,
+        streamId,
+        includeSettled: true,
+      });
+      if (['committed', 'committed_effect'].includes(terminal?.acknowledgement?.state))
+        return 'completed';
+      if (terminal?.acknowledgement?.state === 'failed') return 'failed';
+      return terminal ? 'terminal' : 'missing';
+    }
     if (job.metadata?.userId !== ownerId) return 'missing';
     const ack = job.metadata?.deliveryAcknowledgement;
     // VIVENTIUM: a committed durable effect also settles its own accepted source.

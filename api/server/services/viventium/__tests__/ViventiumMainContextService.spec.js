@@ -169,6 +169,100 @@ describe('ViventiumMainContextService', () => {
         ).not.toThrow();
       },
     );
+    function assistantFile(raw) {
+      Object.assign(raw[1], {
+        role: 'assistant',
+        isCreatedByUser: false,
+        error: false,
+        unfinished: false,
+        text: '',
+        content: null,
+        files: null,
+        attachments: [
+          {
+            user: 'owner',
+            file_id: 'native-file',
+            filename: 'result.txt',
+            type: 'text/plain',
+            bytes: 12,
+            nativeOutputFile: { version: 1, status: 'available', messageId: 'file-source' },
+          },
+        ],
+      });
+    }
+    test.each(['web', 'voice', 'telegram'])(
+      '%s preserves completed attachment-only assistant ancestry without invented text',
+      (surface) => {
+        const { raw, messages, snapshot } = capture({
+          surface,
+          rapid: false,
+          modifyRaw: assistantFile,
+        });
+        expect(messages.map((message) => message.id)).toEqual(['prior', 'current']);
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['prior', 'current']);
+        expect(snapshot.visibleMessageChain.at(-1).parentId).toBe('file-source');
+        expect(raw[1].attachments).toEqual([
+          expect.objectContaining({
+            file_id: 'native-file',
+            nativeOutputFile: expect.objectContaining({ messageId: 'file-source' }),
+          }),
+        ]);
+        expect(raw[1].text).toBe('');
+      },
+    );
+    test.each([
+      ['no files', { attachments: [] }],
+      ['invalid reference', { attachments: [{ filename: 'result.txt' }] }],
+      ['invalid reference entry', { attachments: [null] }],
+      ['foreign source owner', { user: 'another-owner' }],
+      ['foreign source conversation', { conversationId: 'another-conversation' }],
+      ['deleted source', { deletedAt: '2026-01-01T00:00:00Z' }],
+      ['unfinished source', { unfinished: true }],
+      ['unknown content', { content: [{ type: 'unknown_payload', value: 'Keep this.' }] }],
+      ['authored caption', { text: 'Keep this caption.', content: 'Keep this caption.' }],
+      ['image reference', { attachments: [{ file_id: 'image', type: 'image/png' }] }],
+      ['audio reference', { attachments: [{ file_id: 'audio', type: 'audio/wav' }] }],
+      ['video reference', { attachments: [{ file_id: 'video', type: 'video/mp4' }] }],
+    ])('refuses missing assistant %s carrier', (_label, changes) => {
+      expect(() =>
+        capture({
+          rapid: false,
+          modifyRaw: (raw) => {
+            assistantFile(raw);
+            Object.assign(raw[1], changes);
+          },
+          modifyMessages: (messages) => {
+            const index = messages.findIndex((message) => message.id === 'file-source');
+            if (index >= 0) messages.splice(index, 1);
+          },
+        }),
+      ).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+    });
+    test.each([true, false])(
+      'does not omit unclassified blank source without a file (user=%s)',
+      (user) => {
+        const run = () =>
+          capture({
+            rapid: false,
+            modifyRaw: (raw) =>
+              Object.assign(raw[1], {
+                isCreatedByUser: user,
+                role: user ? 'user' : 'assistant',
+                files: [],
+                attachments: [],
+                content: null,
+                text: '',
+              }),
+          });
+        if (user) {
+          // The formatter keeps this empty user row; it must stay in the digest chain.
+          expect(run().snapshot.visibleMessageChain.map((row) => row.id)).toContain('file-source');
+        } else {
+          // No file lane can justify omission of an otherwise unclassified assistant row.
+          expect(run).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+        }
+      },
+    );
     test.each([
       [
         'caption',

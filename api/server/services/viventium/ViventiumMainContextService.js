@@ -508,7 +508,7 @@ function isAttachmentOnlyMainTextCarrier(message, text) {
   const references = [message?.files, message?.attachments];
   const attachments = references.flatMap((value) => (Array.isArray(value) ? value : []));
   return (
-    message?.isCreatedByUser === true &&
+    typeof message?.isCreatedByUser === 'boolean' &&
     message?.error !== true &&
     message?.unfinished !== true &&
     text.length === 0 &&
@@ -950,7 +950,7 @@ function assertUnreconciledHistoryCarrier(
       position = matched + signatures.length;
       continue;
     }
-    // Blank answers and attachment-only user text remain in the owned ancestry. The existing
+    // Blank answers and attachment-only text of either role remain in owned ancestry. The existing
     // attachment lane carries the original file; media and authored words cannot disappear.
     if (
       isBlankContextOnlyMainCarrier(source, sourceText) ||

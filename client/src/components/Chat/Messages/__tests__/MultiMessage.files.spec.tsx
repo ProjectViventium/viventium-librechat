@@ -76,6 +76,9 @@ jest.mock('~/components/Chat/Input/Files/FileContainer', () => ({
   default: ({ file }: { file: { filename: string } }) => <button>{file.filename}</button>,
 }));
 jest.mock('../Content/Image', () => () => null);
+jest.mock('../Content/Parts/LogLink', () => ({
+  useAttachmentLink: () => ({ handleDownload: jest.fn() }),
+}));
 jest.mock('../Content/Markdown', () => ({ content }: { content: string }) => (
   <span>{content}</span>
 ));

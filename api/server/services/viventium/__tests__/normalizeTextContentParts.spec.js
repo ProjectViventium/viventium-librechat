@@ -9,6 +9,7 @@
  * === VIVENTIUM END === */
 
 const {
+  isRuntimeOnlyAssistantMessage,
   coerceTextToString,
   normalizeUserMessageContent,
   normalizeTextContentParts,
@@ -913,5 +914,47 @@ describe('native output attachment history DATA', () => {
     const row = source();
     mutate(row);
     expect(normalizeUserMessageContent(row)).toBe(row);
+  });
+});
+
+// VIVENTIUM: zero-parts and empty-text runtime carriers have the same structural meaning.
+describe('empty assistant runtime-only parity', () => {
+  const empty = () => ({
+    isCreatedByUser: false,
+    text: '',
+    content: [],
+    unfinished: false,
+    error: false,
+    attachments: [],
+  });
+  test('classifies zero parts exactly like the existing empty text part', () => {
+    expect(isRuntimeOnlyAssistantMessage(empty())).toBe(true);
+    expect(
+      isRuntimeOnlyAssistantMessage({ ...empty(), content: [{ type: 'text', text: '' }] }),
+    ).toBe(true);
+  });
+  test.each([
+    ['authored user', { isCreatedByUser: true }],
+    ['unfinished assistant', { unfinished: true }],
+    ['authored text', { text: 'Preserve these words.' }],
+    ['structured text', { content: [{ type: 'text', text: 'Preserve these words.' }] }],
+    ['unknown part', { content: [{ type: 'unknown', value: 'Evidence.' }] }],
+    ['native file', { attachments: [{ file_id: 'file', type: 'text/plain' }] }],
+    ['unknown attachment', { attachments: [{ type: 'unknown' }] }],
+    ['malformed attachment', { attachments: {} }],
+    ['ordinary file', { files: [{ file_id: 'file' }] }],
+    ['malformed file', { files: {} }],
+    [
+      'image',
+      { image_urls: [{ type: 'image_url', image_url: { url: 'https://example.invalid/image' } }] },
+    ],
+    ['document', { documents: [{ type: 'document' }] }],
+    ['audio', { audios: [{ type: 'input_audio' }] }],
+    ['video', { videos: [{ type: 'video' }] }],
+    ['tool calls', { tool_calls: [{ id: 'call' }] }],
+    ['invalid tool calls', { invalid_tool_calls: [{ id: 'call' }] }],
+    ['tool result identity', { tool_call_id: 'call' }],
+  ])('retains %s in the existing source lane', (_label, changes) => {
+    expect(isRuntimeOnlyAssistantMessage({ ...empty(), ...changes })).toBe(false);
   });
 });

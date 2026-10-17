@@ -1,5 +1,8 @@
 import React from 'react';
 import { FileSources } from 'librechat-data-provider';
+/* === VIVENTIUM START: Blob downloads retain the declared text representation name. === */
+import { getFileDownloadName } from 'librechat-data-provider';
+/* === VIVENTIUM END === */
 import { useToastContext } from '@librechat/client';
 import { useCodeOutputDownload, useFileDownload } from '~/data-provider';
 
@@ -29,9 +32,15 @@ const isLocallyStoredSource = (source?: string): boolean => {
   if (!source) {
     return false;
   }
-  return [FileSources.local, FileSources.firebase, FileSources.s3, FileSources.azure_blob].includes(
-    source as FileSources,
-  );
+  /* === VIVENTIUM START: Text uploads use the server's local storage strategy too. === */
+  return [
+    FileSources.local,
+    FileSources.firebase,
+    FileSources.s3,
+    FileSources.azure_blob,
+    FileSources.text,
+  ].includes(source as FileSources);
+  /* === VIVENTIUM END === */
 };
 
 export const useAttachmentLink = ({
@@ -61,7 +70,9 @@ export const useAttachmentLink = ({
       }
       const link = document.createElement('a');
       link.href = stream.data;
-      link.setAttribute('download', filename);
+      /* === VIVENTIUM START: Blob anchors cannot inherit the server's Content-Disposition. === */
+      link.setAttribute('download', getFileDownloadName(filename, source));
+      /* === VIVENTIUM END === */
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);

@@ -5683,3 +5683,74 @@ describe('native whole-source courier admission', () => {
   });
 });
 /* === VIVENTIUM END === */
+
+// VIVENTIUM: preserve raw ancestry while excluding the existing zero-text runtime carrier.
+test('zero-part assistant bookkeeping cannot poison later Main source admission', () => {
+  const { formatAgentMessages, formatMessage } = require('@librechat/agents');
+  const { isRuntimeOnlyAssistantMessage } = require('../normalizeTextContentParts');
+  const raw = [
+    {
+      messageId: 'prior',
+      parentMessageId: '',
+      user: 'owner',
+      conversationId: 'conversation',
+      role: 'user',
+      isCreatedByUser: true,
+      text: 'Keep this source.',
+    },
+    {
+      messageId: 'empty-assistant',
+      parentMessageId: 'prior',
+      user: 'owner',
+      conversationId: 'conversation',
+      role: 'assistant',
+      isCreatedByUser: false,
+      text: '',
+      content: [],
+      unfinished: false,
+      error: false,
+      attachments: [],
+    },
+    {
+      messageId: 'current',
+      parentMessageId: 'empty-assistant',
+      user: 'owner',
+      conversationId: 'conversation',
+      role: 'user',
+      isCreatedByUser: true,
+      text: 'Continue.',
+    },
+  ];
+  const before = JSON.stringify(raw);
+  const proof = traceMainHistoryAncestry({
+    messages: raw,
+    headId: 'empty-assistant',
+    ownerId: 'owner',
+    conversationId: 'conversation',
+  });
+  expect(proof.skippedMessageIds).toContain('empty-assistant');
+  const selected = raw.filter((message) => !isRuntimeOnlyAssistantMessage(message));
+  const messages = formatAgentMessages(
+    selected.map((message) => ({ ...formatMessage({ message }), messageId: message.messageId })),
+  ).messages;
+  for (const native of [true, false]) {
+    const snapshot = captureMainContextSnapshot(
+      { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+      {
+        agent: {
+          id: 'main',
+          model_parameters: {
+            configuration: { defaultHeaders: native ? { 'X-GlassHive-Agent-Id': 'main' } : {} },
+          },
+        },
+        messages,
+        visibleMessages: selected,
+        historyAncestry: proof,
+        nativeBodyCarrier: native,
+        protectUnreconciledHistory: true,
+      },
+    );
+    expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['prior', 'current']);
+  }
+  expect(JSON.stringify(raw)).toBe(before);
+});

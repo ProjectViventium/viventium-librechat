@@ -655,13 +655,23 @@ async function resolveConversationProviderUploadedFiles(
   const historyUploads = includeHistory
     ? await resolveConversationProviderHistoryAttachments(req, trustedRequestBody)
     : [];
-  // Current source records retain their text and order when persisted ancestry repeats their IDs.
+  // Fill missing bodies only from the same owned selected source; current text and order prevail.
+  const historyById = new Map(historyUploads.map((file) => [file.file_id, file]));
+  const hydratedCurrent = currentUploads.map((file) => {
+    const history = file.file_id && historyById.get(file.file_id);
+    return file.text === undefined &&
+      file.source &&
+      file.source === history?.source &&
+      typeof history.text === 'string'
+      ? { ...file, text: history.text }
+      : file;
+  });
   const currentUploadKeys = new Set(currentUploads.map((file) => file.file_id || file.filename));
   return Array.from(
     new Map(
       trustedUploadedFilesFromRequestBody({
         files: [
-          ...currentUploads,
+          ...hydratedCurrent,
           ...historyUploads.filter((file) => !currentUploadKeys.has(file.file_id || file.filename)),
         ],
       }).map((file) => [file.file_id || file.filename, file]),

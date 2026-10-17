@@ -16,6 +16,15 @@ export enum FileSources {
   document_parser = 'document_parser',
 }
 
+/* === VIVENTIUM START: Extracted text downloads must not impersonate original binary files. === */
+export const getFileDownloadName = (filename: string, source?: string): string => {
+  if (source !== FileSources.text || filename.toLowerCase().endsWith('.txt')) {
+    return filename;
+  }
+  return `${filename || 'attachment'}.txt`;
+};
+/* === VIVENTIUM END === */
+
 export const checkOpenAIStorage = (source: string) =>
   source === FileSources.openai || source === FileSources.azure;
 

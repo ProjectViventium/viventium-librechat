@@ -5,6 +5,9 @@ import type { TFile, TMessage } from 'librechat-data-provider';
 import Files from '../Files';
 
 jest.mock('~/utils', () => ({ getCachedPreview: jest.fn() }));
+jest.mock('../Parts/LogLink', () => ({
+  useAttachmentLink: () => ({ handleDownload: jest.fn() }),
+}));
 jest.mock('../Image', () => ({
   __esModule: true,
   default: ({ imagePath, file }: { imagePath: string; file?: TFile }) => (

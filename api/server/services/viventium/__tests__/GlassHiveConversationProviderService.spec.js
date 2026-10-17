@@ -3811,6 +3811,74 @@ describe('signed text file body parity', () => {
     expect(getMessages).not.toHaveBeenCalled();
   });
 
+  test('hydrates current metadata from the exact owned selected history body without changing order', async () => {
+    const current = [bravo, alpha].map(({ text: _text, ...file }) => ({
+      ...file,
+      media_group_index: 7,
+    }));
+    const req = {
+      user: { id: 'owner' },
+      body: { conversationId, parentMessageId: parent, files: current },
+    };
+    const before = JSON.stringify(req.body);
+    const early = await resolveConversationProviderUploadedFiles(req);
+    expect(early).toEqual(
+      current.map((file) => ({
+        ...file,
+        text: file.file_id === alpha.file_id ? alpha.text : bravo.text,
+      })),
+    );
+    expect(early).toEqual(await signed(current));
+    expect(JSON.stringify(req.body)).toBe(before);
+    expect(getFiles.mock.calls.every(([filter]) => filter.user === 'owner')).toBe(true);
+  });
+
+  test.each(['', 'Current supplied text.\n'])(
+    'does not replace explicit current text %p',
+    async (text) => {
+      expect((await signed([{ ...alpha, text }]))[0].text).toBe(text);
+    },
+  );
+
+  test('hydrates a first persisted user upload with the existing selected branch read', async () => {
+    getMessages.mockResolvedValue([{ messageId: parent, files: [{ file_id: alpha.file_id }] }]);
+    const { text: _text, ...current } = alpha;
+    expect(await signed([current])).toEqual([alpha]);
+    expect(getMessages).toHaveBeenCalledTimes(1);
+    expect(getFiles).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not hydrate an unselected sibling even when its filename matches', async () => {
+    const { text: _text, ...current } = sibling;
+    expect((await signed([current]))[0]).toEqual(current);
+    expect(getFiles.mock.calls[0][0].file_id.$in).not.toContain(sibling.file_id);
+  });
+
+  test.each([
+    'different-source',
+    'foreign-owner',
+    'unselected-parent',
+    'deleted-file',
+    'disabled-history',
+  ])('does not hydrate current metadata across %s', async (boundary) => {
+    const { text: _text, ...current } = alpha;
+    const req = {
+      user: { id: 'owner' },
+      body: { conversationId, parentMessageId: parent, files: [current] },
+    };
+    if (boundary === 'different-source') current.source = 'local';
+    if (boundary === 'foreign-owner') req.user.id = 'different-owner';
+    if (boundary === 'unselected-parent')
+      req.body.parentMessageId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    if (boundary === 'deleted-file') getFiles.mockResolvedValue([]);
+    const files = await resolveConversationProviderUploadedFiles(req, req.body, {
+      includeHistory: boundary !== 'disabled-history',
+    });
+    expect(files[0]).toEqual(current);
+    expect(files[0]).not.toHaveProperty('text');
+    if (boundary === 'disabled-history') expect(getMessages).not.toHaveBeenCalled();
+  });
+
   test('failed selected history lookup cannot become a positive empty upload projection', async () => {
     getFiles.mockRejectedValue(new Error('Synthetic file owner unavailable'));
     await expect(

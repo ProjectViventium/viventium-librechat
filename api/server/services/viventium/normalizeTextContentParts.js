@@ -51,15 +51,27 @@ function isRuntimeOnlyAssistantMessage(message) {
   return (
     message?.isCreatedByUser === false &&
     message.unfinished !== true &&
-    !message.files?.length &&
-    !message.image_urls?.length &&
+    [
+      'files',
+      'image_urls',
+      'documents',
+      'audios',
+      'videos',
+      'tool_calls',
+      'invalid_tool_calls',
+    ].every(
+      (key) => message[key] == null || (Array.isArray(message[key]) && message[key].length === 0),
+    ) &&
+    !message.tool_call_id &&
     // A memory status receipt is not a user file or model answer. Unknown and
     // file-bearing attachment types stay in history under the existing guard.
-    !message.attachments?.some((attachment) => attachment?.type !== Tools.memory) &&
+    (message.attachments == null ||
+      (Array.isArray(message.attachments) &&
+        !message.attachments.some((attachment) => attachment?.type !== Tools.memory))) &&
     (internalWorkerStatus ||
       (!message.text &&
+        // Zero parts carry the same authored text as an empty text part.
         Array.isArray(message.content) &&
-        message.content.length > 0 &&
         message.content.every(
           (part) =>
             part &&

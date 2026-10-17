@@ -1561,9 +1561,24 @@ describe('/api/viventium/telegram', () => {
         '        const onStart = (userMsg, respMsgId, _isNewConvo) => {',
       );
       const end = controller.indexOf('        const startPartialCheckpointing = () => {', start);
+      const source = {
+        _id: 'synthetic-source-row',
+        messageId: sourceMessageId,
+        conversationId,
+        text: 'First input',
+      };
+      const { nativeResponseSource } = jest.requireActual('@librechat/data-schemas');
       const sandbox = {
         req,
         Date,
+        getTrustedInteractionContext: require('~/server/services/viventium/interactionContext')
+          .getTrustedInteractionContext,
+        nativeResponseSource,
+        require: (name) => {
+          if (name === '@librechat/api') return jest.requireActual(name);
+          throw new Error(`Unexpected source reread: ${name}`);
+        },
+        jobCreatedAt: 1,
         streamId: 'stream_1',
         conversationId,
         userId: row.libreChatUserId,
@@ -1576,6 +1591,7 @@ describe('/api/viventium/telegram', () => {
         trackAssistantSnapshot: (work) => work(),
         ensureUserSourceSegmentPersisted: async () => {
           events.push('source');
+          return source;
         },
         persistAssistantSnapshot: async () => {
           events.push('placeholder');
@@ -1592,6 +1608,16 @@ describe('/api/viventium/telegram', () => {
         'new-assistant',
         true,
       );
+      expect(req._viventiumHostResponseIdentity).toMatchObject({
+        userId: row.libreChatUserId,
+        conversationId,
+        responseMessageId: 'new-assistant',
+        streamId: 'stream_1',
+        jobCreatedAt: 1,
+        logicalTurnId: 'new-turn',
+        revision: 1,
+        source: nativeResponseSource(source),
+      });
     };
     const { res, done } = continueRetainedInput(row);
     await done;

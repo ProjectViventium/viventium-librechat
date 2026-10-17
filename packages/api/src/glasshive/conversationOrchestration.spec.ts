@@ -87,6 +87,44 @@ describe('GlassHive conversation orchestration contract', () => {
     resourceClass: 'standard',
   };
 
+  it('preserves an explicit workspace root exactly without inferring one from the objective', () => {
+    const workspaceRoot = '/workspaces/Shared Project/資料';
+    const validate = new Ajv().compile(MAIN_DELEGATION_JSON_SCHEMA);
+    const selected = { ...ordinaryMission, workspaceRoot };
+    expect(validate(selected)).toBe(true);
+    expect(canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, selected)).toEqual(
+      selected,
+    );
+    const omitted = { ...ordinaryMission, instruction: 'Read /workspaces/Other Project.' };
+    expect(canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, omitted)).toEqual(
+      omitted,
+    );
+    expect(MAIN_DELEGATION_JSON_SCHEMA.required).not.toContain('workspaceRoot');
+  });
+
+  test.each(['', ' ', ' /workspaces/Project '])(
+    'leaves native workspace normalization and default behavior unchanged (%j)',
+    (workspaceRoot) => {
+      const selected = { ...ordinaryMission, workspaceRoot };
+      expect(new Ajv().compile(MAIN_DELEGATION_JSON_SCHEMA)(selected)).toBe(true);
+      expect(canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, selected)).toEqual(
+        selected,
+      );
+    },
+  );
+
+  test.each([null, 1, true, [], {}])(
+    'rejects a non-string explicit workspace root (%j)',
+    (workspaceRoot) => {
+      expect(() =>
+        canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, {
+          ...ordinaryMission,
+          workspaceRoot,
+        }),
+      ).toThrow('workspaceRoot');
+    },
+  );
+
   test.each(['direct-openai', 'direct-anthropic', 'direct-xai'])(
     'advertises the registered Direct worker profile %s without allowing arbitrary profiles',
     (profile) => {

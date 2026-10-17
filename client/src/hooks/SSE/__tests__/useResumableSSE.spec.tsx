@@ -548,6 +548,10 @@ describe('useResumableSSE', () => {
   });
 
   it('renders CREATED and content events from the canonical message cache after new-chat settlement', async () => {
+    mockActiveJobIds = ['conversation-canonical-cache'];
+    mockActiveStreams = [
+      { streamId: 'stream-canonical-cache', conversationId: 'conversation-canonical-cache' },
+    ];
     (request.post as jest.Mock).mockResolvedValueOnce({
       streamId: 'stream-canonical-cache',
       conversationId: 'conversation-canonical-cache',
@@ -612,6 +616,7 @@ describe('useResumableSSE', () => {
     });
 
     const stream = mockSSEInstances.at(-1);
+    expect(stream?.close).not.toHaveBeenCalled();
     act(() => {
       stream?.emit('message', {
         data: JSON.stringify({
@@ -652,6 +657,7 @@ describe('useResumableSSE', () => {
     expect(queryClient.getQueryData<TMessage[]>([QueryKeys.messages, Constants.NEW_CONVO])).toEqual(
       [],
     );
+    expect(stream?.close).not.toHaveBeenCalled();
   });
 
   it('keeps a lost-response retry on the original canonical route and stream', async () => {

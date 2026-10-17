@@ -644,6 +644,31 @@ function resolveConversationProviderHistoryAttachments(req, requestBody = req?.b
   );
 }
 
+/** Exact current-source precedence and selected ancestry for both sizing and signed invocation. */
+async function resolveConversationProviderUploadedFiles(
+  req,
+  requestBody = req?.body,
+  { includeHistory = true } = {},
+) {
+  const trustedRequestBody = projectTrustedClientPresentation(requestBody, req);
+  const currentUploads = trustedUploadedFilesFromRequestBody(trustedRequestBody);
+  const historyUploads = includeHistory
+    ? await resolveConversationProviderHistoryAttachments(req, trustedRequestBody)
+    : [];
+  // Current source records retain their text and order when persisted ancestry repeats their IDs.
+  const currentUploadKeys = new Set(currentUploads.map((file) => file.file_id || file.filename));
+  return Array.from(
+    new Map(
+      trustedUploadedFilesFromRequestBody({
+        files: [
+          ...currentUploads,
+          ...historyUploads.filter((file) => !currentUploadKeys.has(file.file_id || file.filename)),
+        ],
+      }).map((file) => [file.file_id || file.filename, file]),
+    ).values(),
+  );
+}
+
 function conversationProviderUsesLocalVisibleAccounting(req, agentOrProvider) {
   return (
     resolveConversationProviderCapability(req, agentOrProvider)?.usage_accounting_scope ===
@@ -1998,23 +2023,9 @@ async function attachConversationProviderCapabilityBundle({
     capability.excluded_mcp_servers,
   );
   const trustedRequestBody = projectTrustedClientPresentation(requestBody, req);
-  const currentUploads = trustedUploadedFilesFromRequestBody(trustedRequestBody);
-  const historyUploads =
-    capability.workspace_binding === true
-      ? await resolveConversationProviderHistoryAttachments(req, trustedRequestBody)
-      : [];
-  // Current source records retain their text and order when persisted ancestry repeats their IDs.
-  const currentUploadKeys = new Set(currentUploads.map((file) => file.file_id || file.filename));
-  const uploadedFiles = Array.from(
-    new Map(
-      trustedUploadedFilesFromRequestBody({
-        files: [
-          ...currentUploads,
-          ...historyUploads.filter((file) => !currentUploadKeys.has(file.file_id || file.filename)),
-        ],
-      }).map((file) => [file.file_id || file.filename, file]),
-    ).values(),
-  );
+  const uploadedFiles = await resolveConversationProviderUploadedFiles(req, trustedRequestBody, {
+    includeHistory: capability.workspace_binding === true,
+  });
   const hostToolCapabilityState = await resolveHostToolCapabilityState({
     targetAgent: capabilitySourceAgent,
     declarationSource: mcpCapabilitySource,
@@ -2195,6 +2206,7 @@ function attachConversationProviderBootstrapBundle({
 
 module.exports = {
   resolveConversationProviderHistoryAttachments,
+  resolveConversationProviderUploadedFiles,
   restrictedConversationProviderBootstrapHeaders,
   attachConversationProviderBootstrapBundle,
   applyHostEvidenceBoundaryInstructions,

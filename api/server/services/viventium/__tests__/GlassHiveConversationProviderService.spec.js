@@ -54,6 +54,7 @@ const {
   resolvedConversationOrchestrationToolNames,
   setConversationProviderCapability,
   restrictedConversationProviderBootstrapHeaders,
+  resolveConversationProviderUploadedFiles,
 } = require('../GlassHiveConversationProviderService');
 
 describe('GlassHiveConversationProviderService', () => {
@@ -3779,6 +3780,47 @@ describe('signed text file body parity', () => {
       );
     },
   );
+  test('early sizing and signed invocation share current precedence and selected ancestry without mutation', async () => {
+    const current = {
+      ...alpha,
+      filename: 'current.txt',
+      text: 'Current exact words.\n',
+      filepath: '/private/untrusted',
+      source_path: '/private/untrusted',
+      url: 'https://untrusted.invalid',
+    };
+    const req = {
+      user: { id: 'owner' },
+      body: { conversationId, parentMessageId: parent, files: [current] },
+    };
+    const before = JSON.stringify(req.body);
+    const early = await resolveConversationProviderUploadedFiles(req);
+    expect(early).toEqual(await signed([current]));
+    expect(early.map((file) => [file.file_id, file.text])).toEqual([
+      [alpha.file_id, current.text],
+      [bravo.file_id, bravo.text],
+    ]);
+    expect(early.some((file) => file.file_id === sibling.file_id)).toBe(false);
+    expect(JSON.stringify(early)).not.toContain('/private/');
+    expect(JSON.stringify(early)).not.toContain('untrusted.invalid');
+    expect(JSON.stringify(req.body)).toBe(before);
+    getMessages.mockClear();
+    expect(
+      await resolveConversationProviderUploadedFiles(req, req.body, { includeHistory: false }),
+    ).toEqual([early[0]]);
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+
+  test('failed selected history lookup cannot become a positive empty upload projection', async () => {
+    getFiles.mockRejectedValue(new Error('Synthetic file owner unavailable'));
+    await expect(
+      resolveConversationProviderUploadedFiles({
+        user: { id: 'owner' },
+        body: { conversationId, parentMessageId: parent, files: [] },
+      }),
+    ).rejects.toThrow('Synthetic file owner unavailable');
+  });
+
   test('keeps owner-selected text available on a later no-reupload turn', async () => {
     const out = await signed([]);
     expect(out.map((f) => f.text)).toEqual([alpha.text, bravo.text]);

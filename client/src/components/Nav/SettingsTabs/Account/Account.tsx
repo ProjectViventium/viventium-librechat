@@ -16,16 +16,15 @@ function Account() {
   const { data: startupConfig } = useGetStartupConfig();
   const whoopEnabled =
     startupConfig?.viventiumHealthWhoopEnabled === true && user?.role === SystemRoles.ADMIN;
-  const parallelWorkAvailable = startupConfig?.viventiumParallelWorkAvailable === true;
 
   return (
     <div className="flex flex-col gap-3 p-1 text-sm text-text-primary">
       {/* === VIVENTIUM START ===
        * Feature: Account-wide Parallel work.
-       * Purpose: Keep the control dark until runtime support is explicitly available.
+       * Purpose: Let the authenticated owner preference control availability.
        * === VIVENTIUM END === */}
       <div className="pb-3">
-        <ParallelWork featureAvailable={parallelWorkAvailable} />
+        <ParallelWork />
       </div>
       {/* === VIVENTIUM START ===
        * Feature: Connected Accounts.

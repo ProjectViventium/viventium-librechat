@@ -11,11 +11,7 @@ import {
 } from '~/data-provider/ViventiumOrchestration';
 import { useLocalize } from '~/hooks';
 
-type ParallelWorkProps = {
-  featureAvailable: boolean;
-};
-
-function ParallelWorkPreference() {
+export default function ParallelWorkPreference() {
   const localize = useLocalize();
   const { showToast } = useToastContext();
   const preferenceQuery = useOrchestrationPreferenceQuery();
@@ -109,8 +105,4 @@ function ParallelWorkPreference() {
       )}
     </section>
   );
-}
-
-export default function ParallelWork({ featureAvailable }: ParallelWorkProps) {
-  return featureAvailable ? <ParallelWorkPreference /> : null;
 }

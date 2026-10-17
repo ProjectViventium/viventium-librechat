@@ -69,6 +69,7 @@ const {
   persistCompletedCortexGraphInsight,
   normalizeCortexInsight,
   buildCortexPromptFrame,
+  buildCortexRequestBody,
   createBackgroundRes,
 } = require('../BackgroundCortexService');
 const { captureMainContextSnapshot } = require('../viventium/ViventiumMainContextService');
@@ -2416,6 +2417,148 @@ describe('BackgroundCortexService activation policy helpers', () => {
       expect.objectContaining({ activeMessageId: 'current-user-turn' }),
       expect.any(Object),
     );
+  });
+
+  describe('prepared current Cortex attachments', () => {
+    const ownerId = 'owner-synthetic';
+    const fileId = '11111111-1111-4111-8111-111111111111';
+    const otherId = '22222222-2222-4222-8222-222222222222';
+    const prepared = {
+      file_id: fileId,
+      user: ownerId,
+      filename: 'source.pdf',
+      source: 'text',
+      type: 'text/plain',
+      bytes: 17,
+      text: 'Exact extraction.\n',
+    };
+    const build = (files, attachments = [prepared], extra = {}) =>
+      buildCortexRequestBody({
+        requestBody: { files, parentMessageId: 'prior-answer' },
+        attachments,
+        ownerId,
+        activeMessageId: 'current-user-turn',
+        ...extra,
+      });
+
+    test.each([
+      ['id-only fresh upload', { file_id: fileId }],
+      ['saved current metadata', { file_id: fileId, filename: 'source.pdf', source: 'text' }],
+    ])('forwards prepared current files through the real attempt: %s', async (_label, current) => {
+      const agent = {
+        id: 'cortex-synthetic',
+        provider: 'openai',
+        model: 'test-model',
+        model_parameters: { model: 'test-model' },
+        tools: [],
+        instructions: '',
+      };
+      const requestBody = { files: [current], parentMessageId: 'prior-answer' };
+      const original = JSON.stringify(requestBody);
+      const prepareCapabilityFn = jest.fn(async () => undefined);
+      const createRunFn = jest.fn(async () => ({
+        processStream: jest.fn(async () => [{ type: 'text', text: 'done' }]),
+      }));
+      await executeCortexOnce(
+        {
+          agent,
+          messages: [],
+          runId: 'cortex-run',
+          conversationId: 'conversation-synthetic',
+          activeMessageId: 'current-user-turn',
+          contextMode: 'minimal',
+          mainContextBinding: 'isolated',
+          completedResultPolicy: 'internal',
+          req: {
+            user: { id: ownerId },
+            body: requestBody,
+            config: {
+              endpoints: {
+                agents: { allowedProviders: ['openai'], providerCapabilities: {} },
+              },
+            },
+          },
+        },
+        {
+          initializeAgentFn: jest.fn(async () => ({ ...agent, attachments: [prepared] })),
+          prepareCapabilityFn,
+          createRunFn,
+        },
+      );
+      const expected = { ...prepared };
+      delete expected.user;
+      expect(prepareCapabilityFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestBody: expect.objectContaining({
+            files: [expected],
+            parentMessageId: 'current-user-turn',
+          }),
+        }),
+      );
+      expect(createRunFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          requestBody: expect.objectContaining({
+            files: [expected],
+            parentMessageId: 'current-user-turn',
+          }),
+        }),
+      );
+      expect(JSON.stringify(requestBody)).toBe(original);
+    });
+
+    test.each(['', 'Current exact words.\n'])('preserves explicit current text %p', (text) => {
+      expect(build([{ file_id: fileId, source: 'text', text }]).files[0].text).toBe(text);
+    });
+
+    test.each(['foreign-owner', 'missing-owner', 'source-mismatch', 'different-id'])(
+      'does not hydrate across %s',
+      (boundary) => {
+        const current = { file_id: fileId, source: 'text' };
+        const attachment = { ...prepared };
+        if (boundary === 'foreign-owner') attachment.user = 'another-owner';
+        if (boundary === 'missing-owner') delete attachment.user;
+        if (boundary === 'source-mismatch') current.source = 'local';
+        if (boundary === 'different-id') attachment.file_id = otherId;
+        expect(build([current], [attachment]).files).toEqual([current]);
+      },
+    );
+
+    test('preserves selected order and current metadata without adding prepared resources', () => {
+      const files = [
+        {
+          file_id: otherId,
+          source: 'text',
+          filename: 'current.txt',
+          bytes: 9,
+          media_group_index: 7,
+        },
+        { file_id: fileId, media_group_index: 3 },
+      ];
+      const attachments = [
+        prepared,
+        { ...prepared, file_id: 'unrelated-resource' },
+        { ...prepared, file_id: otherId },
+      ];
+      const original = JSON.stringify({ files, attachments });
+      const out = build(files, attachments);
+      expect(out.files.map((file) => file.file_id)).toEqual([otherId, fileId]);
+      expect(out.files[0]).toMatchObject(files[0]);
+      expect(out.files.map((file) => file.media_group_index)).toEqual([7, 3]);
+      expect(out.files.map((file) => file.text)).toEqual([prepared.text, prepared.text]);
+      expect(out.files.every((file) => !('user' in file))).toBe(true);
+      expect(JSON.stringify({ files, attachments })).toBe(original);
+    });
+
+    test('keeps absent files and the existing parent when no current source is supplied', () => {
+      const out = buildCortexRequestBody({
+        requestBody: { parentMessageId: 'prior-answer' },
+        ownerId,
+        attachments: [prepared],
+      });
+      expect(out).not.toHaveProperty('files');
+      expect(out.parentMessageId).toBe('prior-answer');
+      expect(build([], [prepared]).files).toEqual([]);
+    });
   });
 
   test('keeps specialist background cortices independent from the pinned embodiment capsule', () => {

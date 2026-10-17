@@ -3752,19 +3752,50 @@ function buildCortexRequestBody({
   runId,
   conversationId = null,
   idempotencyKey = '',
+  activeMessageId = null,
+  attachments = [],
+  ownerId = '',
 } = {}) {
   const resolvedConversationId =
     String(conversationId || '').trim() ||
     String(requestBody?.conversationId || '').trim() ||
     String(runId || '').trim();
   const cortexRequestBody = { ...(requestBody || {}) };
+  // Reuse prepared current files; this body must not revert to the browser's thin references.
+  const preparedById = new Map(
+    (attachments || [])
+      .filter((file) => ownerId && String(file?.user || '') === String(ownerId))
+      .map((file) => [file.file_id, file]),
+  );
+  if (Array.isArray(cortexRequestBody.files)) {
+    cortexRequestBody.files = cortexRequestBody.files.map((file) => {
+      const prepared = file?.file_id && preparedById.get(file.file_id);
+      if (!prepared || (file.source && file.source !== prepared.source)) return file;
+      const hydrated = { ...file };
+      for (const field of [
+        'filename',
+        'source',
+        'context',
+        'type',
+        'bytes',
+        'width',
+        'height',
+        'text',
+      ]) {
+        if (hydrated[field] === undefined && prepared[field] !== undefined) {
+          hydrated[field] = prepared[field];
+        }
+      }
+      return hydrated;
+    });
+  }
   // Main owns this mutable carrier; cortices assemble their own time, memory and file context.
   delete cortexRequestBody.viventiumGlassHiveTurnContextB64;
   return {
     ...cortexRequestBody,
     messageId: runId,
     conversationId: resolvedConversationId,
-    parentMessageId: requestBody?.parentMessageId,
+    parentMessageId: String(activeMessageId || '').trim() || requestBody?.parentMessageId,
     viventiumGlassHiveIdempotencyKey: idempotencyKey,
   };
 }
@@ -4633,6 +4664,9 @@ async function runCortexAttempt(
       runId,
       conversationId,
       idempotencyKey: cortexIdempotencyKey,
+      activeMessageId,
+      attachments: initializedAgent.attachments,
+      ownerId: safeReq.user?.id || safeReq.user?._id,
     });
     cortexCancellationReq = harnessInvocationReq;
     cortexCancellationReq.body = cortexRequestBody;

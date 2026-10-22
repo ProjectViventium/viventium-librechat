@@ -2973,75 +2973,78 @@ async function renewGlassHiveCallbackDeliveryDispatch({
   });
   let renewedPermit = null;
   try {
-    await runGlassHiveTerminalCallbackTransaction(async (session) => {
-      const current = await ViventiumGlassHiveCallbackDelivery.findOne({
-        ...constraint,
-        dispatchPermitExpiresAt: { $gt: now },
-      })
-        .session(session)
-        .lean();
-      if (!current || !presentedDispatchPermitMatches(current, dispatchPermit)) {
-        throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
-      }
-      const question = nativeWorkInputPresentation(current);
-      if (question) {
-        if (!(await exactNativeInputPresentation(current, session)))
-          throw new Error('glasshive_callback_delivery_dispatch_fenced');
-        await fenceGlassHiveCallbackRunState({
-          binding: {
-            ownerId: current.userId,
-            originRef: current.originRef,
-            workRef: current.workRef,
-          },
-          body: { event: current.event, worker_id: current.workerId, run_id: current.runId },
-          effectSession: session,
-        });
-      }
-      const presentation =
-        plainWorkerCompletionPresentation(current) ||
-        (hasWorkerAttention(current) ? workerBindingPresentation(current) : null);
-      const leases = question
-        ? []
-        : presentation
-          ? workerCompletionEffectLeases(current)
-          : [dispatchPermitLease(current)];
-      if (
-        (presentation &&
-          (!(await exactCanonicalWorkerDelivery(current, session)) ||
-            !(await workerCompletionLeasesAreCurrent(current, leases, now, session)))) ||
-        !Array.isArray(leases) ||
-        leases.some((lease) => !lease)
-      ) {
-        throw new Error('glasshive_callback_delivery_dispatch_fenced');
-      }
-      for (const lease of leases) {
-        const renewed = await renewGlassHiveTerminalCallbackEffectLease({
-          ResultModel: GlassHiveTerminalCallbackResult,
-          lease,
-          now,
-          leaseDurationMs: durationMs,
-          session,
-        });
-        if (!renewed) throw new Error('glasshive_callback_delivery_dispatch_fenced');
-      }
-      const expiresAt = new Date(
-        question
-          ? Math.min(now.getTime() + durationMs, Date.parse(question.binding.expiresAt))
-          : now.getTime() + durationMs,
-      );
-      const row = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
-        {
+    await runGlassHiveTerminalCallbackTransaction(
+      async (session) => {
+        const current = await ViventiumGlassHiveCallbackDelivery.findOne({
           ...constraint,
-          dispatchPermitId: current.dispatchPermitId,
-          dispatchPermitGeneration: current.dispatchPermitGeneration,
           dispatchPermitExpiresAt: { $gt: now },
-        },
-        { $set: { dispatchPermitExpiresAt: expiresAt } },
-        { new: true, session },
-      ).lean();
-      if (!row) throw new Error('glasshive_callback_delivery_dispatch_claim_changed');
-      renewedPermit = toDispatchPermit(row);
-    }, { retry: 'native' });
+        })
+          .session(session)
+          .lean();
+        if (!current || !presentedDispatchPermitMatches(current, dispatchPermit)) {
+          throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
+        }
+        const question = nativeWorkInputPresentation(current);
+        if (question) {
+          if (!(await exactNativeInputPresentation(current, session)))
+            throw new Error('glasshive_callback_delivery_dispatch_fenced');
+          await fenceGlassHiveCallbackRunState({
+            binding: {
+              ownerId: current.userId,
+              originRef: current.originRef,
+              workRef: current.workRef,
+            },
+            body: { event: current.event, worker_id: current.workerId, run_id: current.runId },
+            effectSession: session,
+          });
+        }
+        const presentation =
+          plainWorkerCompletionPresentation(current) ||
+          (hasWorkerAttention(current) ? workerBindingPresentation(current) : null);
+        const leases = question
+          ? []
+          : presentation
+            ? workerCompletionEffectLeases(current)
+            : [dispatchPermitLease(current)];
+        if (
+          (presentation &&
+            (!(await exactCanonicalWorkerDelivery(current, session)) ||
+              !(await workerCompletionLeasesAreCurrent(current, leases, now, session)))) ||
+          !Array.isArray(leases) ||
+          leases.some((lease) => !lease)
+        ) {
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        }
+        for (const lease of leases) {
+          const renewed = await renewGlassHiveTerminalCallbackEffectLease({
+            ResultModel: GlassHiveTerminalCallbackResult,
+            lease,
+            now,
+            leaseDurationMs: durationMs,
+            session,
+          });
+          if (!renewed) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        }
+        const expiresAt = new Date(
+          question
+            ? Math.min(now.getTime() + durationMs, Date.parse(question.binding.expiresAt))
+            : now.getTime() + durationMs,
+        );
+        const row = await ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
+          {
+            ...constraint,
+            dispatchPermitId: current.dispatchPermitId,
+            dispatchPermitGeneration: current.dispatchPermitGeneration,
+            dispatchPermitExpiresAt: { $gt: now },
+          },
+          { $set: { dispatchPermitExpiresAt: expiresAt } },
+          { new: true, session },
+        ).lean();
+        if (!row) throw new Error('glasshive_callback_delivery_dispatch_claim_changed');
+        renewedPermit = toDispatchPermit(row);
+      },
+      { retry: 'native' },
+    );
   } catch (error) {
     if (
       [

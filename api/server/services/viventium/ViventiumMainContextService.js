@@ -1060,39 +1060,73 @@ function mainHistoryFitsNativeBody(
   }
 }
 
-function buildInheritedConversationContext({ conversationId, messages = [], sections = {}, messageChain = [], sourceSegments = [] }) {
+function buildInheritedConversationContext({
+  conversationId,
+  messages = [],
+  sections = {},
+  messageChain = [],
+  sourceSegments = [],
+}) {
   const chain = new Map(messageChain.map((row) => [String(row.id), row]));
-  const ordinalsFor = (id) => sourceSegments.flatMap((source, index) =>
-    String(source.source_message_id || '') === id ? [index + 1] : []);
-  return { version: 1, conversation_id: conversationId, sources: [
-    ...(Array.isArray(messages) ? messages : []).map((message, index) => {
-      const id = String(message.id || message.messageId || index);
-      const row = chain.get(id);
-      const sourceOrdinals = Array.isArray(row?.source_ordinals) ? row.source_ordinals : ordinalsFor(id);
-      return {
-        id: `message:${id}`,
-        role: String(message.role || message._getType?.() || (message.isCreatedByUser === false ? 'assistant' : 'user')),
-        text: messageContentText(message, true),
-        current_input: row?.current_input === true || sourceOrdinals.length > 0,
-        source_ordinals: sourceOrdinals,
-        ...(message.tool_calls?.length ? { tool_calls: canonical(message.tool_calls) } : {}),
-        ...(message.tool_call_id ? { tool_call_id: String(message.tool_call_id) } : {}),
-      };
-    }),
-    ...Object.entries(sections).flatMap(([key, value]) => typeof value === 'string' && value
-      ? [{ id: `context:${key}`, role: 'context', text: value,
-          current_input: key === 'currentFollowUp', source_ordinals: key === 'currentFollowUp' ? [1] : [] }] : []),
-  ] };
+  const ordinalsFor = (id) =>
+    sourceSegments.flatMap((source, index) =>
+      String(source.source_message_id || '') === id ? [index + 1] : [],
+    );
+  return {
+    version: 1,
+    conversation_id: conversationId,
+    sources: [
+      ...(Array.isArray(messages) ? messages : []).map((message, index) => {
+        const id = String(message.id || message.messageId || index);
+        const row = chain.get(id);
+        const sourceOrdinals = Array.isArray(row?.source_ordinals)
+          ? row.source_ordinals
+          : ordinalsFor(id);
+        return {
+          id: `message:${id}`,
+          role: String(
+            message.role ||
+              message._getType?.() ||
+              (message.isCreatedByUser === false ? 'assistant' : 'user'),
+          ),
+          text: messageContentText(message, true),
+          current_input: row?.current_input === true || sourceOrdinals.length > 0,
+          source_ordinals: sourceOrdinals,
+          ...(message.tool_calls?.length ? { tool_calls: canonical(message.tool_calls) } : {}),
+          ...(message.tool_call_id ? { tool_call_id: String(message.tool_call_id) } : {}),
+        };
+      }),
+      ...Object.entries(sections).flatMap(([key, value]) =>
+        typeof value === 'string' && value
+          ? [
+              {
+                id: `context:${key}`,
+                role: 'context',
+                text: value,
+                current_input: key === 'currentFollowUp',
+                source_ordinals: key === 'currentFollowUp' ? [1] : [],
+              },
+            ]
+          : [],
+      ),
+    ],
+  };
 }
 
 function assignInheritedConversationContext(context, sourceOrdinals = []) {
   if (!context || context.version !== 1 || !Array.isArray(context.sources)) return context;
   const selected = new Set(sourceOrdinals);
-  return { ...context, assigned_source_ordinals: [...selected], sources: context.sources.map((source) => ({
-    ...source,
-    assigned_input: source.current_input === true && Array.isArray(source.source_ordinals) &&
-      source.source_ordinals.some((ordinal) => selected.has(ordinal)),
-  })) };
+  return {
+    ...context,
+    assigned_source_ordinals: [...selected],
+    sources: context.sources.map((source) => ({
+      ...source,
+      assigned_input:
+        source.current_input === true &&
+        Array.isArray(source.source_ordinals) &&
+        source.source_ordinals.some((ordinal) => selected.has(ordinal)),
+    })),
+  };
 }
 
 function captureMainContextSnapshot(
@@ -1277,9 +1311,11 @@ function captureMainContextSnapshot(
     ...body,
     snapshotSha256: digest(body),
   };
-  const configuredModel = req.config?.endpoints?.agents?.providerCapabilities?.[agent?.endpoint || agent?.provider]?.models
-    ?.find((model) => model.id === (agent?.model || agent?.model_parameters?.model));
-  const inheritConversation = agent?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
+  const configuredModel = req.config?.endpoints?.agents?.providerCapabilities?.[
+    agent?.endpoint || agent?.provider
+  ]?.models?.find((model) => model.id === (agent?.model || agent?.model_parameters?.model));
+  const inheritConversation =
+    agent?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
     ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(configuredModel?.harnessProfile);
   /* === VIVENTIUM START ===
    * Feature: Exact local attempt replay.
@@ -1288,13 +1324,25 @@ function captureMainContextSnapshot(
    * never serialized into provider headers or an enumerable request field.
    * === VIVENTIUM END === */
   Object.defineProperty(snapshot, LOCAL_ATTEMPT_STATE, {
-    value: Object.freeze(canonical({
-      ...attemptState,
-      ...(inheritConversation ? { inheritedConversation: buildInheritedConversationContext({
-        conversationId, messages: selectedMessages, messageChain: chain, sourceSegments: interaction.source_segments || [],
-        sections: { mainContinuity: sections.mainContinuity, conversationContinuity: sections.conversationContinuity },
-      }) } : {}),
-    })),
+    value: Object.freeze(
+      canonical({
+        ...attemptState,
+        ...(inheritConversation
+          ? {
+              inheritedConversation: buildInheritedConversationContext({
+                conversationId,
+                messages: selectedMessages,
+                messageChain: chain,
+                sourceSegments: interaction.source_segments || [],
+                sections: {
+                  mainContinuity: sections.mainContinuity,
+                  conversationContinuity: sections.conversationContinuity,
+                },
+              }),
+            }
+          : {}),
+      }),
+    ),
     configurable: false,
     enumerable: false,
     writable: false,

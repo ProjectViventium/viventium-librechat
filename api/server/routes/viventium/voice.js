@@ -3923,18 +3923,31 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
     return;
   }
   if (!job) {
-    const terminal = await require('~/server/services/viventium/nativeResponseService')
-      .readRetainedHostFinal({ userId, streamId, surface: 'voice', callSessionId });
+    const terminal =
+      await require('~/server/services/viventium/nativeResponseService').readRetainedHostFinal({
+        userId,
+        streamId,
+        surface: 'voice',
+        callSessionId,
+      });
     if (requestAbort.signal.aborted) return;
     if (terminal) {
       let task;
       try {
-        task = await hydrateVoiceTaskByStreamId(streamId, { callSessionId, userId, requireDurable: true });
+        task = await hydrateVoiceTaskByStreamId(streamId, {
+          callSessionId,
+          userId,
+          requireDurable: true,
+        });
       } catch {
         return res.status(503).json({ code: 'gateway_down', retryable: true });
       }
       if (task) {
-        const suppressed = await isVoiceTaskSuppressedDurably(task.taskId, { callSessionId, userId, streamId });
+        const suppressed = await isVoiceTaskSuppressedDurably(task.taskId, {
+          callSessionId,
+          userId,
+          streamId,
+        });
         if (requestAbort.signal.aborted) return;
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache, no-transform');

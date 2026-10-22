@@ -60,7 +60,12 @@ const {
 } = require('./CortexInsightDeliveryService');
 const { settleOwnedCompletedCortexInsights } = require('./CortexInsightOutboxService');
 
-const { getTrustedInteractionContext, getTrustedDeliveryPolicy, getTrustedAdapterCapabilities, setTrustedInteractionContext } = require('./interactionContext');
+const {
+  getTrustedInteractionContext,
+  getTrustedDeliveryPolicy,
+  getTrustedAdapterCapabilities,
+  setTrustedInteractionContext,
+} = require('./interactionContext');
 const { getCortexFollowupGraceMs } = require('./cortexFollowupGrace');
 
 /* === VIVENTIUM START ===
@@ -2080,7 +2085,8 @@ async function resolveFollowUpLLMConfig({
     // builder has no eligible resources or cannot authorize this invocation.
     clearConversationProviderCapabilityBundle(resolvedAgent);
     const modelDefinition = followUpCapability?.models?.find((model) => model.id === resolvedModel);
-    const coordinationOnly = resolvedAgent.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
+    const coordinationOnly =
+      resolvedAgent.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
       ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(modelDefinition?.harnessProfile);
     let capabilityReq = req;
     let inheritedConversation;
@@ -2088,21 +2094,41 @@ async function resolveFollowUpLLMConfig({
       if (!inheritedContext?.prompt) throw new Error('coordination_context_unavailable');
       const { buildInheritedConversationContext } = require('./ViventiumMainContextService');
       const id = responseMessageId || runId || parentMessageId;
-      const source = { ordinal: 0, source_index: 0, source_event_id: id,
-        source_message_id: id, text: inheritedContext.prompt };
-      capabilityReq = Object.assign(Object.create(req), { body: { ...(req.body || {}),
-        text: inheritedContext.prompt, viventiumSourceEventId: id,
-        viventiumTriggeringSourceSegments: [source],
-      } });
-      setTrustedInteractionContext(capabilityReq, {
-        actor_kind: 'system', origin: 'callback', surface: getTrustedInteractionContext(req)?.surface || 'web',
-        conversation_id: conversationId || req.body?.conversationId || '', source_event_id: id,
-        source_segments: [source],
-      }, getTrustedAdapterCapabilities(req) || undefined, getTrustedDeliveryPolicy(req) || undefined);
+      const source = {
+        ordinal: 0,
+        source_index: 0,
+        source_event_id: id,
+        source_message_id: id,
+        text: inheritedContext.prompt,
+      };
+      capabilityReq = Object.assign(Object.create(req), {
+        body: {
+          ...(req.body || {}),
+          text: inheritedContext.prompt,
+          viventiumSourceEventId: id,
+          viventiumTriggeringSourceSegments: [source],
+        },
+      });
+      setTrustedInteractionContext(
+        capabilityReq,
+        {
+          actor_kind: 'system',
+          origin: 'callback',
+          surface: getTrustedInteractionContext(req)?.surface || 'web',
+          conversation_id: conversationId || req.body?.conversationId || '',
+          source_event_id: id,
+          source_segments: [source],
+        },
+        getTrustedAdapterCapabilities(req) || undefined,
+        getTrustedDeliveryPolicy(req) || undefined,
+      );
       inheritedConversation = buildInheritedConversationContext({
         conversationId: conversationId || req.body?.conversationId || '',
         messages: inheritedContext.messages,
-        sections: { conversationContinuity: inheritedContext.continuationContext, currentFollowUp: inheritedContext.prompt },
+        sections: {
+          conversationContinuity: inheritedContext.continuationContext,
+          currentFollowUp: inheritedContext.prompt,
+        },
       });
     }
     await attachConversationProviderCapabilityBundle({

@@ -4684,22 +4684,29 @@ describe('AgentClient - titleConvo', () => {
     it.each([
       { ranges: [] },
       { ranges: [{ start: 0, end: 20, disposition: { version: 1, audio: 'skip', valid: true } }] },
-      { ranges: [{ start: 0, end: 20, disposition: { version: 1, audio: 'eligible', valid: true } }] },
-    ])('keeps memory source stable when speech presentation ranges are removed (%j)', ({ ranges }) => {
-      const source = {
-        text: 'Exact source content',
-        content: [{ type: ContentTypes.TEXT, text: 'Exact source content' }],
-        metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
-      };
-      const projected = {
-        ...source,
-        content: [{ ...source.content[0], deliveryDispositionRanges: ranges }],
-      };
-      expect(AgentClient.memoryWriterSourceDigest(projected)).toBe(
-        AgentClient.memoryWriterSourceDigest(source),
-      );
-      expect(projected.content[0].deliveryDispositionRanges).toBe(ranges);
-    });
+      {
+        ranges: [
+          { start: 0, end: 20, disposition: { version: 1, audio: 'eligible', valid: true } },
+        ],
+      },
+    ])(
+      'keeps memory source stable when speech presentation ranges are removed (%j)',
+      ({ ranges }) => {
+        const source = {
+          text: 'Exact source content',
+          content: [{ type: ContentTypes.TEXT, text: 'Exact source content' }],
+          metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
+        };
+        const projected = {
+          ...source,
+          content: [{ ...source.content[0], deliveryDispositionRanges: ranges }],
+        };
+        expect(AgentClient.memoryWriterSourceDigest(projected)).toBe(
+          AgentClient.memoryWriterSourceDigest(source),
+        );
+        expect(projected.content[0].deliveryDispositionRanges).toBe(ranges);
+      },
+    );
 
     it.each(['text', 'tool_arguments', 'tool_output', 'tool_ranges', 'native_evidence'])(
       'keeps memory source changes protected when %s changes',
@@ -4708,9 +4715,14 @@ describe('AgentClient - titleConvo', () => {
           text: 'Exact source content',
           content: [
             { type: ContentTypes.TEXT, text: 'Exact source content' },
-            { type: ContentTypes.TOOL_CALL, tool_call: {
-              id: 'call-one', args: '{"target":"original"}', output: 'Original result',
-            } },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'call-one',
+                args: '{"target":"original"}',
+                output: 'Original result',
+              },
+            },
           ],
           metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
         };
@@ -4719,7 +4731,8 @@ describe('AgentClient - titleConvo', () => {
         if (change === 'tool_arguments') revised.content[1].tool_call.args = '{"target":"changed"}';
         if (change === 'tool_output') revised.content[1].tool_call.output = 'Different result';
         if (change === 'tool_ranges') revised.content[1].deliveryDispositionRanges = [];
-        if (change === 'native_evidence') revised.metadata.viventium.nativeToolEvidence.revision = 2;
+        if (change === 'native_evidence')
+          revised.metadata.viventium.nativeToolEvidence.revision = 2;
         expect(AgentClient.memoryWriterSourceDigest(revised)).not.toBe(
           AgentClient.memoryWriterSourceDigest(source),
         );

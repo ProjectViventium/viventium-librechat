@@ -547,9 +547,15 @@ async function buildCapabilityCatalog({
             ),
           }
         : declaredDefinition;
-    if (baseDefinition && resources?.request_body?.viventiumInheritedConversation?.version === 1 &&
-        isConversationOrchestrationMutationTool(toolName)) {
-      baseDefinition = { ...baseDefinition, inputSchema: inheritedWorkSchema(baseDefinition.inputSchema, resources.request_body) };
+    if (
+      baseDefinition &&
+      resources?.request_body?.viventiumInheritedConversation?.version === 1 &&
+      isConversationOrchestrationMutationTool(toolName)
+    ) {
+      baseDefinition = {
+        ...baseDefinition,
+        inputSchema: inheritedWorkSchema(baseDefinition.inputSchema, resources.request_body),
+      };
     }
     const definition =
       baseDefinition &&
@@ -1044,8 +1050,11 @@ async function invokeConversationDelegation({
     configurable: {
       user: catalog.user,
       requestBody,
-      glasshive_inherited_conversation: require('./ViventiumMainContextService').assignInheritedConversationContext(
-        baseRequestBody.viventiumInheritedConversation, selection.sourceOrdinals),
+      glasshive_inherited_conversation:
+        require('./ViventiumMainContextService').assignInheritedConversationContext(
+          baseRequestBody.viventiumInheritedConversation,
+          selection.sourceOrdinals,
+        ),
       glasshive_worker_memory: cleanBoundedString(resources.worker_memory, 200000),
       glasshive_worker_feelings: cleanBoundedString(resources.worker_feelings, 200000),
       glasshive_worker_feelings_enabled: resources.worker_feelings_enabled === true,
@@ -1347,13 +1356,14 @@ async function invokeConversationOrchestrationTool({
     }
     try {
       const requestBody = hostTool.resources.request_body;
-      const inheritedConversation = args.inheritContext === true &&
+      const inheritedConversation =
+        args.inheritContext === true &&
         ['queue', 'message', 'steer', 'retry'].includes(input.action)
-        ? require('./ViventiumMainContextService').assignInheritedConversationContext(
-            requestBody.viventiumInheritedConversation,
-            selectTrustedLaunchRequestBody(requestBody, args.sourceOrdinals).sourceOrdinals,
-          )
-        : undefined;
+          ? require('./ViventiumMainContextService').assignInheritedConversationContext(
+              requestBody.viventiumInheritedConversation,
+              selectTrustedLaunchRequestBody(requestBody, args.sourceOrdinals).sourceOrdinals,
+            )
+          : undefined;
       return await executeManagedSourceMutation({
         userId: catalog.user.id,
         requestBody,
@@ -1432,35 +1442,71 @@ function inheritedWorkSchema(schema, requestBody) {
   const selection = mainDelegationJsonSchema(requestBody);
   return {
     ...schema,
-    properties: { ...schema.properties, inheritContext: { type: 'boolean', enum: [true] },
-      sourceOrdinals: selection.properties.sourceOrdinals },
-    required: (schema.required || []).filter((name) => !['title', 'instruction', 'resourceClass'].includes(name)),
+    properties: {
+      ...schema.properties,
+      inheritContext: { type: 'boolean', enum: [true] },
+      sourceOrdinals: selection.properties.sourceOrdinals,
+    },
+    required: (schema.required || []).filter(
+      (name) => !['title', 'instruction', 'resourceClass'].includes(name),
+    ),
     anyOf: [{ required: ['inheritContext'] }, { required: schema.required || [] }],
   };
 }
 
 function inheritedWorkArguments(resources, args, start = false) {
   const body = resources?.request_body;
-  if (body?.viventiumInheritedConversation?.version !== 1) throw Object.assign(new Error('inherited_context_unavailable'), { code: 'inherited_context_unavailable' });
+  if (body?.viventiumInheritedConversation?.version !== 1)
+    throw Object.assign(new Error('inherited_context_unavailable'), {
+      code: 'inherited_context_unavailable',
+    });
   const selection = selectTrustedLaunchRequestBody(body, args.sourceOrdinals);
   if (selection.error) throw Object.assign(new Error(selection.error), { code: selection.error });
   const selected = selection.requestBody;
   const segments = selected.viventiumTriggeringSourceSegments;
   const texts = Array.isArray(segments)
-    ? segments.map((segment) => typeof segment.text === 'string' ? segment.text : '').filter(Boolean)
+    ? segments
+        .map((segment) => (typeof segment.text === 'string' ? segment.text : ''))
+        .filter(Boolean)
     : [];
-  const instruction = texts.length ? texts.join('\n\n') : String(selected.text || '') ||
-    (trustedUploadedFilesFromRequestBody(selected).length ? JSON.stringify({ source_segments: segments || [], files: trustedUploadedFilesFromRequestBody(selected) }) : '');
-  if (!instruction) throw Object.assign(new Error('current_task_source_unavailable'), { code: 'current_task_source_unavailable' });
-  return { ...args, instruction,
-    ...(start ? { title: instruction, resourceClass: 'standard' } : {}) };
+  const instruction = texts.length
+    ? texts.join('\n\n')
+    : String(selected.text || '') ||
+      (trustedUploadedFilesFromRequestBody(selected).length
+        ? JSON.stringify({
+            source_segments: segments || [],
+            files: trustedUploadedFilesFromRequestBody(selected),
+          })
+        : '');
+  if (!instruction)
+    throw Object.assign(new Error('current_task_source_unavailable'), {
+      code: 'current_task_source_unavailable',
+    });
+  return {
+    ...args,
+    instruction,
+    ...(start ? { title: instruction, resourceClass: 'standard' } : {}),
+  };
 }
 
 function inheritedSelectionFailure(error, tool) {
   const code = error?.code;
-  if (!['source_selection_required', 'invalid_source_selection', 'inherited_context_unavailable', 'current_task_source_unavailable'].includes(code)) return null;
-  return { status: 'blocked', reason: code, tool,
-    retryable: ['source_selection_required', 'invalid_source_selection'].includes(code), needsInput: false };
+  if (
+    ![
+      'source_selection_required',
+      'invalid_source_selection',
+      'inherited_context_unavailable',
+      'current_task_source_unavailable',
+    ].includes(code)
+  )
+    return null;
+  return {
+    status: 'blocked',
+    reason: code,
+    tool,
+    retryable: ['source_selection_required', 'invalid_source_selection'].includes(code),
+    needsInput: false,
+  };
 }
 
 async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationId, signal } = {}) {
@@ -1472,10 +1518,23 @@ async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationI
     return memoryBinding.invoke(grant, args);
   }
   if (isConversationOrchestrationTool(hostTool.toolName)) {
-    if (hostTool.toolName === 'active_work_action' && args.inheritContext === true &&
-        ['queue', 'message', 'steer', 'retry'].includes(args.action)) {
-      try { args = inheritedWorkArguments(hostTool.resources, args); }
-      catch (error) { return inheritedSelectionFailure(error, hostTool.toolName) || { status: 'blocked', reason: 'invalid_arguments', tool: hostTool.toolName, retryable: false }; }
+    if (
+      hostTool.toolName === 'active_work_action' &&
+      args.inheritContext === true &&
+      ['queue', 'message', 'steer', 'retry'].includes(args.action)
+    ) {
+      try {
+        args = inheritedWorkArguments(hostTool.resources, args);
+      } catch (error) {
+        return (
+          inheritedSelectionFailure(error, hostTool.toolName) || {
+            status: 'blocked',
+            reason: 'invalid_arguments',
+            tool: hostTool.toolName,
+            retryable: false,
+          }
+        );
+      }
     }
     return invokeConversationOrchestrationTool({
       grant,
@@ -1986,7 +2045,11 @@ async function handleToolCall({
       let canonicalMutationArgs;
       try {
         if (args.inheritContext === true) {
-          args = inheritedWorkArguments(hostTool.resources, args, toolName === DELEGATION_TOOL_NAME);
+          args = inheritedWorkArguments(
+            hostTool.resources,
+            args,
+            toolName === DELEGATION_TOOL_NAME,
+          );
         }
         canonicalMutationArgs = canonicalConversationOrchestrationArguments(toolName, args);
       } catch (error) {

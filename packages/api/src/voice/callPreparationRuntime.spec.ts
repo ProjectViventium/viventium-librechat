@@ -1,4 +1,4 @@
-import { createCallPreparationRuntime } from './callPreparationRuntime';
+import { createCallPreparationRuntime, isCurrentCallPreparationDispatch } from './callPreparationRuntime';
 import { createCallPreparationBinding } from './callPreparation';
 import type { CallPreparationRuntimeBridge } from './callPreparationRuntime';
 import type { CallPreparationSession } from './callPreparation';
@@ -161,6 +161,9 @@ describe('call preparation existing-owner wiring', () => {
     const init = jest.mocked(global.fetch).mock.calls[0][1]!;
     const body = JSON.parse(String(init.body));
     expect(body.deliveryChannels).toEqual(['librechat']);
+    expect(body.agentId).toBe('main-synthetic');
+    expect(body.callPreparation).toEqual({ callSessionId: 'call-synthetic' });
+    expect(body).not.toHaveProperty('scheduledAgentExecution');
     expect(body).not.toHaveProperty('voiceMode');
     expect(body).not.toHaveProperty('viventiumVoiceTaskId');
     expect(body).not.toHaveProperty('provider');
@@ -383,5 +386,45 @@ describe('call preparation existing-owner wiring', () => {
       '/scheduler/dispatches/call-context%3Acall-synthetic%3Av1',
     );
     expect(bridge.bindStream).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('current call preparation dispatch binding', () => {
+  const dispatchFor = (session: CallPreparationSession) => ({
+    callSessionId: session.callSessionId,
+    userId: session.userId,
+    conversationId: session.conversationId,
+    agentId: session.agentId,
+    idempotencyKey: session.contextPreparation!.idempotencyKey,
+    authoringDeadlineAt: session.contextPreparation!.deadlineAt,
+  });
+
+  it('accepts only the current bound preparation, including its exact idempotent retry', () => {
+    const session = initial();
+    expect(isCurrentCallPreparationDispatch(session, dispatchFor(session))).toBe(true);
+    session.contextPreparation!.streamId = 'same-accepted-stream';
+    expect(isCurrentCallPreparationDispatch(session, dispatchFor(session))).toBe(true);
+  });
+
+  it.each(['callSessionId', 'userId', 'conversationId', 'agentId', 'idempotencyKey', 'authoringDeadlineAt'] as const)(
+    'rejects a changed %s without execution authority', (field) => {
+      const session = initial();
+      expect(isCurrentCallPreparationDispatch(session, {
+        ...dispatchFor(session), [field]: 'different-synthetic',
+      })).toBe(false);
+    },
+  );
+
+  it('rejects ended, listen-only, released, expired and absent preparations', () => {
+    const session = initial();
+    const dispatch = dispatchFor(session);
+    expect(isCurrentCallPreparationDispatch(null, dispatch)).toBe(false);
+    expect(isCurrentCallPreparationDispatch({ ...session, status: 'ended' }, dispatch)).toBe(false);
+    expect(isCurrentCallPreparationDispatch({ ...session, mode: 'listen_only' }, dispatch)).toBe(false);
+    expect(isCurrentCallPreparationDispatch({ ...session, contextPreparation: undefined }, dispatch)).toBe(false);
+    expect(isCurrentCallPreparationDispatch(session, dispatch,
+      new Date(dispatch.authoringDeadlineAt).getTime())).toBe(false);
+    session.contextPreparation!.releasedStreamId = 'released-synthetic';
+    expect(isCurrentCallPreparationDispatch(session, dispatch)).toBe(false);
   });
 });

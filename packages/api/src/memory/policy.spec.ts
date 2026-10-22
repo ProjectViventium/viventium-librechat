@@ -14,6 +14,38 @@ jest.mock('~/utils', () => ({
 }));
 
 describe('memory policy', () => {
+  describe('draft retention during maintenance', () => {
+    it.each([
+      '- Launch review | in_progress: evidence ready. Next: review the draft.',
+      '- thread: launch_review | status: in_progress | source: https://example.org/evidence',
+      '- thread: launch_review | status: in_progress | last_worked: recently',
+      '- thread: launch_review\n  status: in_progress | owner: reviewer',
+      '- thread: launch_review\n  status: in_progress | started: recently',
+      '- thread: launch_review | status: in_progress\n_expires: 2026-10-31',
+      [
+        '- thread: launch_review | status: in_progress | last_worked: 2026-10-17',
+        '  summary: "Evidence ready."',
+        '  next: Review the draft.',
+        '  additional_source: Keep this exact supporting detail.',
+      ].join('\n'),
+      'Archived:\n- Earlier work in an unsupported archive format.',
+      [
+        'An existing free-form note that must survive.',
+        '- thread: launch_review | status: in_progress | last_worked: 2026-10-17',
+        '  summary: "Evidence ready."',
+        '  next: Review the draft.',
+      ].join('\n'),
+    ])('preserves a drafts value that cannot be fully parsed: %s', (value) => {
+      const plan = createMemoryMaintenancePlan({
+        memories: [{ key: 'drafts', value, tokenCount: value.length }],
+        policy: { tokenLimit: 1, maintenanceThresholdPercent: 80 },
+        now: new Date('2026-10-17T12:00:00.000Z'),
+      });
+
+      expect(plan.updates.find((entry) => entry.key === 'drafts')).toBeUndefined();
+    });
+  });
+
   describe('runMemoryMaintenance', () => {
     it('carries each snapshot revision into deterministic maintenance writes', async () => {
       const setMemory = jest.fn().mockResolvedValue({ ok: true, revision: 8 });

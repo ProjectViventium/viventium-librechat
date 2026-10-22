@@ -24,6 +24,7 @@ export * from './nativeMedia';
 export * from './callbackSanitizer';
 export * from './terminalCallbackTransaction';
 export * from './nativeResponse';
+export * from './foregroundAttention';
 export * from './nativeOutputFiles';
 export * from './nativeToolEvidence';
 export * from './nativeToolCatalog';

@@ -441,3 +441,10 @@ test.each(['active', 'history'] as const)('compact %s work retains delivery unce
     expect(item).not.toHaveProperty('updatedAt');
   }
 });
+
+
+test('coordination roster names match actual tools without changing full defaults', () => {
+  const input = { snapshot: { snapshot: 'fresh', work: [] }, preferredMode: 'parallel' as const, available: true };
+  expect(formatActiveWorkContext({ ...input, coordinationOnly: true })).toContain('"fullRosterTool":"list_workers"');
+  expect(formatActiveWorkContext(input)).toContain('"fullRosterTool":"active_work_list"');
+});

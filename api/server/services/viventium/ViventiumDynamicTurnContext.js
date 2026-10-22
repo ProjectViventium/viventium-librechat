@@ -159,6 +159,7 @@ function buildActiveWorkCapsule({
   snapshot,
   maxBytes = MAX_CAPSULE_BYTES,
   onRenderedRoster,
+  coordinationOnly = false,
 }) {
   const effectiveMode = mode === 'parallel' ? 'parallel' : 'focused';
   const parsedMaxBytes = Number(maxBytes);
@@ -189,7 +190,7 @@ function buildActiveWorkCapsule({
         work: work === null ? null : includedItems,
         overflowCount: Number.isInteger(snapshot?.overflowCount) ? snapshot.overflowCount : null,
         omittedVisibleWork: ordered.length - includedItems.length,
-        fullRosterTool: 'active_work_list',
+        fullRosterTool: coordinationOnly ? 'list_workers' : 'active_work_list',
       }),
       '</viventium_untrusted_active_work_data>',
     ].join('\n');
@@ -238,6 +239,7 @@ async function loadActiveWorkTurnContext({
   hasKnownWork,
   available,
   request,
+  agent,
   maxBytes,
   getUserByIdImpl = defaultGetUserById,
   hasKnownWorkImpl = defaultHasKnownWork,
@@ -295,7 +297,12 @@ async function loadActiveWorkTurnContext({
     mode !== 'parallel' && knownWork !== true
       ? { snapshot: 'unavailable', work: null, overflowCount: null }
       : await getActiveWorkSnapshotImpl({ ownerId });
+  const model = request?.config?.endpoints?.agents?.providerCapabilities?.[agent?.endpoint || agent?.provider]?.models
+    ?.find((item) => item.id === (agent?.model || agent?.model_parameters?.model));
+  const coordinationOnly = agent?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
+    ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(model?.harnessProfile);
   const projection = {
+    coordinationOnly,
     mode,
     requestedMode,
     available: effectiveAvailable,

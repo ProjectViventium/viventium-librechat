@@ -814,7 +814,7 @@ function fingerprintObjectiveValue(value: unknown): { bytes: number; sha256: str
   };
 }
 
-function delegationLaunchPayloadDigest(args: RuntimeRecord = {}): string {
+function delegationLaunchPayloadDigest(args: RuntimeRecord = {}, inheritedConversationJson?: string): string {
   const canonical = stableStringify({
     alias: normalizeText(args.alias),
     backend: normalizeText(args.backend),
@@ -825,6 +825,8 @@ function delegationLaunchPayloadDigest(args: RuntimeRecord = {}): string {
     expose_diagnostics: truthyFlag(args.expose_diagnostics),
     goal: normalizeText(args.goal, 100_000),
     instruction: normalizeText(args.instruction, 100_000),
+    ...(inheritedConversationJson ? { inherited_conversation_sha256: crypto.createHash('sha256')
+      .update(inheritedConversationJson, 'utf8').digest('hex') } : {}),
     owner_id: normalizeText(args.owner_id, 160),
     profile: normalizeText(args.profile, 160),
     project_id: normalizeText(args.project_id, 160),
@@ -1509,12 +1511,22 @@ function attachGlassHiveTrustedLaunchMetadata(
     // Registration already bounded these text-only segments before building the matching packet.
     // Re-normalizing without their separate file descriptors would drop file-only authored sources.
   const cleanBundle = stripMissionRoutingIdentity(bundle) as RuntimeRecord;
+  // Preserve trusted conversation data byte-for-byte on this signed hop. Re-serializing numbers
+  // or lone surrogates in another language must not invalidate an otherwise exact source.
+  // Historical tool arguments are data, not bootstrap routing/security authority.
+  if (bundle.inherited_conversation !== undefined) {
+    if (!bundle.inherited_conversation || typeof bundle.inherited_conversation !== 'object' ||
+        Array.isArray(bundle.inherited_conversation)) {
+      throw new Error('inherited_conversation_invalid');
+    }
+    cleanBundle.inherited_conversation = JSON.stringify(bundle.inherited_conversation);
+  }
   const packetBase = launchContext.delegationPacket || buildTrustedDelegationPacket(args, context);
   const trustedIdentity = {
     version: 2,
     idempotency_key: normalizeText(identity.idempotency_key, 64).toLowerCase(),
     goal_digest: normalizeText(identity.goal_digest, 64).toLowerCase(),
-    launch_payload_digest: delegationLaunchPayloadDigest(args),
+    launch_payload_digest: delegationLaunchPayloadDigest(args, cleanBundle.inherited_conversation),
     source_event_id: normalizeText(identity.source_event_id, 512),
     objective_ordinal: ordinal,
     call_identity_digest: callIdentityDigest,

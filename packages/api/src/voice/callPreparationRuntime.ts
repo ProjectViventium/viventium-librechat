@@ -65,6 +65,35 @@ export interface CallPreparationRuntimeBridge {
   ) => Promise<{ messageId: string } | null>;
 }
 
+interface CallPreparationDispatch {
+  callSessionId: string;
+  userId: string;
+  conversationId: string;
+  agentId: string;
+  idempotencyKey: string;
+  authoringDeadlineAt: string;
+}
+
+export function isCurrentCallPreparationDispatch(
+  session: CallPreparationSession | null,
+  dispatch: CallPreparationDispatch,
+  now = Date.now(),
+): boolean {
+  const binding = session?.contextPreparation;
+  return Boolean(
+    session && binding?.version === 1 &&
+    session.status !== 'ended' && session.mode !== 'listen_only' &&
+    session.callSessionId === dispatch.callSessionId &&
+    session.userId === dispatch.userId &&
+    session.conversationId === dispatch.conversationId &&
+    session.agentId === dispatch.agentId &&
+    binding.idempotencyKey === dispatch.idempotencyKey &&
+    binding.deadlineAt === dispatch.authoringDeadlineAt &&
+    new Date(binding.deadlineAt).getTime() > now &&
+    !binding.releasedStreamId,
+  );
+}
+
 export function createCallPreparationRuntime(bridge: CallPreparationRuntimeBridge) {
   const { calls, tasks } = bridge;
   // Retain the exact native stop receipt across bounded ingress retries.
@@ -307,7 +336,9 @@ export function createCallPreparationRuntime(bridge: CallPreparationRuntimeBridg
           },
           body: JSON.stringify({
             userId: session.userId,
+            agentId: session.agentId,
             conversationId: session.conversationId,
+            callPreparation: { callSessionId: session.callSessionId },
             text: bridge.getRequiredPromptText(binding.promptId),
             titleText: 'Conversation context',
             idempotencyKey: binding.idempotencyKey,

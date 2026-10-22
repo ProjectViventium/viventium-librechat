@@ -83,6 +83,7 @@ export interface IAgent extends Omit<Document, 'model'> {
     orchestration?: {
       parallel_available: boolean;
       default_mode: 'focused' | 'parallel';
+    tool_mode?: 'full' | 'coordination';
       worker_profile?: 'codex-cli' | 'claude-code' | 'grok-build' | 'openclaw-general';
       fallback_worker_profile?: 'codex-cli' | 'claude-code' | 'grok-build' | 'openclaw-general';
       worker_model?: string;

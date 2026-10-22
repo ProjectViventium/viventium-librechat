@@ -149,6 +149,7 @@ export interface InitializeAgentParams {
     orchestration?: {
       parallel_available: boolean;
       default_mode: 'focused' | 'parallel';
+    tool_mode?: 'full' | 'coordination';
       worker_profile?: string;
       fallback_worker_profile?: string;
     };

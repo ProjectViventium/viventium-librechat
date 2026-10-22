@@ -1893,3 +1893,57 @@ describe('Phase B invocation-fresh native declarations', () => {
   );
 });
 /* === VIVENTIUM END === */
+
+describe('Phase B thin Queen inherited source', () => {
+  test.each([['coordination', true], ['coordination', false], ['full', true]])('%s preserves callback source without replaying old input (trusted request %s)', async (toolMode, trusted) => {
+    const tools = ['worker_delegate_once_mcp_glasshive-workers-projects', 'active_work_list', 'active_work_action'];
+    const req = { user: { id: 'synthetic-owner' }, body: {
+      conversationId: 'synthetic-conversation', text: 'Earlier action. Do not replay.',
+      viventiumTriggeringSourceSegments: [{ ordinal: 0, text: 'Earlier action. Do not replay.' }],
+    }, config: { endpoints: { agents: { providerCapabilities: { 'glasshive-harness': {
+      workspace_binding: true, phase_b_followup: true, responses_api: false,
+      native_tools: true, host_tools_transport: 'broker_mcp', conversation_orchestration_tools: tools,
+      models: [{ id: 'direct-test', harnessProfile: 'direct-xai' }],
+    } } } } } };
+    if (trusted) setTrustedInteractionContext(req, { actor_kind: 'external_user', origin: 'interactive', surface: 'web',
+      conversation_id: 'synthetic-conversation', source_event_id: 'old-input' });
+    const originalBody = JSON.stringify(req.body);
+    const bootstrap = jest.spyOn(require('../GlassHiveCapabilityBootstrapService'), 'buildConversationProviderBootstrapBundle')
+      .mockResolvedValue({ glasshive_capability_broker: { grant_id: 'fresh-callback' } });
+    const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream: jest.fn().mockResolvedValue('Verified result.') });
+    require('~/models/Agent').getAgent.mockResolvedValue(null);
+    const prior = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-thin-callback';
+    try {
+      await generateFollowUpText({ req, agent: { id: 'synthetic-main', provider: 'glasshive-harness', model: 'direct-test', tools,
+        model_parameters: { model: 'direct-test' }, glasshive_options: { orchestration: {
+          parallel_available: true, tool_mode: toolMode,
+        } } }, conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent', runId: 'new-callback',
+        conversationMessages: [{ messageId: 'old-input', role: 'user', content: 'Earlier action. Do not replay.' }],
+        continuationContext: 'Exact retained conversation context.',
+        insightsData: { insights: [{ cortexName: 'Worker', insight: 'Verified new result.' }] },
+      });
+      expect(bootstrap).toHaveBeenCalledTimes(1);
+      const params = bootstrap.mock.calls[0][0];
+      const headers = run.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
+      if (toolMode === 'coordination') {
+        expect(params.conversationToolMode).toBe('coordination');
+        expect(params.inheritedConversation.sources[0].text).toBe('Earlier action. Do not replay.');
+        expect(params.requestBody.text).toContain('Verified new result.');
+        expect(params.requestBody.viventiumTriggeringSourceSegments).toEqual([
+          expect.objectContaining({ text: params.requestBody.text, source_event_id: 'new-callback' }),
+        ]);
+        expect(headers['X-Viventium-Actor-Kind']).toBe('system');
+        expect(headers['X-Viventium-Origin']).toBe('callback');
+      } else {
+        expect(params).not.toHaveProperty('inheritedConversation');
+        expect(params.requestBody.text).toBe('Earlier action. Do not replay.');
+      }
+      expect(JSON.stringify(req.body)).toBe(originalBody);
+    } finally {
+      bootstrap.mockRestore(); run.mockRestore();
+      if (prior === undefined) delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = prior;
+    }
+  });
+});

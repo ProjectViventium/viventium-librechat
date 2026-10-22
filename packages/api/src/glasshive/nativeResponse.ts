@@ -52,7 +52,7 @@ function nativeAnswerDigest(row: { text?: unknown; content?: unknown }): string 
   return nativeResponseDigest({ text: row.text, content });
 }
 type Transaction = <T>(operation: () => Promise<T>) => Promise<T>;
-type NativeResult = {
+export type NativeResult = {
   version: number;
   object: string;
   state: string;
@@ -67,6 +67,11 @@ type NativeResult = {
   run_id: string;
   graph_tool_evidence?: unknown;
   failure_class?: string;
+  foreground_attention_control?: {
+    version: 1;
+    can_cancel: boolean;
+    capacity_released: boolean;
+  };
   response?: {
     id: string;
     object: string;

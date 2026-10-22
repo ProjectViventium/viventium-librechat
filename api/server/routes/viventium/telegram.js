@@ -2292,6 +2292,52 @@ function setTelegramOrchestrationNoStore(res) {
   res.setHeader('Pragma', 'no-cache');
 }
 
+/* Exact foreground control uses the saved native response, never a mission work reference. */
+function foregroundAttentionScope(req) {
+  const identity = extractTelegramIdentity(req);
+  const threadId = normalizeTelegramThreadId(req.query?.telegramMessageThreadId);
+  return {
+    ownerId: String(req.user?.id || ''),
+    conversationId: String(req.query?.conversationId || ''),
+    responseMessageId: String(req.params?.responseMessageId || ''),
+    sourceOrderScope:
+      threadId === null
+        ? ''
+        : buildTelegramSourceOrderScope({
+            librechat_owner_id: req.user?.id,
+            telegram_user_id: identity.telegramUserId,
+            telegram_chat_id: identity.telegramChatId,
+            message_thread_id: threadId,
+            source_domain: 'telegram-interactive-v1',
+          }),
+  };
+}
+router.get('/foreground/:responseMessageId/attention', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  try {
+    const control =
+      require('~/server/services/viventium/nativeResponseService').getForegroundAttentionControl();
+    return res.json(await control.attention(foregroundAttentionScope(req)));
+  } catch (_error) {
+    return res.status(409).json({ error: 'foreground_attention_unavailable' });
+  }
+});
+router.post('/foreground/:responseMessageId/cancel', telegramAuth, async (req, res) => {
+  setTelegramOrchestrationNoStore(res);
+  try {
+    const control =
+      require('~/server/services/viventium/nativeResponseService').getForegroundAttentionControl();
+    return res.json(
+      await control.cancel(foregroundAttentionScope(req), {
+        receipt: req.body?.receipt,
+        operationId: req.body?.operationId,
+      }),
+    );
+  } catch (_error) {
+    return res.status(409).json({ error: 'foreground_attention_unavailable' });
+  }
+});
+
 router.get('/orchestration', telegramAuth, async (req, res) => {
   setTelegramOrchestrationNoStore(res);
   observeOrchestrationOwner(String(req.user.id));

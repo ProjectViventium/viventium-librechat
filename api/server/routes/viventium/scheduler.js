@@ -14,7 +14,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const { GenerationJobManager } = require('@librechat/api');
+const { GenerationJobManager, isCurrentCallPreparationDispatch } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
 const {
@@ -31,7 +31,8 @@ const { Message, Conversation } = require('~/db/models');
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
 const { resolveTelegramMappingByUserId } = require('~/server/services/TelegramLinkService');
-const { resolveUserVoiceRoute } = require('~/server/services/viventium/CallSessionService');
+const { resolveUserVoiceRoute, getCallSession } = require('~/server/services/viventium/CallSessionService');
+const { normalizeScheduledAgentExecution } = require('~/server/services/viventium/scheduledAgentOverride');
 /* === VIVENTIUM NOTE ===
  * Feature: Sidebar parity for gateway-created conversations (title + icon).
  * Purpose: Match web UI behavior for new conversations created via scheduler gateway.
@@ -162,8 +163,7 @@ const SCHEDULER_PUBLIC_FAILURES = Object.freeze({
   provider_response_deadline_exceeded: 'The model provider response exceeded its deadline.',
   provider_temporarily_unavailable: 'The model provider is temporarily unavailable.',
   conversation_session_authority_conflict: 'The conversation is busy with an active response.',
-  source_context_unavailable:
-    'The conversation context could not be preserved. Please retry this turn.',
+  source_context_unavailable: 'The conversation context could not be preserved. Please retry this turn.',
   completion_error: 'The scheduled model response could not be completed.',
 });
 
@@ -551,17 +551,13 @@ router.post(
     delete sanitizedIncoming.externalWorkRequired;
     delete sanitizedIncoming.titleText;
     delete sanitizedIncoming.authoringDeadlineAt;
+    delete sanitizedIncoming.callPreparation;
     if (incoming.authoringDeadlineAt != null) {
       const deadline = new Date(incoming.authoringDeadlineAt).getTime();
-      if (
-        typeof incoming.authoringDeadlineAt !== 'string' ||
-        !Number.isFinite(deadline) ||
-        deadline <= Date.now()
-      ) {
-        return _res.status(400).json({
-          error: 'A future authoring deadline is required',
-          reason: 'invalid_authoring_deadline',
-        });
+      if (typeof incoming.authoringDeadlineAt !== 'string' || !Number.isFinite(deadline) ||
+          deadline <= Date.now()) {
+        return _res.status(400).json({ error: 'A future authoring deadline is required',
+          reason: 'invalid_authoring_deadline' });
       }
       req.viventiumSchedulerAuthoringDeadlineAt = new Date(deadline).toISOString();
     }
@@ -617,6 +613,7 @@ router.post(
     const requestedConversationId =
       typeof incoming.conversationId === 'string' ? incoming.conversationId : 'new';
     let requestedAgentId = '';
+    let verifiedPreparationAgentId = '';
     if (typeof incoming.agentId === 'string') {
       requestedAgentId = incoming.agentId;
     } else if (typeof incoming.agent_id === 'string') {
@@ -635,6 +632,47 @@ router.post(
     const existingDispatch = dispatchDocumentId
       ? await schedulerDispatchCollection().findOne({ _id: dispatchDocumentId })
       : null;
+    /* === VIVENTIUM START === Bind operator preparation policy to the current exact call. === */
+    if (incoming.callPreparation != null) {
+      const callSessionId = incoming.callPreparation?.callSessionId;
+      const session = typeof callSessionId === 'string' ? await getCallSession(callSessionId) : null;
+      // A new conversation can materialize after this exact stream was accepted. Reuse
+      // only that bound accepted stream; this never grants a second execution.
+      const acceptedPreparationRetry = requestedConversationId === 'new' &&
+        existingDispatch?.status === 'accepted' &&
+        existingDispatch.streamId === session?.contextPreparation?.streamId &&
+        existingDispatch.conversationId === session?.conversationId;
+      const current = isCurrentCallPreparationDispatch(session, {
+        callSessionId,
+        userId: String(req.user?.id || ''),
+        conversationId: acceptedPreparationRetry ? existingDispatch.conversationId : requestedConversationId,
+        agentId: requestedAgentId || session?.agentId || '',
+        idempotencyKey,
+        authoringDeadlineAt: req.viventiumSchedulerAuthoringDeadlineAt || '',
+      });
+      if (!current) {
+        return _res.status(403).json({
+          error: 'The call preparation binding is no longer current',
+          reason: 'invalid_call_preparation_binding',
+        });
+      }
+      verifiedPreparationAgentId = session.agentId;
+      const policy = process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_EXECUTION;
+      if (policy) {
+        try {
+          req.viventiumScheduledAgentExecution = normalizeScheduledAgentExecution(
+            JSON.parse(policy), req.config?.endpoints?.agents || {},
+          );
+          if (!req.viventiumScheduledAgentExecution) throw new Error('Missing preparation policy');
+        } catch {
+          return _res.status(400).json({
+            error: 'The configured call preparation route is unavailable',
+            reason: 'invalid_call_preparation_execution',
+          });
+        }
+      }
+    }
+    /* === VIVENTIUM END === */
     if (existingDispatch?.streamId) {
       const existingJob =
         existingDispatch.status === 'accepted'
@@ -734,7 +772,7 @@ router.post(
       { commit_authority: 'server' },
     );
 
-    const agentId = await resolveAgentId({
+    const agentId = verifiedPreparationAgentId || await resolveAgentId({
       req,
       conversationId,
       requestedAgentId,
@@ -893,12 +931,8 @@ router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
   }
 
   if (releaseUnconfirmed) {
-    return res.status(202).json({
-      success: false,
-      cancelled: streamId,
-      reason: 'release_unconfirmed',
-      capacityReleased: false,
-    });
+    return res.status(202).json({ success: false, cancelled: streamId,
+      reason: 'release_unconfirmed', capacityReleased: false });
   }
   return res.json({ success: true, cancelled: streamId });
 });
@@ -932,10 +966,7 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       try {
         voiceRoute = await resolveUserVoiceRoute(userId, { includeSources: true });
       } catch (err) {
-        logger.warn(
-          '[VIVENTIUM][scheduler/telegram] Speaking route unavailable',
-          schedulerSafeFailure(err),
-        );
+        logger.warn('[VIVENTIUM][scheduler/telegram] Speaking route unavailable', schedulerSafeFailure(err));
         speechUnavailable = 'voice_route_unavailable';
       }
     }
@@ -955,9 +986,7 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       '[VIVENTIUM][scheduler/telegram] Failed to resolve mapping',
       schedulerSafeFailure(err),
     );
-    return res
-      .status(500)
-      .json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
+    return res.status(500).json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
   }
 });
 
@@ -1072,11 +1101,7 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
     },
     (error, errorClass) => {
       if (!res.writableEnded) {
-        writeSseEvent(
-          res,
-          'error',
-          schedulerSafeFailure(errorClass ? { code: errorClass } : error),
-        );
+        writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
         endStream();
       }
     },
@@ -1255,11 +1280,7 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
       },
       (error, errorClass) => {
         if (!res.writableEnded) {
-          writeSseEvent(
-            res,
-            'error',
-            schedulerSafeFailure(errorClass ? { code: errorClass } : error),
-          );
+          writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
           res.end();
         }
       },

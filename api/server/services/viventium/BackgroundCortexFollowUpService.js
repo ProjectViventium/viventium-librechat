@@ -60,7 +60,7 @@ const {
 } = require('./CortexInsightDeliveryService');
 const { settleOwnedCompletedCortexInsights } = require('./CortexInsightOutboxService');
 
-const { getTrustedInteractionContext, getTrustedDeliveryPolicy } = require('./interactionContext');
+const { getTrustedInteractionContext, getTrustedDeliveryPolicy, getTrustedAdapterCapabilities, setTrustedInteractionContext } = require('./interactionContext');
 const { getCortexFollowupGraceMs } = require('./cortexFollowupGrace');
 
 /* === VIVENTIUM START ===
@@ -1886,6 +1886,7 @@ async function resolveFollowUpLLMConfig({
   conversationId = '',
   parentMessageId = '',
   responseMessageId = '',
+  inheritedContext,
 }) {
   const capabilityRequiredProviders =
     req?.config?.endpoints?.agents?.capabilityRequiredProviders || [];
@@ -2078,13 +2079,40 @@ async function resolveFollowUpLLMConfig({
     // A follow-up owns its capability. Never inherit Main's signed grant when the fresh
     // builder has no eligible resources or cannot authorize this invocation.
     clearConversationProviderCapabilityBundle(resolvedAgent);
+    const modelDefinition = followUpCapability?.models?.find((model) => model.id === resolvedModel);
+    const coordinationOnly = resolvedAgent.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
+      ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(modelDefinition?.harnessProfile);
+    let capabilityReq = req;
+    let inheritedConversation;
+    if (coordinationOnly) {
+      if (!inheritedContext?.prompt) throw new Error('coordination_context_unavailable');
+      const { buildInheritedConversationContext } = require('./ViventiumMainContextService');
+      const id = responseMessageId || runId || parentMessageId;
+      const source = { ordinal: 0, source_index: 0, source_event_id: id,
+        source_message_id: id, text: inheritedContext.prompt };
+      capabilityReq = Object.assign(Object.create(req), { body: { ...(req.body || {}),
+        text: inheritedContext.prompt, viventiumSourceEventId: id,
+        viventiumTriggeringSourceSegments: [source],
+      } });
+      setTrustedInteractionContext(capabilityReq, {
+        actor_kind: 'system', origin: 'callback', surface: getTrustedInteractionContext(req)?.surface || 'web',
+        conversation_id: conversationId || req.body?.conversationId || '', source_event_id: id,
+        source_segments: [source],
+      }, getTrustedAdapterCapabilities(req) || undefined, getTrustedDeliveryPolicy(req) || undefined);
+      inheritedConversation = buildInheritedConversationContext({
+        conversationId: conversationId || req.body?.conversationId || '',
+        messages: inheritedContext.messages,
+        sections: { conversationContinuity: inheritedContext.continuationContext, currentFollowUp: inheritedContext.prompt },
+      });
+    }
     await attachConversationProviderCapabilityBundle({
       targetAgent: resolvedAgent,
       declaredAgent: resolvedAgent,
-      req,
+      req: capabilityReq,
+      inheritedConversation,
       capability: followUpCapability,
       requestBody: {
-        ...(req.body || {}),
+        ...(capabilityReq.body || {}),
         conversationId: conversationId || req.body?.conversationId || '',
         parentMessageId: parentMessageId || req.body?.parentMessageId || '',
         messageId: responseMessageId || parentMessageId || req.body?.messageId || '',
@@ -3023,6 +3051,7 @@ async function generateFollowUpText({
   recentResponse = '',
   userRequest = '',
   continuationContext = '',
+  conversationMessages = [],
   runId = '',
   primaryResponseMode = false,
   conversationId = '',
@@ -3110,6 +3139,7 @@ async function generateFollowUpText({
     conversationId,
     parentMessageId,
     responseMessageId: nativeAuthor?.messageId,
+    inheritedContext: { prompt, messages: conversationMessages, continuationContext },
   });
   if (!llmConfig?.provider) {
     throw new Error(
@@ -3550,6 +3580,7 @@ async function prepareCortexFollowUpMessage({
         recentResponse: followUpRecentResponse,
         userRequest,
         continuationContext: continuationContext.contextText,
+        conversationMessages,
         runId: runId || parentMessageId || conversationId || '',
         primaryResponseMode: shouldForceVisibleFollowUp,
         conversationId,

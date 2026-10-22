@@ -858,8 +858,11 @@ function tomlString(value) {
 
 function brokerContextBrief(
   allowedServers,
-  { contentReadScope = false, deferredServers = [], allowedHostTools = [] } = {},
+  { contentReadScope = false, deferredServers = [], allowedHostTools = [], conversationToolMode = 'full' } = {},
 ) {
+  if (conversationToolMode === 'coordination') {
+    return 'Declared conversation tools: hand_off_to, list_workers. Their contracts own action work and current worker state. Other authorized capabilities belong to the configured workers.';
+  }
   const serverList = allowedServers.length ? allowedServers.join(', ') : 'none';
   const deferredServerList = deferredServers.length ? deferredServers.join(', ') : 'none';
   const hostToolList = allowedHostTools.length ? allowedHostTools.join(', ') : 'none';
@@ -1061,6 +1064,7 @@ function mergeBrokerBundle({
   contentReadScope = false,
   workerMemory = '',
   workerFeelings = '',
+  conversationToolMode = 'full',
 }) {
   const bundle = mergeWorkerContextBundle({ existingBundle, workerMemory, workerFeelings });
   const codexTokenEnvVar = 'GLASSHIVE_CAPABILITY_BROKER_TOKEN';
@@ -1111,6 +1115,7 @@ function mergeBrokerBundle({
     contentReadScope,
     deferredServers,
     allowedHostTools,
+    conversationToolMode,
   });
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
@@ -1320,6 +1325,10 @@ async function maybeInjectGlassHiveCapabilityBroker({
       ...workerFeelingRangeTelemetry,
       reason,
     });
+    const inheritedConversation = config?.configurable?.glasshive_inherited_conversation;
+    if (inheritedConversation) {
+      args.bootstrap_bundle_json.inherited_conversation = inheritedConversation;
+    }
     const trustedLaunchArgs = attachGlassHiveTrustedLaunchMetadata(
       args,
       launchContext,
@@ -1514,6 +1523,8 @@ async function buildConversationProviderBootstrapBundle({
   fallbackWorkerReasoningEffort = '',
   workerMemory = '',
   workerFeelings = '',
+  conversationToolMode = 'full',
+  inheritedConversation,
   workerFeelingsEnabled = false,
   workerFeelingsHash = '',
   workerFeelingsScope = 'unknown',
@@ -1556,6 +1567,11 @@ async function buildConversationProviderBootstrapBundle({
   // can make one normal file-search context disable every capability at the cache bound.
   const orchestrationRequestBody = { ...requestBody };
   delete orchestrationRequestBody.tool_resources;
+  if (conversationToolMode === 'coordination') {
+    if (inheritedConversation?.version !== 1 ||
+        inheritedConversation.conversation_id !== requestBody.conversationId ||
+        !Array.isArray(inheritedConversation.sources)) throw new Error('coordination_context_unavailable');
+  }
   const delegationResources = normalizedConversationOrchestrationTools.includes(
     DELEGATION_TOOL_NAME,
   )
@@ -1658,9 +1674,9 @@ async function buildConversationProviderBootstrapBundle({
     return declaredServers.has(serverName) || declaredDeferredServers.has(serverName);
   });
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
-  const eagerServers = allowedServers.filter((serverName) => declaredServers.has(serverName));
+  const eagerServers = conversationToolMode === 'coordination' ? [] : allowedServers.filter((serverName) => declaredServers.has(serverName));
   const deferredServers = allowedServers.filter(
-    (serverName) => !declaredServers.has(serverName) && declaredDeferredServers.has(serverName),
+    (serverName) => conversationToolMode === 'coordination' || (!declaredServers.has(serverName) && declaredDeferredServers.has(serverName)),
   );
   if (allowedServers.length === 0 && allProviderHostTools.length === 0) {
     return degradedConversationCapabilityBundle('no_reviewed_capabilities');
@@ -1678,6 +1694,7 @@ async function buildConversationProviderBootstrapBundle({
       ...(Object.keys(orchestrationResources).length > 0
         ? { conversationRequestBody: orchestrationRequestBody }
         : {}),
+      ...(conversationToolMode === 'coordination' ? { inheritedConversation } : {}),
       authorityKind:
         normalizedConversationOrchestrationTools.length > 0
           ? BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
@@ -1716,6 +1733,11 @@ async function buildConversationProviderBootstrapBundle({
     logger.info(
       JSON.stringify({
         event: 'glasshive_broker_grant_created',
+        ...(conversationToolMode === 'coordination' ? {
+          conversationToolMode,
+          inheritedContextSourceCount: inheritedConversation.sources.length,
+          inheritedContextSha256: crypto.createHash('sha256').update(JSON.stringify(inheritedConversation)).digest('hex'),
+        } : {}),
         grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
         message_id_sha256: scopeHash(mintedGrant.payload.message_id),
         conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
@@ -1734,7 +1756,9 @@ async function buildConversationProviderBootstrapBundle({
     deferredServers,
     allowedHostTools: allProviderHostTools,
     contentReadScope,
+    conversationToolMode,
   });
+  if (conversationToolMode === 'coordination') bundle.conversation_tool_mode = 'coordination';
   /* === VIVENTIUM START === Reuse the current authorized MCP catalog as bounded factual data. === */
   const catalogStartedAt = Date.now();
   try {

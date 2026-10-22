@@ -34,13 +34,18 @@ interface ContextUser {
 
 interface ContextRequest {
   user?: ContextUser;
+  config?: { endpoints?: { agents?: { providerCapabilities?: Record<string, { models?: Array<{ id: string; harnessProfile?: string }> }> } } };
   _viventiumParallelWorkTurnAvailable?: boolean;
   _viventiumParallelWorkTurnReadiness?: { status?: string; reason?: string };
   _viventiumActiveWorkContext?: { scope: string; promise: Promise<WorkSnapshot | null> };
 }
 
 interface ContextAgent {
-  glasshive_options?: { orchestration?: { parallel_available?: boolean } };
+  provider?: string;
+  endpoint?: string;
+  model?: string;
+  model_parameters?: { model?: string };
+  glasshive_options?: { orchestration?: { parallel_available?: boolean; tool_mode?: 'full' | 'coordination' } };
 }
 
 interface ContextDependencies {
@@ -175,7 +180,9 @@ export function formatActiveWorkContext({
   preferredMode,
   available,
   readiness,
+  coordinationOnly = false,
 }: {
+  coordinationOnly?: boolean;
   snapshot: WorkSnapshot;
   preferredMode: 'parallel' | 'focused';
   available: boolean;
@@ -209,7 +216,7 @@ export function formatActiveWorkContext({
     work: rows ? work : null,
     overflowCount: snapshot.overflowCount ?? null,
     omittedVisibleWork: 0,
-    fullRosterTool: 'active_work_list',
+    fullRosterTool: coordinationOnly ? 'list_workers' : 'active_work_list',
   };
   const mode = available ? preferredMode : 'focused';
   const render = () => `# Parallel work\nMode: ${mode}\n${JSON.stringify(facts)}`;
@@ -275,7 +282,12 @@ export function createActiveWorkContextService(dependencies: ContextDependencies
     const expectedScope = scope(req);
     const snapshot = await startActiveWorkContext(req, agent);
     if (!snapshot) return '';
+    const model = req.config?.endpoints?.agents?.providerCapabilities?.[agent.endpoint || agent.provider || '']?.models
+      ?.find((item) => item.id === (agent.model || agent.model_parameters?.model));
+    const coordinationOnly = agent.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
+      ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(model?.harnessProfile || '');
     return formatActiveWorkContext({
+      coordinationOnly,
       snapshot: scope(req) === expectedScope ? snapshot : unavailable(),
       preferredMode: dependencies.preferredMode(req.user),
       available: req._viventiumParallelWorkTurnAvailable === true,

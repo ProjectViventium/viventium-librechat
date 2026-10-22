@@ -303,7 +303,7 @@ function sourceSelectionTurnContext(req, replaysPinnedMainContext = false) {
   return replaysPinnedMainContext ? '' : buildSourceSelectionCapsule(req);
 }
 
-function startActiveWorkTurnContext(req) {
+function startActiveWorkTurnContext(req, agent) {
   if (!req || typeof req !== 'object') return Promise.resolve('');
   if (req._viventiumActiveWorkTurnContextPromise) {
     return req._viventiumActiveWorkTurnContextPromise;
@@ -319,6 +319,7 @@ function startActiveWorkTurnContext(req) {
           ? req._viventiumParallelWorkTurnAvailable
           : undefined,
       request: req,
+      agent,
       maxBytes: activeWorkTurnContextByteBudget(req),
     });
   } catch (error) {
@@ -678,9 +679,14 @@ const MEMORY_WRITER_VISIBLE_REASONS = new Set(['auth', 'quota']);
 const MEMORY_WRITER_VISIBLE_TRANSITION = Symbol('memory_writer_visible_transition');
 
 function memoryWriterSourceDigest(message) {
-  const content = (Array.isArray(message?.content) ? message.content : []).filter(
-    (part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL,
-  );
+  // Speech ranges are presentation metadata; late projection must not revoke unchanged memory input.
+  const content = (Array.isArray(message?.content) ? message.content : [])
+    .filter((part) => part?.type === ContentTypes.TEXT || part?.type === ContentTypes.TOOL_CALL)
+    .map((part) => {
+      if (part.type !== ContentTypes.TEXT) return part;
+      const { deliveryDispositionRanges: _speechPresentation, ...source } = part;
+      return source;
+    });
   return crypto
     .createHash('sha256')
     .update(
@@ -1017,7 +1023,7 @@ const {
   createRuntimeHoldTextPart,
   isRuntimeHoldTextPart,
 } = require('~/server/services/viventium/runtimeHoldText');
-const { getPromptText } = require('~/server/services/viventium/promptRegistry');
+const { getRequiredPromptText } = require('~/server/services/viventium/promptRegistry');
 const {
   isVoiceTaskSuppressed,
   isVoiceTaskSuppressedDurably,
@@ -1944,28 +1950,6 @@ function formatActivationSummary(activatedCortices) {
  * instruction contract stable so the main answer does not contradict backend-owned cards/results.
  * === VIVENTIUM END === */
 const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_PROMPT_ID = 'main.background_cortex_runtime_card_guard';
-const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_FALLBACK = [
-  '# Runtime-Owned Background Cards',
-  'Runtime may display background-cortex status/result cards outside your text.',
-  'Do not claim you cannot control those cards, do not say there is nothing to show, and do not narrate UI mechanics.',
-  'A background-cortex card is not a durable mission receipt and never proves that user-requested background work started.',
-  '',
-  'When the user asks for a durable background mission, use the exact delegation tool for that mission. Only acknowledge durable background work after its delegation tool returns a work receipt. Without that receipt, do not say the mission started, is underway, or will report back.',
-  'A request to run multiple independent objectives concurrently or in parallel while Main remains available counts as a durable background mission, even when the user does not say Worker or background.',
-  'For multiple independent delegated objectives, invoke one mission per objective; never combine sibling deliverables into one launch.',
-  'Main opening delivered artifacts after callbacks is presentation work, not Worker host access. Set `requiresHostAccess` only when the Worker itself must use the live host session during execution.',
-  'A blocked objective does not cancel or block independent work. Continue other permitted launches when the returned blocker does not apply to them; report which result or prerequisite is still missing.',
-  'Never claim that Workers finished or that artifacts, downloads, files, or browser windows exist or opened without current-turn delivery evidence for those exact results.',
-  '',
-  'A cortex insight may inform your answer, but it is not a substitute for a requested durable mission. This rule supersedes earlier background-card guidance.',
-  'Do not say a specific background agent/cortex ran, is running, activated, completed, or checked the issue unless it appears in the current turn\'s "Activated Background Agents" runtime section. If the user asked for a named background agent that is not listed there, do not claim it ran; answer the substantive request and let visible runtime cards provide the proof.',
-  'Do not tell the user that background cortices will check Gmail, Outlook, MS365, Google Workspace, the web, or any live connector. For live data, use verified current-run tool evidence, a brokered worker, or state the limitation plainly.',
-  "Answer the user's substantive request and let runtime-owned cards speak for themselves.",
-].join('\n');
-
-const BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_MARKER =
-  'A background-cortex card is not a durable mission receipt';
-
 function ensureBackgroundCortexRuntimeCardGuard(agent) {
   if (!agent || typeof agent !== 'object') {
     return false;
@@ -1974,16 +1958,27 @@ function ensureBackgroundCortexRuntimeCardGuard(agent) {
     return false;
   }
   const instructions = typeof agent.instructions === 'string' ? agent.instructions : '';
-  if (instructions.includes(BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_MARKER)) {
+  const runtimeCardGuard = getRequiredPromptText(BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_PROMPT_ID);
+  if (instructions.includes(runtimeCardGuard)) {
     return false;
   }
-  const runtimeCardGuard = getPromptText(
-    BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_PROMPT_ID,
-    BACKGROUND_CORTEX_RUNTIME_CARD_GUARD_FALLBACK,
-  );
-  agent.instructions = [instructions, runtimeCardGuard]
-    .filter((part) => typeof part === 'string' && part.trim().length > 0)
-    .join('\n\n');
+  // The source-owned heading and closing line bound the legacy appended section.
+  const guardLines = runtimeCardGuard.split('\n');
+  const heading = guardLines[0];
+  const closing = guardLines[guardLines.length - 1];
+  const start = instructions.indexOf(`${heading}\n`);
+  const closingStart = start < 0 ? -1 : instructions.indexOf(closing, start + heading.length);
+  const end = closingStart < 0 ? -1 : closingStart + closing.length;
+  const hasOwnedSection =
+    start >= 0 &&
+    (start === 0 || instructions[start - 1] === '\n') &&
+    end >= 0 &&
+    (end === instructions.length || instructions[end] === '\n');
+  agent.instructions = hasOwnedSection
+    ? `${instructions.slice(0, start)}${runtimeCardGuard}${instructions.slice(end)}`
+    : [instructions, runtimeCardGuard]
+        .filter((part) => typeof part === 'string' && part.trim().length > 0)
+        .join('\n\n');
   return runtimeCardGuard;
 }
 
@@ -2911,11 +2906,28 @@ function createCompletionErrorContentPart(err) {
       ...(capacityClass ? { capacity_class: capacityClass.slice(0, 80) } : {}),
     };
   };
+  /* === VIVENTIUM START === Preserve a typed attention reference for owner-checked recovery. === */
+  const attentionFailure =
+    errorClass === 'provider_progress_stalled'
+      ? getCompletionErrorChain(err).find(
+          (failure) =>
+            failure?.code === 'provider_progress_stalled' &&
+            failure?.foregroundAttention?.version === 1 &&
+            typeof failure.foregroundAttention.responseMessageId === 'string' &&
+            failure.foregroundAttention.responseMessageId.length > 0 &&
+            failure.foregroundAttention.responseMessageId.length <= 128,
+        )
+      : null;
+  const foregroundAttention = attentionFailure
+    ? { version: 1, responseMessageId: attentionFailure.foregroundAttention.responseMessageId }
+    : null;
+  /* === VIVENTIUM END === */
   return {
     type: ContentTypes.ERROR,
     [ContentTypes.ERROR]: publicMessageByClass[errorClass] || publicMessageByClass.completion_error,
     error_class: errorClass,
     ...hostCapacityMetadata(),
+    ...(foregroundAttention ? { foregroundAttention } : {}),
   };
 }
 
@@ -4915,7 +4927,7 @@ class AgentClient extends BaseClient {
 
   async buildMessages(messages, parentMessageId, _buildOptions, opts) {
     const req = this.options.req;
-    startActiveWorkTurnContext(req);
+    startActiveWorkTurnContext(req, this.options.agent);
     const buildStart = startDeepTiming(req);
     const voiceBuildStartedAt = isVoiceLatencyEnabled(req) ? voiceLatencyNow() : null;
     if (isDeepTimingEnabled(req)) {
@@ -7296,13 +7308,24 @@ class AgentClient extends BaseClient {
         reason: 'no_visible_reply',
       });
     }
-    const metadata = scheduledExecutionMetadata({
+    let metadata = scheduledExecutionMetadata({
       req: this.options.req,
       agent: this.options.agent,
       contentParts: completion,
       interactionContext,
       graphFallbackRecoveryReceipt,
     });
+    /* === VIVENTIUM START === Retain failed-producer identity without treating it as authority. === */
+    const foregroundAttention = completion.find(
+      (part) =>
+        part?.type === ContentTypes.ERROR &&
+        part.error_class === 'provider_progress_stalled' &&
+        part.foregroundAttention?.version === 1,
+    )?.foregroundAttention;
+    if (foregroundAttention) {
+      metadata = { ...metadata, viventium: { ...metadata?.viventium, foregroundAttention } };
+    }
+    /* === VIVENTIUM END === */
     return metadata ? { completion, metadata } : { completion };
   }
 
@@ -8105,7 +8128,7 @@ class AgentClient extends BaseClient {
     /** @type {ReturnType<createRun>} */
     let run;
     const req = this.options.req;
-    startActiveWorkTurnContext(req);
+    startActiveWorkTurnContext(req, this.options.agent);
     initializeTextTurnTiming(req, {
       turnId: this.responseMessageId,
       mainAgentId: this.options.agent?.id,

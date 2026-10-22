@@ -133,6 +133,7 @@ jest.mock('~/server/services/Tools/mcp', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  configureOrchestrationMode: (...args) => jest.requireActual('@librechat/api').configureOrchestrationMode(...args),
   nativeToolDefinitionsFromCache: (...args) =>
     jest.requireActual('@librechat/api').nativeToolDefinitionsFromCache(...args),
   nativeToolCatalogFitsBootstrap: (...args) =>
@@ -1422,12 +1423,32 @@ describe('GlassHive capability broker', () => {
   test.each([
     [{ status: 503, retryable: false }, false],
     [{ status: 503, retryable: false, code: 'work_action_outcome_unconfirmed' }, false],
+    [
+      {
+        status: 503,
+        retryable: false,
+        code: 'work_action_outcome_unconfirmed',
+        outcomeUnknown: true,
+      },
+      false,
+      'pending',
+    ],
+    [
+      { status: 503, retryable: true, code: 'work_action_outcome_unconfirmed', outcomeUnknown: true },
+      false,
+      'pending',
+    ],
+    [
+      { status: 503, retryable: false, code: 'work_action_outcome_unconfirmed', outcomeUnknown: 'true' },
+      false,
+    ],
+    [{ status: 504, code: 'glasshive_account_request_timeout', outcomeUnknown: true }, true],
     [{ status: 429 }, true],
     [{ status: 408 }, true],
     [{ status: 429, failureRetryable: false }, false],
   ])(
     'preserves work-action retryability through the same broker contract: %j',
-    async (failure, retryable) => {
+    async (failure, retryable, status = 'blocked') => {
       const { BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
       const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
       mockGetMCPServersRegistry.mockReturnValue({});
@@ -1456,10 +1477,20 @@ describe('GlassHive capability broker', () => {
         args: { workRef: 'work-1', action: 'pause' },
       });
       expect(result).toMatchObject({
-        status: 'blocked',
+        status,
         reason: failure.code || 'work_action_rejected',
         retryable,
       });
+      if (status === 'pending') {
+        expect(result).toMatchObject({
+          confirmationPending: true,
+          outcomeUnknown: true,
+          workRef: 'work-1',
+        });
+      } else {
+        expect(result).not.toHaveProperty('confirmationPending');
+        expect(result).not.toHaveProperty('outcomeUnknown');
+      }
       expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledTimes(1);
       expect(mockExecuteGlassHiveWorkAction).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -1547,6 +1578,115 @@ describe('GlassHive capability broker', () => {
     ).resolves.toMatchObject({ status: 'blocked' });
     expect(callTool).not.toHaveBeenCalled();
     expect(mockRegisterGlassHiveLaunchContext).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['start', undefined, 'source_selection_required'], ['start', [3], 'invalid_source_selection'],
+    ['steer', undefined, 'source_selection_required'], ['steer', [3], 'invalid_source_selection'],
+  ])('thin Queen %s returns a repairable source-selection reason (%s)', async (action, sourceOrdinals, reason) => {
+    const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+    const tool = action === 'start' ? 'worker_delegate_once_mcp_glasshive-workers-projects' : 'active_work_action';
+    mockGetMCPServersRegistry.mockReturnValue({});
+    const response = await handleToolCall({ grant: {
+      grant_id: 'ghcb_selection', user_id: 'user-1', user_role: 'USER', conversation_id: 'conv-1',
+      message_id: 'msg-1', turn_id: 'turn-1', authority_kind: 'conversation_orchestrator',
+      allowed_servers: [], eager_servers: [], deferred_servers: [], allowed_host_tools: [tool],
+      host_tool_resources: { [tool]: { version: 1, request_body: {
+        conversationId: 'conv-1', messageId: 'msg-1',
+        viventiumInheritedConversation: { version: 1, conversation_id: 'conv-1', sources: [] },
+        viventiumTriggeringSourceSegments: [
+          { source_event_id: 'a', source_index: 0, text: 'First original input.' },
+          { source_event_id: 'b', source_index: 0, text: 'Second original input.' },
+        ],
+      } } },
+    }, toolName: tool, args: { inheritContext: true, ...(sourceOrdinals ? { sourceOrdinals } : {}),
+      ...(action === 'start' ? {} : { action, workRef: 'work-1' }) }, invocationId: 'select-input' });
+    expect(response).toMatchObject({ status: 'blocked', reason, retryable: true, needsInput: false });
+    expect(mockExecuteGlassHiveWorkAction).not.toHaveBeenCalled();
+  });
+
+  test.each(['Open the selected page.', 'x'.repeat(199) + '😀 tail'])(
+    'thin Queen inherits exact selected task and full conversation without a generated brief (%s)', async (selectedText) => {
+    const callTool = jest.fn().mockResolvedValue({ structuredContent: { status: 'accepted', work_ref: 'work-native-1' } });
+    mockGetMCPManager.mockReturnValue({ callTool });
+    mockGetMCPServersRegistry.mockReturnValue({ getAllServerConfigs: jest.fn().mockResolvedValue({}) });
+    mockReconcileGlassHiveLaunchResult.mockResolvedValue({ workRef: 'work-native-1' });
+    const inherited = { version: 1, conversation_id: 'conv-1', sources: [
+      { id: 'old', role: 'user', text: 'Prior conversation is background, not another task.' },
+      { id: 'current', role: 'user', text: selectedText },
+    ] };
+    const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+    const result = await executeMainDelegation({
+      user: { id: 'user-1', role: 'USER' },
+      requestBody: { conversationId: 'conv-1', messageId: 'msg-1',
+        viventiumInheritedConversation: inherited,
+        viventiumTriggeringSourceSegments: [
+          { source_event_id: 'one', source_index: 0, text: 'Keep the other work running.' },
+          { source_event_id: 'two', source_index: 0, text: selectedText },
+        ],
+      },
+      args: { inheritContext: true, sourceOrdinals: [2] }, invocationId: 'thin-queen-start',
+    });
+    expect(result).toMatchObject({ status: 'ok', workRef: 'work-native-1' });
+    const args = callTool.mock.calls[0][0].toolArguments;
+    expect(args.instruction).toContain(selectedText);
+    expect(args.title.length).toBeLessThanOrEqual(200);
+    expect(selectedText.startsWith(args.title)).toBe(true);
+    expect(Buffer.from(args.title, 'utf8').toString('utf8')).toBe(args.title);
+    expect(args.instruction).not.toContain('Keep the other work running.');
+    expect(args.bootstrap_bundle_json.inherited_conversation).toEqual({ ...inherited, assigned_source_ordinals: [2], sources: inherited.sources.map((source) => ({ ...source, assigned_input: false })) });
+    expect(args.resource_class).toBe('standard');
+  });
+
+  test.each(['queue', 'message', 'steer', 'retry'])(
+    'thin Queen %s transports the current shared source separately from exact selected guidance', async (action) => {
+      const { BROKER_AUTHORITY_KINDS } = require('../GlassHiveCapabilityBrokerAuth');
+      const { handleToolCall } = require('../GlassHiveCapabilityBrokerService');
+      mockGetMCPServersRegistry.mockReturnValue({});
+      mockExecuteGlassHiveWorkAction.mockResolvedValue({ state: 'queued' });
+      const inherited = { version: 1, conversation_id: 'conv-1', sources: [
+        { id: 'after-launch', role: 'user', text: 'The selected colour is amber.' },
+        { id: 'current', role: 'user', text: 'Use that one.', current_input: true, source_ordinals: [2] },
+      ] };
+      const result = await handleToolCall({
+        grant: { grant_id: `ghcb_refresh_${action}`, user_id: 'user-1', user_role: 'USER',
+          conversation_id: 'conv-1', message_id: 'msg-1', turn_id: `turn-${action}`,
+          authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+          allowed_servers: [], eager_servers: [], deferred_servers: [],
+          allowed_host_tools: ['active_work_action'],
+          host_tool_resources: { active_work_action: { version: 1, request_body: {
+            conversationId: 'conv-1', messageId: 'msg-1',
+            viventiumInheritedConversation: inherited,
+            viventiumTriggeringSourceSegments: [
+              { source_event_id: 'one', source_index: 0, text: 'Keep the other work running.' },
+              { source_event_id: 'two', source_index: 0, text: 'Use that one.' },
+            ],
+          } } },
+        },
+        toolName: 'active_work_action',
+        args: { workRef: 'work-1', action, inheritContext: true, sourceOrdinals: [2] },
+      });
+      expect(result.reason).toBeUndefined();
+      expect(result).toMatchObject({ status: 'ok', tool: 'active_work_action' });
+      expect(mockExecuteGlassHiveWorkAction).toHaveBeenLastCalledWith(expect.objectContaining({
+        instruction: 'Use that one.',
+        inheritedConversation: expect.objectContaining({ conversation_id: 'conv-1',
+          assigned_source_ordinals: [2], sources: [
+            expect.objectContaining({ text: 'The selected colour is amber.', assigned_input: false }),
+            expect.objectContaining({ text: 'Use that one.', assigned_input: true }),
+          ],
+        }),
+      }));
+    },
+  );
+
+  test('thin Queen cannot omit the exact inherited context binding', async () => {
+    const { executeMainDelegation } = require('../GlassHiveCapabilityBrokerService');
+    await expect(executeMainDelegation({ user: { id: 'user-1' },
+      requestBody: { conversationId: 'conv-1', messageId: 'msg-1', text: 'Start work.' },
+      args: { inheritContext: true }, invocationId: 'unbound-start',
+    })).resolves.toMatchObject({ status: 'blocked' });
+    expect(mockGetMCPManager).not.toHaveBeenCalled();
   });
 
   test.each(['docker', 'host'])(
@@ -5502,4 +5642,13 @@ test('a fresh or inherited broker scope never retains a prior grant catalog', ()
   });
   expect(bundle.glasshive_capability_broker.grant_id).toBe('fresh-worker-grant');
   expect(bundle.glasshive_capability_broker.tool_catalog).toBeUndefined();
+});
+
+
+test('coordination broker brief names only the actual two projected tools', () => {
+  const { brokerContextBrief } = require('../GlassHiveCapabilityBootstrapService');
+  const brief = brokerContextBrief(['synthetic-server'], { allowedHostTools: ['web_search', 'active_work_list'], conversationToolMode: 'coordination' });
+  expect(brief).toContain('hand_off_to, list_workers');
+  expect(brief).not.toContain('web_search');
+  expect(brief).not.toContain('active_work_list');
 });

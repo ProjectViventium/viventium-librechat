@@ -1945,6 +1945,7 @@ async function attachConversationProviderCapabilityBundle({
   nativeTools,
   privateStructuredResponse = false,
   deferUntilInvocation = false,
+  inheritedConversation: suppliedInheritedConversation,
 } = {}) {
   if (
     typeof privateStructuredResponse !== 'boolean' ||
@@ -2048,6 +2049,15 @@ async function attachConversationProviderCapabilityBundle({
     capability,
   );
   const workerRoute = configuredConversationOrchestrationWorkerRoute(mcpCapabilitySource);
+  const modelDefinition = capability.models?.find((item) => item.id === (targetAgent.model || targetAgent.model_parameters?.model));
+  const coordinationOnly = mcpCapabilitySource?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
+    ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(modelDefinition?.harnessProfile);
+  const inheritedConversation = coordinationOnly
+    ? suppliedInheritedConversation || require('./ViventiumMainContextService').getMainContextAttemptState(req)?.inheritedConversation
+    : undefined;
+  if (coordinationOnly && !inheritedConversation) {
+    throw new Error('coordination_context_unavailable');
+  }
   const unavailableInstructions = applyHostEvidenceBoundaryInstructions(
     targetAgent,
     hostToolCapabilityState.unavailableHostTools,
@@ -2072,6 +2082,7 @@ async function attachConversationProviderCapabilityBundle({
       user: req?.user,
       requestBody: trustedRequestBody,
       allowedServerNames,
+      ...(coordinationOnly ? { conversationToolMode: 'coordination', inheritedConversation } : {}),
       allowedHostTools: hostToolCapabilityState.authorizedHostTools,
       hostToolResources: hostToolCapabilityState.hostToolResources,
       ...(allowedConversationOrchestrationTools.length > 0
@@ -2132,6 +2143,7 @@ async function attachConversationProviderCapabilityBundle({
     setConversationProviderInstructionAppend(targetAgent, unavailableInstructions);
     return false;
   }
+  if (coordinationOnly) bundle.conversation_tool_mode = 'coordination';
   // The signed ledger carries only current upload IDs and safe metadata. GlassHive resolves
   // original bytes under this authenticated owner's storage root, never a request-supplied path.
   if (uploadedFiles.length > 0) {
@@ -2227,6 +2239,10 @@ module.exports = {
   bindConversationProviderStableAuthorityDigest,
   captureConversationProviderStableAuthority,
   bindHarnessCancellation,
+  deliverHarnessCancellation,
+  MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
+  MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
+  MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
   CORTEX_ATTEMPT_DEADLINE_REASON,
   probeHarnessFamilyRelease,
   prepareRestrictedVoiceCancellation,

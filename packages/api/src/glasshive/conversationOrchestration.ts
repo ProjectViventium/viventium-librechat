@@ -369,7 +369,11 @@ export function canonicalConversationOrchestrationArguments(
     if (Object.prototype.hasOwnProperty.call(input, 'nativeHumanInput') || Object.prototype.hasOwnProperty.call(input, 'ownerInputControl')) {
       throw new TypeError('native owner input authority is server-owned');
     }
-    const instruction = boundedString(input.instruction, 8000);
+    if (input.inheritContext === true && typeof input.instruction === 'string' && input.instruction.length > 100000) {
+      throw Object.assign(new TypeError('Inherited action input exceeds the native instruction limit.'),
+        { code: 'inherited_instruction_too_large' });
+    }
+    const instruction = boundedString(input.instruction, input.inheritContext === true ? 100000 : 8000);
     const fileIds = input.fileIds;
     const nativeInput =
       input.nativeInput === undefined
@@ -400,6 +404,9 @@ export function canonicalConversationOrchestrationArguments(
     return {
       workRef: boundedString(input.workRef, 160),
       action: boundedString(input.action, 32).toLowerCase(),
+      ...(input.inheritContext === true ? {
+        inheritContext: true, sourceOrdinals: canonicalSourceOrdinals(input.sourceOrdinals),
+      } : {}),
       ...(instruction ? { instruction } : {}),
       ...(nativeInput ? { nativeInput } : {}),
       ...(Array.isArray(fileIds) && fileIds.length ? { fileIds: [...(fileIds as string[])] } : {}),

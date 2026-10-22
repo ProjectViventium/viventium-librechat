@@ -36,6 +36,7 @@ const {
   normalizeVoiceTypedInput,
   resolveVoiceTaskResultFilenames,
   runBoundVoiceClassifierFaultControl,
+  safeErrorLogFields,
 } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
@@ -3922,31 +3923,18 @@ router.get('/stream/:streamId', voiceAuth, async (req, res) => {
     return;
   }
   if (!job) {
-    const terminal =
-      await require('~/server/services/viventium/nativeResponseService').readRetainedHostFinal({
-        userId,
-        streamId,
-        surface: 'voice',
-        callSessionId,
-      });
+    const terminal = await require('~/server/services/viventium/nativeResponseService')
+      .readRetainedHostFinal({ userId, streamId, surface: 'voice', callSessionId });
     if (requestAbort.signal.aborted) return;
     if (terminal) {
       let task;
       try {
-        task = await hydrateVoiceTaskByStreamId(streamId, {
-          callSessionId,
-          userId,
-          requireDurable: true,
-        });
+        task = await hydrateVoiceTaskByStreamId(streamId, { callSessionId, userId, requireDurable: true });
       } catch {
         return res.status(503).json({ code: 'gateway_down', retryable: true });
       }
       if (task) {
-        const suppressed = await isVoiceTaskSuppressedDurably(task.taskId, {
-          callSessionId,
-          userId,
-          streamId,
-        });
+        const suppressed = await isVoiceTaskSuppressedDurably(task.taskId, { callSessionId, userId, streamId });
         if (requestAbort.signal.aborted) return;
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -4553,9 +4541,11 @@ router.post('/glasshive/deliveries/:deliveryId/renew', voiceAuth, async (req, re
     if (!permit) return res.status(409).json({ error: 'delivery_dispatch_not_authorized' });
     return res.json({ permit });
   } catch (error) {
-    logger.warn('[VIVENTIUM][voice/glasshive-delivery] Permit renewal failed', {
-      code: String(error?.code || error?.name || 'permit_renewal_failed').slice(0, 120),
-    });
+    logger.warn(
+      `[VIVENTIUM][voice/glasshive-delivery] Permit renewal failed ${JSON.stringify(
+        safeErrorLogFields(error, 'permit_renewal_failed'),
+      )}`,
+    );
     return res.status(500).json({ error: 'Failed to renew GlassHive delivery authorization' });
   }
 });

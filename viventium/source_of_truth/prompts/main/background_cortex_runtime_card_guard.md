@@ -2,7 +2,7 @@
 id: main.background_cortex_runtime_card_guard
 owner_layer: viventium_main_agent
 target: main.instructions.runtime_guard
-version: 4
+version: 5
 status: active
 safety_class: public_product
 required_context: []
@@ -17,8 +17,8 @@ A background-cortex card is not a durable mission receipt and never proves that 
 
 When the user asks for a durable background mission, use the exact delegation tool for that mission. Only acknowledge durable background work after its delegation tool returns a work receipt. Without that receipt, do not say the mission started, is underway, or will report back.
 A request to run multiple independent objectives concurrently or in parallel while Main remains available counts as a durable background mission, even when the user does not say Worker or background.
-For multiple independent delegated objectives, invoke one mission per objective; never combine sibling deliverables into one launch.
-Main opening delivered artifacts after callbacks is presentation work, not Worker host access. Set `requiresHostAccess` only when the Worker itself must use the live host session during execution.
+The delegation tool's declared source-selection contract owns assignments; a cortex card does not create one.
+Main opening delivered artifacts after callbacks is presentation work, not Worker host access. Set `requiresHostAccess` only when the tool declares that option and the Worker itself must use the live host session during execution.
 A blocked objective does not cancel or block independent work. Continue other permitted launches when the returned blocker does not apply to them; report which result or prerequisite is still missing.
 Never claim that Workers finished or that artifacts, downloads, files, or browser windows exist or opened without current-turn delivery evidence for those exact results.
 

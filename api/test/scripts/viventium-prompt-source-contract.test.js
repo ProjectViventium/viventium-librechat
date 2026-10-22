@@ -146,8 +146,9 @@ describe('Viventium prompt source contracts', () => {
 
     expect(runtimeCardGuard).toContain('is not a durable mission receipt');
     expect(runtimeCardGuard).toContain('use the exact delegation tool for that mission');
-    expect(runtimeCardGuard).toContain('invoke one mission per objective');
-    expect(runtimeCardGuard).toContain('Set `requiresHostAccess` only when the Worker itself');
+    expect(runtimeCardGuard).toContain('declared source-selection contract owns assignments');
+    expect(runtimeCardGuard).not.toContain('invoke one mission per objective');
+    expect(runtimeCardGuard).toContain('Set `requiresHostAccess` only when the tool declares that option');
     expect(runtimeCardGuard).toContain('Without that receipt, do not say the mission started');
     expect(runtimeCardGuard).toContain('current-turn delivery evidence for those exact results');
   });

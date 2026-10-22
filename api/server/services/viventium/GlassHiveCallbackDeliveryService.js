@@ -3041,7 +3041,7 @@ async function renewGlassHiveCallbackDeliveryDispatch({
       ).lean();
       if (!row) throw new Error('glasshive_callback_delivery_dispatch_claim_changed');
       renewedPermit = toDispatchPermit(row);
-    });
+    }, { retry: 'native' });
   } catch (error) {
     if (
       [

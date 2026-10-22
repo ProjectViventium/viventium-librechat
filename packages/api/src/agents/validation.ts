@@ -173,6 +173,7 @@ export const glassHiveOptionsSchema = z
       .object({
         parallel_available: z.boolean(),
         default_mode: z.enum(['focused', 'parallel']),
+        tool_mode: z.enum(['full', 'coordination']).optional(),
         // The configured model catalog and native runtime own available profiles.
         worker_profile: z.string().trim().min(1).max(160).optional(),
         worker_model: z.string().trim().max(160).optional(),
@@ -349,6 +350,7 @@ export function applyAgentProviderCapabilityDefaults<T extends Record<string, un
       orchestration?: {
         parallel_available: boolean;
         default_mode: 'focused' | 'parallel';
+    tool_mode?: 'full' | 'coordination';
         worker_profile?: string;
         fallback_worker_profile?: string;
         worker_model?: string;

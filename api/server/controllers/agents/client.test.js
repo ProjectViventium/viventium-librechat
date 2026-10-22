@@ -2110,6 +2110,62 @@ describe('late completion error content parts', () => {
 });
 
 describe('background cortex runtime card guard', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const registry = require('~/server/services/viventium/promptRegistry');
+  const { buildPromptBundleFixture } = require('../../../../scripts/test-support/promptBundle.cjs');
+  const previousBundlePath = process.env[registry.PROMPT_BUNDLE_ENV];
+  let bundleDirectory;
+
+  beforeAll(() => {
+    bundleDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'viventium-card-guard-'));
+    const bundlePath = path.join(bundleDirectory, 'bundle.json');
+    const sourceRoot = path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts');
+    fs.writeFileSync(bundlePath, JSON.stringify(buildPromptBundleFixture(sourceRoot)));
+    process.env[registry.PROMPT_BUNDLE_ENV] = bundlePath;
+    registry.resetPromptRegistryForTests();
+  });
+
+  afterAll(() => {
+    if (previousBundlePath == null) delete process.env[registry.PROMPT_BUNDLE_ENV];
+    else process.env[registry.PROMPT_BUNDLE_ENV] = previousBundlePath;
+    registry.resetPromptRegistryForTests();
+    fs.rmSync(bundleDirectory, { recursive: true, force: true });
+  });
+
+  test('refreshes only the owned section and preserves surrounding user instructions', () => {
+    const current = registry.getRequiredPromptText('main.background_cortex_runtime_card_guard');
+    const previous = current.replace(
+      "The delegation tool's declared source-selection contract owns assignments; a cortex card does not create one.",
+      'For multiple independent delegated objectives, invoke one mission per objective; never combine sibling deliverables into one launch.',
+    );
+    const prefix = '# User instructions\nKeep my preferred tone.\n\n';
+    const suffix = '\n\n# Extra instructions\nPreserve this exact text.\n';
+    const agent = {
+      instructions: prefix + previous + suffix,
+      background_cortices: [{ id: 'agent_background_analysis' }],
+    };
+    expect(previous).not.toBe(current);
+    expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toBe(current);
+    expect(agent.instructions).toBe(prefix + current + suffix);
+    expect(AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toBe(false);
+  });
+
+  test('requires the registered prompt instead of silently restoring inline rules', () => {
+    const configuredPath = process.env[registry.PROMPT_BUNDLE_ENV];
+    try {
+      delete process.env[registry.PROMPT_BUNDLE_ENV];
+      registry.resetPromptRegistryForTests();
+      const agent = { instructions: 'Keep this.', background_cortices: [{ id: 'background' }] };
+      expect(() => AgentClient.ensureBackgroundCortexRuntimeCardGuard(agent)).toThrow();
+      expect(agent.instructions).toBe('Keep this.');
+    } finally {
+      process.env[registry.PROMPT_BUNDLE_ENV] = configuredPath;
+      registry.resetPromptRegistryForTests();
+    }
+  });
+
   test('marks activated background agents as an exclusive runtime list', () => {
     const summary = AgentClient.formatActivationSummary([
       { cortexName: 'Confirmation Bias', reason: 'bias check', confidence: 0.9 },
@@ -4624,6 +4680,51 @@ describe('AgentClient - titleConvo', () => {
         }),
       ).not.toBe(AgentClient.memoryWriterSourceDigest(source));
     });
+
+    it.each([
+      { ranges: [] },
+      { ranges: [{ start: 0, end: 20, disposition: { version: 1, audio: 'skip', valid: true } }] },
+      { ranges: [{ start: 0, end: 20, disposition: { version: 1, audio: 'eligible', valid: true } }] },
+    ])('keeps memory source stable when speech presentation ranges are removed (%j)', ({ ranges }) => {
+      const source = {
+        text: 'Exact source content',
+        content: [{ type: ContentTypes.TEXT, text: 'Exact source content' }],
+        metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
+      };
+      const projected = {
+        ...source,
+        content: [{ ...source.content[0], deliveryDispositionRanges: ranges }],
+      };
+      expect(AgentClient.memoryWriterSourceDigest(projected)).toBe(
+        AgentClient.memoryWriterSourceDigest(source),
+      );
+      expect(projected.content[0].deliveryDispositionRanges).toBe(ranges);
+    });
+
+    it.each(['text', 'tool_arguments', 'tool_output', 'tool_ranges', 'native_evidence'])(
+      'keeps memory source changes protected when %s changes',
+      (change) => {
+        const source = {
+          text: 'Exact source content',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Exact source content' },
+            { type: ContentTypes.TOOL_CALL, tool_call: {
+              id: 'call-one', args: '{"target":"original"}', output: 'Original result',
+            } },
+          ],
+          metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
+        };
+        const revised = structuredClone(source);
+        if (change === 'text') revised.content[0].text = 'Actually revised source';
+        if (change === 'tool_arguments') revised.content[1].tool_call.args = '{"target":"changed"}';
+        if (change === 'tool_output') revised.content[1].tool_call.output = 'Different result';
+        if (change === 'tool_ranges') revised.content[1].deliveryDispositionRanges = [];
+        if (change === 'native_evidence') revised.metadata.viventium.nativeToolEvidence.revision = 2;
+        expect(AgentClient.memoryWriterSourceDigest(revised)).not.toBe(
+          AgentClient.memoryWriterSourceDigest(source),
+        );
+      },
+    );
 
     it('checks original source on a live save without vetoing ordinary later user turns', async () => {
       const { HumanMessage } = require('@librechat/agents/langchain/messages');
@@ -8653,6 +8754,40 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     });
   });
 
+  test('persists the validated foreground attention reference through the final completion pipeline', async () => {
+    const declared = APIError.generate(
+      409,
+      {
+        error: {
+          code: 'provider_progress_stalled',
+          message: 'Synthetic private detail',
+          foregroundAttention: {
+            version: 1,
+            responseMessageId: 'saved-failed-response',
+            privateDetail: 'do not persist',
+          },
+        },
+      },
+      undefined,
+      new Headers(),
+    );
+    client.chatCompletion = jest.fn(async () => {
+      client.contentParts.push(AgentClient.createCompletionErrorContentPart(declared));
+    });
+    const result = await client.sendCompletion({ text: 'Continue the conversation.' });
+    expect(result.metadata).toEqual({
+      viventium: {
+        foregroundAttention: { version: 1, responseMessageId: 'saved-failed-response' },
+      },
+    });
+    expect(result.completion[0].foregroundAttention).toEqual(
+      result.metadata.viventium.foregroundAttention,
+    );
+    expect(JSON.stringify(result)).not.toContain('private');
+    expect(client.chatCompletion).toHaveBeenCalledTimes(1);
+    expect(mockScheduleEmotionalReaction).not.toHaveBeenCalled();
+  });
+
   test('annotates a scheduler conflict in the actual final completion pipeline', async () => {
     setTrustedInteractionContext(
       req,
@@ -10207,6 +10342,57 @@ describe('Phase B follow-up input recovery', () => {
 });
 
 describe('native provider attention outcome presentation', () => {
+  test.each([200, 409, 502])(
+    'retains only the typed foreground attention identity over %s',
+    (status) => {
+      const declared = APIError.generate(
+        status,
+        {
+          error: {
+            code: 'provider_progress_stalled',
+            message: 'Synthetic private detail',
+            foregroundAttention: {
+              version: 1,
+              responseMessageId: 'synthetic-response',
+              privateDetail: 'do not forward',
+            },
+          },
+        },
+        undefined,
+        new Headers(),
+      );
+      const part = AgentClient.createCompletionErrorContentPart(
+        new Error('Outer', { cause: declared }),
+      );
+      expect(part).toEqual({
+        type: ContentTypes.ERROR,
+        error_class: 'provider_progress_stalled',
+        error: 'The model needs attention because progress stopped.',
+        foregroundAttention: { version: 1, responseMessageId: 'synthetic-response' },
+      });
+      expect(JSON.stringify(part)).not.toContain('private');
+    },
+  );
+
+  test.each([
+    ['provider_progress_stalled', { version: 2, responseMessageId: 'synthetic-response' }],
+    ['provider_progress_stalled', { version: 1, responseMessageId: '' }],
+    ['provider_access_denied', { version: 1, responseMessageId: 'synthetic-response' }],
+  ])(
+    'does not convert unrelated or malformed attention metadata into control identity',
+    (code, foregroundAttention) => {
+      const declared = APIError.generate(
+        502,
+        { error: { code, foregroundAttention } },
+        undefined,
+        new Headers(),
+      );
+      expect(AgentClient.createCompletionErrorContentPart(declared)).not.toHaveProperty(
+        'foregroundAttention',
+      );
+    },
+  );
+
   test.each([200, 502])(
     'preserves an exact typed stall over status %s and a wrapped provider boundary',
     (status) => {

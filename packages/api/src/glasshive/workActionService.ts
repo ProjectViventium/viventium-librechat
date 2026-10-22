@@ -29,6 +29,7 @@ export interface GlassHiveWorkActionInput {
   instruction?: unknown;
   fileIds?: string[];
   requestBody?: UnknownRecord;
+  inheritedConversation?: UnknownRecord;
   serverReq?: unknown;
   nativeInput?: NativeWorkInputResponse;
   ownerInputControl?: boolean;
@@ -425,6 +426,9 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     await assertCurrentVoiceAuthority();
     const fileInputs = await prepareFileInputs(input, idempotencyKey);
     await assertCurrentVoiceAuthority();
+    if (input.inheritedConversation && !RUN_PRODUCING_ACTIONS.has(action)) {
+      throw new Error('inherited_context_action_invalid');
+    }
     const actionBody = {
         action,
         ...(instruction ? { instruction } : {}),
@@ -433,6 +437,7 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         ...(nativeHumanInput ? { nativeHumanInput } : {}),
         ...(capabilityReauthorization ? { capabilityReauthorization } : {}),
         ...(sourceContext ? { sourceContext } : {}),
+        ...(input.inheritedConversation ? { inheritedConversation: input.inheritedConversation } : {}),
         ...(fileInputs.length ? { fileInputs } : {}),
       };
     let result: unknown;

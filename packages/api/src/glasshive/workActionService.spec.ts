@@ -682,3 +682,35 @@ describe('receipt read failure cannot decide an earlier mutation', () => {
     expect(deps.recordVoiceOrchestrationTraceBestEffort).not.toHaveBeenCalled();
   });
 });
+
+
+test.each(['queue', 'message', 'steer', 'retry'])(
+  '%s carries the server-owned current conversation separately from exact guidance', async (action) => {
+    const deps = dependencies();
+    const inheritedConversation = { version: 1, conversation_id: 'conversation-1',
+      assigned_source_ordinals: [1], sources: [
+        { id: 'message-later', role: 'user', text: 'The chosen colour is amber.' },
+        { id: 'message-now', role: 'user', text: 'Use that one.', current_input: true,
+          source_ordinals: [1], assigned_input: true },
+      ] };
+    await createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+      ownerId: 'owner-1', workRef: 'work-1', action, instruction: 'Use that one.',
+      operationId: 'context-operation', inheritedConversation,
+    });
+    expect(deps.requestAccountApi).toHaveBeenLastCalledWith(expect.objectContaining({
+      method: 'POST', body: expect.objectContaining({
+        action, instruction: 'Use that one.', inheritedConversation,
+        sourceContext: expect.objectContaining({ version: 1, originRef: 'origin-1' }),
+      }),
+    }));
+  },
+);
+
+test('rejects inherited conversation on a non-continuation action', async () => {
+  const deps = dependencies();
+  await expect(createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+    ownerId: 'owner-1', workRef: 'work-1', action: 'pause', operationId: 'context-invalid',
+    inheritedConversation: { version: 1, conversation_id: 'conversation-1', sources: [] },
+  })).rejects.toThrow('inherited_context_action_invalid');
+  expect(deps.requestAccountApi).not.toHaveBeenCalled();
+});

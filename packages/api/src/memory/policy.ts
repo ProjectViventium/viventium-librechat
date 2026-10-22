@@ -717,7 +717,11 @@ function buildSignalsValue(
 }
 
 function compactDraftsValue(value: string, now: Date, keyLimit?: number): string {
-  const records = parseDrafts(value);
+  const { records, fullyParsed } = parseDrafts(value);
+  // VIVENTIUM: Never replace a saved draft with a partial parser projection.
+  if (!fullyParsed || records.length === 0) {
+    return value;
+  }
   let summaryWords = 18;
   let nextWords = 12;
 
@@ -1138,15 +1142,20 @@ function compactWorldClauses(clauses: string[], wordLimit: number): string {
   return truncateWords(accepted.join('; ').split(/\s+/).filter(Boolean), wordLimit);
 }
 
-function parseDrafts(value: string): DraftRecord[] {
+function parseDrafts(value: string): { records: DraftRecord[]; fullyParsed: boolean } {
   const records: DraftRecord[] = [];
+  let fullyParsed = true;
   let current: DraftRecord | null = null;
   let section: 'notes' | 'next_steps' | null = null;
   let inArchivedSection = false;
 
   for (const rawLine of value.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || isMarkerLine(line)) {
+    if (!line) {
+      continue;
+    }
+    if (isMarkerLine(line)) {
+      fullyParsed &&= /^_updated:\s*\d{4}-\d{2}-\d{2}$/.test(line);
       continue;
     }
     if (line === 'Archived:') {
@@ -1168,6 +1177,11 @@ function parseDrafts(value: string): DraftRecord[] {
         notes: [],
         nextSteps: [],
       };
+      fullyParsed &&=
+        current.thread.length > 0 &&
+        threadLine.split('|').slice(1).every((segment) =>
+          /^(?:status:\s*[^|]+|last_worked:\s*\d{4}-\d{2}-\d{2})$/.test(segment.trim()),
+        );
       current.status = threadLine.match(/\bstatus:\s*([^|]+)/i)?.[1]?.trim();
       current.lastWorked = threadLine.match(/\blast_worked:\s*(\d{4}-\d{2}-\d{2})/i)?.[1];
       section = null;
@@ -1187,13 +1201,19 @@ function parseDrafts(value: string): DraftRecord[] {
           notes: [],
           nextSteps: [],
         });
+      } else {
+        fullyParsed = false;
       }
       continue;
     }
     if (!current) {
+      fullyParsed = false;
       continue;
     }
     if (line.startsWith('status: ')) {
+      fullyParsed &&= line.split('|').every((segment) =>
+        /^(?:status:\s*[^|]+|(?:started|last_worked):\s*\d{4}-\d{2}-\d{2})$/.test(segment.trim()),
+      );
       current.status = line.match(/^status:\s*([^|]+)/)?.[1]?.trim();
       current.started = line.match(/\bstarted:\s*(\d{4}-\d{2}-\d{2})/)?.[1];
       current.lastWorked = line.match(/\blast_worked:\s*(\d{4}-\d{2}-\d{2})/)?.[1];
@@ -1229,14 +1249,16 @@ function parseDrafts(value: string): DraftRecord[] {
     }
     if (line.startsWith('- ') && section === 'next_steps') {
       current.nextSteps.push(stripOuterQuotes(line.slice(2)));
+      continue;
     }
+    fullyParsed = false;
   }
 
   if (current) {
     records.push(current);
   }
 
-  return records;
+  return { records, fullyParsed };
 }
 
 function parseSignals(value: string): SignalRecord[] {
@@ -1639,7 +1661,8 @@ function hasLongIdleActiveDrafts(value: string | undefined, now: Date): boolean 
   if (!value) {
     return false;
   }
-  return parseDrafts(value).some(
+  const { records, fullyParsed } = parseDrafts(value);
+  return fullyParsed && records.some(
     (record) =>
       !record.archived &&
       (record.status || '').toLowerCase() === 'in_progress' &&

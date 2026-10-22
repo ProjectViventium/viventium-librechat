@@ -205,9 +205,15 @@ jest.mock(
     ),
 );
 const mockReadHostFinal = jest.fn(async () => null);
+const mockForegroundAttention = jest.fn();
+const mockForegroundCancel = jest.fn();
 jest.mock('~/server/services/viventium/nativeResponseService', () => ({
   readRetainedHostFinal: (...args) => mockReadHostFinal(...args),
   mutateNativeResponseSources: (...args) => mockMutateNativeResponseSources(...args),
+  getForegroundAttentionControl: () => ({
+    attention: (...args) => mockForegroundAttention(...args),
+    cancel: (...args) => mockForegroundCancel(...args),
+  }),
 }));
 
 jest.mock('~/models', () => ({
@@ -588,6 +594,8 @@ function trustedTelegramSourceEventId({
 
 describe('/api/viventium/telegram', () => {
   beforeEach(() => {
+    mockForegroundAttention.mockReset();
+    mockForegroundCancel.mockReset();
     mockReadHostFinal.mockReset().mockResolvedValue(null);
     mockInputService = {
       resolvePendingConversation: jest.fn().mockResolvedValue(null),
@@ -817,6 +825,79 @@ describe('/api/viventium/telegram', () => {
 
   afterAll(() => {
     releaseFixture.cleanup();
+  });
+
+  test.each(['attention', 'cancel'])(
+    'foreground %s binds linked owner and chat/thread scope',
+    async (action) => {
+      const expected = { version: 1, state: 'cancelled', capacityReleased: true };
+      mockForegroundAttention.mockResolvedValue(expected);
+      mockForegroundCancel.mockResolvedValue(expected);
+      const req = createMockReq({
+        method: action === 'attention' ? 'GET' : 'POST',
+        url: `/api/viventium/telegram/foreground/failed-answer/${action}`,
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        query: {
+          telegramUserId: 'tg-1',
+          telegramChatId: '-100123',
+          telegramMessageThreadId: '77',
+          conversationId: 'conversation-a',
+          ownerId: 'forged-owner',
+        },
+        body: { receipt: 'a'.repeat(64), operationId: 'operation-a', ownerId: 'forged-owner' },
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../telegram')), req, res);
+      expect(res.statusCode).toBe(200);
+      const target = action === 'attention' ? mockForegroundAttention : mockForegroundCancel;
+      expect(res.headers['Cache-Control']).toBe('no-store, private');
+      expect(target.mock.calls[0][0]).toEqual({
+        ownerId: 'user_1',
+        conversationId: 'conversation-a',
+        responseMessageId: 'failed-answer',
+        sourceOrderScope: trustedTelegramSourceScope({ telegramMessageThreadId: '77' }),
+      });
+      if (action === 'cancel')
+        expect(target.mock.calls[0][1]).toEqual({
+          receipt: 'a'.repeat(64),
+          operationId: 'operation-a',
+        });
+    },
+  );
+
+  test.each([undefined, ''])(
+    'foreground attention preserves the normal empty thread %s',
+    async (threadId) => {
+      mockForegroundAttention.mockResolvedValue({ version: 1 });
+      const req = createMockReq({
+        method: 'GET',
+        url: '/api/viventium/telegram/foreground/failed-answer/attention',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        query: {
+          telegramUserId: 'tg-1',
+          telegramChatId: '-100123',
+          conversationId: 'conversation-a',
+          ...(threadId === undefined ? {} : { telegramMessageThreadId: threadId }),
+        },
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../telegram')), req, res);
+      expect(res.statusCode).toBe(200);
+      expect(mockForegroundAttention.mock.calls[0][0].sourceOrderScope).toBe(
+        trustedTelegramSourceScope(),
+      );
+    },
+  );
+
+  test('foreground cancel rejects unauthenticated control before the native adapter', async () => {
+    const req = createMockReq({
+      url: '/api/viventium/telegram/foreground/failed-answer/cancel',
+      query: { telegramUserId: 'tg-1', telegramChatId: '-100123' },
+    });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../telegram')), req, res);
+    expect(res.statusCode).toBe(401);
+    expect(mockForegroundCancel).not.toHaveBeenCalled();
   });
 
   test('POST /source-order binds the authenticated owner and ignores caller owner claims', async () => {

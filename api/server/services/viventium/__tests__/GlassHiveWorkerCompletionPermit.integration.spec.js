@@ -68,6 +68,7 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
   }, 30000);
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     mockRecordGlassHiveSurfaceDeliveryOutcome.mockClear();
     mockRecordVoiceOrchestrationTrace.mockClear();
     await mongoose.connection.dropDatabase();
@@ -81,7 +82,7 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
     await replicaSet?.stop({ doCleanup: true, force: true });
   }, 15000);
 
-  test('authorize then presentation-complete owns, fences, and releases every binding', async () => {
+  test.each([false, true])('authorize then presentation-complete owns every binding (renew conflict=%s)', async (renewConflict) => {
     const ownerId = 'owner-grouped-voice';
     const resultA = terminalIdentity('a', 'grouped-voice-a', ownerId);
     const resultB = terminalIdentity('b', 'grouped-voice-b', ownerId);
@@ -191,6 +192,20 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
       resultRevision: representative.resultRevision,
       resultDigest: representative.resultDigest,
     });
+    // A concurrent projection may touch the result after renewal reads its snapshot.
+    const originalUpdateOne = GlassHiveTerminalCallbackResult.updateOne.bind(GlassHiveTerminalCallbackResult);
+    const renewSpy = renewConflict ? jest.spyOn(GlassHiveTerminalCallbackResult, 'updateOne')
+      .mockImplementationOnce((...args) => {
+        const query = originalUpdateOne(...args);
+        const originalExec = query.exec.bind(query);
+        query.exec = async () => {
+          await GlassHiveTerminalCallbackResult.collection.updateOne(
+            { _id: args[0]._id }, { $set: { updatedAt: new Date(Date.now() + 1000) } },
+          );
+          return originalExec();
+        };
+        return query;
+      }) : null;
     const permit = await renewGlassHiveCallbackDeliveryDispatch({
       deliveryId: claimed.deliveryId,
       claimId: claimed.claimId,
@@ -199,6 +214,7 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
       userId: ownerId,
       voiceCallSessionId: presentation.callSessionId,
     });
+    renewSpy?.mockRestore();
     expect(permit).toMatchObject({
       permitId: initialPermit.permitId,
       permitGeneration: initialPermit.permitGeneration,

@@ -370,3 +370,22 @@ describe('advertised historical file choices', () => {
     expect(schema.required).toEqual(expect.arrayContaining(['sourceOrdinals', 'fileIds']));
   });
 });
+
+
+test('continuation identity keeps the exact inherited source selection', () => {
+  expect(canonicalConversationOrchestrationArguments('active_work_action', {
+    workRef: 'work-1', action: 'steer', instruction: 'Use that one.',
+    inheritContext: true, sourceOrdinals: [2],
+  })).toEqual({ workRef: 'work-1', action: 'steer', instruction: 'Use that one.',
+    inheritContext: true, sourceOrdinals: [2] });
+});
+
+
+test('inherited control input is not silently truncated at the legacy brief limit', () => {
+  const input = { workRef: 'work-1', action: 'steer', inheritContext: true,
+    sourceOrdinals: [1], instruction: 'x'.repeat(9000) };
+  expect(canonicalConversationOrchestrationArguments('active_work_action', input).instruction).toBe(input.instruction);
+  expect(() => canonicalConversationOrchestrationArguments('active_work_action', {
+    ...input, instruction: 'x'.repeat(100001),
+  })).toThrow('Inherited action input exceeds the native instruction limit.');
+});

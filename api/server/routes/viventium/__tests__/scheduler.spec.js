@@ -11,9 +11,10 @@ let mockGetMessage;
 let mockGetMessages;
 let mockGetConvo;
 let mockResolveTelegramMappingByUserId;
-let mockResolveUserVoiceRoute = jest
-  .fn()
-  .mockResolvedValue({ tts: { provider: 'xai', variant: 'Eve', source: 'saved' } });
+let mockResolveUserVoiceRoute = jest.fn().mockResolvedValue({ tts: {provider: 'xai', variant: 'Eve', source: 'saved'} });
+let mockGetCallSession = jest.fn().mockResolvedValue(null);
+let mockApiActual;
+let mockCurrentCallPreparationDispatch = jest.fn();
 let mockGetAgent;
 let mockGetJob;
 let mockGetActiveStreamIdForConversation;
@@ -82,6 +83,7 @@ jest.mock('~/server/middleware', () => ({
                   id: 'codex-cli:gpt-5.6-sol',
                   effortChoices: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
                 },
+                { id: 'codex-cli:gpt-6.1-sol', effortChoices: ['low', 'medium', 'high', 'xhigh', 'max'] },
               ],
             },
           },
@@ -174,7 +176,10 @@ jest.mock('~/db/models', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('@librechat/api'),
+  ...(mockApiActual ??= jest.requireActual('@librechat/api')),
+  isCurrentCallPreparationDispatch: (...args) => {
+    return mockCurrentCallPreparationDispatch(...args);
+  },
   GenerationJobManager: {
     getActiveStreamIdForConversation: (...args) => mockGetActiveStreamIdForConversation(...args),
     getJob: (...args) => mockGetJob(...args),
@@ -186,6 +191,7 @@ jest.mock('@librechat/api', () => ({
 
 jest.mock('~/server/services/viventium/CallSessionService', () => ({
   resolveUserVoiceRoute: (...args) => mockResolveUserVoiceRoute(...args),
+  getCallSession: (...args) => mockGetCallSession(...args),
 }));
 
 jest.mock('~/server/services/TelegramLinkService', () => ({
@@ -541,7 +547,7 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     expect(res.statusCode).toBe(200);
     expect(mockResolveUserVoiceRoute).toHaveBeenCalledWith('user_1', { includeSources: true });
     expect(res.body).toEqual({
-      voiceRoute: { tts: { provider: 'xai', variant: 'Eve', source: 'saved' } },
+      voiceRoute: { tts: {provider: 'xai', variant: 'Eve', source: 'saved'} },
       telegram_user_id: 'tg-1',
       telegram_chat_id: 'tg-1',
       linked: true,
@@ -556,8 +562,7 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     mockResolveUserVoiceRoute.mockRejectedValueOnce(new Error('synthetic unavailable'));
     const schedulerRouter = require('../scheduler');
     const app = createTestApp(schedulerRouter);
-    const req = createMockReq({
-      url: '/api/viventium/scheduler/telegram/resolve',
+    const req = createMockReq({ url: '/api/viventium/scheduler/telegram/resolve',
       headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
       body: { userId: 'user_1', voiceRoute: { tts: { provider: 'untrusted' } } },
     });
@@ -570,17 +575,13 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     expect(res.body.telegram_user_id).toBe('tg-1');
     expect(res.body.telegram_chat_id).toBe('tg-1');
     expect(res.body.linked).toBe(true);
-    expect(res.body.voice_preferences).toEqual({
-      always_voice_response: false,
-      voice_responses_enabled: true,
-    });
+    expect(res.body.voice_preferences).toEqual({ always_voice_response: false, voice_responses_enabled: true });
   });
 
   test('address-only status resolution does not require Speaking even without a cached identity', async () => {
     const schedulerRouter = require('../scheduler');
     const app = createTestApp(schedulerRouter);
-    const req = createMockReq({
-      url: '/api/viventium/scheduler/telegram/resolve',
+    const req = createMockReq({ url: '/api/viventium/scheduler/telegram/resolve',
       headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
       body: { userId: 'user_1', resolveVoice: false },
     });
@@ -1201,70 +1202,38 @@ describe('/api/viventium/scheduler/chat', () => {
     );
   });
 
-  test.each(['rejected', 'pending'])(
-    'retracts the exact provisional message when child release is %s',
-    async (state) => {
-      if (state === 'pending') jest.useFakeTimers();
-      mockAbortJob.mockImplementationOnce(() =>
-        state === 'pending'
-          ? new Promise(() => {})
-          : Promise.reject(new Error('main_compaction_native_release_unconfirmed')),
-      );
-      mockGetJob.mockResolvedValueOnce({
-        status: 'running',
-        metadata: {
-          userId: 'user_1',
-          responseMessageId: 'unconfirmed-placeholder',
-          conversationId: 'conversation-scheduled',
-          interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' },
-        },
-      });
-      try {
-        const app = createTestApp(require('../scheduler'));
-        const res = createMockRes();
-        const operation = dispatch(
-          app,
-          createMockReq({
-            url: '/api/viventium/scheduler/stream/stream-timeout/cancel',
-            headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
-            body: { userId: 'user_1', reason: 'stream_timeout' },
-          }),
-          res,
-        );
-        if (state === 'pending') {
-          await jest.advanceTimersByTimeAsync(8_000);
-          expect(res.body).toMatchObject({ reason: 'release_unconfirmed' });
-        }
-        await operation;
-        expect(res.statusCode).toBe(202);
-        expect(res.body).toEqual({
-          success: false,
-          cancelled: 'stream-timeout',
-          reason: 'release_unconfirmed',
-          capacityReleased: false,
-        });
-        expect(mockAbortJob).toHaveBeenCalledWith('stream-timeout', 'user_cancelled', 'user_1');
-        expect(mockDeleteSchedulerPlaceholder).toHaveBeenCalledWith(
-          expect.objectContaining({
-            user: 'user_1',
-            messageId: 'unconfirmed-placeholder',
-            unfinished: true,
-            'metadata.viventium.interactionContext.actor_kind': 'system',
-            'metadata.viventium.interactionContext.origin': 'scheduler',
-          }),
-        );
-        expect(mockUpdateSchedulerConversation).toHaveBeenCalledWith(
-          { user: 'user_1', conversationId: 'conversation-scheduled' },
-          expect.any(Object),
-        );
-      } finally {
-        if (state === 'pending') {
-          await jest.advanceTimersByTimeAsync(2_000);
-          jest.useRealTimers();
-        }
+  test.each(['rejected', 'pending'])('retracts the exact provisional message when child release is %s', async state => {
+    if (state === 'pending') jest.useFakeTimers();
+    mockAbortJob.mockImplementationOnce(() => state === 'pending' ? new Promise(() => {}) :
+      Promise.reject(new Error('main_compaction_native_release_unconfirmed')));
+    mockGetJob.mockResolvedValueOnce({ status: 'running', metadata: { userId: 'user_1',
+      responseMessageId: 'unconfirmed-placeholder', conversationId: 'conversation-scheduled',
+      interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' } } });
+    try {
+      const app = createTestApp(require('../scheduler')); const res = createMockRes();
+      const operation = dispatch(app, createMockReq({
+        url: '/api/viventium/scheduler/stream/stream-timeout/cancel',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body: { userId: 'user_1', reason: 'stream_timeout' } }), res);
+      if (state === 'pending') {
+        await jest.advanceTimersByTimeAsync(8_000);
+        expect(res.body).toMatchObject({ reason: 'release_unconfirmed' });
       }
-    },
-  );
+      await operation;
+      expect(res.statusCode).toBe(202);
+      expect(res.body).toEqual({ success: false, cancelled: 'stream-timeout',
+        reason: 'release_unconfirmed', capacityReleased: false });
+      expect(mockAbortJob).toHaveBeenCalledWith('stream-timeout', 'user_cancelled', 'user_1');
+      expect(mockDeleteSchedulerPlaceholder).toHaveBeenCalledWith(expect.objectContaining({
+        user: 'user_1', messageId: 'unconfirmed-placeholder', unfinished: true,
+        'metadata.viventium.interactionContext.actor_kind': 'system',
+        'metadata.viventium.interactionContext.origin': 'scheduler' }));
+      expect(mockUpdateSchedulerConversation).toHaveBeenCalledWith(
+        { user: 'user_1', conversationId: 'conversation-scheduled' }, expect.any(Object));
+    } finally { if (state === 'pending') {
+      await jest.advanceTimersByTimeAsync(2_000); jest.useRealTimers();
+    } }
+  });
 
   test('does not let scheduler credentials cancel an interactive stream', async () => {
     mockGetJob.mockResolvedValueOnce({
@@ -1328,49 +1297,22 @@ describe('/api/viventium/scheduler/chat', () => {
     const app = createTestApp(require('../scheduler'));
     const deadline = new Date(Date.now() + 600000).toISOString();
     const res = createMockRes();
-    await dispatch(
-      app,
-      createMockReq({
-        url: '/api/viventium/scheduler/chat',
-        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
-        body: {
-          userId: 'user_1',
-          text: 'Synthetic scheduled check',
-          conversationId: 'new',
-          agentId: 'agent_test',
-          authoringDeadlineAt: deadline,
-        },
-      }),
-      res,
-    );
+    await dispatch(app, createMockReq({ url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: { userId: 'user_1', text: 'Synthetic scheduled check', conversationId: 'new',
+        agentId: 'agent_test', authoringDeadlineAt: deadline } }), res);
     expect(res.statusCode).toBe(200);
     expect(lastSchedulerRequest.viventiumSchedulerAuthoringDeadlineAt).toBe(deadline);
     expect(lastSchedulerRequest.body).not.toHaveProperty('authoringDeadlineAt');
   });
-  test.each(['invalid', new Date(0).toISOString()])(
-    'rejects an invalid or elapsed authoring deadline: %s',
-    async (deadline) => {
-      const app = createTestApp(require('../scheduler'));
-      const res = createMockRes();
-      await dispatch(
-        app,
-        createMockReq({
-          url: '/api/viventium/scheduler/chat',
-          headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
-          body: {
-            userId: 'user_1',
-            text: 'Synthetic scheduled check',
-            conversationId: 'new',
-            agentId: 'agent_test',
-            authoringDeadlineAt: deadline,
-          },
-        }),
-        res,
-      );
-      expect(res.statusCode).toBe(400);
-      expect(agentControllerCalls).toBe(0);
-    },
-  );
+  test.each(['invalid', new Date(0).toISOString()])('rejects an invalid or elapsed authoring deadline: %s', async deadline => {
+    const app = createTestApp(require('../scheduler')); const res = createMockRes();
+    await dispatch(app, createMockReq({ url: '/api/viventium/scheduler/chat',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: { userId: 'user_1', text: 'Synthetic scheduled check', conversationId: 'new',
+        agentId: 'agent_test', authoringDeadlineAt: deadline } }), res);
+    expect(res.statusCode).toBe(400); expect(agentControllerCalls).toBe(0);
+  });
 
   test('authors a trusted noninteractive Workbench context and ignores forged privileged fields', async () => {
     const schedulerRouter = require('../scheduler');
@@ -1408,6 +1350,143 @@ describe('/api/viventium/scheduler/chat', () => {
       source_event_id: 'scheduled-run-42',
       schedule_id: 'schedule-42',
       schedule_run_id: 'run-42',
+    });
+  });
+
+  describe('operator-pinned call preparation', () => {
+    const execution = {
+      provider: 'glasshive-harness', model: 'codex-cli:gpt-6.1-sol', reasoning_effort: 'high',
+    };
+    const originalPolicy = process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_EXECUTION;
+    let session;
+    let body;
+
+    beforeEach(() => {
+      const deadlineAt = new Date(Date.now() + 60000).toISOString();
+      session = {
+        callSessionId: 'call-synthetic', userId: 'user_1', agentId: 'agent_test',
+        conversationId: 'new', status: 'listening', mode: 'call',
+        contextPreparation: {
+          version: 1, idempotencyKey: 'preparation-synthetic', deadlineAt,
+        },
+      };
+      body = {
+        userId: 'user_1', conversationId: 'new', agentId: 'agent_test',
+        text: 'Gather synthetic context.', idempotencyKey: 'preparation-synthetic',
+        authoringDeadlineAt: deadlineAt, callPreparation: { callSessionId: 'call-synthetic' },
+      };
+      mockGetCallSession = jest.fn(async () => session);
+      mockCurrentCallPreparationDispatch = jest.fn((...args) =>
+        mockApiActual.isCurrentCallPreparationDispatch(...args),
+      );
+      process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_EXECUTION = JSON.stringify(execution);
+    });
+    afterEach(() => {
+      if (originalPolicy === undefined) delete process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_EXECUTION;
+      else process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_EXECUTION = originalPolicy;
+    });
+    const send = async (input = body) => {
+      const app = createTestApp(require('../scheduler'));
+      const req = createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' }, body: input,
+      });
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      return res;
+    };
+
+    test('uses only the trusted operator tuple and retains the exact call agent', async () => {
+      mockConfiguredMainAgentId = 'different-main-synthetic';
+      const res = await send({ ...body, scheduledAgentExecution: {
+        provider: 'openai', model: 'untrusted', reasoning_effort: 'low',
+      }, model: 'untrusted', fallback: { model: 'untrusted' } });
+      expect(res.statusCode).toBe(200);
+      expect(lastScheduledAgentExecution).toEqual(execution);
+      expect(lastAgentId).toBe(session.agentId);
+      expect(lastSchedulerModel).toBeNull();
+      expect(lastSchedulerRequest.body).not.toHaveProperty('callPreparation');
+      expect(lastSchedulerRequest.body).not.toHaveProperty('fallback');
+      expect(mockCurrentCallPreparationDispatch).toHaveBeenCalledWith(session, {
+        callSessionId: 'call-synthetic', userId: 'user_1', agentId: 'agent_test',
+        conversationId: 'new', idempotencyKey: 'preparation-synthetic',
+        authoringDeadlineAt: body.authoringDeadlineAt,
+      });
+    });
+
+    test('omitting policy follows Agent Builder and ordinary scheduler tuples stay ignored', async () => {
+      delete process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_EXECUTION;
+      expect((await send()).statusCode).toBe(200);
+      expect(lastScheduledAgentExecution).toBeNull();
+    });
+
+    test('a configured preparation policy does not override ordinary scheduled work', async () => {
+      mockConfiguredMainAgentId = 'different-main-synthetic';
+      const ordinary = { ...body };
+      delete ordinary.callPreparation;
+      expect((await send({ ...ordinary, scheduledAgentExecution: execution })).statusCode).toBe(200);
+      expect(lastScheduledAgentExecution).toBeNull();
+      expect(lastAgentId).toBe('different-main-synthetic');
+      expect(mockGetCallSession).not.toHaveBeenCalled();
+    });
+
+    test.each(['userId', 'conversationId', 'agentId', 'idempotencyKey', 'deadlineAt', 'ended', 'listen_only', 'released', 'missing'])(
+      'rejects %s preparation authority before starting a model', async (field) => {
+        if (field === 'missing') session = null;
+        else if (field === 'ended') session.status = 'ended';
+        else if (field === 'listen_only') session.mode = 'listen_only';
+        else if (field === 'released') session.contextPreparation.releasedStreamId = 'released-synthetic';
+        else if (field === 'idempotencyKey') session.contextPreparation.idempotencyKey = 'different';
+        else if (field === 'deadlineAt') session.contextPreparation.deadlineAt = new Date(0).toISOString();
+        else session[field] = 'different';
+        const res = await send();
+        expect(res.statusCode).toBe(403);
+        expect(res.body.reason).toBe('invalid_call_preparation_binding');
+        expect(agentControllerCalls).toBe(0);
+      },
+    );
+
+    test.each([
+      'not-json',
+      JSON.stringify({ ...execution, model: 'undeclared' }),
+      JSON.stringify({ ...execution, reasoning_effort: 'none' }),
+    ])('rejects unavailable operator policy %p', async (policy) => {
+      process.env.VIVENTIUM_VOICE_PREBUILD_CONTEXT_EXECUTION = policy;
+      const res = await send();
+      expect(res.statusCode).toBe(400);
+      expect(res.body.reason).toBe('invalid_call_preparation_execution');
+      expect(agentControllerCalls).toBe(0);
+    });
+
+    test.each(['stream', 'conversation', 'status'])(
+      'a materialized retry cannot reuse a different %s binding', async (field) => {
+        const first = await send();
+        session.contextPreparation.streamId = first.body.streamId;
+        session.conversationId = 'materialized-synthetic';
+        [...mockSchedulerDispatchIntents.values()][0].conversationId = session.conversationId;
+        if (field === 'stream') session.contextPreparation.streamId = 'other-stream';
+        if (field === 'conversation') session.conversationId = 'other-conversation';
+        if (field === 'status') {
+          const dispatch = [...mockSchedulerDispatchIntents.values()][0];
+          dispatch.status = 'reserved';
+        }
+        const second = await send();
+        expect(second.statusCode).toBe(403);
+        expect(agentControllerCalls).toBe(1);
+      },
+    );
+
+    test('an exact retry keeps its one accepted stream', async () => {
+      const first = await send();
+      session.contextPreparation.streamId = first.body.streamId;
+      // Normal bind materializes the call's formerly-new conversation after acceptance.
+      session.conversationId = 'materialized-synthetic';
+      [...mockSchedulerDispatchIntents.values()][0].conversationId = session.conversationId;
+      const second = await send();
+      expect(second.statusCode).toBe(200);
+      expect(second.body.streamId).toBe(first.body.streamId);
+      expect(second.body.duplicate).toBe(true);
+      expect(agentControllerCalls).toBe(1);
     });
   });
 
@@ -2379,4 +2458,5 @@ Holding Examples
     },
   );
   /* === VIVENTIUM END === */
+
 });

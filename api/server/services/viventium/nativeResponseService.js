@@ -1,6 +1,7 @@
 /* === VIVENTIUM START === Thin host adapter for the typed native result owner. === */
 const {
   createNativeResponseRecoveryService,
+  createForegroundAttentionControl,
   createNativeResponseFetch,
   isAcceptedMainProjectionComplete,
   GenerationJobManager,
@@ -199,6 +200,40 @@ async function resolveNativeResponseRoute(identity) {
 }
 
 let service;
+let foregroundAttentionControl;
+function getForegroundAttentionControl() {
+  if (foregroundAttentionControl) return foregroundAttentionControl;
+  const db = require('~/models');
+  foregroundAttentionControl = createForegroundAttentionControl({
+    readMessage: (ownerId, messageId) => db.getMessage({ user: ownerId, messageId }),
+    readNative: (ownerId, messageId) => db.getNativeResponse(ownerId, messageId),
+    sourceMatches: (identity) => db.nativeResponseSourceMatches(identity),
+    readResult: (identity) => getService().readResult(identity),
+    resolveRoute: resolveNativeResponseRoute,
+    cancel: (identity, result, route) => {
+      const {
+        deliverHarnessCancellation,
+        MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
+        MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
+        MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
+      } = require('./GlassHiveConversationProviderService');
+      return deliverHarnessCancellation({
+        url: `${route.baseURL.replace(/\/$/, '')}/requests/${encodeURIComponent(result.request_id)}/cancel`,
+        headers: {
+          ...route.headers,
+          'X-Viventium-Foreground-Attention': identity.invocationId,
+        },
+        fetchImpl: fetch,
+        requireCapacityRelease: true,
+        includeRequestState: true,
+        attemptTimeoutMs: MAINTENANCE_CANCELLATION_ATTEMPT_TIMEOUT_MS,
+        retryDelaysMs: MAINTENANCE_CANCELLATION_RETRY_DELAYS_MS,
+        totalTimeoutMs: MAINTENANCE_CANCELLATION_TOTAL_TIMEOUT_MS,
+      });
+    },
+  });
+  return foregroundAttentionControl;
+}
 function getService() {
   if (service) return service;
   const db = require('~/models');
@@ -1027,6 +1062,7 @@ module.exports = {
   readCurrentMainBackgroundInputs,
   resolveNativeResponseRoute,
   getService,
+  getForegroundAttentionControl,
   createNativeResponseRelease,
   wrapNativeResponseFetch,
   recoverSavedNativeResponse,

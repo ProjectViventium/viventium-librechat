@@ -163,6 +163,7 @@ mainAgent:
     orchestration:
       parallel_available: true
       default_mode: parallel
+      tool_mode: coordination
       worker_profile: codex-cli
       worker_model: codex-cli:gpt-6.1-sol
       worker_reasoning_effort: high
@@ -405,11 +406,11 @@ mainAgent:
         confidence_threshold: 0.7
         cooldown_ms: 30000
         max_history: 15
-  voice_llm_model: grok-build:grok-4.7-build-fast
+  voice_llm_model: direct-xai:grok-4.7
   voice_llm_provider: glasshive-harness
   voice_llm_model_parameters:
-    model: grok-build:grok-4.7-build-fast
-    reasoning_effort: high
+    model: direct-xai:grok-4.7
+    reasoning_effort: low
   voice_fallback_llm_model: claude-code:claude-opus-5-5
   voice_fallback_llm_provider: glasshive-harness
   voice_fallback_llm_model_parameters:

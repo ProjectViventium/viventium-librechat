@@ -858,7 +858,12 @@ function tomlString(value) {
 
 function brokerContextBrief(
   allowedServers,
-  { contentReadScope = false, deferredServers = [], allowedHostTools = [], conversationToolMode = 'full' } = {},
+  {
+    contentReadScope = false,
+    deferredServers = [],
+    allowedHostTools = [],
+    conversationToolMode = 'full',
+  } = {},
 ) {
   if (conversationToolMode === 'coordination') {
     return 'Declared conversation tools: hand_off_to, list_workers. Their contracts own action work and current worker state. Other authorized capabilities belong to the configured workers.';
@@ -1568,9 +1573,12 @@ async function buildConversationProviderBootstrapBundle({
   const orchestrationRequestBody = { ...requestBody };
   delete orchestrationRequestBody.tool_resources;
   if (conversationToolMode === 'coordination') {
-    if (inheritedConversation?.version !== 1 ||
-        inheritedConversation.conversation_id !== requestBody.conversationId ||
-        !Array.isArray(inheritedConversation.sources)) throw new Error('coordination_context_unavailable');
+    if (
+      inheritedConversation?.version !== 1 ||
+      inheritedConversation.conversation_id !== requestBody.conversationId ||
+      !Array.isArray(inheritedConversation.sources)
+    )
+      throw new Error('coordination_context_unavailable');
   }
   const delegationResources = normalizedConversationOrchestrationTools.includes(
     DELEGATION_TOOL_NAME,
@@ -1674,9 +1682,14 @@ async function buildConversationProviderBootstrapBundle({
     return declaredServers.has(serverName) || declaredDeferredServers.has(serverName);
   });
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
-  const eagerServers = conversationToolMode === 'coordination' ? [] : allowedServers.filter((serverName) => declaredServers.has(serverName));
+  const eagerServers =
+    conversationToolMode === 'coordination'
+      ? []
+      : allowedServers.filter((serverName) => declaredServers.has(serverName));
   const deferredServers = allowedServers.filter(
-    (serverName) => conversationToolMode === 'coordination' || (!declaredServers.has(serverName) && declaredDeferredServers.has(serverName)),
+    (serverName) =>
+      conversationToolMode === 'coordination' ||
+      (!declaredServers.has(serverName) && declaredDeferredServers.has(serverName)),
   );
   if (allowedServers.length === 0 && allProviderHostTools.length === 0) {
     return degradedConversationCapabilityBundle('no_reviewed_capabilities');
@@ -1733,11 +1746,16 @@ async function buildConversationProviderBootstrapBundle({
     logger.info(
       JSON.stringify({
         event: 'glasshive_broker_grant_created',
-        ...(conversationToolMode === 'coordination' ? {
-          conversationToolMode,
-          inheritedContextSourceCount: inheritedConversation.sources.length,
-          inheritedContextSha256: crypto.createHash('sha256').update(JSON.stringify(inheritedConversation)).digest('hex'),
-        } : {}),
+        ...(conversationToolMode === 'coordination'
+          ? {
+              conversationToolMode,
+              inheritedContextSourceCount: inheritedConversation.sources.length,
+              inheritedContextSha256: crypto
+                .createHash('sha256')
+                .update(JSON.stringify(inheritedConversation))
+                .digest('hex'),
+            }
+          : {}),
         grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
         message_id_sha256: scopeHash(mintedGrant.payload.message_id),
         conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),

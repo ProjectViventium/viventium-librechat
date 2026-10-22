@@ -288,16 +288,22 @@ function mintBrokerGrant({
   // One signed resource owns the exact conversation body. Allowed tool descriptors reference it;
   // hydration below resolves the reference only after the grant's resource hash and expiry checks.
   const hasConversationRequestBody = conversationRequestBody !== undefined;
-  if (hasConversationRequestBody &&
-      (normalizeBrokerAuthorityKind(authorityKind) !== BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR ||
-       !conversationRequestBody || typeof conversationRequestBody !== 'object' ||
-       Array.isArray(conversationRequestBody) ||
-       normalizedHostTools.includes('conversation_request_body'))) {
+  if (
+    hasConversationRequestBody &&
+    (normalizeBrokerAuthorityKind(authorityKind) !==
+      BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR ||
+      !conversationRequestBody ||
+      typeof conversationRequestBody !== 'object' ||
+      Array.isArray(conversationRequestBody) ||
+      normalizedHostTools.includes('conversation_request_body'))
+  ) {
     throw new Error('GlassHive capability broker conversation resource scope is invalid');
   }
   const normalizedGrantResources = hasConversationRequestBody
-    ? { ...normalizedHostResources,
-        conversation_request_body: JSON.parse(JSON.stringify(conversationRequestBody)) }
+    ? {
+        ...normalizedHostResources,
+        conversation_request_body: JSON.parse(JSON.stringify(conversationRequestBody)),
+      }
     : normalizedHostResources;
   let contextRecord = null;
   if (hasConversationRequestBody) {
@@ -306,20 +312,29 @@ function mintBrokerGrant({
     delete normalizedGrantResources.conversation_request_body.viventiumInheritedConversationRef;
   }
   if (inheritedConversation !== undefined) {
-    if (!hasConversationRequestBody || inheritedConversation?.version !== 1 ||
-        inheritedConversation.conversation_id !== conversationId ||
-        !Array.isArray(inheritedConversation.sources)) {
+    if (
+      !hasConversationRequestBody ||
+      inheritedConversation?.version !== 1 ||
+      inheritedConversation.conversation_id !== conversationId ||
+      !Array.isArray(inheritedConversation.sources)
+    ) {
       throw new Error('inherited_context_scope_invalid');
     }
     const context = JSON.parse(JSON.stringify(inheritedConversation));
     const digest = valueHash(context);
-    const key = inheritedContextKey({ tenant_id: resolveBrokerTenantId(),
-      user_id: userId, conversation_id: conversationId }, digest);
+    const key = inheritedContextKey(
+      { tenant_id: resolveBrokerTenantId(), user_id: userId, conversation_id: conversationId },
+      digest,
+    );
     contextRecord = {
-      grant_id: key, resource_ref: digest, resources: context,
+      grant_id: key,
+      resource_ref: digest,
+      resources: context,
       size_bytes: Buffer.byteLength(stableJson(context), 'utf8'),
-      expires_at_ms: Math.max(exp * 1000,
-        Number(FALLBACK_GRANT_RESOURCE_CACHE.get(key)?.expires_at_ms || 0)),
+      expires_at_ms: Math.max(
+        exp * 1000,
+        Number(FALLBACK_GRANT_RESOURCE_CACHE.get(key)?.expires_at_ms || 0),
+      ),
     };
     normalizedGrantResources.conversation_request_body.viventiumInheritedConversationRef = digest;
   }
@@ -492,9 +507,17 @@ async function persistBrokerGrantResources(mintedGrant) {
     }
     return { persisted: false, fallback: true };
   }
-  await Promise.all([record, mintedGrant.contextRecord].filter(Boolean).map((item) =>
-    cache.set(grantResourceCacheKey(item.grant_id), JSON.stringify(item),
-      Math.max(60_000, item.expires_at_ms - Date.now()))));
+  await Promise.all(
+    [record, mintedGrant.contextRecord]
+      .filter(Boolean)
+      .map((item) =>
+        cache.set(
+          grantResourceCacheKey(item.grant_id),
+          JSON.stringify(item),
+          Math.max(60_000, item.expires_at_ms - Date.now()),
+        ),
+      ),
+  );
   return { persisted: true, sizeBytes: record.size_bytes };
 }
 
@@ -525,12 +548,16 @@ async function hydrateBrokerGrantResources(grant, { nowMs = Date.now() } = {}) {
     throw new Error('GlassHive capability broker resource scope is unavailable');
   }
   const hostToolResources = sanitizeHostToolResources(
-    record.resources, sanitizeAllowedHostTools(grant.allowed_host_tools),
+    record.resources,
+    sanitizeAllowedHostTools(grant.allowed_host_tools),
   );
   const conversationRequestBody = record.resources.conversation_request_body;
-  const hydratedConversationRequestBody = conversationRequestBody &&
-    typeof conversationRequestBody === 'object' && !Array.isArray(conversationRequestBody)
-    ? JSON.parse(JSON.stringify(conversationRequestBody)) : undefined;
+  const hydratedConversationRequestBody =
+    conversationRequestBody &&
+    typeof conversationRequestBody === 'object' &&
+    !Array.isArray(conversationRequestBody)
+      ? JSON.parse(JSON.stringify(conversationRequestBody))
+      : undefined;
   const contextDigest = hydratedConversationRequestBody?.viventiumInheritedConversationRef;
   if (contextDigest) {
     const key = inheritedContextKey(grant, contextDigest);
@@ -538,26 +565,37 @@ async function hydrateBrokerGrantResources(grant, { nowMs = Date.now() } = {}) {
     if (!context) {
       const cache = await getRateLimitCache();
       const raw = cache?.get ? await cache.get(grantResourceCacheKey(key)) : null;
-      try { context = typeof raw === 'string' ? JSON.parse(raw) : raw; }
-      catch { context = null; }
+      try {
+        context = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      } catch {
+        context = null;
+      }
     }
-    if (!context || context.grant_id !== key || context.expires_at_ms < nowMs ||
-        valueHash(context.resources) !== contextDigest ||
-        context.resources?.conversation_id !== grant.conversation_id) {
+    if (
+      !context ||
+      context.grant_id !== key ||
+      context.expires_at_ms < nowMs ||
+      valueHash(context.resources) !== contextDigest ||
+      context.resources?.conversation_id !== grant.conversation_id
+    ) {
       throw new Error('inherited_context_unavailable');
     }
-    hydratedConversationRequestBody.viventiumInheritedConversation =
-      JSON.parse(JSON.stringify(context.resources));
+    hydratedConversationRequestBody.viventiumInheritedConversation = JSON.parse(
+      JSON.stringify(context.resources),
+    );
   }
   for (const resources of Object.values(hostToolResources)) {
     if (resources.request_body_ref === undefined) {
       continue; // Retain existing inline resources from older grants.
     }
-    if (grant.authority_kind !== BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR ||
-        resources.request_body_ref !== 'conversation_request_body' ||
-        resources.request_body !== undefined ||
-        !conversationRequestBody || typeof conversationRequestBody !== 'object' ||
-        Array.isArray(conversationRequestBody)) {
+    if (
+      grant.authority_kind !== BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR ||
+      resources.request_body_ref !== 'conversation_request_body' ||
+      resources.request_body !== undefined ||
+      !conversationRequestBody ||
+      typeof conversationRequestBody !== 'object' ||
+      Array.isArray(conversationRequestBody)
+    ) {
       throw new Error('GlassHive capability broker conversation resource scope is unavailable');
     }
     resources.request_body = hydratedConversationRequestBody;

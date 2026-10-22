@@ -31,8 +31,13 @@ const { Message, Conversation } = require('~/db/models');
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
 const { resolveTelegramMappingByUserId } = require('~/server/services/TelegramLinkService');
-const { resolveUserVoiceRoute, getCallSession } = require('~/server/services/viventium/CallSessionService');
-const { normalizeScheduledAgentExecution } = require('~/server/services/viventium/scheduledAgentOverride');
+const {
+  resolveUserVoiceRoute,
+  getCallSession,
+} = require('~/server/services/viventium/CallSessionService');
+const {
+  normalizeScheduledAgentExecution,
+} = require('~/server/services/viventium/scheduledAgentOverride');
 /* === VIVENTIUM NOTE ===
  * Feature: Sidebar parity for gateway-created conversations (title + icon).
  * Purpose: Match web UI behavior for new conversations created via scheduler gateway.
@@ -163,7 +168,8 @@ const SCHEDULER_PUBLIC_FAILURES = Object.freeze({
   provider_response_deadline_exceeded: 'The model provider response exceeded its deadline.',
   provider_temporarily_unavailable: 'The model provider is temporarily unavailable.',
   conversation_session_authority_conflict: 'The conversation is busy with an active response.',
-  source_context_unavailable: 'The conversation context could not be preserved. Please retry this turn.',
+  source_context_unavailable:
+    'The conversation context could not be preserved. Please retry this turn.',
   completion_error: 'The scheduled model response could not be completed.',
 });
 
@@ -554,10 +560,15 @@ router.post(
     delete sanitizedIncoming.callPreparation;
     if (incoming.authoringDeadlineAt != null) {
       const deadline = new Date(incoming.authoringDeadlineAt).getTime();
-      if (typeof incoming.authoringDeadlineAt !== 'string' || !Number.isFinite(deadline) ||
-          deadline <= Date.now()) {
-        return _res.status(400).json({ error: 'A future authoring deadline is required',
-          reason: 'invalid_authoring_deadline' });
+      if (
+        typeof incoming.authoringDeadlineAt !== 'string' ||
+        !Number.isFinite(deadline) ||
+        deadline <= Date.now()
+      ) {
+        return _res.status(400).json({
+          error: 'A future authoring deadline is required',
+          reason: 'invalid_authoring_deadline',
+        });
       }
       req.viventiumSchedulerAuthoringDeadlineAt = new Date(deadline).toISOString();
     }
@@ -635,17 +646,21 @@ router.post(
     /* === VIVENTIUM START === Bind operator preparation policy to the current exact call. === */
     if (incoming.callPreparation != null) {
       const callSessionId = incoming.callPreparation?.callSessionId;
-      const session = typeof callSessionId === 'string' ? await getCallSession(callSessionId) : null;
+      const session =
+        typeof callSessionId === 'string' ? await getCallSession(callSessionId) : null;
       // A new conversation can materialize after this exact stream was accepted. Reuse
       // only that bound accepted stream; this never grants a second execution.
-      const acceptedPreparationRetry = requestedConversationId === 'new' &&
+      const acceptedPreparationRetry =
+        requestedConversationId === 'new' &&
         existingDispatch?.status === 'accepted' &&
         existingDispatch.streamId === session?.contextPreparation?.streamId &&
         existingDispatch.conversationId === session?.conversationId;
       const current = isCurrentCallPreparationDispatch(session, {
         callSessionId,
         userId: String(req.user?.id || ''),
-        conversationId: acceptedPreparationRetry ? existingDispatch.conversationId : requestedConversationId,
+        conversationId: acceptedPreparationRetry
+          ? existingDispatch.conversationId
+          : requestedConversationId,
         agentId: requestedAgentId || session?.agentId || '',
         idempotencyKey,
         authoringDeadlineAt: req.viventiumSchedulerAuthoringDeadlineAt || '',
@@ -661,7 +676,8 @@ router.post(
       if (policy) {
         try {
           req.viventiumScheduledAgentExecution = normalizeScheduledAgentExecution(
-            JSON.parse(policy), req.config?.endpoints?.agents || {},
+            JSON.parse(policy),
+            req.config?.endpoints?.agents || {},
           );
           if (!req.viventiumScheduledAgentExecution) throw new Error('Missing preparation policy');
         } catch {
@@ -772,12 +788,14 @@ router.post(
       { commit_authority: 'server' },
     );
 
-    const agentId = verifiedPreparationAgentId || await resolveAgentId({
-      req,
-      conversationId,
-      requestedAgentId,
-      userId: req.user?.id,
-    });
+    const agentId =
+      verifiedPreparationAgentId ||
+      (await resolveAgentId({
+        req,
+        conversationId,
+        requestedAgentId,
+        userId: req.user?.id,
+      }));
 
     if (!agentId) {
       return _res.status(400).json({ error: 'agentId is required' });
@@ -931,8 +949,12 @@ router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
   }
 
   if (releaseUnconfirmed) {
-    return res.status(202).json({ success: false, cancelled: streamId,
-      reason: 'release_unconfirmed', capacityReleased: false });
+    return res.status(202).json({
+      success: false,
+      cancelled: streamId,
+      reason: 'release_unconfirmed',
+      capacityReleased: false,
+    });
   }
   return res.json({ success: true, cancelled: streamId });
 });
@@ -966,7 +988,10 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       try {
         voiceRoute = await resolveUserVoiceRoute(userId, { includeSources: true });
       } catch (err) {
-        logger.warn('[VIVENTIUM][scheduler/telegram] Speaking route unavailable', schedulerSafeFailure(err));
+        logger.warn(
+          '[VIVENTIUM][scheduler/telegram] Speaking route unavailable',
+          schedulerSafeFailure(err),
+        );
         speechUnavailable = 'voice_route_unavailable';
       }
     }
@@ -986,7 +1011,9 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       '[VIVENTIUM][scheduler/telegram] Failed to resolve mapping',
       schedulerSafeFailure(err),
     );
-    return res.status(500).json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
+    return res
+      .status(500)
+      .json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
   }
 });
 
@@ -1101,7 +1128,11 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
     },
     (error, errorClass) => {
       if (!res.writableEnded) {
-        writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
+        writeSseEvent(
+          res,
+          'error',
+          schedulerSafeFailure(errorClass ? { code: errorClass } : error),
+        );
         endStream();
       }
     },
@@ -1280,7 +1311,11 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
       },
       (error, errorClass) => {
         if (!res.writableEnded) {
-          writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
+          writeSseEvent(
+            res,
+            'error',
+            schedulerSafeFailure(errorClass ? { code: errorClass } : error),
+          );
           res.end();
         }
       },

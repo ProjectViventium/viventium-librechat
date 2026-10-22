@@ -82,225 +82,235 @@ describe('GlassHive grouped Voice completion dispatch permit', () => {
     await replicaSet?.stop({ doCleanup: true, force: true });
   }, 15000);
 
-  test.each([false, true])('authorize then presentation-complete owns every binding (renew conflict=%s)', async (renewConflict) => {
-    const ownerId = 'owner-grouped-voice';
-    const resultA = terminalIdentity('a', 'grouped-voice-a', ownerId);
-    const resultB = terminalIdentity('b', 'grouped-voice-b', ownerId);
-    const acceptedA = await compareAndSetGlassHiveTerminalCallbackResult({
-      ResultModel: GlassHiveTerminalCallbackResult,
-      incoming: resultA,
-    });
-    const acceptedB = await compareAndSetGlassHiveTerminalCallbackResult({
-      ResultModel: GlassHiveTerminalCallbackResult,
-      incoming: resultB,
-    });
-    const durableResults = await GlassHiveTerminalCallbackResult.find({ ownerId }).lean();
-    const durableByCallback = new Map(durableResults.map((row) => [row.callbackId, row]));
-    const bindings = [
-      [resultA, acceptedA],
-      [resultB, acceptedB],
-    ].map(([result, accepted]) => {
-      const durable = durableByCallback.get(result.callbackId);
-      return {
-        originRef: result.originRef,
-        workRef: result.workRef,
-        workerId: result.workerId,
-        runId: result.runId,
-        callbackRef: canonicalizeGlassHiveCallbackRef(result.callbackId),
-        attemptNumber: result.attemptNumber,
-        resultKey: String(durable._id),
-        acceptedOperationId: accepted.acceptedOperationId,
-        terminalCallbackId: result.callbackId,
-        resultDigest: result.resultDigest,
-        resultRevision: result.resultRevision,
-        effectGeneration: durable.acceptedOperationGeneration,
-      };
-    });
-    const conversationId = '00000000-0000-4000-8000-000000000002';
-    const responseText = 'Both synthetic Workers completed.';
-    const presentation = buildVoiceWorkerCompletionPresentation({
-      ownerId,
-      conversationId,
-      callSessionId: 'call-grouped-voice',
-      responseMessageId: 'message-grouped-voice',
-      responseText,
-      bindings,
-    });
-    const representative = presentation.bindings[0];
-    await saveMessage(
-      {
-        user: { id: ownerId },
-        body: { viventiumQaRun: true, viventiumEvalIsolation: { conversationRecall: true } },
-        config: {},
-      },
-      {
-        messageId: presentation.responseMessageId,
-        conversationId,
-        parentMessageId: 'parent-grouped-voice',
-        sender: 'AI',
-        endpoint: 'agents',
-        model: 'agent-main',
-        text: responseText,
-        isCreatedByUser: false,
-        unfinished: false,
-        error: false,
-      },
-      { context: 'viventium/tests/grouped-voice-presentation' },
-    );
-    await ViventiumGlassHiveCallbackDelivery.create({
-      deliveryKey: 'delivery-grouped-voice',
-      deliveryId: 'delivery-grouped-voice',
-      callbackMessageId: presentation.responseMessageId,
-      callbackId: representative.callbackRef,
-      originRef: representative.originRef,
-      workRef: representative.workRef,
-      userId: ownerId,
-      conversationId,
-      surface: 'voice',
-      event: 'main.followup',
-      status: 'pending',
-      text: responseText,
-      voiceCallSessionId: presentation.callSessionId,
-      voiceRequestId: presentation.turnId,
-      nextAttemptAt: new Date(0),
-      expiresAt: new Date(Date.now() + 60_000),
-      terminalCallbackResultKey: representative.resultKey,
-      terminalCallbackAcceptedOperationId: representative.acceptedOperationId,
-      terminalCallbackId: representative.terminalCallbackId,
-      terminalCallbackResultDigest: representative.resultDigest,
-      terminalCallbackResultRevision: representative.resultRevision,
-      terminalCallbackEffectGeneration: representative.effectGeneration,
-      workerCompletionPresentation: presentation,
-    });
-
-    const [claimed] = await claimPendingGlassHiveCallbackDeliveries({
-      surface: 'voice',
-      userId: ownerId,
-      voiceCallSessionId: presentation.callSessionId,
-      limit: 1,
-    });
-    const initialPermit = await authorizeGlassHiveCallbackDeliveryDispatch({
-      deliveryId: claimed.deliveryId,
-      claimId: claimed.claimId,
-      userId: ownerId,
-      voiceCallSessionId: presentation.callSessionId,
-    });
-    expect(initialPermit).toMatchObject({
-      deliveryId: claimed.deliveryId,
-      claimId: claimed.claimId,
-      surface: 'voice',
-      resultRevision: representative.resultRevision,
-      resultDigest: representative.resultDigest,
-    });
-    // A concurrent projection may touch the result after renewal reads its snapshot.
-    const originalUpdateOne = GlassHiveTerminalCallbackResult.updateOne.bind(GlassHiveTerminalCallbackResult);
-    const renewSpy = renewConflict ? jest.spyOn(GlassHiveTerminalCallbackResult, 'updateOne')
-      .mockImplementationOnce((...args) => {
-        const query = originalUpdateOne(...args);
-        const originalExec = query.exec.bind(query);
-        query.exec = async () => {
-          await GlassHiveTerminalCallbackResult.collection.updateOne(
-            { _id: args[0]._id }, { $set: { updatedAt: new Date(Date.now() + 1000) } },
-          );
-          return originalExec();
+  test.each([false, true])(
+    'authorize then presentation-complete owns every binding (renew conflict=%s)',
+    async (renewConflict) => {
+      const ownerId = 'owner-grouped-voice';
+      const resultA = terminalIdentity('a', 'grouped-voice-a', ownerId);
+      const resultB = terminalIdentity('b', 'grouped-voice-b', ownerId);
+      const acceptedA = await compareAndSetGlassHiveTerminalCallbackResult({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        incoming: resultA,
+      });
+      const acceptedB = await compareAndSetGlassHiveTerminalCallbackResult({
+        ResultModel: GlassHiveTerminalCallbackResult,
+        incoming: resultB,
+      });
+      const durableResults = await GlassHiveTerminalCallbackResult.find({ ownerId }).lean();
+      const durableByCallback = new Map(durableResults.map((row) => [row.callbackId, row]));
+      const bindings = [
+        [resultA, acceptedA],
+        [resultB, acceptedB],
+      ].map(([result, accepted]) => {
+        const durable = durableByCallback.get(result.callbackId);
+        return {
+          originRef: result.originRef,
+          workRef: result.workRef,
+          workerId: result.workerId,
+          runId: result.runId,
+          callbackRef: canonicalizeGlassHiveCallbackRef(result.callbackId),
+          attemptNumber: result.attemptNumber,
+          resultKey: String(durable._id),
+          acceptedOperationId: accepted.acceptedOperationId,
+          terminalCallbackId: result.callbackId,
+          resultDigest: result.resultDigest,
+          resultRevision: result.resultRevision,
+          effectGeneration: durable.acceptedOperationGeneration,
         };
-        return query;
-      }) : null;
-    const permit = await renewGlassHiveCallbackDeliveryDispatch({
-      deliveryId: claimed.deliveryId,
-      claimId: claimed.claimId,
-      dispatchPermit: initialPermit,
-      leaseMs: 120_000,
-      userId: ownerId,
-      voiceCallSessionId: presentation.callSessionId,
-    });
-    renewSpy?.mockRestore();
-    expect(permit).toMatchObject({
-      permitId: initialPermit.permitId,
-      permitGeneration: initialPermit.permitGeneration,
-    });
-    expect(new Date(permit.expiresAt).getTime()).toBeGreaterThan(
-      new Date(initialPermit.expiresAt).getTime(),
-    );
-    const authorized = await ViventiumGlassHiveCallbackDelivery.findOne({
-      deliveryId: claimed.deliveryId,
-    }).lean();
-    expect(authorized).toMatchObject({
-      status: 'claimed',
-      dispatchPermitId: permit.permitId,
-      dispatchPermitGeneration: permit.permitGeneration,
-      workerCompletionEffectLeases: [
-        expect.objectContaining({ resultKey: presentation.bindings[0].resultKey }),
-        expect.objectContaining({ resultKey: presentation.bindings[1].resultKey }),
-      ],
-    });
-
-    await expect(
-      completeGlassHiveWorkerCompletionPresentation({
-        deliveryId: claimed.deliveryId,
-        claimId: claimed.claimId,
-        dispatchPermit: { ...permit, permitId: 'f'.repeat(32) },
-        presentationRef: presentation.presentationRef,
-        userId: ownerId,
-        voiceCallSessionId: presentation.callSessionId,
-      }),
-    ).resolves.toBeNull();
-    await expect(
-      ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: claimed.deliveryId }).lean(),
-    ).resolves.toMatchObject({
-      status: 'claimed',
-      dispatchPermitId: permit.permitId,
-      workerCompletionEffectLeases: expect.arrayContaining([
-        expect.objectContaining({ resultKey: presentation.bindings[0].resultKey }),
-        expect.objectContaining({ resultKey: presentation.bindings[1].resultKey }),
-      ]),
-    });
-    await expect(
-      markGlassHiveCallbackDeliverySent({
-        deliveryId: claimed.deliveryId,
-        claimId: claimed.claimId,
-        dispatchPermit: permit,
-        userId: ownerId,
-        voiceCallSessionId: presentation.callSessionId,
-      }),
-    ).resolves.toBeNull();
-    await expect(
-      ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: claimed.deliveryId }).lean(),
-    ).resolves.toMatchObject({ status: 'claimed', dispatchPermitId: permit.permitId });
-
-    await expect(
-      completeGlassHiveWorkerCompletionPresentation({
-        deliveryId: claimed.deliveryId,
-        claimId: claimed.claimId,
-        dispatchPermit: permit,
-        presentationRef: presentation.presentationRef,
-        userId: ownerId,
-        voiceCallSessionId: presentation.callSessionId,
-      }),
-    ).resolves.toMatchObject({ status: 'sent' });
-    await expect(
-      ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: claimed.deliveryId }).lean(),
-    ).resolves.toMatchObject({
-      status: 'sent',
-      dispatchPermitId: '',
-      dispatchPermitGeneration: 0,
-      dispatchPermitExpiresAt: null,
-      workerCompletionEffectLeases: [],
-    });
-    const releasedResults = await GlassHiveTerminalCallbackResult.find({ ownerId }).lean();
-    expect(releasedResults).toHaveLength(2);
-    for (const result of releasedResults) {
-      expect(result.effectLeaseId).toBeUndefined();
-      expect(result.effectLeaseExpiresAt).toBeUndefined();
-    }
-    expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledTimes(4);
-    expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith(
-      expect.objectContaining({
+      });
+      const conversationId = '00000000-0000-4000-8000-000000000002';
+      const responseText = 'Both synthetic Workers completed.';
+      const presentation = buildVoiceWorkerCompletionPresentation({
+        ownerId,
+        conversationId,
+        callSessionId: 'call-grouped-voice',
+        responseMessageId: 'message-grouped-voice',
+        responseText,
+        bindings,
+      });
+      const representative = presentation.bindings[0];
+      await saveMessage(
+        {
+          user: { id: ownerId },
+          body: { viventiumQaRun: true, viventiumEvalIsolation: { conversationRecall: true } },
+          config: {},
+        },
+        {
+          messageId: presentation.responseMessageId,
+          conversationId,
+          parentMessageId: 'parent-grouped-voice',
+          sender: 'AI',
+          endpoint: 'agents',
+          model: 'agent-main',
+          text: responseText,
+          isCreatedByUser: false,
+          unfinished: false,
+          error: false,
+        },
+        { context: 'viventium/tests/grouped-voice-presentation' },
+      );
+      await ViventiumGlassHiveCallbackDelivery.create({
+        deliveryKey: 'delivery-grouped-voice',
+        deliveryId: 'delivery-grouped-voice',
+        callbackMessageId: presentation.responseMessageId,
+        callbackId: representative.callbackRef,
         originRef: representative.originRef,
-        state: 'sent',
-      }),
-    );
-  }, 15000);
+        workRef: representative.workRef,
+        userId: ownerId,
+        conversationId,
+        surface: 'voice',
+        event: 'main.followup',
+        status: 'pending',
+        text: responseText,
+        voiceCallSessionId: presentation.callSessionId,
+        voiceRequestId: presentation.turnId,
+        nextAttemptAt: new Date(0),
+        expiresAt: new Date(Date.now() + 60_000),
+        terminalCallbackResultKey: representative.resultKey,
+        terminalCallbackAcceptedOperationId: representative.acceptedOperationId,
+        terminalCallbackId: representative.terminalCallbackId,
+        terminalCallbackResultDigest: representative.resultDigest,
+        terminalCallbackResultRevision: representative.resultRevision,
+        terminalCallbackEffectGeneration: representative.effectGeneration,
+        workerCompletionPresentation: presentation,
+      });
+
+      const [claimed] = await claimPendingGlassHiveCallbackDeliveries({
+        surface: 'voice',
+        userId: ownerId,
+        voiceCallSessionId: presentation.callSessionId,
+        limit: 1,
+      });
+      const initialPermit = await authorizeGlassHiveCallbackDeliveryDispatch({
+        deliveryId: claimed.deliveryId,
+        claimId: claimed.claimId,
+        userId: ownerId,
+        voiceCallSessionId: presentation.callSessionId,
+      });
+      expect(initialPermit).toMatchObject({
+        deliveryId: claimed.deliveryId,
+        claimId: claimed.claimId,
+        surface: 'voice',
+        resultRevision: representative.resultRevision,
+        resultDigest: representative.resultDigest,
+      });
+      // A concurrent projection may touch the result after renewal reads its snapshot.
+      const originalUpdateOne = GlassHiveTerminalCallbackResult.updateOne.bind(
+        GlassHiveTerminalCallbackResult,
+      );
+      const renewSpy = renewConflict
+        ? jest
+            .spyOn(GlassHiveTerminalCallbackResult, 'updateOne')
+            .mockImplementationOnce((...args) => {
+              const query = originalUpdateOne(...args);
+              const originalExec = query.exec.bind(query);
+              query.exec = async () => {
+                await GlassHiveTerminalCallbackResult.collection.updateOne(
+                  { _id: args[0]._id },
+                  { $set: { updatedAt: new Date(Date.now() + 1000) } },
+                );
+                return originalExec();
+              };
+              return query;
+            })
+        : null;
+      const permit = await renewGlassHiveCallbackDeliveryDispatch({
+        deliveryId: claimed.deliveryId,
+        claimId: claimed.claimId,
+        dispatchPermit: initialPermit,
+        leaseMs: 120_000,
+        userId: ownerId,
+        voiceCallSessionId: presentation.callSessionId,
+      });
+      renewSpy?.mockRestore();
+      expect(permit).toMatchObject({
+        permitId: initialPermit.permitId,
+        permitGeneration: initialPermit.permitGeneration,
+      });
+      expect(new Date(permit.expiresAt).getTime()).toBeGreaterThan(
+        new Date(initialPermit.expiresAt).getTime(),
+      );
+      const authorized = await ViventiumGlassHiveCallbackDelivery.findOne({
+        deliveryId: claimed.deliveryId,
+      }).lean();
+      expect(authorized).toMatchObject({
+        status: 'claimed',
+        dispatchPermitId: permit.permitId,
+        dispatchPermitGeneration: permit.permitGeneration,
+        workerCompletionEffectLeases: [
+          expect.objectContaining({ resultKey: presentation.bindings[0].resultKey }),
+          expect.objectContaining({ resultKey: presentation.bindings[1].resultKey }),
+        ],
+      });
+
+      await expect(
+        completeGlassHiveWorkerCompletionPresentation({
+          deliveryId: claimed.deliveryId,
+          claimId: claimed.claimId,
+          dispatchPermit: { ...permit, permitId: 'f'.repeat(32) },
+          presentationRef: presentation.presentationRef,
+          userId: ownerId,
+          voiceCallSessionId: presentation.callSessionId,
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: claimed.deliveryId }).lean(),
+      ).resolves.toMatchObject({
+        status: 'claimed',
+        dispatchPermitId: permit.permitId,
+        workerCompletionEffectLeases: expect.arrayContaining([
+          expect.objectContaining({ resultKey: presentation.bindings[0].resultKey }),
+          expect.objectContaining({ resultKey: presentation.bindings[1].resultKey }),
+        ]),
+      });
+      await expect(
+        markGlassHiveCallbackDeliverySent({
+          deliveryId: claimed.deliveryId,
+          claimId: claimed.claimId,
+          dispatchPermit: permit,
+          userId: ownerId,
+          voiceCallSessionId: presentation.callSessionId,
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: claimed.deliveryId }).lean(),
+      ).resolves.toMatchObject({ status: 'claimed', dispatchPermitId: permit.permitId });
+
+      await expect(
+        completeGlassHiveWorkerCompletionPresentation({
+          deliveryId: claimed.deliveryId,
+          claimId: claimed.claimId,
+          dispatchPermit: permit,
+          presentationRef: presentation.presentationRef,
+          userId: ownerId,
+          voiceCallSessionId: presentation.callSessionId,
+        }),
+      ).resolves.toMatchObject({ status: 'sent' });
+      await expect(
+        ViventiumGlassHiveCallbackDelivery.findOne({ deliveryId: claimed.deliveryId }).lean(),
+      ).resolves.toMatchObject({
+        status: 'sent',
+        dispatchPermitId: '',
+        dispatchPermitGeneration: 0,
+        dispatchPermitExpiresAt: null,
+        workerCompletionEffectLeases: [],
+      });
+      const releasedResults = await GlassHiveTerminalCallbackResult.find({ ownerId }).lean();
+      expect(releasedResults).toHaveLength(2);
+      for (const result of releasedResults) {
+        expect(result.effectLeaseId).toBeUndefined();
+        expect(result.effectLeaseExpiresAt).toBeUndefined();
+      }
+      expect(mockRecordVoiceOrchestrationTrace).toHaveBeenCalledTimes(4);
+      expect(mockRecordGlassHiveSurfaceDeliveryOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({
+          originRef: representative.originRef,
+          state: 'sent',
+        }),
+      );
+    },
+    15000,
+  );
 
   test.each([
     ['run.blocked', true],

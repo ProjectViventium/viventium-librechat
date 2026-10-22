@@ -2049,11 +2049,16 @@ async function attachConversationProviderCapabilityBundle({
     capability,
   );
   const workerRoute = configuredConversationOrchestrationWorkerRoute(mcpCapabilitySource);
-  const modelDefinition = capability.models?.find((item) => item.id === (targetAgent.model || targetAgent.model_parameters?.model));
-  const coordinationOnly = mcpCapabilitySource?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
+  const modelDefinition = capability.models?.find(
+    (item) => item.id === (targetAgent.model || targetAgent.model_parameters?.model),
+  );
+  const coordinationOnly =
+    mcpCapabilitySource?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
     ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(modelDefinition?.harnessProfile);
   const inheritedConversation = coordinationOnly
-    ? suppliedInheritedConversation || require('./ViventiumMainContextService').getMainContextAttemptState(req)?.inheritedConversation
+    ? suppliedInheritedConversation ||
+      require('./ViventiumMainContextService').getMainContextAttemptState(req)
+        ?.inheritedConversation
     : undefined;
   if (coordinationOnly && !inheritedConversation) {
     throw new Error('coordination_context_unavailable');

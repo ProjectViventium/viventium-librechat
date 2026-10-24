@@ -10,10 +10,14 @@ test.each([false, true])('launch reconciliation startup respects quiesced=%s', a
   expect(start).toBeGreaterThan(0);
   expect(end).toBeGreaterThan(start);
   const startRecovery = jest.fn();
+  const recoverScheduled = jest.fn().mockResolvedValue(undefined);
   const modules = {
     './services/viventium/channelAdminService': { restoreChannelWorkers: async () => {} },
     './services/viventium/memoryWriterCoordinator': { startMemoryWriterRecovery: jest.fn() },
     './services/viventium/nativeResponseService': { installNativeResponseRecovery: async () => {} },
+    './services/viventium/ScheduleDueService': {
+      reconcileScheduleDueAdmissions: recoverScheduled,
+    },
     './services/viventium/GlassHiveLaunchReconciliationService': {
       startGlassHiveLaunchReconciliation: startRecovery,
     },
@@ -50,6 +54,7 @@ test.each([false, true])('launch reconciliation startup respects quiesced=%s', a
   };
   await vm.runInNewContext(source.slice(start, end) + '\nonServerListening();', context);
   expect(startRecovery).toHaveBeenCalledTimes(quiesced ? 0 : 1);
+  expect(recoverScheduled).toHaveBeenCalledTimes(quiesced ? 0 : 1);
   if (quiesced) expect(required).not.toHaveBeenCalled();
   else expect(context.upgradeFinalization.markReady).toHaveBeenCalledTimes(1);
 });

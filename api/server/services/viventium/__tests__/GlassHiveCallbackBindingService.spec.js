@@ -5,6 +5,7 @@
  * === VIVENTIUM END === */
 
 let mockTerminalFindOne;
+let mockSchedulerDispatchFindOne;
 let mockBindingFindOne;
 let mockBindingUpdateOne;
 let mockExternalFind;
@@ -78,6 +79,9 @@ jest.mock('mongoose', () => {
             findOneAndUpdate: (...args) => mockExternalFindOneAndUpdate(...args),
             updateOne: (...args) => mockExternalUpdateOne(...args),
           };
+        }
+        if (name === 'viventium_scheduler_dispatch_intents') {
+          return { findOne: (...args) => mockSchedulerDispatchFindOne(...args) };
         }
         if (name === 'viventium_glasshive_mission_evidence') return {};
         if (name === 'viventium_glasshive_callback_results')
@@ -159,6 +163,7 @@ describe('GlassHiveCallbackBindingService', () => {
     mockAfterCommit = null;
     mockInvalidateActiveWorkSnapshot.mockClear();
     mockTerminalFindOne = jest.fn().mockResolvedValue(null);
+    mockSchedulerDispatchFindOne = jest.fn().mockResolvedValue(null);
     mockBindingFindOne = jest.fn();
     mockBindingUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockExternalCursor = {
@@ -1881,59 +1886,73 @@ describe('GlassHiveCallbackBindingService', () => {
     expect(mockMarkUserParallelWorkKnown).toHaveBeenCalledWith('owner-cleanup-fence');
   });
 
-  test('a required scheduled pre-dispatch failure closes waiting_external truth', async () => {
-    const originalUrl = process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL;
-    const originalSecret = process.env.VIVENTIUM_SCHEDULER_SECRET;
-    const originalFetch = global.fetch;
-    process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL =
-      'http://scheduler.example/internal/scheduled-prompts/external-work-callback';
-    process.env.VIVENTIUM_SCHEDULER_SECRET = 'synthetic-scheduler-secret';
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      json: jest.fn().mockResolvedValue({ accepted: true }),
-    });
-    mockExternalFindOne.mockResolvedValueOnce(null);
-    mockExternalFind.mockReturnValueOnce({
-      toArray: jest
-        .fn()
-        .mockResolvedValue([{ _id: 'ghi-scheduled', required: true, externalState: 'failed' }]),
-    });
-
-    try {
-      await markGlassHiveLaunchPreDispatchFailed(
-        {
-          originRef: 'ghi-scheduled',
-          ownerId: 'owner-scheduled',
-          required: true,
-          schedulerDispatchDocumentId: 'dispatch-scheduled',
-          scheduleOccurrenceKey: 'occurrence-scheduled',
-        },
-        Object.assign(new Error('authorization unavailable'), {
-          code: 'authorization_prepare_failed',
-        }),
-      );
-
-      expect(global.fetch).toHaveBeenCalledWith(
-        'http://scheduler.example/internal/scheduled-prompts/external-work-callback',
-        expect.objectContaining({
-          method: 'POST',
-          body: expect.stringContaining('"state":"failed"'),
-        }),
-      );
-    } finally {
-      if (originalUrl == null) {
-        delete process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL;
-      } else {
-        process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL = originalUrl;
+  test.each(['legacy', 'application'])(
+    'a required scheduled pre-dispatch failure preserves its clock owner: %s',
+    async (clockOwner) => {
+      if (clockOwner === 'application') {
+        mockSchedulerDispatchFindOne.mockResolvedValue({ kind: 'schedule_due' });
       }
-      if (originalSecret == null) {
-        delete process.env.VIVENTIUM_SCHEDULER_SECRET;
-      } else {
-        process.env.VIVENTIUM_SCHEDULER_SECRET = originalSecret;
+      const originalUrl = process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL;
+      const originalSecret = process.env.VIVENTIUM_SCHEDULER_SECRET;
+      const originalFetch = global.fetch;
+      process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL =
+        'http://scheduler.example/internal/scheduled-prompts/external-work-callback';
+      process.env.VIVENTIUM_SCHEDULER_SECRET = 'synthetic-scheduler-secret';
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: jest.fn().mockResolvedValue({ accepted: true }),
+      });
+      mockExternalFindOne.mockResolvedValueOnce(null);
+      mockExternalFind.mockReturnValueOnce({
+        toArray: jest
+          .fn()
+          .mockResolvedValue([{ _id: 'ghi-scheduled', required: true, externalState: 'failed' }]),
+      });
+
+      try {
+        await markGlassHiveLaunchPreDispatchFailed(
+          {
+            originRef: 'ghi-scheduled',
+            ownerId: 'owner-scheduled',
+            required: true,
+            schedulerDispatchDocumentId: 'dispatch-scheduled',
+            scheduleOccurrenceKey: 'occurrence-scheduled',
+          },
+          Object.assign(new Error('authorization unavailable'), {
+            code: 'authorization_prepare_failed',
+          }),
+        );
+
+        expect(mockSchedulerDispatchFindOne).toHaveBeenCalledWith({
+          _id: 'dispatch-scheduled',
+          userId: 'owner-scheduled',
+        });
+        if (clockOwner === 'application') {
+          expect(global.fetch).not.toHaveBeenCalled();
+        } else {
+          expect(global.fetch).toHaveBeenCalledWith(
+            'http://scheduler.example/internal/scheduled-prompts/external-work-callback',
+            expect.objectContaining({
+              method: 'POST',
+              body: expect.stringContaining('"state":"failed"'),
+            }),
+          );
+        }
+      } finally {
+        if (originalUrl == null) {
+          delete process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL;
+        } else {
+          process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL = originalUrl;
+        }
+        if (originalSecret == null) {
+          delete process.env.VIVENTIUM_SCHEDULER_SECRET;
+        } else {
+          process.env.VIVENTIUM_SCHEDULER_SECRET = originalSecret;
+        }
+        global.fetch = originalFetch;
       }
-      global.fetch = originalFetch;
-    }
-  });
+    },
+  );
 
   test('reconciles a lost launch response from GlassHive origin lookup without creating new work', async () => {
     mockExternalCursor.toArray.mockResolvedValueOnce([

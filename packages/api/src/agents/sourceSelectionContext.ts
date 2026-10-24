@@ -153,7 +153,7 @@ export function buildTrustedSourceSelectionCapsule(
     while (
       candidate.attachments?.length &&
       Buffer.byteLength(encodedUntrustedSources([...sources, candidate]), 'utf8') >
-      MAX_CAPSULE_BYTES
+        MAX_CAPSULE_BYTES
     ) {
       candidate.attachments = candidate.attachments.slice(0, -1);
       candidate.attachmentsTruncated = true;
@@ -173,10 +173,10 @@ export function buildTrustedSourceSelectionCapsule(
       'The listed user input is the current accepted input. Its attachment references belong to that input; other available files remain historical context. The preview is the user’s original text and may be empty for an attachment-only input. Use its S-number when delegating that input.';
   } else if (additive) {
     selectionDescription = `This Main invocation owns the listed user inputs, oldest to newest: its current accepted input and the earlier unanswered inputs whose prior presentation was removed or that were deferred to it.${
-          owned.length < segments.length
-            ? ' Unlisted earlier inputs already have independent authoring owners; do not answer or delegate them again from this invocation.'
-            : ''
-        } For every durable delegation, pass sourceOrdinals with the exact S-number(s) that mission owns. Handle any unselected quick input directly. Never omit sourceOrdinals or merge unrelated sources into one mission unless the user asked to combine them.`;
+      owned.length < segments.length
+        ? ' Unlisted earlier inputs already have independent authoring owners; do not answer or delegate them again from this invocation.'
+        : ''
+    } For every durable delegation, pass sourceOrdinals with the exact S-number(s) that mission owns. Handle any unselected quick input directly. Never omit sourceOrdinals or merge unrelated sources into one mission unless the user asked to combine them.`;
   } else {
     selectionDescription =
       'Multiple unresolved user inputs are present, oldest to newest. For every durable delegation, pass sourceOrdinals with the exact S-number(s) that mission owns. Handle any unselected quick input directly. Never omit sourceOrdinals or merge unrelated sources into one mission unless the user asked to combine them.';

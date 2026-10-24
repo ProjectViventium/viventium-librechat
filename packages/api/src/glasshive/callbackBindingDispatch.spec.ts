@@ -396,36 +396,87 @@ test.each(['', 'Read the selected source.'])(
 
 /* === VIVENTIUM END === */
 
-
 test('launch signature binds only the trusted inherited conversation with stable exact content', () => {
   const { service, launch } = fixture();
-  const context = { version: 1, conversation_id: 'conversation', sources: [{ id: 'source', text: 'Exact é\ncontent.' }] };
-  const trustedLaunch = { ...launch, delegationPacket: undefined, delegationIdentity: {
-    version: 1, idempotency_key: 'a'.repeat(64), goal_digest: 'b'.repeat(64),
-    call_identity_digest: 'c'.repeat(64), source_event_id: 'source', objective_ordinal: 0,
-  }, delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] } };
-  const attach = (bundle: object, modelBundle: object = {}) => service.attachGlassHiveTrustedLaunchMetadata(
-    { title: 'Task', instruction: 'Use the source.', bootstrap_bundle_json: modelBundle }, trustedLaunch, bundle,
-  ) as { bootstrap_bundle_json: { inherited_conversation?: string; viventium_delegation_identity: { launch_payload_digest: string } } };
+  const context = {
+    version: 1,
+    conversation_id: 'conversation',
+    sources: [{ id: 'source', text: 'Exact é\ncontent.' }],
+  };
+  const trustedLaunch = {
+    ...launch,
+    delegationPacket: undefined,
+    delegationIdentity: {
+      version: 1,
+      idempotency_key: 'a'.repeat(64),
+      goal_digest: 'b'.repeat(64),
+      call_identity_digest: 'c'.repeat(64),
+      source_event_id: 'source',
+      objective_ordinal: 0,
+    },
+    delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] },
+  };
+  const attach = (bundle: object, modelBundle: object = {}) =>
+    service.attachGlassHiveTrustedLaunchMetadata(
+      { title: 'Task', instruction: 'Use the source.', bootstrap_bundle_json: modelBundle },
+      trustedLaunch,
+      bundle,
+    ) as {
+      bootstrap_bundle_json: {
+        inherited_conversation?: string;
+        viventium_delegation_identity: { launch_payload_digest: string };
+      };
+    };
   const original = attach({ inherited_conversation: context });
-  const changed = attach({ inherited_conversation: { ...context, sources: [{ id: 'source', text: 'Different content.' }] } });
+  const changed = attach({
+    inherited_conversation: { ...context, sources: [{ id: 'source', text: 'Different content.' }] },
+  });
   expect(JSON.parse(original.bootstrap_bundle_json.inherited_conversation!)).toEqual(context);
-  expect(original.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest)
-    .not.toEqual(changed.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest);
+  expect(
+    original.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest,
+  ).not.toEqual(changed.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest);
   expect(attach({}, { inherited_conversation: context })).toEqual(attach({}));
 });
 
-
 test('trusted history crosses the signed hop as one exact JSON string without routing-key scrubbing', () => {
   const { service, launch } = fixture();
-  const context = { version: 1, conversation_id: 'conversation', sources: [{ id: 'prior', text: 'Exact original.',
-    tool_calls: [{ name: 'original_tool', args: { small: 0.00005, exponent: 1e-7, lone: '\ud800',
-      telegramUserId: 'historical value', callbackUrl: 'historical value' } }] }] };
-  const attached = service.attachGlassHiveTrustedLaunchMetadata({ title: 'Task', instruction: 'Use the source.' },
-    { ...launch, delegationPacket: undefined, delegationIdentity: {
-      version: 1, idempotency_key: 'a'.repeat(64), goal_digest: 'b'.repeat(64), call_identity_digest: 'c'.repeat(64),
-      source_event_id: 'source', objective_ordinal: 0,
-    }, delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] } },
+  const context = {
+    version: 1,
+    conversation_id: 'conversation',
+    sources: [
+      {
+        id: 'prior',
+        text: 'Exact original.',
+        tool_calls: [
+          {
+            name: 'original_tool',
+            args: {
+              small: 0.00005,
+              exponent: 1e-7,
+              lone: '\ud800',
+              telegramUserId: 'historical value',
+              callbackUrl: 'historical value',
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const attached = service.attachGlassHiveTrustedLaunchMetadata(
+    { title: 'Task', instruction: 'Use the source.' },
+    {
+      ...launch,
+      delegationPacket: undefined,
+      delegationIdentity: {
+        version: 1,
+        idempotency_key: 'a'.repeat(64),
+        goal_digest: 'b'.repeat(64),
+        call_identity_digest: 'c'.repeat(64),
+        source_event_id: 'source',
+        objective_ordinal: 0,
+      },
+      delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] },
+    },
     { inherited_conversation: context, callbackUrl: 'not trusted routing' },
   ) as { bootstrap_bundle_json: { inherited_conversation: string; callbackUrl?: string } };
   expect(attached.bootstrap_bundle_json.inherited_conversation).toBe(JSON.stringify(context));

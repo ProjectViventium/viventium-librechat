@@ -90,10 +90,11 @@ function observeNativeResponsePhase(req, stage, operation) {
       return result;
     }
     return Promise.resolve(result)
-      .then((result) => {
-        outcome = 'completed';
-        return result;
-      },
+      .then(
+        (result) => {
+          outcome = 'completed';
+          return result;
+        },
         (error) => {
           recordFailure(error);
           throw error;
@@ -564,7 +565,8 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
       };
     },
     (identity) =>
-      observeNativeResponsePhase(req, 'host_native_admission', () => getService().admit(identity, req._viventiumNativeResponseIdentity),
+      observeNativeResponsePhase(req, 'host_native_admission', () =>
+        getService().admit(identity, req._viventiumNativeResponseIdentity),
       ),
     (identity) => {
       req._viventiumNativeResponseIdentity = identity;

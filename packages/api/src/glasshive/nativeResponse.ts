@@ -47,7 +47,9 @@ const CORTEX_LIFECYCLE_PARTS = new Set<string>([
 ]);
 function nativeAnswerDigest(row: { text?: unknown; content?: unknown }): string {
   const content = Array.isArray(row.content)
-    ? convertHarnessActivityParts(row.content.filter((part) => !CORTEX_LIFECYCLE_PARTS.has(part?.type)))
+    ? convertHarnessActivityParts(
+        row.content.filter((part) => !CORTEX_LIFECYCLE_PARTS.has(part?.type)),
+      )
     : row.content;
   return nativeResponseDigest({ text: row.text, content });
 }
@@ -182,7 +184,8 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       throw new Error('native_response_handoff_unavailable');
     await releaseUnsupported(identity);
   }
-  async function prepareInvocation(identity: NativeResponseIdentity,
+  async function prepareInvocation(
+    identity: NativeResponseIdentity,
     previousIdentity?: NativeResponseIdentity,
   ): Promise<boolean> {
     await currentRoute(identity);

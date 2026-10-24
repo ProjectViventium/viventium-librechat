@@ -640,7 +640,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
         if (main && !(await mainIsCurrent(current, session)))
           throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const leases = main ? [] : dispatchPermitLeases(current);
-        if (!main && leases.length === 0) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        if (!main && leases.length === 0)
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
         for (const lease of leases) {
           const renewed = await renewEffectLease({
             lease,
@@ -681,7 +682,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
         if (main && !(await mainIsCurrent(current, session)))
           throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const leases = main ? [] : dispatchPermitLeases(current);
-        if (!main && leases.length === 0) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        if (!main && leases.length === 0)
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
         for (const lease of leases) {
           const released = await releaseEffectLease({ lease, session });
           if (!released) throw new Error('glasshive_callback_delivery_dispatch_fenced');
@@ -695,7 +697,7 @@ export function createGlassHiveCallbackDeliveryDispatchService(
           {
             $set: {
               dispatchPermitId: '',
-              dispatchPermitGeneration: main ? current.dispatchPermitGeneration: 0,
+              dispatchPermitGeneration: main ? current.dispatchPermitGeneration : 0,
               dispatchPermitExpiresAt: null,
               workerCompletionEffectLeases: [],
             },
@@ -719,7 +721,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
     const now = new Date();
     const constraint = constraintFilter(input);
     const initial = await DeliveryModel.findOne(constraint).lean();
-    if (!initial || (!terminalCallbackReference(initial) && !mainGenerationPresentation(initial))) return { handled: false };
+    if (!initial || (!terminalCallbackReference(initial) && !mainGenerationPresentation(initial)))
+      return { handled: false };
     if (workerCompletionReferences(initial) !== null) return { handled: true, row: null };
     const dispatchPermit = input.dispatchPermit;
     if (!dispatchPermit || !permitMatches(initial, dispatchPermit)) {
@@ -743,7 +746,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
           throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
         }
         const main = mainGenerationPresentation(current);
-        if (main && !(await mainIsCurrent(current, session))) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        if (main && !(await mainIsCurrent(current, session)))
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const lease = main ? null : dispatchPermitLease(current);
         if (!main && !lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const updated = await DeliveryModel.findOneAndUpdate(
@@ -796,7 +800,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
     const now = new Date();
     const constraint = constraintFilter(input);
     const initial = await DeliveryModel.findOne(constraint).lean();
-    if (!initial || (!terminalCallbackReference(initial) && !mainGenerationPresentation(initial))) return { handled: false };
+    if (!initial || (!terminalCallbackReference(initial) && !mainGenerationPresentation(initial)))
+      return { handled: false };
     if (workerCompletionReferences(initial) !== null) return { handled: true, row: null };
     const dispatchPermit = input.dispatchPermit;
     if (!dispatchPermit || !permitMatches(initial, dispatchPermit)) {
@@ -819,7 +824,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
           throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
         }
         const main = mainGenerationPresentation(current);
-        if (main && !(await mainIsCurrent(current, session))) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        if (main && !(await mainIsCurrent(current, session)))
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const lease = main ? null : dispatchPermitLease(current);
         if (!main && !lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const updated = await DeliveryModel.findOneAndUpdate(

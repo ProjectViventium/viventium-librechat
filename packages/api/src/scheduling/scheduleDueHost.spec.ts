@@ -688,10 +688,12 @@ describe('Viventium application receiver uses existing owners', () => {
     telegram.telegramMessageThreadId = '42';
     Object.assign(admission.envelope.request_data, { telegramMessageThreadId: 'forged-topic' });
     await data.host.reconcile();
-    expect(data.dispatch).toHaveBeenCalledWith(expect.objectContaining({
-      viventiumSchedulerDeliveryChannels: ['telegram'],
-      viventiumTelegramMessageThreadId: '42',
-    }));
+    expect(data.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        viventiumSchedulerDeliveryChannels: ['telegram'],
+        viventiumTelegramMessageThreadId: '42',
+      }),
+    );
   });
   test('A-at-nine and B-at-ten sharing original context execute only their own saved instruction', async () => {
     for (const instruction of ['Run action A now', 'Run action B now']) {

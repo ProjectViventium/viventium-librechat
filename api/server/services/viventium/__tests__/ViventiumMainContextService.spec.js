@@ -187,7 +187,8 @@ describe('ViventiumMainContextService', () => {
       (surface, protect, rapid) => {
         const { snapshot, req, raw, messages } = capture({ surface, protect, rapid });
         expect(messages.map((message) => message.id)).toEqual(['prior', 'file-source', 'current']);
-        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['prior',
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual([
+          'prior',
           'file-source',
           'current',
         ]);

@@ -8765,7 +8765,8 @@ class AgentClient extends BaseClient {
           payload,
           req._viventiumInheritedConversationContext,
         );
-      const sanitizedPayload = normalizeTextPartsInPayload(stripInternalContentParts(inheritedPayload),
+      const sanitizedPayload = normalizeTextPartsInPayload(
+        stripInternalContentParts(inheritedPayload),
       );
       const hardenedPayload = Array.isArray(sanitizedPayload)
         ? sanitizedPayload.map((message) => {

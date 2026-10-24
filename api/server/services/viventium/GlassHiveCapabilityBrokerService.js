@@ -1391,8 +1391,10 @@ async function invokeConversationOrchestrationTool({
             ownerId: catalog.user.id,
             ...input,
             ...(inheritedConversation ? { inheritedConversation } : {}),
-            ...(['queue', 'message', 'steer', 'retry', 'resume'].includes(input.action) || input.nativeInput
-              ? { requestBody } : {}),
+            ...(['queue', 'message', 'steer', 'retry', 'resume'].includes(input.action) ||
+            input.nativeInput
+              ? { requestBody }
+              : {}),
             operationId: stableInvocationId,
             ...(isManagedSourceMutation(requestBody)
               ? {
@@ -1482,14 +1484,14 @@ function inheritedWorkArguments(resources, args, start = false) {
   const instruction =
     suppliedInstruction ??
     (texts.length
-    ? texts.join('\n\n')
-    : String(selected.text || '') ||
-      (trustedUploadedFilesFromRequestBody(selected).length
-        ? JSON.stringify({
-            source_segments: segments || [],
-            files: trustedUploadedFilesFromRequestBody(selected),
-          })
-        : ''));
+      ? texts.join('\n\n')
+      : String(selected.text || '') ||
+        (trustedUploadedFilesFromRequestBody(selected).length
+          ? JSON.stringify({
+              source_segments: segments || [],
+              files: trustedUploadedFilesFromRequestBody(selected),
+            })
+          : ''));
   if (!instruction)
     throw Object.assign(new Error('current_task_source_unavailable'), {
       code: 'current_task_source_unavailable',
@@ -1517,7 +1519,9 @@ function inheritedSelectionFailure(error, tool) {
     status: 'blocked',
     reason: code,
     tool,
-    retryable: ['source_selection_required', 'invalid_source_selection',
+    retryable: [
+      'source_selection_required',
+      'invalid_source_selection',
       'invalid_source_instruction_selection',
     ].includes(code),
     needsInput: false,

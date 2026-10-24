@@ -2174,7 +2174,10 @@ async function attachConversationProviderCapabilityBundle({
   // The signed ledger carries only current upload IDs and safe metadata. GlassHive resolves
   // original bytes under this authenticated owner's storage root, never a request-supplied path.
   if (uploadedFiles.length > 0) {
-    bundle = { ...bundle, viventium_upload_context: { selected_uploads: uploadedFiles,
+    bundle = {
+      ...bundle,
+      viventium_upload_context: {
+        selected_uploads: uploadedFiles,
         current_upload_ids: trustedUploadedFilesFromRequestBody(trustedRequestBody)
           .map((file) => file.file_id)
           .filter(Boolean),

@@ -159,18 +159,24 @@ describe('GenerationJobManager logical turns', () => {
         deliveryPolicy: externalDelivery,
       });
       const authority = {
-        version: 1 as const, callSessionId: 'call-1', userId: 'owner-1',
-        kind: 'participant_text' as const, fingerprint: 'a'.repeat(64), turnIds: [],
+        version: 1 as const,
+        callSessionId: 'call-1',
+        userId: 'owner-1',
+        kind: 'participant_text' as const,
+        fingerprint: 'a'.repeat(64),
+        turnIds: [],
       };
       await manager.updateMetadata('typed-voice-authority', {
         viventiumCallSessionId: 'call-1',
         viventiumVoiceWorkAuthority: authority,
       });
       expect(await store.getJob('typed-voice-authority')).toMatchObject({
-        viventiumCallSessionId: 'call-1', viventiumVoiceWorkAuthority: authority,
+        viventiumCallSessionId: 'call-1',
+        viventiumVoiceWorkAuthority: authority,
       });
       expect((await manager.getJob('typed-voice-authority'))?.metadata).toMatchObject({
-        viventiumCallSessionId: 'call-1', viventiumVoiceWorkAuthority: authority,
+        viventiumCallSessionId: 'call-1',
+        viventiumVoiceWorkAuthority: authority,
       });
     } finally {
       await manager.destroy();
@@ -523,11 +529,16 @@ describe('GenerationJobManager logical turns', () => {
       supersede_scope: 'response_only' as const,
     };
     try {
-      const old = await manager.createJob('telegram-old-conversation', 'user-1', 'conversation-old', {
-        interactionContext: orderedContext('conversation-old', 'old-replay', 1),
-        adapterCapabilities: responseOnly,
-        deliveryPolicy: externalDelivery,
-      });
+      const old = await manager.createJob(
+        'telegram-old-conversation',
+        'user-1',
+        'conversation-old',
+        {
+          interactionContext: orderedContext('conversation-old', 'old-replay', 1),
+          adapterCapabilities: responseOnly,
+          deliveryPolicy: externalDelivery,
+        },
+      );
       const fresh = await manager.createJob(
         'telegram-reset-conversation',
         'user-1',
@@ -587,7 +598,10 @@ describe('GenerationJobManager logical turns', () => {
       deliveryPolicy: externalDelivery,
     });
     try {
-      await manager.observeSourceOrder({ source_order_scope: sourceOrderScope, source_sequence: 2 });
+      await manager.observeSourceOrder({
+        source_order_scope: sourceOrderScope,
+        source_sequence: 2,
+      });
       await manager.createJob(
         'telegram-newer-active',
         'user-1',
@@ -2188,7 +2202,8 @@ describe('GenerationJobManager logical turns', () => {
         expect(terminals[0]).toMatchObject(
           lateReceipt
             ? {
-                final: true, superseded: true,
+                final: true,
+                superseded: true,
                 durableEffectReceipt: { effect_ref: 'effect-old' },
               }
             : { final: true, superseded: true },
@@ -2598,8 +2613,12 @@ describe('GenerationJobManager logical turns', () => {
     await create('telegram-release-b', 'event-b');
     const c = await create('telegram-release-c', 'event-c');
 
-    expect((await store.getJob('telegram-release-b'))?.nativeReleaseTargets).toEqual(['response-a']);
-    expect((await store.getJob('telegram-release-c'))?.nativeReleaseTargets).toEqual(['response-a']);
+    expect((await store.getJob('telegram-release-b'))?.nativeReleaseTargets).toEqual([
+      'response-a',
+    ]);
+    expect((await store.getJob('telegram-release-c'))?.nativeReleaseTargets).toEqual([
+      'response-a',
+    ]);
     expect((await store.getJob('telegram-release-c'))?.nativePredecessor).toBeUndefined();
     expect(c.metadata.interactionContext).toMatchObject({ revision: 3 });
     expect(a.abortController.signal.reason).toBe('superseded');
@@ -3038,7 +3057,8 @@ describe('GenerationJobManager logical turns', () => {
     ).resolves.toBe(true);
 
     expect((await store.getJob('telegram-action-a'))?.durableEffectReceipt).toMatchObject({
-      confirmation_pending: true, effect_kind: 'durable_work_action_accepted',
+      confirmation_pending: true,
+      effect_kind: 'durable_work_action_accepted',
     });
 
     expect(terminals).toEqual([
@@ -3067,7 +3087,8 @@ describe('GenerationJobManager logical turns', () => {
       });
       await manager.initialize();
       const claim = await store.claimLogicalTurn('legacy-stream', 'owner', {
-        ...telegramContext('conversation', 'source'), surface,
+        ...telegramContext('conversation', 'source'),
+        surface,
       });
       const context = claim.interactionContext;
       await store.createJob('legacy-stream', 'owner', 'conversation', {
@@ -3076,22 +3097,40 @@ describe('GenerationJobManager logical turns', () => {
         deliveryPolicy: externalDelivery,
       });
       const receipt = {
-        effect_kind: 'durable_work_accepted' as const, effect_ref: 'work-existing',
-        source_event_id: 'source', response_message_id: 'answer-old', committed_at: 1,
+        effect_kind: 'durable_work_accepted' as const,
+        effect_ref: 'work-existing',
+        source_event_id: 'source',
+        response_message_id: 'answer-old',
+        committed_at: 1,
       };
       await store.updateJob('legacy-stream', {
-        status: 'superseded', responseMessageId: 'answer-old',
-        durableEffectReceipt: receipt, durableEffectReceipts: [receipt],
-        finalEvent: JSON.stringify({ final: true, responseMessage: {
-          messageId: 'answer-old', text: 'Legacy generated operation receipt.',
-        } }),
+        status: 'superseded',
+        responseMessageId: 'answer-old',
+        durableEffectReceipt: receipt,
+        durableEffectReceipts: [receipt],
+        finalEvent: JSON.stringify({
+          final: true,
+          responseMessage: {
+            messageId: 'answer-old',
+            text: 'Legacy generated operation receipt.',
+          },
+        }),
       });
       try {
-        const expected = { final: true, superseded: true, logical_turn_id: context.logical_turn_id, revision: 1,
-          durableEffectReceipt: { effect_ref: 'work-existing' } };
+        const expected = {
+          final: true,
+          superseded: true,
+          logical_turn_id: context.logical_turn_id,
+          revision: 1,
+          durableEffectReceipt: { effect_ref: 'work-existing' },
+        };
         expect((await manager.getResumeState('legacy-stream'))?.finalEvent).toEqual(expected);
         const terminals: unknown[] = [];
-        await manager.subscribe('legacy-stream', () => {}, (event) => terminals.push(event));
+        await manager.subscribe(
+          'legacy-stream',
+          () => {},
+          (event) => terminals.push(event),
+        );
         await new Promise((resolve) => setImmediate(resolve));
         expect(terminals).toEqual([expected]);
         expect((await store.getJob('legacy-stream'))?.durableEffectReceipts).toEqual([receipt]);

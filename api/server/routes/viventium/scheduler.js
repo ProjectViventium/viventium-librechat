@@ -979,11 +979,11 @@ router.post(
   async (req, res, next) => {
     if (req.viventiumSchedulerDispatchDocumentId) {
       req._viventiumBeforeGenerationReceipt = async ({ streamId, conversationId }) => {
-      await schedulerDispatchCollection().updateOne(
-        { _id: req.viventiumSchedulerDispatchDocumentId },
-        { $set: { status: 'accepted', streamId, conversationId, updatedAt: new Date() } },
-      );
-    };
+        await schedulerDispatchCollection().updateOne(
+          { _id: req.viventiumSchedulerDispatchDocumentId },
+          { $set: { status: 'accepted', streamId, conversationId, updatedAt: new Date() } },
+        );
+      };
     }
     return AgentController(req, res, next, initializeClient, addSchedulerTitle);
   },

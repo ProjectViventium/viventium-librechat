@@ -2071,12 +2071,12 @@ router.post(
         /* === VIVENTIUM END === */
         const changed =
           await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
-          sourceFilter,
-          () =>
-            Message.updateOne(sourceFilter, {
-              $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
-            }),
-        );
+            sourceFilter,
+            () =>
+              Message.updateOne(sourceFilter, {
+                $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
+              }),
+          );
         if (retainedParentRecovery && changed?.matchedCount !== 1) {
           throw Object.assign(
             new Error('The retained input changed before conversation recovery.'),

@@ -570,7 +570,9 @@ function restoreTaskFromSuppression(tombstone) {
     events: [event],
     observedEventKeys: new Set(),
     sources: [],
-    current: { phase: state, label: event.label,
+    current: {
+      phase: state,
+      label: event.label,
       ...(event.detail ? { detail: event.detail } : {}),
     },
     lastEvent: event,

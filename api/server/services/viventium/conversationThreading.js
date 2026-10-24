@@ -243,7 +243,8 @@ async function resolveReusableConversationState({
   return {
     conversationId,
     /* === VIVENTIUM START === Exclude live drafts; retain authored interrupted parents. === */
-    parentMessageId: resolveLatestLeafMessageId(messages.filter(
+    parentMessageId: resolveLatestLeafMessageId(
+      messages.filter(
         (message) =>
           message.isCreatedByUser !== false ||
           message.unfinished !== true ||

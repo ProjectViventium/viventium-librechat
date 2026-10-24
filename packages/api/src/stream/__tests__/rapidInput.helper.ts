@@ -581,13 +581,13 @@ export function rapidInputContract(createStore: () => IJobStore) {
     });
     await manager.initialize();
     manager.setNativeSourceRecovery((current, previous) =>
-        prepareNativeSourceRecovery(current, previous, {
-          beforeCapture: async () => Date.now() + 1000,
+      prepareNativeSourceRecovery(current, previous, {
+        beforeCapture: async () => Date.now() + 1000,
         isUnboundCancelled: (job) => store.isNativeResponseUnboundCancelled!(job),
         getJob: (id) => store.getJob(id),
         readFacts: async () => ({ facts: { effects: [], work: [] }, pending: false }),
-          sleep: async () => {
-            throw new Error('Unexpected pending source proof');
+        sleep: async () => {
+          throw new Error('Unexpected pending source proof');
         },
       }),
     );
@@ -637,7 +637,9 @@ export function rapidInputContract(createStore: () => IJobStore) {
         [1, 'a', 'Willow 427 / Elm 441'],
         [2, 'b', null],
       ]);
-      expect(committed!.source_segments?.map((source) => source.authoring_revision)).toEqual([2, 2]);
+      expect(committed!.source_segments?.map((source) => source.authoring_revision)).toEqual([
+        2, 2,
+      ]);
       await expect(
         store.commitLogicalTurnAdmission!('a-stream', 'owner', authored!),
       ).rejects.toMatchObject({ code: 'stream_id_conflict' });
@@ -707,17 +709,20 @@ export function rapidInputContract(createStore: () => IJobStore) {
     ['other actor', 'owner', { actor_kind: 'system' as const }],
     ['other origin', 'owner', { origin: 'scheduler' as const }],
     ['other surface', 'owner', { surface: 'web' as const }],
-  ])('author relinquish rejects %s without releasing the admitted source', async (_, owner, change) => {
-    const first = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
-    const authored = await admitAndCommit('a-stream', first);
-    await store.relinquishLogicalTurnAuthor!('a-stream', owner, { ...authored, ...change });
-    const successor = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
-    const committed = await admitAndCommit('b-stream', successor);
-    expect(owned(committed)).toEqual([[2, 'b', null]]);
-    await expect(
-      store.commitLogicalTurnAdmission!('a-stream', 'owner', authored),
-    ).resolves.toEqual(authored);
-  });
+  ])(
+    'author relinquish rejects %s without releasing the admitted source',
+    async (_, owner, change) => {
+      const first = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
+      const authored = await admitAndCommit('a-stream', first);
+      await store.relinquishLogicalTurnAuthor!('a-stream', owner, { ...authored, ...change });
+      const successor = await store.claimLogicalTurn('b-stream', 'owner', context('b', 2));
+      const committed = await admitAndCommit('b-stream', successor);
+      expect(owned(committed)).toEqual([[2, 'b', null]]);
+      await expect(
+        store.commitLogicalTurnAdmission!('a-stream', 'owner', authored),
+      ).resolves.toEqual(authored);
+    },
+  );
   test('a completed Main remains historical after a stale relinquish call', async () => {
     const first = await store.claimLogicalTurn('a-stream', 'owner', quoted('a', 1));
     const authored = await admitAndCommit('a-stream', first);
@@ -752,14 +757,16 @@ export function rapidInputContract(createStore: () => IJobStore) {
       });
       await manager.commitLogicalTurnAuthor('a-stream', 'owner');
       await manager.updateMetadata('a-stream', { responseMessageId: 'response-a' });
-      expect(await manager.markDurableEffectReceipt({
-        streamId: 'a-stream',
-        userId: 'owner',
-        sourceEventId: 'a',
-        responseMessageId: 'response-a',
-        effectKind: 'durable_work_accepted',
-        effectRef: 'durable-worker-a',
-      })).toBe(true);
+      expect(
+        await manager.markDurableEffectReceipt({
+          streamId: 'a-stream',
+          userId: 'owner',
+          sourceEventId: 'a',
+          responseMessageId: 'response-a',
+          effectKind: 'durable_work_accepted',
+          effectRef: 'durable-worker-a',
+        }),
+      ).toBe(true);
       const before = await store.getJob('a-stream');
       await manager.createJob('b-stream', 'owner', 'conversation', {
         interactionContext: context('b', 2),

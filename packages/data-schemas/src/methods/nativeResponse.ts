@@ -91,12 +91,21 @@ export function nativeResponseDigest(value: unknown): string {
 }
 
 /** Only the foreground final and its file/disposition facts own this receipt. */
-export function hostFinalDigest(message: Pick<IMessage, 'text' | 'content' | 'metadata' | 'attachments' | 'files'>): string {
+export function hostFinalDigest(
+  message: Pick<IMessage, 'text' | 'content' | 'metadata' | 'attachments' | 'files'>,
+): string {
   return nativeResponseDigest({
     text: message.text,
-    content: message.content?.filter((part) => !(
-      [ContentTypes.CORTEX_ACTIVATION, ContentTypes.CORTEX_BREWING, ContentTypes.CORTEX_INSIGHT] as string[]
-    ).includes(String(metadataRecord(part).type))),
+    content: message.content?.filter(
+      (part) =>
+        !(
+          [
+            ContentTypes.CORTEX_ACTIVATION,
+            ContentTypes.CORTEX_BREWING,
+            ContentTypes.CORTEX_INSIGHT,
+          ] as string[]
+        ).includes(String(metadataRecord(part).type)),
+    ),
     attachments: message.attachments,
     files: message.files,
     deliveryDisposition: metadataRecord(message.metadata?.viventium).deliveryDisposition,
@@ -325,7 +334,10 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     return saved.matchedCount === 1;
   }
 
-  async function lockSource(identity: Pick<NativeResponseIdentity, 'userId' | 'conversationId' | 'source'>, historical = false): Promise<void> {
+  async function lockSource(
+    identity: Pick<NativeResponseIdentity, 'userId' | 'conversationId' | 'source'>,
+    historical = false,
+  ): Promise<void> {
     const source = await messages()
       .findOne({
         _id: identity.source.id,
@@ -376,7 +388,9 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     if (parentTouched.matchedCount !== 1) throw new Error('native_response_parent_missing');
   }
 
-  async function nativeResponseSourceMatches(identity: Pick<NativeResponseIdentity, 'userId' | 'conversationId' | 'source'>): Promise<boolean> {
+  async function nativeResponseSourceMatches(
+    identity: Pick<NativeResponseIdentity, 'userId' | 'conversationId' | 'source'>,
+  ): Promise<boolean> {
     const source = await messages()
       .findOne({
         _id: identity.source.id,
@@ -934,9 +948,12 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
   }
 
   const hostResponseFilter = (identity: HostResponseIdentity) => ({
-    user: identity.userId, conversationId: identity.conversationId,
-    messageId: identity.responseMessageId, parentMessageId: identity.source.messageId,
-    deletedAt: null, isCreatedByUser: false,
+    user: identity.userId,
+    conversationId: identity.conversationId,
+    messageId: identity.responseMessageId,
+    parentMessageId: identity.source.messageId,
+    deletedAt: null,
+    isCreatedByUser: false,
     'metadata.viventium.interactionContext.logical_turn_id': identity.logicalTurnId,
     'metadata.viventium.interactionContext.revision': identity.revision,
   });
@@ -966,19 +983,39 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
         });
         const saved = await persist();
         await prove(async () => {
-          const row = await messages().findOne(hostResponseFilter(identity))
-            .select('+nativeResponse +hostFinal').lean<NativeResponseRow>();
-          const context = metadataRecord(metadataRecord(row?.metadata?.viventium).interactionContext);
-          if (!saved || !row || row.error === true || typeof row.text !== 'string' ||
-            !Array.isArray(row.content) || row.content.some((part) => metadataRecord(part).type === ContentTypes.ERROR) ||
+          const row = await messages()
+            .findOne(hostResponseFilter(identity))
+            .select('+nativeResponse +hostFinal')
+            .lean<NativeResponseRow>();
+          const context = metadataRecord(
+            metadataRecord(row?.metadata?.viventium).interactionContext,
+          );
+          if (
+            !saved ||
+            !row ||
+            row.error === true ||
+            typeof row.text !== 'string' ||
+            !Array.isArray(row.content) ||
+            row.content.some((part) => metadataRecord(part).type === ContentTypes.ERROR) ||
             (row.nativeResponse && row.nativeResponse.status !== 'unsupported') ||
-            context.conversation_id !== identity.conversationId || context.surface !== identity.surface ||
-            (identity.callSessionId && metadataRecord(row.metadata?.viventium).callSessionId !== identity.callSessionId))
+            context.conversation_id !== identity.conversationId ||
+            context.surface !== identity.surface ||
+            (identity.callSessionId &&
+              metadataRecord(row.metadata?.viventium).callSessionId !== identity.callSessionId)
+          )
             throw new Error('host_final_identity_invalid');
-          const receipt: HostResponseFinal = { ...identity, version: 1, storedAt: Date.now(),
-            payloadSha256: hostFinalDigest(row), contextSha256: nativeResponseDigest(context) };
-          const recorded = await messages().updateOne(hostResponseFilter(identity), { $set: { hostFinal: receipt } });
-          if (recorded.matchedCount !== 1 || !(await isCurrent())) throw new Error('host_final_author_changed');
+          const receipt: HostResponseFinal = {
+            ...identity,
+            version: 1,
+            storedAt: Date.now(),
+            payloadSha256: hostFinalDigest(row),
+            contextSha256: nativeResponseDigest(context),
+          };
+          const recorded = await messages().updateOne(hostResponseFilter(identity), {
+            $set: { hostFinal: receipt },
+          });
+          if (recorded.matchedCount !== 1 || !(await isCurrent()))
+            throw new Error('host_final_author_changed');
         });
         return saved;
       });
@@ -991,51 +1028,95 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
   }
 
   async function readHostResponseFinal(query: {
-    userId?: string; streamId?: string; logicalTurnId?: string; revision?: number;
-    surface?: string; callSessionId?: string; includeSettled?: boolean;
+    userId?: string;
+    streamId?: string;
+    logicalTurnId?: string;
+    revision?: number;
+    surface?: string;
+    callSessionId?: string;
+    includeSettled?: boolean;
   }): Promise<NativeResponseRow | null> {
-    if ((!query.userId || !query.streamId) && (!query.logicalTurnId || !query.revision)) return null;
-    const rows = await messages().find({
-      ...(query.userId ? { user: query.userId } : {}),
-      ...(query.streamId ? { 'hostFinal.streamId': query.streamId } : {}),
-      ...(query.logicalTurnId ? { 'hostFinal.logicalTurnId': query.logicalTurnId,
-        'hostFinal.revision': query.revision } : {}),
-      deletedAt: null, isCreatedByUser: false, error: { $ne: true },
-      'hostFinal.version': 1,
-    }).select('+nativeResponse +hostFinal').limit(2).lean<NativeResponseRow[]>();
+    if ((!query.userId || !query.streamId) && (!query.logicalTurnId || !query.revision))
+      return null;
+    const rows = await messages()
+      .find({
+        ...(query.userId ? { user: query.userId } : {}),
+        ...(query.streamId ? { 'hostFinal.streamId': query.streamId } : {}),
+        ...(query.logicalTurnId
+          ? { 'hostFinal.logicalTurnId': query.logicalTurnId, 'hostFinal.revision': query.revision }
+          : {}),
+        deletedAt: null,
+        isCreatedByUser: false,
+        error: { $ne: true },
+        'hostFinal.version': 1,
+      })
+      .select('+nativeResponse +hostFinal')
+      .limit(2)
+      .lean<NativeResponseRow[]>();
     if (rows.length !== 1) return null;
-    const row = rows[0], identity = row.hostFinal!;
+    const row = rows[0],
+      identity = row.hostFinal!;
     const metadata = metadataRecord(row.metadata?.viventium);
     const context = metadataRecord(metadata.interactionContext);
     const ack = metadataRecord(metadata.deliveryAcknowledgement);
-    if (String(row.user) !== identity.userId || row.conversationId !== identity.conversationId ||
-      row.messageId !== identity.responseMessageId || row.parentMessageId !== identity.source.messageId ||
-      context.logical_turn_id !== identity.logicalTurnId || context.revision !== identity.revision ||
+    if (
+      String(row.user) !== identity.userId ||
+      row.conversationId !== identity.conversationId ||
+      row.messageId !== identity.responseMessageId ||
+      row.parentMessageId !== identity.source.messageId ||
+      context.logical_turn_id !== identity.logicalTurnId ||
+      context.revision !== identity.revision ||
       context.conversation_id !== identity.conversationId ||
       context.surface !== identity.surface ||
       (query.surface && identity.surface !== query.surface) ||
       (identity.callSessionId && metadata.callSessionId !== identity.callSessionId) ||
       (query.callSessionId && identity.callSessionId !== query.callSessionId) ||
-      !identity.storedAt || identity.payloadSha256 !== hostFinalDigest(row) ||
+      !identity.storedAt ||
+      identity.payloadSha256 !== hostFinalDigest(row) ||
       identity.contextSha256 !== nativeResponseDigest(context) ||
       (row.nativeResponse && row.nativeResponse.status !== 'unsupported') ||
       row.content?.some((part) => metadataRecord(part).type === ContentTypes.ERROR) ||
-      (!query.includeSettled && ['committed', 'committed_effect', 'failed'].includes(String(ack.state))) ||
-      !(await nativeResponseSourceMatches(identity))) return null;
+      (!query.includeSettled &&
+        ['committed', 'committed_effect', 'failed'].includes(String(ack.state))) ||
+      !(await nativeResponseSourceMatches(identity))
+    )
+      return null;
     // A newer durable author or source-order observation cannot revive an older host answer.
-    if (await messages().exists({ user: identity.userId, deletedAt: null, $or: [
-      { 'metadata.viventium.interactionContext.logical_turn_id': identity.logicalTurnId,
-        'metadata.viventium.interactionContext.revision': { $gt: identity.revision } },
-      { 'nativeResponse.logicalTurnId': identity.logicalTurnId,
-        'nativeResponse.revision': { $gt: identity.revision } },
-      ...(identity.sourceOrderScope && identity.sourceSequence != null ? [{
-        'metadata.viventium.interactionContext.source_order_scope': identity.sourceOrderScope,
-        'metadata.viventium.interactionContext.source_sequence': { $gt: identity.sourceSequence },
-      }] : []),
-    ] })) return null;
-    const current = await messages().findOne({
-      ...hostResponseFilter(identity), hostFinal: identity,
-    }).select('+hostFinal').lean<NativeResponseRow>();
+    if (
+      await messages().exists({
+        user: identity.userId,
+        deletedAt: null,
+        $or: [
+          {
+            'metadata.viventium.interactionContext.logical_turn_id': identity.logicalTurnId,
+            'metadata.viventium.interactionContext.revision': { $gt: identity.revision },
+          },
+          {
+            'nativeResponse.logicalTurnId': identity.logicalTurnId,
+            'nativeResponse.revision': { $gt: identity.revision },
+          },
+          ...(identity.sourceOrderScope && identity.sourceSequence != null
+            ? [
+                {
+                  'metadata.viventium.interactionContext.source_order_scope':
+                    identity.sourceOrderScope,
+                  'metadata.viventium.interactionContext.source_sequence': {
+                    $gt: identity.sourceSequence,
+                  },
+                },
+              ]
+            : []),
+        ],
+      })
+    )
+      return null;
+    const current = await messages()
+      .findOne({
+        ...hostResponseFilter(identity),
+        hostFinal: identity,
+      })
+      .select('+hostFinal')
+      .lean<NativeResponseRow>();
     return current && hostFinalDigest(current) === identity.payloadSha256 ? current : null;
   }
 
@@ -1045,11 +1126,19 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     transaction: Transaction,
     isCurrent: (identity: HostResponseIdentity) => Promise<boolean> = async () => true,
   ) {
-    if (!['committed', 'failed'].includes(acknowledgement.state) || acknowledgement.effect_ref ||
-      acknowledgement.source_kind === 'schedule_result') return { status: 'not_found' as const };
+    if (
+      !['committed', 'failed'].includes(acknowledgement.state) ||
+      acknowledgement.effect_ref ||
+      acknowledgement.source_kind === 'schedule_result'
+    )
+      return { status: 'not_found' as const };
     return transaction(async () => {
-      const row = await readHostResponseFinal({ logicalTurnId: acknowledgement.logical_turn_id,
-        revision: acknowledgement.revision, surface, includeSettled: true });
+      const row = await readHostResponseFinal({
+        logicalTurnId: acknowledgement.logical_turn_id,
+        revision: acknowledgement.revision,
+        surface,
+        includeSettled: true,
+      });
       if (!row?.hostFinal) return { status: 'not_found' as const };
       const identity = row.hostFinal;
       if (!(await isCurrent(identity))) return { status: 'stale_revision' as const };
@@ -1058,26 +1147,52 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
       const previous = metadataRecord(metadata.deliveryAcknowledgement);
       const { presentation_committed_at: _ignored, ...input } = acknowledgement;
       const { presentation_committed_at: _previousTime, ...prior } = previous;
-      if (previous.state && previous.state !== 'partial_removed' &&
-        nativeResponseDigest(prior) !== nativeResponseDigest(input)) return { status: 'conflict' as const };
-      const accepted = previous.state === input.state ? previous : {
-        ...input, ...(input.state === 'committed' ? { presentation_committed_at: Date.now() } : {}),
-      };
-      const result = await messages().updateOne({
-        ...hostResponseFilter(identity), hostFinal: identity,
-        text: row.text, content: row.content, attachments: row.attachments, files: row.files,
-        'metadata.viventium.deliveryAcknowledgement': metadata.deliveryAcknowledgement === undefined
-          ? { $exists: false } : metadata.deliveryAcknowledgement,
-      }, { $set: {
-        'metadata.viventium.deliveryAcknowledgement': accepted,
-        ...(input.state === 'committed' ? { unfinished: false } : {}),
-      } });
+      if (
+        previous.state &&
+        previous.state !== 'partial_removed' &&
+        nativeResponseDigest(prior) !== nativeResponseDigest(input)
+      )
+        return { status: 'conflict' as const };
+      const accepted =
+        previous.state === input.state
+          ? previous
+          : {
+              ...input,
+              ...(input.state === 'committed' ? { presentation_committed_at: Date.now() } : {}),
+            };
+      const result = await messages().updateOne(
+        {
+          ...hostResponseFilter(identity),
+          hostFinal: identity,
+          text: row.text,
+          content: row.content,
+          attachments: row.attachments,
+          files: row.files,
+          'metadata.viventium.deliveryAcknowledgement':
+            metadata.deliveryAcknowledgement === undefined
+              ? { $exists: false }
+              : metadata.deliveryAcknowledgement,
+        },
+        {
+          $set: {
+            'metadata.viventium.deliveryAcknowledgement': accepted,
+            ...(input.state === 'committed' ? { unfinished: false } : {}),
+          },
+        },
+      );
       if (result.matchedCount !== 1) return { status: 'conflict' as const };
       if (!(await isCurrent(identity))) throw new Error('host_final_author_changed');
-      return { status: 'recorded' as const, idempotent: previous.state === input.state,
+      return {
+        status: 'recorded' as const,
+        idempotent: previous.state === input.state,
         acknowledgement: accepted as InteractionDeliveryAck,
-        presentation: { userId: identity.userId, conversationId: identity.conversationId,
-          responseMessageId: identity.responseMessageId, interactionContext: metadata.interactionContext } };
+        presentation: {
+          userId: identity.userId,
+          conversationId: identity.conversationId,
+          responseMessageId: identity.responseMessageId,
+          interactionContext: metadata.interactionContext,
+        },
+      };
     });
   }
 

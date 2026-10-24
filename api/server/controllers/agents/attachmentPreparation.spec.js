@@ -53,7 +53,9 @@ function preparationOwner(interactionContext = null) {
       ';return conversationContinuity;};',
     scope,
   );
-  return { run: scope.module.exports, continuity,
+  return {
+    run: scope.module.exports,
+    continuity,
     buildRequestBody: scope.buildViventiumMcpRequestBody,
   };
 }

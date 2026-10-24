@@ -2185,7 +2185,9 @@ async function enqueueGlassHiveCallbackDelivery({
             text: preview,
             fullText: deliveryContext.mainGenerationPresentation
               ? String(message.text || '')
-              : completeText && completeText !== preview ? completeText : '',
+              : completeText && completeText !== preview
+                ? completeText
+                : '',
             attachments: Array.isArray(message.attachments) ? message.attachments : [],
             expiresAt,
           },

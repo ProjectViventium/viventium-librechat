@@ -171,17 +171,25 @@ export function nativeStoreContract(
     const { identity, job } = await admitted(store);
     await store.cancelNativeResponse(job);
     await store.updateJob(job.streamId, { status: 'superseded' });
-    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(true);
+    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(
+      true,
+    );
     expect(await store.bindNativeResponse(identity)).toBe(false);
-    expect(await store.isNativeResponseUnboundCancelled!({ ...job, createdAt: job.createdAt + 1 })).toBe(false);
-    expect(await store.isNativeResponseUnboundCancelled!({ ...job, userId: 'foreign-owner' })).toBe(false);
+    expect(
+      await store.isNativeResponseUnboundCancelled!({ ...job, createdAt: job.createdAt + 1 }),
+    ).toBe(false);
+    expect(await store.isNativeResponseUnboundCancelled!({ ...job, userId: 'foreign-owner' })).toBe(
+      false,
+    );
   });
   test('an actually bound publication cannot claim never-admitted cancellation', async () => {
     const { identity, job } = await admitted(store);
     expect(await store.bindNativeResponse(identity)).toBe(true);
     await store.cancelNativeResponse((await store.getJob(job.streamId))!);
     await store.updateJob(job.streamId, { status: 'superseded' });
-    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(false);
+    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(
+      false,
+    );
   });
   test('identity-fenced updates reject a stale incarnation and accept the exact native owner', async () => {
     const { identity } = await admitted(store);
@@ -506,18 +514,28 @@ export function nativeStoreContract(
   test('cancelled native FINAL preserves supersession while retaining its exact revoked publication', async () => {
     const { identity } = await admitted(store);
     expect(await store.bindNativeResponse(identity)).toBe(true);
-    expect(await store.cancelNativeResponse((await store.getJob(identity.streamId))!)).toEqual({ status: 'revoked' });
+    expect(await store.cancelNativeResponse((await store.getJob(identity.streamId))!)).toEqual({
+      status: 'revoked',
+    });
     await store.updateJob(identity.streamId, { status: 'superseded' });
-    expect(await store.finishNativeResponse(identity, '', 'superseded-final', 'cancelled')).toBe(true);
+    expect(await store.finishNativeResponse(identity, '', 'superseded-final', 'cancelled')).toBe(
+      true,
+    );
     expect(await store.settleNativeResponse(identity, 'cancelled')).toBe(true);
     expect(await store.getJob(identity.streamId)).toMatchObject({
-      status: 'superseded', nativeResponseCancelled: true, nativeResponseFinished: true,
-      nativeResponseSettled: true, finalEvent: 'superseded-final',
+      status: 'superseded',
+      nativeResponseCancelled: true,
+      nativeResponseFinished: true,
+      nativeResponseSettled: true,
+      finalEvent: 'superseded-final',
     });
     expect(await store.getNativeResponseCommit(identity)).toEqual({ status: 'revoked' });
     expect(await store.finishNativeResponse(identity, digest, 'late-answer')).toBe(false);
     await store.updateJob(identity.streamId, { status: 'running', finalEvent: 'late-answer' });
-    expect(await store.getJob(identity.streamId)).toMatchObject({ status: 'superseded', finalEvent: 'superseded-final' });
+    expect(await store.getJob(identity.streamId)).toMatchObject({
+      status: 'superseded',
+      finalEvent: 'superseded-final',
+    });
   });
   test('same-stream replacement cannot inherit a cancelled FINAL or accept its late finish', async () => {
     const { identity } = await admitted(store);

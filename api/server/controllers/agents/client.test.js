@@ -1804,16 +1804,14 @@ describe('late completion error content parts', () => {
   test.each(['status 429 rate_limit_error', '401 unauthorized', 'context length exceeded'])(
     'does not treat real provider failures as late stream termination: %s',
     (message) => {
-      expect(AgentClient.isLateStreamTerminationError(new Error(message))).toBe(
-      false);
+      expect(AgentClient.isLateStreamTerminationError(new Error(message))).toBe(false);
     },
   );
 
   test('suppresses terminated stream errors after visible assistant text', () => {
     const contentParts = [{ type: ContentTypes.TEXT, text: 'Partial but visible answer.' }];
     expect(
-      AgentClient.shouldSuppressCompletionErrorContentPart(contentParts,
-        new Error('terminated')),
+      AgentClient.shouldSuppressCompletionErrorContentPart(contentParts, new Error('terminated')),
     ).toBe(true);
   });
 
@@ -1826,15 +1824,14 @@ describe('late completion error content parts', () => {
   });
 
   test('keeps visible errors when there is no assistant text or the error is not suppressible', () => {
-    expect(
-      AgentClient.shouldSuppressCompletionErrorContentPart([], new Error('terminated'))).toBe(
+    expect(AgentClient.shouldSuppressCompletionErrorContentPart([], new Error('terminated'))).toBe(
       false,
     );
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
         [
           {
-      type: ContentTypes.TEXT,
+            type: ContentTypes.TEXT,
             text: 'Final answer.',
           },
         ],
@@ -1845,14 +1842,15 @@ describe('late completion error content parts', () => {
       AgentClient.shouldSuppressCompletionErrorContentPart(
         [
           {
-      type: ContentTypes.TEXT,
+            type: ContentTypes.TEXT,
             text: 'Partial answer.',
           },
         ],
         new Error('status 429 rate_limit_error'),
       ),
     ).toBe(false);
-    expect(AgentClient.createCompletionErrorContentPart(new Error('status 429 rate_limit_error')),
+    expect(
+      AgentClient.createCompletionErrorContentPart(new Error('status 429 rate_limit_error')),
     ).toEqual({
       type: ContentTypes.ERROR,
       [ContentTypes.ERROR]:

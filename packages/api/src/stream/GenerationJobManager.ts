@@ -983,71 +983,155 @@ class GenerationJobManagerClass {
     }
     try {
       const predecessors = this.nativeSourceRecovery
-        ? await this.jobStore.getLogicalTurnSourcePredecessors?.(streamId, userId, context) ?? [] : [];
+        ? ((await this.jobStore.getLogicalTurnSourcePredecessors?.(streamId, userId, context)) ??
+          [])
+        : [];
       const unbound: SerializableJobData[] = [];
       for (const previous of predecessors) {
-        if (unboundPredecessorSourceRecovery(job, previous, await this.jobStore.isNativeResponseUnboundCancelled?.(previous))) unbound.push(previous);
+        if (
+          unboundPredecessorSourceRecovery(
+            job,
+            previous,
+            await this.jobStore.isNativeResponseUnboundCancelled?.(previous),
+          )
+        )
+          unbound.push(previous);
       }
       const unboundIds = new Set(unbound.map((previous) => previous.streamId));
       if (unbound.length) {
         const noNativeTargets = new Set(unbound.map((previous) => previous.responseMessageId));
-        const nativeReleaseTargets = (job.nativeReleaseTargets ?? []).filter((target) => !noNativeTargets.has(target));
+        const nativeReleaseTargets = (job.nativeReleaseTargets ?? []).filter(
+          (target) => !noNativeTargets.has(target),
+        );
         await this.jobStore.updateJob(streamId, { nativeReleaseTargets });
         job = { ...job, nativeReleaseTargets };
       }
-      const bound = predecessors.filter((previous) => previous.nativeResponse && !unboundIds.has(previous.streamId)).sort((a, b) => b.interactionContext!.revision - a.interactionContext!.revision)[0];
-      const anchor = job.nativePredecessor && !unboundIds.has(job.nativePredecessor.streamId) ? await this.jobStore.getJob(job.nativePredecessor.streamId) : bound;
-      if (anchor?.nativeResponse && (anchor.nativeResponse.jobCreatedAt !== anchor.createdAt ||
-        (job.nativePredecessor && !unboundIds.has(job.nativePredecessor.streamId) && (job.nativePredecessor.createdAt !== anchor.createdAt || job.nativePredecessor.invocationId !== anchor.nativeResponse.invocationId)))) {
+      const bound = predecessors
+        .filter((previous) => previous.nativeResponse && !unboundIds.has(previous.streamId))
+        .sort((a, b) => b.interactionContext!.revision - a.interactionContext!.revision)[0];
+      const anchor =
+        job.nativePredecessor && !unboundIds.has(job.nativePredecessor.streamId)
+          ? await this.jobStore.getJob(job.nativePredecessor.streamId)
+          : bound;
+      if (
+        anchor?.nativeResponse &&
+        (anchor.nativeResponse.jobCreatedAt !== anchor.createdAt ||
+          (job.nativePredecessor &&
+            !unboundIds.has(job.nativePredecessor.streamId) &&
+            (job.nativePredecessor.createdAt !== anchor.createdAt ||
+              job.nativePredecessor.invocationId !== anchor.nativeResponse.invocationId)))
+      ) {
         throw nativeSourceRecoveryUnconfirmed('native_identity', job, anchor);
       }
-      if (anchor?.nativeResponse && anchor.status === 'superseded' && anchor.nativeResponseCancelled === true) {
+      if (
+        anchor?.nativeResponse &&
+        anchor.status === 'superseded' &&
+        anchor.nativeResponseCancelled === true
+      ) {
         const before = anchor.nativeResponse.revision;
-        const skipped = Array.from({ length: Math.min(9, Math.max(0, context.revision - before - 1)) }, (_, index) => before + index + 1);
-        if (context.revision - before > 9 || skipped.some((revision) => !unbound.some((previous) => previous.interactionContext?.revision === revision))) {
-          throw Object.assign(new Error('native_source_recovery_predecessor_unavailable'), { code: 'native_source_recovery_predecessor_unavailable' });
+        const skipped = Array.from(
+          { length: Math.min(9, Math.max(0, context.revision - before - 1)) },
+          (_, index) => before + index + 1,
+        );
+        if (
+          context.revision - before > 9 ||
+          skipped.some(
+            (revision) =>
+              !unbound.some((previous) => previous.interactionContext?.revision === revision),
+          )
+        ) {
+          throw Object.assign(new Error('native_source_recovery_predecessor_unavailable'), {
+            code: 'native_source_recovery_predecessor_unavailable',
+          });
         }
         const nativePredecessor: NativePredecessor = {
-          streamId: anchor.streamId, createdAt: anchor.createdAt,
-          responseMessageId: anchor.nativeResponse.responseMessageId, invocationId: anchor.nativeResponse.invocationId,
+          streamId: anchor.streamId,
+          createdAt: anchor.createdAt,
+          responseMessageId: anchor.nativeResponse.responseMessageId,
+          invocationId: anchor.nativeResponse.invocationId,
           ...(skipped.length ? { unadmittedRevisions: skipped } : {}),
         };
-        const nativeReleaseTargets = [...new Set([...(job.nativeReleaseTargets ?? []), anchor.nativeResponse.responseMessageId])];
+        const nativeReleaseTargets = [
+          ...new Set([
+            ...(job.nativeReleaseTargets ?? []),
+            anchor.nativeResponse.responseMessageId,
+          ]),
+        ];
         await this.jobStore.updateJob(streamId, { nativePredecessor, nativeReleaseTargets });
         job = { ...job, nativePredecessor, nativeReleaseTargets };
       }
       if (this.nativeSourceRecovery && job.nativeReleaseTargets?.length && !job.nativePredecessor) {
-        throw Object.assign(new Error('native_source_recovery_predecessor_unavailable'), { code: 'native_source_recovery_predecessor_unavailable' });
+        throw Object.assign(new Error('native_source_recovery_predecessor_unavailable'), {
+          code: 'native_source_recovery_predecessor_unavailable',
+        });
       }
-      const committedAnchor = anchor?.nativeResponse && anchor.nativeResponseCancelled !== true &&
-        anchor.userId === job.userId && anchor.conversationId === job.conversationId &&
+      const committedAnchor =
+        anchor?.nativeResponse &&
+        anchor.nativeResponseCancelled !== true &&
+        anchor.userId === job.userId &&
+        anchor.conversationId === job.conversationId &&
         anchor.nativeResponse.logicalTurnId === context.logical_turn_id &&
         (await this.jobStore.getNativeResponseCommit(anchor.nativeResponse)).status === 'committed';
       const predecessorStream = committedAnchor
         ? unbound.at(-1)?.streamId
-        : anchor?.streamId ?? unbound.at(-1)?.streamId;
+        : (anchor?.streamId ?? unbound.at(-1)?.streamId);
       if (predecessorStream && this.nativeSourceRecovery) {
         const previous = await this.jobStore.getJob(predecessorStream);
-        if (!previous) throw Object.assign(new Error('native_source_recovery_unavailable'), {
-          code: 'native_source_recovery_unavailable',
-        });
+        if (!previous)
+          throw Object.assign(new Error('native_source_recovery_unavailable'), {
+            code: 'native_source_recovery_unavailable',
+          });
         const facts = await this.nativeSourceRecovery(job, previous);
         const current = await this.jobStore.getJob(streamId);
         const released = await this.jobStore.getJob(previous.streamId);
         const currentLogicalTurn = await this.jobStore.isCurrentLogicalTurn(streamId);
-        if (!current || current.createdAt !== job.createdAt || current.userId !== userId ||
-          (!nativePredecessorSourceRecovery(current, released) &&  !unboundPredecessorSourceRecovery(current, released, released ? await this.jobStore.isNativeResponseUnboundCancelled?.(released) : false)) ||
+        if (
+          !current ||
+          current.createdAt !== job.createdAt ||
+          current.userId !== userId ||
+          (!nativePredecessorSourceRecovery(current, released) &&
+            !unboundPredecessorSourceRecovery(
+              current,
+              released,
+              released ? await this.jobStore.isNativeResponseUnboundCancelled?.(released) : false,
+            )) ||
           !currentLogicalTurn ||
-          !this.jobStore.relinquishLogicalTurnAuthor) {
-          throw nativeSourceRecoveryUnconfirmed('author_commit', current, released, currentLogicalTurn);
+          !this.jobStore.relinquishLogicalTurnAuthor
+        ) {
+          throw nativeSourceRecoveryUnconfirmed(
+            'author_commit',
+            current,
+            released,
+            currentLogicalTurn,
+          );
         }
-        for (const stopped of [...unbound, released].filter((value, index, rows) => rows.findIndex((row) => row.streamId === value.streamId) === index)) {
+        for (const stopped of [...unbound, released].filter(
+          (value, index, rows) =>
+            rows.findIndex((row) => row.streamId === value.streamId) === index,
+        )) {
           const exact = await this.jobStore.getJob(stopped.streamId);
-          if (!exact || exact.createdAt !== stopped.createdAt ||
-            (!nativePredecessorSourceRecovery(current, exact) && !unboundPredecessorSourceRecovery(current, exact, await this.jobStore.isNativeResponseUnboundCancelled?.(exact)))) {
-            throw nativeSourceRecoveryUnconfirmed('author_relinquish', current, exact, currentLogicalTurn);
+          if (
+            !exact ||
+            exact.createdAt !== stopped.createdAt ||
+            (!nativePredecessorSourceRecovery(current, exact) &&
+              !unboundPredecessorSourceRecovery(
+                current,
+                exact,
+                await this.jobStore.isNativeResponseUnboundCancelled?.(exact),
+              ))
+          ) {
+            throw nativeSourceRecoveryUnconfirmed(
+              'author_relinquish',
+              current,
+              exact,
+              currentLogicalTurn,
+            );
           }
-          await this.jobStore.relinquishLogicalTurnAuthor(exact.streamId, userId, exact.interactionContext!);
+          await this.jobStore.relinquishLogicalTurnAuthor(
+            exact.streamId,
+            userId,
+            exact.interactionContext!,
+          );
         }
         context = { ...context, source_recovery_facts: facts };
         await this.jobStore.updateJob(streamId, { interactionContext: context });
@@ -1392,7 +1476,7 @@ class GenerationJobManagerClass {
     if (runtime && this.runtimeState.get(identity.streamId) === runtime) {
       runtime.finalEvent = undefined;
       runtime.errorEvent = undefined;
-    runtime.errorClass = undefined;
+      runtime.errorClass = undefined;
       runtime.nativeProducer = undefined;
       this.runtimeState.delete(identity.streamId);
       this.runStepBuffers?.delete(identity.streamId);
@@ -1709,7 +1793,8 @@ class GenerationJobManagerClass {
     if (job.responseMessageId !== responseMessageId) return reject('response_mismatch');
     const currentSource = job.interactionContext?.source_event_id === sourceEventId;
     const ownedEarlierSource = job.interactionContext?.source_segments?.some(
-      (source) => source.source_event_id === sourceEventId &&
+      (source) =>
+        source.source_event_id === sourceEventId &&
         source.authoring_revision === job.interactionContext?.revision,
     );
     if (!currentSource && !ownedEarlierSource) {
@@ -1927,20 +2012,20 @@ class GenerationJobManagerClass {
     // Existing post-ACK state proves whether this exact result still has a live producer.
     const producerPending = Boolean(
       ownerJob &&
-        job &&
-        job.streamId === ownerStreamId &&
-        job.createdAt === ownerJob.createdAt &&
-        job.userId === ownerJob.userId &&
-        job.conversationId === ownerJob.conversationId &&
-        Boolean(ownerJob.responseMessageId) &&
-        job.responseMessageId === ownerJob.responseMessageId &&
-        job.interactionContext?.logical_turn_id === acknowledgement.logical_turn_id &&
-        job.interactionContext?.revision === acknowledgement.revision &&
-        ownerJob.interactionContext?.logical_turn_id === acknowledgement.logical_turn_id &&
-        ownerJob.interactionContext?.revision === acknowledgement.revision &&
-        job.status === 'running' &&
-        job.generationCompleted !== true &&
-        job.nativeResponseCancelled !== true,
+      job &&
+      job.streamId === ownerStreamId &&
+      job.createdAt === ownerJob.createdAt &&
+      job.userId === ownerJob.userId &&
+      job.conversationId === ownerJob.conversationId &&
+      Boolean(ownerJob.responseMessageId) &&
+      job.responseMessageId === ownerJob.responseMessageId &&
+      job.interactionContext?.logical_turn_id === acknowledgement.logical_turn_id &&
+      job.interactionContext?.revision === acknowledgement.revision &&
+      ownerJob.interactionContext?.logical_turn_id === acknowledgement.logical_turn_id &&
+      ownerJob.interactionContext?.revision === acknowledgement.revision &&
+      job.status === 'running' &&
+      job.generationCompleted !== true &&
+      job.nativeResponseCancelled !== true,
     );
     const presentation = ownerJob
       ? {

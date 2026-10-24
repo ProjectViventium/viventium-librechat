@@ -6157,7 +6157,9 @@ test('coordination broker brief separates two callable tools from authorized wor
   const { brokerContextBrief } = require('../GlassHiveCapabilityBootstrapService');
   const { VOICE_TASK_TOOL_NAME } = require('../VoiceTaskManagementTool');
   const brief = brokerContextBrief(['synthetic-server'], {
-    allowedHostTools: ['web_search', 'active_work_list',
+    allowedHostTools: [
+      'web_search',
+      'active_work_list',
       'active_work_action',
       'worker_delegate_once_mcp_glasshive-workers-projects',
       VOICE_TASK_TOOL_NAME,

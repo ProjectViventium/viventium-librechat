@@ -332,7 +332,7 @@ describe('brewingHold', () => {
     expect(text).toBe('Checking now.');
   });
 
-  test('shouldForcePhaseBFollowUp forces new follow-up when no-response parent has Phase B output', () => {
+  test('shouldForcePhaseBFollowUp preserves ordinary judgment when an authored no-response parent has Phase B output', () => {
     expect(
       shouldForcePhaseBFollowUp({
         shouldDeferMainResponse: false,
@@ -341,7 +341,7 @@ describe('brewingHold', () => {
         hasMergedText: false,
         allowErrorOnlyFollowUp: false,
       }),
-    ).toBe(true);
+    ).toBe(false);
 
     expect(
       shouldForcePhaseBFollowUp({
@@ -351,7 +351,7 @@ describe('brewingHold', () => {
         hasMergedText: true,
         allowErrorOnlyFollowUp: false,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test('shouldForcePhaseBFollowUp does not force a normal parent unless explicitly deferred', () => {

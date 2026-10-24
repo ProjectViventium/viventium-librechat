@@ -398,3 +398,15 @@ describe('getThreadData', () => {
     });
   });
 });
+
+test('Cortex dispatch proof stays server-held without mutating canonical metadata', () => {
+  const message = {
+    messageId: 'answer',
+    metadata: {
+      viventium: { cortexTelegramPresentation: { claimToken: 'private' }, ordinary: 'kept' },
+    },
+  };
+  const result = sanitizeMessageForTransmit(message);
+  expect(result.metadata?.viventium).toEqual({ ordinary: 'kept' });
+  expect(message.metadata.viventium.cortexTelegramPresentation.claimToken).toBe('private');
+});

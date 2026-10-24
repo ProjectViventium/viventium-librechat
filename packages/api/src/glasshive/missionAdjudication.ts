@@ -2636,7 +2636,11 @@ export function createGlassHiveMissionAdjudicationService(
           summary.silent += rows.length;
           continue;
         }
-        if (runtimeError.code === 'glasshive_mission_evidence_superseded') {
+        if (
+          ['glasshive_mission_evidence_superseded', 'glasshive_callback_effect_fenced'].includes(
+            runtimeError.code || '',
+          )
+        ) {
           await Promise.all(
             rows.map((row) =>
               collection().updateOne(
@@ -2666,16 +2670,20 @@ export function createGlassHiveMissionAdjudicationService(
           },
         );
         const failedFollowUp = authoredCommitted ? (followUp as RuntimeRecord | null) : null;
-        const exhausted =
-          !failedFollowUp?.messageId &&
-          rows.every((row) => Number(row.attempts || 0) >= MAX_ADJUDICATION_ATTEMPTS);
+        const exhausted = rows.every(
+          (row) => Number(row.attempts || 0) >= MAX_ADJUDICATION_ATTEMPTS,
+        );
         let failedState = 'failed';
         if (exhausted) failedState = 'deadletter';
         else if (failedFollowUp?.messageId) failedState = 'delivery_pending';
         await finishRows(rows, {
           state: failedState,
           followUpMessageId: safeText(failedFollowUp?.messageId, 160),
-          errorCode: exhausted ? 'mission_adjudication_retry_exhausted' : errorCode,
+          errorCode: exhausted
+            ? failedFollowUp?.messageId
+              ? 'mission_delivery_retry_exhausted'
+              : 'mission_adjudication_retry_exhausted'
+            : errorCode,
           preserveFollowUpMessageIds:
             runtimeError.code === 'mission_adjudication_group_follow_up_conflict' ||
             (!authoredCommitted && rows.some((row) => safeText(row.followUpMessageId, 160))),

@@ -136,6 +136,32 @@ export interface TelegramInputRepository {
   due(now: number, limit: number): Promise<TelegramInputRecord[]>;
   group(record: TelegramInputRecord): Promise<TelegramInputRecord[]>;
 }
+/** Presentation follows all exact merged sources, while original input ownership stays unchanged. */
+export function telegramTerminalPresentationScope(
+  record: TelegramInputRecord,
+  context?: {
+    source_sequence?: number;
+    ready_input_continuation?: { presentation_source_sequence: number };
+    source_segments?: readonly { source_event_id: string; source_sequence?: number }[];
+  },
+) {
+  const excludedSourceEventIds = new Set([
+    record.sourceEventId,
+    ...(record.relatedSourceEventIds || []),
+  ]);
+  let sourceSequence = Math.max(
+    record.sourceSequence,
+    Number(context?.source_sequence) || 0,
+    Number(context?.ready_input_continuation?.presentation_source_sequence) || 0,
+  );
+  for (const source of context?.source_segments || []) {
+    if (source.source_event_id) excludedSourceEventIds.add(source.source_event_id);
+    if (Number.isSafeInteger(source.source_sequence))
+      sourceSequence = Math.max(sourceSequence, source.source_sequence!);
+  }
+  return { sourceSequence, excludedSourceEventIds: [...excludedSourceEventIds] };
+}
+
 export interface TelegramInputDependencies {
   repository: TelegramInputRepository;
   transaction<T>(operation: () => Promise<T>): Promise<T>;
@@ -144,6 +170,7 @@ export interface TelegramInputDependencies {
   readPrepared(record: TelegramInputIdentity): Promise<TelegramPreparedInput | null>;
   verifyStream(record: TelegramInputIdentity, streamId: string): Promise<boolean>;
   hasCommittedDelivery(record: TelegramInputIdentity): Promise<boolean>;
+  settleObsoleteTerminal?(record: TelegramInputRecord): Promise<boolean>;
   readStream(
     streamId: string,
     ownerId: string,
@@ -479,6 +506,11 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
           if (!committed && record.state !== 'ready')
             stream = await deps.readStream(record.streamId, record.libreChatUserId);
           terminalRecovery = stream === 'terminal';
+          if (
+            (terminalRecovery || stream === 'failed') &&
+            (await deps.settleObsoleteTerminal?.(record))
+          )
+            continue;
           if (record.state === 'failed' && !terminalRecovery && stream !== 'completed') continue;
           if (stream === 'completed') {
             await deps.transaction(async () => {

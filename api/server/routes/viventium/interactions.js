@@ -375,6 +375,17 @@ router.post('/delivery-ack', async (req, res) => {
       }
     }
     /* === VIVENTIUM END === */
+    if (
+      result.status === 'not_found' &&
+      parsed.cortexPresentation &&
+      adapterSurface === 'telegram'
+    ) {
+      result =
+        await require('~/server/services/viventium/CortexTelegramDeliveryDispatchService').acknowledgeRetainedCortexTelegramDelivery(
+          parsed.acknowledgement,
+          parsed.cortexPresentation,
+        );
+    }
     if (result.status === 'not_found' && !parsed.cortexPresentation) {
       result =
         await require('~/server/services/viventium/nativeResponseService').acknowledgeRetainedHostFinal(
@@ -389,6 +400,19 @@ router.post('/delivery-ack', async (req, res) => {
       parsed.acknowledgement.state === 'failed'
     ) {
       result = await acknowledgeRetainedTelegramFailure(parsed.acknowledgement, adapterSurface);
+    }
+    if (
+      result.status === 'recorded' &&
+      !parsed.cortexPresentation &&
+      adapterSurface === 'telegram' &&
+      parsed.acknowledgement.state === 'failed' &&
+      result.transportOnly !== true
+    ) {
+      const terminal = await acknowledgeRetainedTelegramFailure(
+        parsed.acknowledgement,
+        adapterSurface,
+      );
+      if (terminal.status !== 'not_found') result = terminal;
     }
     if (result.status === 'recorded') {
       const committed = ['committed', 'committed_effect'].includes(result.acknowledgement?.state);

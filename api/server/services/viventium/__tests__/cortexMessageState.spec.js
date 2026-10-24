@@ -7,6 +7,7 @@ let mockGetMessage;
 let mockGetMessages;
 let mockGetInsightDeliveries;
 const mockGetMemoryWriteStatus = jest.fn().mockResolvedValue(null);
+const mockReadHostResponseFinal = jest.fn().mockResolvedValue(null);
 
 jest.mock(
   '@librechat/data-schemas',
@@ -27,6 +28,7 @@ jest.mock('~/models', () => ({
     return mockGetMessages(...args);
   },
   getMemoryWriteStatus: (...args) => mockGetMemoryWriteStatus(...args),
+  readHostResponseFinal: (...args) => mockReadHostResponseFinal(...args),
 }));
 
 jest.mock('~/models/Agent', () => ({
@@ -41,6 +43,7 @@ const { getCortexMessageState, memoryReceiptFromAttachments } = require('../cort
 
 describe('cortexMessageState insight delivery projection', () => {
   beforeEach(() => {
+    mockReadHostResponseFinal.mockReset().mockResolvedValue(null);
     mockGetAgent = jest.fn().mockResolvedValue(null);
     mockGetMessages = jest.fn().mockResolvedValue([]);
     mockGetInsightDeliveries = jest.fn().mockResolvedValue([
@@ -244,6 +247,84 @@ describe('cortexMessageState insight delivery projection', () => {
     },
   );
 
+  test.each([
+    ['{NTA}', false],
+    ['The requested result.', false],
+    ['{NTA}', true],
+    ['The requested result.', true],
+  ])(
+    'uses validated completed host final before polling fallback for %s (promoted=%s)',
+    async (text, promoted) => {
+      const main = {
+        messageId: 'quiet-parent',
+        conversationId: 'conversation-1',
+        text,
+        content: [{ type: 'text', text }],
+        isCreatedByUser: false,
+        unfinished: true,
+        error: false,
+        metadata: {
+          viventium: {
+            interactionContext: {
+              logical_turn_id: 'quiet-turn',
+              revision: 2,
+              surface: 'telegram',
+            },
+          },
+        },
+      };
+      mockGetMessage.mockResolvedValue(main);
+      mockGetInsightDeliveries.mockResolvedValue([]);
+      if (promoted) mockGetMessages.mockResolvedValue([{ messageId: main.messageId, text }]);
+      mockReadHostResponseFinal.mockResolvedValue(main);
+      const state = await getCortexMessageState({ userId: 'owner-1', messageId: main.messageId });
+      expect(state.canonicalText).toBe(text);
+      expect(state.canonicalTextFallbackReason).toBe('');
+      expect(state.followUp).toBeNull();
+      expect(mockReadHostResponseFinal).toHaveBeenCalledWith({
+        userId: 'owner-1',
+        logicalTurnId: 'quiet-turn',
+        revision: 2,
+        surface: 'telegram',
+        includeSettled: true,
+      });
+      expect(main.unfinished).toBe(true);
+    },
+  );
+
+  test.each(['absent', 'foreign-message', 'foreign-conversation'])(
+    'does not classify an unfinished message as completed using %s host proof',
+    async (proof) => {
+      const main = {
+        messageId: 'unfinished-parent',
+        conversationId: 'conversation-1',
+        text: '{NTA}',
+        content: [{ type: 'text', text: '{NTA}' }],
+        unfinished: true,
+        metadata: {
+          viventium: {
+            interactionContext: {
+              logical_turn_id: 'quiet-turn',
+              revision: 2,
+              surface: 'telegram',
+            },
+          },
+        },
+      };
+      mockGetMessage.mockResolvedValue(main);
+      mockGetInsightDeliveries.mockResolvedValue([]);
+      if (proof !== 'absent')
+        mockReadHostResponseFinal.mockResolvedValue({
+          ...main,
+          messageId: proof === 'foreign-message' ? 'foreign' : main.messageId,
+          conversationId: proof === 'foreign-conversation' ? 'foreign' : main.conversationId,
+        });
+      const state = await getCortexMessageState({ userId: 'owner-1', messageId: main.messageId });
+      expect(state.canonicalText).toBe("I couldn't finish that check just now.");
+      expect(state.canonicalTextFallbackReason).toBe('empty_deferred_response');
+    },
+  );
+
   test('keeps quiet Main separate from active and completed Cortex follow-up delivery', async () => {
     const main = {
       messageId: 'quiet-parent',
@@ -255,6 +336,12 @@ describe('cortexMessageState insight delivery projection', () => {
       content: [{ type: 'cortex_activation', status: 'running' }],
       metadata: {
         viventium: {
+          interactionContext: { logical_turn_id: 'quiet-turn', revision: 1, surface: 'telegram' },
+          deliveryAcknowledgement: {
+            logical_turn_id: 'quiet-turn',
+            revision: 1,
+            state: 'committed',
+          },
           deliveryDisposition: {
             version: 1,
             audio: 'skip',
@@ -298,6 +385,7 @@ describe('cortexMessageState insight delivery projection', () => {
       followUpDecision: { result: 'skipped' },
       canonicalTextFallbackReason: '',
     });
+    expect(mockReadHostResponseFinal).not.toHaveBeenCalled();
   });
 
   test('requires committed completion and typed model skip before treating non-native polling as quiet', async () => {

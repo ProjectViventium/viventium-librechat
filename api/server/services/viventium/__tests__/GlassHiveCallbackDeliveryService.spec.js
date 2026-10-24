@@ -2847,6 +2847,60 @@ describe('GlassHiveCallbackDeliveryService', () => {
     });
   });
 
+  test('unlinked bounded prefix defers so a later linked owner can progress', async () => {
+    const matches = require('sift').default;
+    const rows = Array.from({ length: 25 }, (_, i) => ({
+      deliveryId: `unlinked-${i}`,
+      userId: `owner-unlinked-${i}`,
+      surface: 'telegram',
+      status: 'unresolved',
+      createdAt: new Date(i),
+      nextAttemptAt: null,
+    })).concat({
+      deliveryId: 'linked-last',
+      userId: 'owner-linked',
+      surface: 'telegram',
+      status: 'unresolved',
+      createdAt: new Date(30),
+      nextAttemptAt: null,
+    });
+    mockFindDeliveries.mockImplementation((filter) => {
+      let limit = Infinity;
+      const q = {
+        sort: () => q,
+        limit: (n) => {
+          limit = n;
+          return q;
+        },
+        lean: async () => rows.filter(matches(filter)).slice(0, limit),
+      };
+      return q;
+    });
+    mockResolveTelegramMappingByUserId.mockImplementation(async ({ libreChatUserId }) =>
+      libreChatUserId === 'owner-linked' ? { telegramUserId: '77', telegramChatId: '77' } : null,
+    );
+    mockUpdateOne.mockImplementation(async (filter, update) => {
+      const row = rows.find(matches(filter));
+      if (row) Object.assign(row, update.$set);
+      return { matchedCount: row ? 1 : 0 };
+    });
+    mockFindOneAndUpdate.mockImplementation((filter, update) => {
+      const row = rows.find(matches(filter));
+      if (row) Object.assign(row, update.$set);
+      return leanResult(row || null);
+    });
+    expect(await reconcileUnresolvedGlassHiveCallbackDeliveries({ limit: 25 })).toMatchObject({
+      scanned: 25,
+      pending: 25,
+    });
+    expect(await reconcileUnresolvedGlassHiveCallbackDeliveries({ limit: 25 })).toMatchObject({
+      scanned: 1,
+      repaired: 1,
+    });
+    expect(rows.at(-1)).toMatchObject({ status: 'pending', telegramUserId: '77' });
+    expect(rows[0].status).toBe('unresolved');
+  });
+
   test('claim uses the surface ledger without user-prompt matching', async () => {
     mockFindOne
       .mockReturnValueOnce(

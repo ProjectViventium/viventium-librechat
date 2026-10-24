@@ -3332,3 +3332,90 @@ describe('canonical written details in Voice follow-up', () => {
     }
   });
 });
+
+/* VIVENTIUM START: authored silence must reach ordinary Phase B judgment intact. */
+describe('authored no-response primary preparation', () => {
+  test.each([
+    ['web', '{NTA}', '{NTA}', false, ''],
+    ['telegram', ' { nta } ', '{NTA}', false, ''],
+    ['web', 'Nothing new to add.', '{NTA}', false, ''],
+    [
+      'web',
+      '{NTA}',
+      'The completed check found a new blocker.',
+      false,
+      'The completed check found a new blocker.',
+    ],
+    ['web', '', 'A recovered answer.', true, 'A recovered answer.'],
+    ['web', 'Generation in progress.', 'A recovered answer.', true, 'A recovered answer.'],
+  ])(
+    'keeps authored silence distinct from blank recovery: %s / %s / %s',
+    async (surface, recentResponse, generated, forced, expected) => {
+      const processStream = jest.fn().mockResolvedValue(generated);
+      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      const priorKey = process.env.XAI_API_KEY;
+      process.env.XAI_API_KEY = 'synthetic-xai-key';
+      try {
+        const prepared = await prepareCortexFollowUpMessage({
+          req: { body: { viventiumSurface: surface } },
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+          recentResponse,
+          insightsData: {
+            cortexCount: 1,
+            insights: [{ cortexName: 'Synthetic evidence', insight: 'A verified finding.' }],
+          },
+        });
+        expect(prepared.shouldForceVisibleFollowUp).toBe(forced);
+        expect(prepared.followUpDecisionRecord.forceVisibleFollowUp).toBe(forced);
+        expect(prepared.text).toBe(expected);
+        expect(prepared.followUpDecisionRecord.generationFailed).toBe(false);
+        expect(processStream).toHaveBeenCalledTimes(1);
+        const instructions = createRun.mock.calls[0][0].graphConfig.instructions;
+        expect(instructions.includes('completing a deferred response')).toBe(forced);
+        if (recentResponse.trim() && !forced) {
+          expect(processStream.mock.calls[0][0].messages[0].content).toContain(
+            recentResponse.trim(),
+          );
+        }
+      } finally {
+        if (priorKey == null) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = priorKey;
+        createRun.mockRestore();
+      }
+    },
+  );
+  test('failed optional synthesis after authored silence cannot expose raw specialist evidence', async () => {
+    const processStream = jest.fn().mockRejectedValue(new Error('synthetic provider unavailable'));
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const priorKey = process.env.XAI_API_KEY;
+    process.env.XAI_API_KEY = 'synthetic-xai-key';
+    try {
+      const prepared = await prepareCortexFollowUpMessage({
+        req: { body: { viventiumSurface: 'telegram' } },
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
+        agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+        recentResponse: '{NTA}',
+        insightsData: {
+          cortexCount: 1,
+          insights: [
+            { cortexName: 'Synthetic evidence', insight: 'Internal unfulfilled request only.' },
+          ],
+        },
+      });
+      expect(prepared.shouldForceVisibleFollowUp).toBe(false);
+      expect(prepared.text).toBe('');
+      expect(prepared.followUpDecisionRecord).toMatchObject({
+        generationFailed: true,
+        selectedStrategy: 'failed_optional_followup_suppressed',
+      });
+    } finally {
+      if (priorKey == null) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = priorKey;
+      createRun.mockRestore();
+    }
+  });
+});
+/* VIVENTIUM END */

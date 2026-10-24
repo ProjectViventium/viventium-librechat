@@ -866,3 +866,75 @@ test.each(['admitted', 'failed'] as const)(
     expect(f.persistPrepared).toHaveBeenCalledTimes(1);
   },
 );
+
+test('an exact obsolete terminal is settled by the host before a new presentation lease', async () => {
+  const f = fixture();
+  const original = await f.service.register(id(), registration);
+  await f.service.ready('owner', claim(original), input);
+  await f.service.bindStream('owner', claim(original), 'old-stream');
+  f.streams.set('old-stream', 'terminal');
+  f.advance();
+  const settle = jest.fn(async (record: TelegramInputRecord) => {
+    f.rows.set(record.sourceEventId, {
+      ...record,
+      state: 'failed',
+      failureCode: 'source_terminal_superseded',
+      retryAt: 0,
+      leaseUntil: 0,
+    });
+    return true;
+  });
+  Object.assign(f.deps, { settleObsoleteTerminal: settle });
+  expect(await f.service.claimPending()).toEqual([]);
+  expect(settle).toHaveBeenCalledTimes(1);
+  expect(f.rows.get(original.sourceEventId)?.state).toBe('failed');
+  expect(await f.service.claimPending()).toEqual([]);
+  expect(f.persistPrepared).toHaveBeenCalledTimes(1);
+});
+
+describe('terminal presentation scope', () => {
+  const scope = require('./telegramInput').telegramTerminalPresentationScope;
+  test('compares actual presentation sequence and preserves own merged inputs', () => {
+    const record = { ...id(10), relatedSourceEventIds: [id(11).sourceEventId] };
+    expect(
+      scope(record, {
+        source_sequence: 11,
+        ready_input_continuation: { presentation_source_sequence: 12 },
+        source_segments: [{ source_event_id: id(11).sourceEventId, source_sequence: 11 }],
+      }),
+    ).toEqual({
+      sourceSequence: 12,
+      excludedSourceEventIds: [id(10).sourceEventId, id(11).sourceEventId],
+    });
+  });
+});
+
+test('an acknowledged current terminal failure settles before a recovery claim or new authoring', async () => {
+  const f = fixture();
+  const original = await f.service.register(id(), registration);
+  await f.service.ready('owner', claim(original), input);
+  await f.service.bindStream('owner', claim(original), 'stream');
+  f.streams.set('stream', 'failed');
+  f.advance();
+  const settle = jest.fn(async (record: TelegramInputRecord) => {
+    f.rows.set(record.sourceEventId, {
+      ...record,
+      state: 'failed',
+      failureCode: 'source_terminal_presented',
+      retryAt: 0,
+      leaseUntil: 0,
+      claimToken: '',
+    });
+    return true;
+  });
+  Object.assign(f.deps, { settleObsoleteTerminal: settle });
+  expect(await f.service.claimPending()).toEqual([]);
+  expect(settle).toHaveBeenCalledTimes(1);
+  expect(f.rows.get(original.sourceEventId)).toMatchObject({
+    state: 'failed',
+    failureCode: 'source_terminal_presented',
+    claimToken: '',
+  });
+  expect(await f.service.claimPending()).toEqual([]);
+  expect(f.persistPrepared).toHaveBeenCalledTimes(1);
+});

@@ -84,6 +84,16 @@ export function sanitizeMessageForTransmit<T extends Partial<TMessage>>(
     delete sanitized[field as keyof typeof sanitized];
   }
 
+  /* VIVENTIUM START: the server-held Cortex dispatch receipt is not client metadata. */
+  if (sanitized.metadata?.viventium && typeof sanitized.metadata.viventium === 'object') {
+    const viventium = {
+      ...(sanitized.metadata.viventium as { cortexTelegramPresentation?: object }),
+    };
+    delete viventium.cortexTelegramPresentation;
+    sanitized.metadata = { ...sanitized.metadata, viventium };
+  }
+  /* VIVENTIUM END */
+
   // Always create a new array when files exist to maintain full immutability
   if (Array.isArray(sanitized.files)) {
     sanitized.files = sanitized.files.map((file) => sanitizeFileForTransmit(file));

@@ -560,3 +560,19 @@ describe('messages route content sanitization', () => {
     expect(saveMessage.mock.calls[0][1].content[0].metadata.keep).toBe('public');
   });
 });
+
+test('message read keeps Cortex transport proof private and leaves canonical evidence intact', async () => {
+  const stored = {
+    messageId: 'answer',
+    conversationId: 'conversation-cortex',
+    content: [{ type: 'text', text: 'Useful answer' }],
+    metadata: {
+      viventium: { cortexTelegramPresentation: { claimToken: 'private-proof' }, ordinary: 'kept' },
+    },
+  };
+  getMessages.mockResolvedValue([stored]);
+  const response = await request(createApp()).get('/api/messages/conversation-cortex');
+  expect(response.status).toBe(200);
+  expect(JSON.stringify(response.body)).not.toContain('private-proof');
+  expect(stored.metadata.viventium.cortexTelegramPresentation.claimToken).toBe('private-proof');
+});

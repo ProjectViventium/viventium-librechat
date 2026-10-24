@@ -2410,3 +2410,26 @@ test('native document sanitization retains the delivery carrier and removes rese
   expect(JSON.stringify(updated)).not.toContain('private-source');
 });
 /* === VIVENTIUM END === */
+
+test.each(['document', 'update'])(
+  'server-held Cortex receipt cannot be forged through %s message writes',
+  (purpose) => {
+    const { sanitizeMessageForPersistence } = require('./Message').__testables;
+    const forged = {
+      metadata: {
+        viventium: { cortexTelegramPresentation: { claimToken: 'forged' }, ordinary: 'kept' },
+      },
+      'metadata.viventium.cortexTelegramPresentation.claimToken': 'forged',
+      ...(purpose === 'update'
+        ? {
+            $rename: {
+              'metadata.viventium.ordinary': 'metadata.viventium.cortexTelegramPresentation',
+            },
+          }
+        : {}),
+    };
+    const result = sanitizeMessageForPersistence(forged, { purpose });
+    expect(JSON.stringify(result)).not.toContain('forged');
+    expect(JSON.stringify(result.$rename || {})).not.toContain('cortexTelegramPresentation');
+  },
+);

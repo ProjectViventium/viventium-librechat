@@ -14,7 +14,7 @@ const { ContentTypes } = require('librechat-data-provider');
 const { validateDeliveryDisposition } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { memoryReceiptFromAttachments } = require('./memoryReceipt');
-const { getMessages } = require('~/models');
+const { getMessages, readHostResponseFinal } = require('~/models');
 const { getAgent } = require('~/models/Agent');
 const {
   sanitizeFollowUpDisplayText,
@@ -384,14 +384,39 @@ async function getCortexMessageState({ userId, messageId, conversationId, schedu
     { total: 0, pending: 0, claimed: 0, sent: 0, dropped: 0 },
   );
 
-  let canonicalText = extractCanonicalMessageText(message);
   if (followUp?.messageId === message.messageId) {
     followUp = null;
   }
+  let canonicalMessage = message;
+  const context = message.metadata?.viventium?.interactionContext;
+  if (
+    message.unfinished === true &&
+    !followUp &&
+    !hasActiveCortexParts(cortexParts) &&
+    context?.logical_turn_id &&
+    Number.isSafeInteger(context.revision)
+  ) {
+    // External presentation can still be pending after production has durably completed.
+    // Reuse the owner/source/body-validated final instead of guessing from the legacy UI flag.
+    const completed = await readHostResponseFinal({
+      userId,
+      logicalTurnId: context.logical_turn_id,
+      revision: context.revision,
+      surface: context.surface,
+      includeSettled: true,
+    });
+    if (
+      completed?.messageId === message.messageId &&
+      completed.conversationId === message.conversationId
+    ) {
+      canonicalMessage = { ...completed, unfinished: false };
+    }
+  }
+  let canonicalText = extractCanonicalMessageText(canonicalMessage);
 
   const configuredHoldTexts = await resolveConfiguredHoldTextsForMessage(message);
   const canonicalState = resolveDeferredFallbackCanonicalTextState({
-    message,
+    message: canonicalMessage,
     followUp,
     canonicalText,
     cortexParts,

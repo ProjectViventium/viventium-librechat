@@ -8145,6 +8145,175 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     },
   );
 
+  test.each([
+    [
+      'recalled_unfulfilled_work',
+      '{NTA}',
+      false,
+      false,
+      'Review whether anything useful deserves an update. This is a continuity check, not a new artifact request.',
+      'Memory recalls that the user previously requested an illustration. That old request remains unfulfilled. No artifact exists, no tool has run, and no completed work or new fact was found.',
+    ],
+    [
+      'completed_canonical_file',
+      '{NTA}',
+      false,
+      false,
+      'Make the requested illustration and send it here when available.',
+      'Verified completed worker result: the requested illustration is finished. Canonical file receipt: filename illustration.svg; media type image/svg+xml; authorized download URL https://files.example.invalid/illustration.svg. The receipt and completed result match this original request. This is an actual completed artifact, not a memory of a request.',
+    ],
+    [
+      'useful_new_fact',
+      '{NTA}',
+      false,
+      false,
+      'Tell me when the workshop room booking changes.',
+      'Verified new booking result: the workshop has moved from Room One to Room Two. The user has not yet been told this change. No further action or question is required.',
+    ],
+    [
+      'deferred_hold',
+      'Checking now.',
+      true,
+      true,
+      'Review the completed check.',
+      'A verified finding.',
+    ],
+    ['blank_primary', '', false, true, 'Review the completed check.', 'A verified finding.'],
+  ])(
+    'routes real completion into actual Phase B preparation: %s',
+    async (caseId, parentText, deferredMain, expectedForced, userRequest, insight) => {
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const os = require('node:os');
+      const { Run } = require('@librechat/agents');
+      const registry = require('~/server/services/viventium/promptRegistry');
+      const {
+        buildPromptBundleFixture,
+      } = require('../../../../scripts/test-support/promptBundle.cjs');
+      const actualFollowUp = jest.requireActual(
+        '~/server/services/viventium/BackgroundCortexFollowUpService',
+      );
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'phase-b-caller-'));
+      const previousBundle = process.env[registry.PROMPT_BUNDLE_ENV];
+      const previousKey = process.env.XAI_API_KEY;
+      const previousNta = process.env.VIVENTIUM_NO_RESPONSE_ENABLED;
+      const bundleFile = path.join(directory, 'bundle.json');
+      fs.writeFileSync(
+        bundleFile,
+        JSON.stringify(
+          buildPromptBundleFixture(
+            path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts'),
+          ),
+        ),
+      );
+      process.env[registry.PROMPT_BUNDLE_ENV] = bundleFile;
+      process.env.XAI_API_KEY = 'synthetic-key';
+      process.env.VIVENTIUM_NO_RESPONSE_ENABLED = 'false';
+      registry.resetPromptRegistryForTests();
+      const requiredPrompt = require('@librechat/api').getRequiredPromptText;
+      const previousRequiredPrompt = requiredPrompt.getMockImplementation();
+      requiredPrompt.mockImplementation((...args) =>
+        jest.requireActual('@librechat/api').getRequiredPromptText(...args),
+      );
+      req.body.viventiumSurface = 'telegram';
+      client.options.agent = { provider: 'xai', model: 'synthetic-model', model_parameters: {} };
+      client.contentParts = parentText ? [{ type: ContentTypes.TEXT, text: parentText }] : [];
+      const messages = [
+        { messageId: 'synthetic-user', isCreatedByUser: true, text: userRequest },
+        {
+          messageId: 'resp-1',
+          parentMessageId: 'synthetic-user',
+          isCreatedByUser: false,
+          text: parentText,
+        },
+      ];
+      const readMessages = jest.spyOn(db, 'getMessages').mockResolvedValue(messages);
+      const readMessage = jest
+        .spyOn(db, 'getMessage')
+        .mockImplementation(
+          async ({ messageId }) =>
+            messages.find((message) => message.messageId === messageId) || null,
+        );
+      const native = require('~/server/services/viventium/nativeResponseService');
+      const evidence = jest.spyOn(native, 'getService').mockReturnValue({
+        readToolEvidenceForPresentation: async () => [],
+      });
+      const processStream = jest.fn().mockResolvedValue('{NTA}');
+      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      let prepared;
+      mockCreateCortexFollowUpMessage.mockImplementation(async (input) => {
+        prepared = await actualFollowUp.prepareCortexFollowUpMessage(input);
+        return null;
+      });
+      try {
+        await client.attachBackgroundCortexCompletionPipeline({
+          cortexExecutionPromise: Promise.resolve({
+            insights: [{ cortexName: 'Synthetic verified evidence', insight }],
+            mergedPrompt: insight,
+            cortexCount: 1,
+          }),
+          pendingCortexParts: [],
+          req,
+          conversationId: 'conv-1',
+          responseMessageId: 'resp-1',
+          agent: client.options.agent,
+          getResponseContentParts: () => client.contentParts,
+          responseController: { lastUserInputTime: 10 },
+          turnUserInputTime: 10,
+          followupGraceMs: 0,
+          shouldDeferMainResponse: deferredMain,
+          getActivatedCorticesList: () => [{ agentId: 'synthetic-background' }],
+        });
+        expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+        expect(createRun).toHaveBeenCalledTimes(1);
+        const input = mockCreateCortexFollowUpMessage.mock.calls[0][0];
+        const configuration = createRun.mock.calls[0][0].graphConfig;
+        const user = processStream.mock.calls[0][0].messages[0].content;
+        const trace = {
+          caseId,
+          parentText,
+          deferredMain,
+          callerForceVisibleFollowUp: input.forceVisibleFollowUp,
+          preparedForceVisibleFollowUp: prepared.shouldForceVisibleFollowUp,
+          system: configuration.instructions,
+          user,
+          maxTokens: configuration.llmConfig.maxTokens,
+        };
+        if (process.env.VIVENTIUM_TEST_PHASE_B_TRACE_DIR) {
+          fs.writeFileSync(
+            path.join(process.env.VIVENTIUM_TEST_PHASE_B_TRACE_DIR, `${caseId}.json`),
+            JSON.stringify(trace, null, 2),
+            { mode: 0o600 },
+          );
+        }
+        expect(input.forceVisibleFollowUp).toBe(deferredMain);
+        expect(prepared.shouldForceVisibleFollowUp).toBe(expectedForced);
+        expect(configuration.instructions.includes('completing a deferred response')).toBe(
+          expectedForced,
+        );
+        expect(user).toContain(userRequest);
+        expect(user).toContain(insight);
+      } finally {
+        readMessages.mockRestore();
+        readMessage.mockRestore();
+        evidence.mockRestore();
+        createRun.mockRestore();
+        requiredPrompt.mockImplementation(previousRequiredPrompt);
+        mockCreateCortexFollowUpMessage.mockReset().mockResolvedValue(null);
+        for (const [key, value] of [
+          [registry.PROMPT_BUNDLE_ENV, previousBundle],
+          ['XAI_API_KEY', previousKey],
+          ['VIVENTIUM_NO_RESPONSE_ENABLED', previousNta],
+        ]) {
+          if (value == null) delete process.env[key];
+          else process.env[key] = value;
+        }
+        registry.resetPromptRegistryForTests();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   test('persists Phase B parts and waits for fallback text before follow-up synthesis', async () => {
     const phaseB = deferred();
     const mainReady = deferred();

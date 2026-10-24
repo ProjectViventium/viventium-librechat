@@ -29,7 +29,6 @@
 const {
   resolveProductivitySpecialistScope,
 } = require('~/server/services/viventium/productivitySpecialistContext');
-const { isNoResponseOnly } = require('~/server/services/viventium/noResponseTag');
 
 function isEnvDisabled(name) {
   const raw = (process.env[name] || '').trim().toLowerCase();
@@ -352,22 +351,8 @@ function pickHoldText({ responseMessageId, agentInstructions, scheduleId } = {})
   return texts[idx];
 }
 
-function shouldForcePhaseBFollowUp({
-  shouldDeferMainResponse: deferred = false,
-  parentText = '',
-  hasInsights = false,
-  hasMergedText = false,
-  allowErrorOnlyFollowUp = false,
-} = {}) {
-  if (deferred === true) {
-    return true;
-  }
-
-  if (!isNoResponseOnly(parentText)) {
-    return false;
-  }
-
-  return hasInsights === true || hasMergedText === true || allowErrorOnlyFollowUp === true;
+function shouldForcePhaseBFollowUp({ shouldDeferMainResponse: deferred = false } = {}) {
+  return deferred === true;
 }
 
 module.exports = {

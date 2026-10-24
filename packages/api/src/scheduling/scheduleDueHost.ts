@@ -112,6 +112,11 @@ interface DueHostDependencies {
     request: ScheduledMainRequest,
   ): Promise<{ streamId: string; conversationId: string; deferred?: boolean }>;
   readJob(streamId: string): Promise<{ status: string } | null>;
+  readRetainedResult?(
+    admission: ScheduleDueAdmission,
+  ): Promise<
+    { state: 'complete'; messageId: string } | { state: 'failed'; failureCode: string } | null
+  >;
   readResume(streamId: string): Promise<{
     responseMessageId?: string;
     finalEvent?: { responseMessage?: { messageId?: string } };
@@ -568,7 +573,10 @@ export function createScheduleDueHost(deps: DueHostDependencies) {
           : { state: 'unknown', failureCode: 'schedule_due_result_unavailable' };
       }
       const job = await deps.readJob(admission.streamId);
-      if (!job) return { state: 'unknown', failureCode: 'schedule_due_stream_unavailable' };
+      if (!job) {
+        const retained = await deps.readRetainedResult?.(admission);
+        return retained || { state: 'unknown', failureCode: 'schedule_due_stream_unavailable' };
+      }
       if (job.status === 'running') {
         watch(admission.streamId);
         return { state: 'pending' };

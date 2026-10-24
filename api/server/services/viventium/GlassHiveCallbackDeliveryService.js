@@ -4180,6 +4180,7 @@ async function reconcileUnresolvedGlassHiveCallbackDeliveries({ userId = '', lim
   const query = ViventiumGlassHiveCallbackDelivery.find({
     status: 'unresolved',
     surface: 'telegram',
+    $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: nowDate() } }],
     ...(normalizedUserId ? { userId: normalizedUserId } : {}),
   });
   const rows = await query.sort({ createdAt: 1 }).limit(safeLimit).lean();
@@ -4190,6 +4191,14 @@ async function reconcileUnresolvedGlassHiveCallbackDeliveries({ userId = '', lim
   for (const row of Array.isArray(rows) ? rows : []) {
     const ownerId = normalizeText(row?.userId);
     if (!ownerId) {
+      await ViventiumGlassHiveCallbackDelivery.updateOne(
+        {
+          deliveryId: normalizeText(row.deliveryId),
+          surface: 'telegram',
+          status: 'unresolved',
+        },
+        { $set: { nextAttemptAt: new Date(Date.now() + 30_000) } },
+      );
       pending += 1;
       continue;
     }
@@ -4203,6 +4212,15 @@ async function reconcileUnresolvedGlassHiveCallbackDeliveries({ userId = '', lim
     const telegramUserId = normalizeText(mapping?.telegramUserId);
     const telegramChatId = normalizeText(mapping?.telegramChatId || telegramUserId);
     if (!telegramUserId || !telegramChatId) {
+      await ViventiumGlassHiveCallbackDelivery.updateOne(
+        {
+          deliveryId: normalizeText(row.deliveryId),
+          userId: ownerId,
+          surface: 'telegram',
+          status: 'unresolved',
+        },
+        { $set: { nextAttemptAt: new Date(Date.now() + 30_000) } },
+      );
       pending += 1;
       continue;
     }

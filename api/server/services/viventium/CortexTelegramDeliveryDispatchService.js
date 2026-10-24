@@ -6,7 +6,13 @@
  * after the per-turn listener closes, while reusing the existing Cortex and logical-turn fences.
  * === VIVENTIUM END === */
 
-const { GenerationJobManager } = require('@librechat/api');
+const {
+  GenerationJobManager,
+  exactCortexTelegramAuthority,
+  cortexTelegramPresentationProof,
+  exactCortexTelegramPresentation,
+  retainedCortexTelegramAcknowledgement,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const {
   Message,
@@ -108,7 +114,7 @@ function publicClaim({ ownerId, messageId, parentMessageId, revision, claims }) 
   };
 }
 
-function validCandidate(row) {
+function validCandidate(row, allowPresented = false) {
   return (
     normalizeText(row?.deliveryId) &&
     normalizeText(row?.userId) &&
@@ -121,62 +127,12 @@ function validCandidate(row) {
     Array.isArray(row?.requiredSurfaces) &&
     row.requiredSurfaces.includes('telegram') &&
     row?.presentedSurfaces?.includes('web') &&
-    !row?.presentedSurfaces?.includes('telegram')
+    (allowPresented || !row?.presentedSurfaces?.includes('telegram'))
   );
 }
 
-function exactTelegramAuthority({ candidate, parent, followup, ingress, mapping, job }) {
-  const parentContext = parent?.metadata?.viventium?.interactionContext;
-  const jobMetadata = job?.metadata;
-  const jobContext = jobMetadata?.interactionContext;
-  const sourceSequence = Number(ingress?.sourceSequence);
-  const revision = Number(parentContext?.revision);
-  return (
-    validCandidate(candidate) &&
-    parent?.unfinished !== true &&
-    normalizeText(parent?.user) === normalizeText(candidate.userId) &&
-    normalizeText(parent?.conversationId) === normalizeText(candidate.conversationId) &&
-    normalizeText(parent?.messageId) === normalizeText(candidate.parentMessageId) &&
-    parentContext?.surface === 'telegram' &&
-    normalizeText(parentContext?.logical_turn_id) &&
-    Number.isSafeInteger(revision) &&
-    revision > 0 &&
-    normalizeText(parentContext?.source_event_id) &&
-    normalizeText(followup?.user) === normalizeText(candidate.userId) &&
-    normalizeText(followup?.conversationId) === normalizeText(candidate.conversationId) &&
-    normalizeText(followup?.messageId) === normalizeText(candidate.persistedMessageId) &&
-    normalizeText(followup?.parentMessageId) === normalizeText(candidate.parentMessageId) &&
-    followup?.metadata?.viventium?.type === 'cortex_followup' &&
-    normalizeText(followup?.metadata?.viventium?.cortexPresentationParentMessageId) ===
-      normalizeText(candidate.parentMessageId) &&
-    normalizeText(followup?.text) &&
-    normalizeText(ingress?.libreChatUserId) === normalizeText(candidate.userId) &&
-    ingress?.authorityBoundAt instanceof Date &&
-    Number.isFinite(ingress.authorityBoundAt.getTime()) &&
-    normalizeText(ingress?.streamId) === normalizeText(candidate.streamId) &&
-    normalizeText(ingress?.conversationId) === normalizeText(candidate.conversationId) &&
-    normalizeText(ingress?.telegramUserId) &&
-    normalizeText(ingress?.telegramChatId) &&
-    normalizeText(ingress?.telegramMessageId) &&
-    Number.isSafeInteger(sourceSequence) &&
-    sourceSequence > 0 &&
-    Number(ingress?.telegramMessageId) === sourceSequence &&
-    /^[a-f0-9]{64}$/.test(normalizeText(ingress?.sourceOrderScope)) &&
-    /^[a-f0-9]{64}$/.test(normalizeText(ingress?.sourceEventId)) &&
-    normalizeText(mapping?.libreChatUserId) === normalizeText(candidate.userId) &&
-    normalizeText(job?.streamId) === normalizeText(candidate.streamId) &&
-    normalizeText(jobMetadata?.userId) === normalizeText(candidate.userId) &&
-    normalizeText(jobMetadata?.conversationId) === normalizeText(candidate.conversationId) &&
-    normalizeText(jobMetadata?.responseMessageId) === normalizeText(candidate.parentMessageId) &&
-    jobMetadata?.deliveryPolicy?.commit_authority === 'external_adapter' &&
-    jobContext?.surface === 'telegram' &&
-    normalizeText(jobContext?.logical_turn_id) === normalizeText(parentContext.logical_turn_id) &&
-    Number(jobContext?.revision) === revision &&
-    normalizeText(jobContext?.source_order_scope) === normalizeText(ingress.sourceOrderScope) &&
-    Number(jobContext?.source_sequence) === sourceSequence &&
-    normalizeText(jobContext?.source_event_id) === normalizeText(ingress.sourceEventId) &&
-    normalizeText(parentContext.source_event_id) === normalizeText(ingress.sourceEventId)
-  );
+function exactTelegramAuthority(input, allowPresented = false) {
+  return validCandidate(input.candidate, allowPresented) && exactCortexTelegramAuthority(input);
 }
 
 function createCortexTelegramDeliveryDispatchService({
@@ -187,6 +143,8 @@ function createCortexTelegramDeliveryDispatchService({
   jobManager = GenerationJobManager,
   deliveryService = cortexInsightDeliveryService,
   bindMessageGeneration = bindRecoveredCortexPresentationGeneration,
+  readRetainedMainFinalState = (scope) =>
+    require('./nativeResponseService').readRetainedMainFinalState(scope),
 } = {}) {
   async function candidateRows(limit) {
     const checkedAt = new Date();
@@ -246,15 +204,105 @@ function createCortexTelegramDeliveryDispatchService({
     const mapping = ingress?.telegramUserId
       ? await resolveMapping({ telegramUserId: normalizeText(ingress.telegramUserId) })
       : null;
-    return { parent, followup, ingress, mapping, job };
+    const scope = {
+      userId: normalizeText(candidate.userId),
+      streamId: normalizeText(candidate.streamId),
+      conversationId: normalizeText(candidate.conversationId),
+      responseMessageId: normalizeText(candidate.parentMessageId),
+      surface: 'telegram',
+      includeSettled: true,
+    };
+    const retainedState = !job ? await readRetainedMainFinalState(scope) : null;
+    const retained = retainedState?.state === 'complete' ? retainedState.final : null;
+    return { parent, followup, ingress, mapping, job, retained, retainedState };
+  }
+
+  async function settleSupersededCandidate(candidate, authority) {
+    if (
+      authority.retainedState?.state !== 'superseded' ||
+      authority.job ||
+      !exactTelegramAuthority({ candidate, ...authority, retained: authority.retainedState.parent })
+    )
+      return false;
+    const batch = await deliveryService.claimPendingByParent({
+      ownerId: normalizeText(candidate.userId),
+      parentMessageId: normalizeText(candidate.parentMessageId),
+      surface: 'telegram',
+      leaseMs: DEFAULT_LEASE_MS,
+    });
+    if (!batch?.claimed?.length) return true;
+    const current = await loadAuthority(candidate);
+    if (
+      current.job ||
+      current.retainedState?.state !== 'superseded' ||
+      !exactTelegramAuthority({ candidate, ...current, retained: current.retainedState.parent })
+    ) {
+      await deliveryService.markFailed({
+        ownerId: normalizeText(candidate.userId),
+        claims: batch.claimed,
+        reason: 'presentation_failed',
+      });
+      return false;
+    }
+    await deliveryService.markDropped({
+      ownerId: normalizeText(candidate.userId),
+      claims: batch.claimed,
+      dropReason: 'conversation_moved_on',
+    });
+    return true;
+  }
+
+  async function deferCandidate(candidate) {
+    await DeliveryModel.updateMany(
+      {
+        userId: normalizeText(candidate.userId),
+        parentMessageId: normalizeText(candidate.parentMessageId),
+        surface: 'telegram',
+        status: { $in: ['pending', 'claimed'] },
+        presentationLeaseToken: { $in: ['', null] },
+      },
+      { $set: { recoveryEligibleAt: new Date(Date.now() + 30_000) } },
+    );
+  }
+
+  async function recordPresentationProof(message, authority) {
+    const previous = message?.metadata?.viventium?.cortexTelegramPresentation;
+    const proof = cortexTelegramPresentationProof(message, authority);
+    const result = await MessageModel.updateOne(
+      {
+        user: authority.ownerId,
+        conversationId: message.conversationId,
+        messageId: authority.messageId,
+        parentMessageId: authority.parentMessageId,
+        text: message.text,
+        deletedAt: null,
+        isCreatedByUser: false,
+        unfinished: false,
+        error: { $ne: true },
+        'metadata.viventium.messageRevision': authority.revision,
+        'metadata.viventium.cortexPresentationGeneration': authority.generation,
+        'metadata.viventium.cortexPresentationClaimToken': authority.claimToken,
+        ...(previous
+          ? { 'metadata.viventium.cortexTelegramPresentation': previous }
+          : {
+              'metadata.viventium.cortexTelegramPresentation': { $exists: false },
+            }),
+      },
+      { $set: { 'metadata.viventium.cortexTelegramPresentation': proof } },
+    );
+    if (Number(result?.matchedCount ?? result?.n ?? 0) !== 1) throw dispatchConflict();
+    return proof;
   }
 
   async function claimCandidate(candidate, leaseMs) {
-    const authority = await loadAuthority(candidate);
-    if (!exactTelegramAuthority({ candidate, ...authority })) return null;
-
     let claimed = null;
     try {
+      const authority = await loadAuthority(candidate);
+      if (!exactTelegramAuthority({ candidate, ...authority })) {
+        if (!(await settleSupersededCandidate(candidate, authority)))
+          await deferCandidate(candidate);
+        return null;
+      }
       claimed = await deliveryService.claimPendingByParent({
         ownerId: normalizeText(candidate.userId),
         parentMessageId: normalizeText(candidate.parentMessageId),
@@ -309,6 +357,9 @@ function createCortexTelegramDeliveryDispatchService({
         revision,
         claims,
       });
+      await recordPresentationProof(message, cortexClaim);
+      const refreshed = await loadAuthority(candidate);
+      if (!exactTelegramAuthority({ candidate, ...refreshed })) throw dispatchConflict();
       const parentContext = authority.parent.metadata.viventium.interactionContext;
       return {
         deliveryId: normalizeText(cortexClaim.deliveryIds[0] || candidate.deliveryId),
@@ -340,6 +391,7 @@ function createCortexTelegramDeliveryDispatchService({
           logger.warn('[VIVENTIUM][cortex-telegram-dispatch] Claim release failed closed');
         }
       }
+      await deferCandidate(candidate).catch(() => undefined);
       logger.warn('[VIVENTIUM][cortex-telegram-dispatch] Candidate could not be authorized', {
         errorClass: normalizeText(error?.code || error?.name || 'dispatch_authorization_failed'),
       });
@@ -379,7 +431,7 @@ function createCortexTelegramDeliveryDispatchService({
 
   async function exactLiveClaims(
     cortexAuthority,
-    { requirePresentationLease = false, allowExpiredLease = false } = {},
+    { requirePresentationLease = false, allowExpiredLease = false, allowPresented = false } = {},
   ) {
     const deliveryIds = Array.from(
       new Set(
@@ -437,10 +489,12 @@ function createCortexTelegramDeliveryDispatchService({
           normalizeText(row?.deliveryId) === deliveryIds[index] &&
           normalizeText(row?.graphResultHash).toLowerCase() === receipts[index].graphResultHash &&
           row?.surface === 'telegram' &&
-          row?.status === 'claimed' &&
-          normalizeText(row?.claimToken) === claimToken &&
+          (row?.status === 'claimed' || (allowPresented && row?.status === 'sent')) &&
+          ((allowPresented && row?.status === 'sent') ||
+            normalizeText(row?.claimToken) === claimToken) &&
           Number(row?.claimGeneration) === generation &&
           (allowExpiredLease ||
+            (allowPresented && row?.status === 'sent') ||
             (row?.leaseExpiresAt instanceof Date &&
               row.leaseExpiresAt.getTime() > checkedAt.getTime())) &&
           Number(row?.presentationRevision ?? row?.messageRevision) === revision &&
@@ -450,6 +504,7 @@ function createCortexTelegramDeliveryDispatchService({
           row.requiredSurfaces.includes('telegram') &&
           row?.presentedSurfaces?.includes('web') &&
           (!presentationLeaseToken ||
+            (allowPresented && row?.status === 'sent') ||
             (normalizeText(row?.presentationLeaseToken) === presentationLeaseToken &&
               normalizeText(row?.presentationLeaseOwnerId) === [...ownerIds][0] &&
               normalizeText(row?.presentationLeaseClaimToken) === claimToken &&
@@ -457,7 +512,7 @@ function createCortexTelegramDeliveryDispatchService({
               (allowExpiredLease ||
                 (row?.presentationLeaseExpiresAt instanceof Date &&
                   row.presentationLeaseExpiresAt.getTime() > checkedAt.getTime())))) &&
-          !row?.presentedSurfaces?.includes('telegram'),
+          (allowPresented || !row?.presentedSurfaces?.includes('telegram')),
       );
     if (!exact) throw dispatchConflict();
     return {
@@ -477,6 +532,13 @@ function createCortexTelegramDeliveryDispatchService({
 
   async function authorizeClaim({ cortexClaim, leaseMs = DEFAULT_LEASE_MS } = {}) {
     const current = await exactLiveClaims(cortexClaim);
+    const candidate = current.rows[0];
+    const authority = await loadAuthority(candidate);
+    if (
+      !exactTelegramAuthority({ candidate, ...authority }) ||
+      !exactCortexTelegramPresentation(authority.followup, cortexClaim)
+    )
+      throw dispatchConflict();
     const fence = await deliveryService.fencePresentation({
       ownerId: current.ownerId,
       claims: current.claims,
@@ -487,9 +549,45 @@ function createCortexTelegramDeliveryDispatchService({
       leaseMs: boundedLeaseMs(leaseMs),
     });
     const presentation = publicPresentation(fence);
-    const bound = await jobManager.bindCortexPresentation(current.streamId, presentation);
-    if (!bound) throw dispatchConflict('Cortex Telegram stream presentation binding failed');
+    await recordPresentationProof(authority.followup, presentation);
+    if (authority.job) {
+      const bound = await jobManager.bindCortexPresentation(current.streamId, presentation);
+      if (!bound) throw dispatchConflict('Cortex Telegram stream presentation binding failed');
+    }
+    const refreshed = await loadAuthority(candidate);
+    if (
+      !exactTelegramAuthority({ candidate, ...refreshed }) ||
+      !exactCortexTelegramPresentation(refreshed.followup, presentation, true)
+    )
+      throw dispatchConflict();
     return presentation;
+  }
+
+  async function acknowledgeRetained(acknowledgement, cortexPresentation) {
+    if (
+      acknowledgement.state !== 'committed' ||
+      acknowledgement.effect_ref ||
+      acknowledgement.source_kind === 'schedule_result'
+    )
+      return { status: 'not_found' };
+    try {
+      const current = await exactLiveClaims(cortexPresentation, {
+        requirePresentationLease: true,
+        allowPresented: true,
+      });
+      const candidate = current.rows[0];
+      const authority = await loadAuthority(candidate);
+      if (!validCandidate(candidate, true)) return { status: 'conflict' };
+      return retainedCortexTelegramAcknowledgement({
+        acknowledgement,
+        presentation: cortexPresentation,
+        authority: { candidate, ...authority },
+        presented: current.rows.every((row) => row.presentedSurfaces?.includes('telegram')),
+      });
+    } catch (error) {
+      if (error?.code === 'cortex_telegram_dispatch_claim_conflict') return { status: 'conflict' };
+      throw error;
+    }
   }
 
   async function failClaim({
@@ -600,6 +698,7 @@ function createCortexTelegramDeliveryDispatchService({
   return {
     claimPending,
     authorizeClaim,
+    acknowledgeRetained,
     failClaim,
     suppressClaim,
     markDeliveryUnknown,
@@ -613,6 +712,7 @@ module.exports = {
   createCortexTelegramDeliveryDispatchService,
   claimPendingCortexTelegramDeliveries: defaultService.claimPending,
   authorizeCortexTelegramDeliveryClaim: defaultService.authorizeClaim,
+  acknowledgeRetainedCortexTelegramDelivery: defaultService.acknowledgeRetained,
   failCortexTelegramDeliveryClaim: defaultService.failClaim,
   suppressCortexTelegramDeliveryClaim: defaultService.suppressClaim,
   markCortexTelegramDeliveryUnknown: defaultService.markDeliveryUnknown,

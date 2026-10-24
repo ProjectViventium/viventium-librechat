@@ -2,8 +2,13 @@ const express = require('express');
 const mockAcknowledgeHostFinal = jest.fn();
 jest.mock('~/server/services/viventium/nativeResponseService', () => ({
   acknowledgeRetainedHostFinal: (...args) => mockAcknowledgeHostFinal(...args),
+  readRetainedMainFinal: async () => null,
 }));
 
+const mockAcknowledgeRetainedCortex = jest.fn();
+jest.mock('~/server/services/viventium/CortexTelegramDeliveryDispatchService', () => ({
+  acknowledgeRetainedCortexTelegramDelivery: (...args) => mockAcknowledgeRetainedCortex(...args),
+}));
 let mockAcknowledgeDelivery;
 let mockAcknowledgeDurableEffectDelivery;
 let mockAcknowledgeServerCommittedTransportReceipt;
@@ -22,6 +27,10 @@ const mockConsumeLocalQaCortexFault = jest.fn();
 const mockTelegramInputDeliveryCoverage = jest.fn(() => null);
 const mockAcknowledgeMongoDurableEffectDelivery = jest.fn();
 const mockAcknowledgeRetainedTelegramFailure = jest.fn();
+jest.mock('~/server/services/viventium/GlassHiveTerminalCallbackTransaction', () => ({
+  runGlassHiveTerminalCallbackTransaction: async (operation) => operation(),
+}));
+
 jest.mock('~/server/services/viventium/TelegramIngressAuthorityService', () => ({
   acknowledgeRetainedTelegramFailure: (...args) => mockAcknowledgeRetainedTelegramFailure(...args),
 }));
@@ -35,6 +44,7 @@ jest.mock('@librechat/api', () => ({
   scheduleExternallyAcceptedMainCompaction: (...args) =>
     mockScheduleExternallyAcceptedMainCompaction(...args),
   GenerationJobManager: {
+    getJob: async () => undefined,
     acknowledgeDelivery: (...args) => mockAcknowledgeDelivery(...args),
     acknowledgeDurableEffectDelivery: (...args) => mockAcknowledgeDurableEffectDelivery(...args),
     acknowledgeServerCommittedTransportReceipt: (...args) =>
@@ -155,6 +165,7 @@ async function dispatch(app, req, res) {
 describe('POST /api/viventium/interactions/delivery-ack', () => {
   beforeEach(() => {
     mockAcknowledgeHostFinal.mockReset().mockResolvedValue({ status: 'not_found' });
+    mockAcknowledgeRetainedCortex.mockReset().mockResolvedValue({ status: 'not_found' });
     mockTelegramInputDeliveryCoverage.mockReset().mockReturnValue(null);
     mockAcknowledgeRetainedTelegramFailure.mockReset().mockResolvedValue({ status: 'not_found' });
     mockAcknowledgeMongoDurableEffectDelivery.mockReset().mockResolvedValue({ status: 'conflict' });
@@ -239,6 +250,166 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
         surface,
       );
       expect(mockCommitAcceptedMainTurnFromPresentation).toHaveBeenCalled();
+      expect(mockAcknowledgeRetainedTelegramFailure).not.toHaveBeenCalled();
+    },
+  );
+
+  test('a recorded live failed Telegram ACK also settles its durable source without Main acceptance', async () => {
+    mockAcknowledgeDelivery.mockResolvedValue({
+      status: 'recorded',
+      acknowledgement: { logical_turn_id: 'turn-1', revision: 2, state: 'failed' },
+    });
+    mockAcknowledgeRetainedTelegramFailure.mockResolvedValue({
+      status: 'recorded',
+      acknowledgement: { logical_turn_id: 'turn-1', revision: 2, state: 'failed' },
+      transportOnly: true,
+      idempotent: false,
+    });
+    const res = response();
+    await dispatch(
+      createApp(require('../interactions')),
+      request({
+        headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+        body: {
+          logical_turn_id: 'turn-1',
+          revision: 2,
+          state: 'failed',
+          presentation_ref: 'telegram:chat',
+        },
+      }),
+      res,
+    );
+    expect(res.body.acknowledged).toBe(true);
+    expect(mockAcknowledgeRetainedTelegramFailure).toHaveBeenCalledTimes(1);
+    expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    expect(mockScheduleExternallyAcceptedMainCompaction).not.toHaveBeenCalled();
+  });
+
+  test('recorded live ACK runs the real failed-ACK owner and clears the exact source claim once', async () => {
+    const matches = require('sift').default;
+    const ack = {
+      logical_turn_id: 'turn-1',
+      revision: 2,
+      state: 'failed',
+      presentation_ref: 'telegram:chat',
+    };
+    const record = {
+      libreChatUserId: 'owner',
+      sourceEventId: 'a'.repeat(64),
+      sourceMessageId: 'question',
+      conversationId: 'conversation',
+      streamId: 'stream',
+      inputState: 'admitted',
+      authorityBoundAt: new Date(1),
+      inputClaimToken: 'original-claim',
+      inputLeaseUntil: 100,
+      inputRetryAt: 0,
+      responseBinding: {
+        streamId: 'stream',
+        responseMessageId: 'answer',
+        logicalTurnId: 'turn-1',
+        revision: 2,
+      },
+    };
+    const message = {
+      user: 'owner',
+      conversationId: 'conversation',
+      messageId: 'answer',
+      parentMessageId: 'question',
+      isCreatedByUser: false,
+      unfinished: false,
+      error: true,
+      deletedAt: null,
+      content: [
+        {
+          type: 'error',
+          error_class: 'source_context_unavailable',
+          error: 'Original source unavailable',
+        },
+      ],
+      metadata: {
+        viventium: {
+          interactionContext: {
+            source_event_id: record.sourceEventId,
+            logical_turn_id: 'turn-1',
+            revision: 2,
+          },
+        },
+      },
+    };
+    const model = (row) => ({
+      findOne: (filter) => ({
+        select() {
+          return this;
+        },
+        lean: async () => (matches(filter)(row) ? row : null),
+      }),
+      exists: async (filter) => matches(filter)(row),
+      updateOne: jest.fn(async (filter, patch) => {
+        if (!matches(filter)(row)) return { matchedCount: 0 };
+        for (const [key, value] of Object.entries(patch.$set || {})) {
+          const parts = key.split('.');
+          const last = parts.pop();
+          let target = row;
+          for (const part of parts) target = target[part] ||= {};
+          target[last] = value;
+        }
+        return { matchedCount: 1 };
+      }),
+    });
+    const IngressModel = model(record),
+      MessageModel = model(message);
+    const actual = jest.requireActual(
+      '~/server/services/viventium/TelegramIngressAuthorityService',
+    );
+    mockAcknowledgeDelivery.mockResolvedValue({ status: 'recorded', acknowledgement: ack });
+    mockAcknowledgeRetainedTelegramFailure.mockImplementation((value, surface) =>
+      actual.acknowledgeRetainedTelegramFailure(value, surface, { IngressModel, MessageModel }),
+    );
+    const app = createApp(require('../interactions'));
+    const send = async () => {
+      const res = response();
+      await dispatch(
+        app,
+        request({
+          headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+          body: ack,
+        }),
+        res,
+      );
+      return res;
+    };
+    expect((await send()).body.acknowledged).toBe(true);
+    expect(record).toMatchObject({
+      inputState: 'failed',
+      inputFailureCode: 'source_terminal_presented',
+      inputClaimToken: '',
+      inputLeaseUntil: 0,
+      inputRetryAt: 0,
+    });
+    expect(message.metadata.viventium.deliveryAcknowledgement).toEqual(ack);
+    expect(IngressModel.updateOne.mock.calls[0][0]).toMatchObject({
+      inputClaimToken: 'original-claim',
+      responseBinding: record.responseBinding,
+    });
+    expect((await send()).body).toEqual({ acknowledged: true, idempotent: true });
+    expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    expect(mockScheduleExternallyAcceptedMainCompaction).not.toHaveBeenCalled();
+  });
+  test.each(['conflict', 'stale_revision', 'stale_source_order'])(
+    'failed live ACK %s never falls back through durable source settlement',
+    async (status) => {
+      mockAcknowledgeDelivery.mockResolvedValue({ status });
+      const res = response();
+      await dispatch(
+        createApp(require('../interactions')),
+        request({
+          headers: { 'x-viventium-adapter-secret': 'adapter-secret' },
+          body: { logical_turn_id: 'turn-1', revision: 2, state: 'failed' },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(409);
       expect(mockAcknowledgeRetainedTelegramFailure).not.toHaveBeenCalled();
     },
   );
@@ -671,6 +842,23 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     expect(mockScheduleExternallyAcceptedMainCompaction).not.toHaveBeenCalled();
     expect(mockMarkCortexTelegramPresentation).toHaveBeenCalledTimes(1);
   });
+
+  test.each(['not_found', 'conflict'])(
+    'retained Cortex recovery only follows missing job (%s)',
+    async (status) => {
+      mockAcknowledgeDelivery.mockResolvedValueOnce({ status });
+      mockAcknowledgeRetainedCortex.mockResolvedValueOnce(recordedCortexReceipt('follow-up-7'));
+      mockMarkCortexTelegramPresentation.mockResolvedValueOnce([
+        { deliveryId: 'delivery-7', claimGeneration: 7 },
+      ]);
+      const res = response();
+      await dispatch(createApp(require('../interactions')), cortexRequest('follow-up-7'), res);
+      expect(res.statusCode).toBe(status === 'not_found' ? 200 : 409);
+      expect(mockAcknowledgeRetainedCortex).toHaveBeenCalledTimes(status === 'not_found' ? 1 : 0);
+      expect(mainMessageWrites()).toEqual([]);
+      expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+    },
+  );
 
   test('a promoted empty answer keeps Main persistence and acceptance for its own message', async () => {
     mockAcknowledgeDelivery.mockResolvedValueOnce(recordedCortexReceipt('server-response'));

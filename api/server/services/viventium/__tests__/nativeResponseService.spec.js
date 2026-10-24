@@ -70,6 +70,10 @@ jest.mock('@librechat/api', () => ({
   isAcceptedMainProjectionComplete: (...args) => mockProjectionComplete(...args),
   prepareNativeSourceRecovery: (...args) =>
     jest.requireActual('@librechat/api').prepareNativeSourceRecovery(...args),
+  readRetainedNativeMainFinal: (...args) =>
+    jest.requireActual('@librechat/api').readRetainedNativeMainFinal(...args),
+  inspectRetainedMainFinalState: (...args) =>
+    jest.requireActual('@librechat/api').inspectRetainedMainFinalState(...args),
   GenerationJobManager: mockJobs,
   nativeIdentityJson: (...args) => jest.requireActual('@librechat/api').nativeIdentityJson(...args),
   nativeJobMatches: (...args) => jest.requireActual('@librechat/api').nativeJobMatches(...args),

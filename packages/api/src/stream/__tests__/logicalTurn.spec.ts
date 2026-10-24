@@ -2321,115 +2321,125 @@ describe('GenerationJobManager logical turns', () => {
     await manager.destroy();
   });
 
-  test('retains only the exact late Cortex presentation lane after external Main delivery commits', async () => {
-    const manager = new GenerationJobManagerClass({
-      jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
-      eventTransport: new InMemoryEventTransport(),
-      cleanupOnComplete: false,
-    });
-    await manager.initialize();
-    const responseOnlyCapabilities = {
-      segment_stability: 'immediate' as const,
-      supersede_scope: 'response_only' as const,
-    };
-    const main = await manager.createJob('telegram-late-cortex', 'owner-1', 'conversation-1', {
-      interactionContext: telegramContext('conversation-1', 'event-late-cortex'),
-      adapterCapabilities: responseOnlyCapabilities,
-      deliveryPolicy: externalDelivery,
-    });
-    await manager.updateMetadata('telegram-late-cortex', { responseMessageId: 'parent-1' });
-    await manager.markMainResponseComplete('telegram-late-cortex', { final: true } as never);
-    await manager.emitDone('telegram-late-cortex', { final: true } as never);
-    const mainAcknowledgement = {
-      logical_turn_id: main.metadata.interactionContext!.logical_turn_id!,
-      revision: 1,
-      state: 'committed' as const,
-      presentation_ref: 'telegram:synthetic-chat:synthetic-main',
-    };
-    await manager.acknowledgeDelivery(mainAcknowledgement, 'telegram');
-    await manager.completeJob('telegram-late-cortex');
+  test.each([false, true])(
+    'retains only the exact late Cortex presentation lane after external Main delivery commits (quiet=%s)',
+    async (quiet) => {
+      const manager = new GenerationJobManagerClass({
+        jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
+        eventTransport: new InMemoryEventTransport(),
+        cleanupOnComplete: false,
+      });
+      await manager.initialize();
+      const responseOnlyCapabilities = {
+        segment_stability: 'immediate' as const,
+        supersede_scope: 'response_only' as const,
+      };
+      const main = await manager.createJob('telegram-late-cortex', 'owner-1', 'conversation-1', {
+        interactionContext: telegramContext('conversation-1', 'event-late-cortex'),
+        adapterCapabilities: responseOnlyCapabilities,
+        deliveryPolicy: externalDelivery,
+      });
+      await manager.updateMetadata('telegram-late-cortex', { responseMessageId: 'parent-1' });
+      const mainFinal = {
+        final: true,
+        responseMessage: {
+          messageId: 'parent-1',
+          text: quiet ? '{NTA}' : 'Main answer.',
+        },
+      };
+      await manager.markMainResponseComplete('telegram-late-cortex', mainFinal as never);
+      await manager.emitDone('telegram-late-cortex', mainFinal as never);
+      const mainAcknowledgement = {
+        logical_turn_id: main.metadata.interactionContext!.logical_turn_id!,
+        revision: 1,
+        state: 'committed' as const,
+        ...(quiet ? {} : { presentation_ref: 'telegram:synthetic-chat:synthetic-main' }),
+      };
+      await manager.acknowledgeDelivery(mainAcknowledgement, 'telegram');
+      await manager.completeJob('telegram-late-cortex');
 
-    expect(main.abortController.signal.aborted).toBe(false);
-    const cortexReceipt = {
-      ownerId: 'owner-1',
-      messageId: 'follow-up-1',
-      parentMessageId: 'parent-1',
-      revision: 1,
-      generation: 1,
-      deliveryIds: ['delivery-1'],
-      deliveryReceipts: [{ deliveryId: 'delivery-1', graphResultHash: 'a'.repeat(64) }],
-      claimToken: 'claim-1',
-      presentationLeaseToken: 'presentation-lease-1',
-    };
-    await expect(
-      manager.emitChunk(
-        'telegram-late-cortex',
-        {
-          event: 'on_cortex_followup',
-          data: {
-            messageId: 'follow-up-1',
-            parentMessageId: 'parent-1',
-            revision: 1,
-            presentationGeneration: 1,
+      expect(main.abortController.signal.aborted).toBe(false);
+      const cortexReceipt = {
+        ownerId: 'owner-1',
+        messageId: 'follow-up-1',
+        parentMessageId: 'parent-1',
+        revision: 1,
+        generation: 1,
+        deliveryIds: ['delivery-1'],
+        deliveryReceipts: [{ deliveryId: 'delivery-1', graphResultHash: 'a'.repeat(64) }],
+        claimToken: 'claim-1',
+        presentationLeaseToken: 'presentation-lease-1',
+      };
+      await expect(
+        manager.emitChunk(
+          'telegram-late-cortex',
+          {
+            event: 'on_cortex_followup',
+            data: {
+              messageId: 'follow-up-1',
+              parentMessageId: 'parent-1',
+              revision: 1,
+              presentationGeneration: 1,
+            },
           },
+          {
+            verifyCortexPresentation: jest.fn().mockResolvedValue(cortexReceipt),
+          },
+        ),
+      ).resolves.toMatchObject({
+        delivered: true,
+        streamId: 'telegram-late-cortex',
+        presentationRef: 'sse:telegram-late-cortex:follow-up-1:1',
+      });
+      const cortexAcknowledgement = {
+        logical_turn_id: main.metadata.interactionContext!.logical_turn_id!,
+        revision: 1,
+        state: 'committed' as const,
+        presentation_ref: 'telegram:synthetic-chat:synthetic-follow-up',
+      };
+      await expect(
+        manager.acknowledgeDelivery(cortexAcknowledgement, 'telegram', cortexReceipt),
+      ).resolves.toMatchObject({
+        status: 'recorded',
+        idempotent: false,
+        presentation: {
+          cortexPresentation: { messageId: 'follow-up-1', generation: 1, claimToken: 'claim-1' },
         },
-        {
-          verifyCortexPresentation: jest.fn().mockResolvedValue(cortexReceipt),
-        },
-      ),
-    ).resolves.toMatchObject({
-      delivered: true,
-      streamId: 'telegram-late-cortex',
-      presentationRef: 'sse:telegram-late-cortex:follow-up-1:1',
-    });
-    const cortexAcknowledgement = {
-      logical_turn_id: main.metadata.interactionContext!.logical_turn_id!,
-      revision: 1,
-      state: 'committed' as const,
-      presentation_ref: 'telegram:synthetic-chat:synthetic-follow-up',
-    };
-    await expect(
-      manager.acknowledgeDelivery(cortexAcknowledgement, 'telegram', cortexReceipt),
-    ).resolves.toMatchObject({
-      status: 'recorded',
-      idempotent: false,
-      presentation: {
-        cortexPresentation: { messageId: 'follow-up-1', generation: 1, claimToken: 'claim-1' },
-      },
-    });
-    await expect(
-      manager.acknowledgeDelivery(cortexAcknowledgement, 'telegram', cortexReceipt),
-    ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
-    await expect(
-      manager.acknowledgeDelivery(
-        {
-          ...cortexAcknowledgement,
-          presentation_ref: 'telegram:synthetic-chat:conflicting-follow-up',
-        },
-        'telegram',
-        cortexReceipt,
-      ),
-    ).resolves.toEqual({ status: 'conflict' });
-    await expect(
-      manager.acknowledgeDelivery(mainAcknowledgement, 'telegram'),
-    ).resolves.toMatchObject({
-      status: 'recorded',
-      idempotent: true,
-      presentation: expect.not.objectContaining({ cortexPresentation: expect.anything() }),
-    });
-    await expect(
-      manager.emitChunk('telegram-late-cortex', {
-        event: 'on_message_delta',
-        data: { text: 'late Main output must stay closed' },
-      }),
-    ).resolves.toEqual({
-      delivered: false,
-      streamId: 'telegram-late-cortex',
-      reason: 'runtime_unavailable',
-    });
+      });
+      await expect(
+        manager.acknowledgeDelivery(cortexAcknowledgement, 'telegram', cortexReceipt),
+      ).resolves.toMatchObject({ status: 'recorded', idempotent: true });
+      await expect(
+        manager.acknowledgeDelivery(
+          {
+            ...cortexAcknowledgement,
+            presentation_ref: 'telegram:synthetic-chat:conflicting-follow-up',
+          },
+          'telegram',
+          cortexReceipt,
+        ),
+      ).resolves.toEqual({ status: 'conflict' });
+      await expect(
+        manager.acknowledgeDelivery(mainAcknowledgement, 'telegram'),
+      ).resolves.toMatchObject({
+        status: 'recorded',
+        idempotent: true,
+        presentation: expect.not.objectContaining({ cortexPresentation: expect.anything() }),
+      });
+      await expect(
+        manager.emitChunk('telegram-late-cortex', {
+          event: 'on_message_delta',
+          data: { text: 'late Main output must stay closed' },
+        }),
+      ).resolves.toEqual({
+        delivered: false,
+        streamId: 'telegram-late-cortex',
+        reason: 'runtime_unavailable',
+      });
 
-    await manager.destroy();
-  });
+      await manager.destroy();
+    },
+  );
 
   test.each(['partial_removed'] as const)(
     'keeps external turn open after recoverable non-delivery outcome %s',

@@ -4869,6 +4869,38 @@ describe('GlassHiveMissionAdjudicationService', () => {
     );
   });
 
+  test.each([
+    ['glasshive_callback_effect_fenced', 1, 'superseded', 'terminal_callback_revision_superseded'],
+    ['mission_surface_delivery_unresolved', 10, 'deadletter', 'mission_delivery_retry_exhausted'],
+  ])(
+    'settles authored delivery %s at attempt %i without regenerating',
+    async (code, attempts, state, errorCode) => {
+      const retained = row({
+        state: 'delivery_pending',
+        attempts,
+        followUpMessageId: 'retained-result',
+        followUpText: 'Retained Main-authored result.',
+      });
+      retainAuthoredFollowUp(retained);
+      mockFind.mockReturnValueOnce(cursor([retained]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...retained, state: 'processing', attempts });
+      mockEnqueueDelivery.mockRejectedValueOnce(Object.assign(new Error(code), { code }));
+      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+      expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+      expect(mockUpdateOne).toHaveBeenCalledWith(
+        { _id: 'cb-1', state: 'processing' },
+        expect.objectContaining({ $set: expect.objectContaining({ state, errorCode }) }),
+      );
+      if (state === 'deadletter')
+        expect(mockUpdateOne).toHaveBeenCalledWith(
+          { _id: 'cb-1', state: 'processing' },
+          expect.objectContaining({
+            $set: expect.objectContaining({ followUpMessageId: 'retained-result' }),
+          }),
+        );
+    },
+  );
+
   test('keeps a zero-target Main continuation durably unresolved and retryable', async () => {
     mockFind.mockReturnValueOnce(cursor([row()]));
     mockCreateCortexFollowUpMessage.mockResolvedValueOnce({

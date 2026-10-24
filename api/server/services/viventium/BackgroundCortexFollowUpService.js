@@ -3566,9 +3566,8 @@ async function prepareCortexFollowUpMessage({
     parentMessageId,
     messages: conversationMessages,
   });
-  const followUpRecentResponse = isNoResponseOnly(recentResponseResolution.text)
-    ? ''
-    : recentResponseResolution.text;
+  // An authored silent response is not a missing primary answer.
+  const followUpRecentResponse = recentResponseResolution.text;
 
   // Durable worker results are separate conversation events, even when their
   // original foreground reply failed. Never promote them into that old branch.

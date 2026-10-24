@@ -11,6 +11,7 @@ const { logger } = require('@librechat/data-schemas');
 const { promptFrameLoggingEnabled, logTurnContextRetention } = require('./promptFrameTelemetry');
 const { buildActiveWorkCapsule } = require('./ViventiumDynamicTurnContext');
 const { sanitizeVoiceAssistantMessageForPersistence } = require('./voiceArtifactText');
+const { projectVisibleTextFromContentParts } = require('./ViventiumVisibleContentProjection');
 const { Constants } = require('librechat-data-provider');
 const {
   buildMainContinuityHeaders,
@@ -548,6 +549,7 @@ function messageManifest(messages = []) {
 
 function unreconciledSourceError() {
   const error = new Error('Prior accepted Main history cannot be carried intact.');
+  Error.captureStackTrace?.(error, unreconciledSourceError);
   error.code = 'source_context_unavailable';
   error.status = 413;
   return error;
@@ -897,6 +899,10 @@ function assertUnreconciledHistoryCarrier(
         !sourceText.includes(source.text.trim()) &&
         !(
           source?.isCreatedByUser === false &&
+          source.text === projectVisibleTextFromContentParts(source.content, { trim: true })
+        ) &&
+        !(
+          source?.isCreatedByUser === false &&
           source?.metadata?.viventium?.interactionContext?.surface === 'voice' &&
           source?.metadata?.viventium?.inputMode === 'voice_call' &&
           typeof source?.metadata?.viventium?.callSessionId === 'string' &&
@@ -1068,10 +1074,26 @@ function buildInheritedConversationContext({
   sourceSegments = [],
 }) {
   const chain = new Map(messageChain.map((row) => [String(row.id), row]));
-  const ordinalsFor = (id) =>
-    sourceSegments.flatMap((source, index) =>
-      String(source.source_message_id || '') === id ? [index + 1] : [],
-    );
+  const sourceFactsFor = (id) => {
+    const ordinals = [];
+    let receivedAt;
+    let receiptConsistent = true;
+    sourceSegments.forEach((source, index) => {
+      if (String(source.source_message_id || '') !== id) return;
+      ordinals.push(index + 1);
+      const receipt = source.source_received_at;
+      if (
+        !Number.isSafeInteger(receipt) ||
+        receipt <= 0 ||
+        (receivedAt !== undefined && receivedAt !== receipt)
+      ) {
+        receiptConsistent = false;
+      } else {
+        receivedAt = receipt;
+      }
+    });
+    return { ordinals, receivedAt: receiptConsistent ? receivedAt : undefined };
+  };
   return {
     version: 1,
     conversation_id: conversationId,
@@ -1079,9 +1101,10 @@ function buildInheritedConversationContext({
       ...(Array.isArray(messages) ? messages : []).map((message, index) => {
         const id = String(message.id || message.messageId || index);
         const row = chain.get(id);
+        const sourceFacts = sourceFactsFor(id);
         const sourceOrdinals = Array.isArray(row?.source_ordinals)
           ? row.source_ordinals
-          : ordinalsFor(id);
+          : sourceFacts.ordinals;
         return {
           id: `message:${id}`,
           role: String(
@@ -1092,6 +1115,9 @@ function buildInheritedConversationContext({
           text: messageContentText(message, true),
           current_input: row?.current_input === true || sourceOrdinals.length > 0,
           source_ordinals: sourceOrdinals,
+          ...(sourceFacts.receivedAt !== undefined
+            ? { source_received_at: sourceFacts.receivedAt }
+            : {}),
           ...(message.tool_calls?.length ? { tool_calls: canonical(message.tool_calls) } : {}),
           ...(message.tool_call_id ? { tool_call_id: String(message.tool_call_id) } : {}),
         };
@@ -1111,6 +1137,19 @@ function buildInheritedConversationContext({
       ),
     ],
   };
+}
+
+// Main and worker consumers share this raw carrier; no model-authored summary is introduced.
+function prependInheritedConversationPayload(payload, context) {
+  if (!context || context.version !== 1 || !Array.isArray(context.sources)) return payload;
+  const inherited = context.sources.map((source) => ({
+    role: source.role === 'context' ? 'system' : source.role,
+    content: source.text,
+    messageId: `inherited:${context.conversation_id}:${source.id}`,
+    ...(source.tool_calls?.length ? { tool_calls: source.tool_calls } : {}),
+    ...(source.tool_call_id ? { tool_call_id: source.tool_call_id } : {}),
+  }));
+  return [...inherited, ...payload];
 }
 
 function assignInheritedConversationContext(context, sourceOrdinals = []) {
@@ -1842,6 +1881,7 @@ module.exports = {
   buildMainAttemptFactsForAgent,
   captureMainContextSnapshot,
   buildInheritedConversationContext,
+  prependInheritedConversationPayload,
   assignInheritedConversationContext,
   createMainAttemptFacts,
   getMainContextAttemptState,

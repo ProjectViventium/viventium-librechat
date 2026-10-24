@@ -42,6 +42,40 @@ describe('VoiceTask durable replay and suppression', () => {
     await ViventiumCallSession.deleteMany({});
   });
 
+  test('preserves continuing-work presentation through the durable suppression barrier and restart', async () => {
+    const scope = { callSessionId: 'call-continued-work', userId: 'user-continued-work' };
+    const task = service.createVoiceTask({
+      ...scope,
+      streamId: 'glasshive:run-continued-work',
+      owner: { kind: 'glasshive_run', id: 'run-continued-work' },
+    });
+    await service.confirmVoiceTaskOwnerCancellation(
+      task.taskId,
+      'This earlier run stopped. The same work is still active.',
+      { label: 'Work continues' },
+    );
+    await service.flushVoiceTaskPersistence();
+    const expected = {
+      taskId: task.taskId,
+      state: 'cancelled_confirmed',
+      label: 'Work continues',
+      detail: 'This earlier run stopped. The same work is still active.',
+      cancellable: false,
+    };
+    const livePage = await service.listDurableVoiceTaskSnapshots({
+      ...scope,
+      requireDurable: true,
+    });
+    expect(livePage.events).toEqual([expect.objectContaining(expected)]);
+    service.resetVoiceTasksForTests();
+    await ViventiumVoiceTask.deleteMany({ taskId: task.taskId });
+    const page = await service.listDurableVoiceTaskSnapshots({ ...scope, requireDurable: true });
+    expect(page.events).toEqual([expect.objectContaining(expected)]);
+    await service.hydrateVoiceTaskByStreamId('glasshive:run-continued-work', scope);
+    expect(service.snapshotEvent(task.taskId)).toMatchObject(expected);
+    expect(service.isVoiceTaskSuppressed(task.taskId)).toBe(true);
+  });
+
   function nativePermission() {
     return {
       version: 1,

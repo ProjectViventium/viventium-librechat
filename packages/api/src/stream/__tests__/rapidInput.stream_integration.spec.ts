@@ -8,6 +8,7 @@ import { once } from 'events';
 import type { ChildProcess } from 'child_process';
 import { RedisJobStore } from '../implementations/RedisJobStore';
 import { rapidInputContract } from './rapidInput.helper';
+import { generationSupersessionContract } from './generationSupersession.helper';
 
 /** The Redis integration CI job provisions this binary; unit CI has no Redis prerequisite. */
 describe('rapid input with owned Redis storage', () => {
@@ -69,4 +70,5 @@ describe('rapid input with owned Redis storage', () => {
     await redis.flushdb();
   });
   rapidInputContract(() => new RedisJobStore(redis));
+  generationSupersessionContract(() => new RedisJobStore(redis));
 });

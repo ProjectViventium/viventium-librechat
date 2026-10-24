@@ -23,6 +23,8 @@ module.exports = function createViventiumVoiceTaskSuppression(db) {
       sequence: { type: Number, default: null },
       emittedAt: { type: Date, default: null },
       state: { type: String, default: 'cancelling' },
+      label: { type: String, default: null, maxlength: 80 },
+      detail: { type: String, default: null, maxlength: 500 },
       conversationId: { type: String, default: null },
       turnId: { type: String, default: null },
       parentTaskId: { type: String, default: null },

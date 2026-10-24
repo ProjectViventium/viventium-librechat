@@ -1154,6 +1154,30 @@ describe('GlassHiveCallbackDeliveryService', () => {
     },
   );
 
+  test('scheduled Main carries byte-exact canonical text for its proof and gateway digest', async () => {
+    mockFindOneAndUpdate.mockImplementation((_filter, update) =>
+      leanResult({ ...update.$setOnInsert }),
+    );
+    const text = '  Actual Main reply.\n';
+    const result = await enqueueGlassHiveCallbackDelivery({
+      body: { callback_id: 'schedule-main-whitespace', event: 'main.followup' },
+      message: { messageId: 'message-main', text },
+      text,
+      deliveryContext: {
+        ownerId: 'owner-main',
+        conversationId: 'conversation-main',
+        originRef: 'binding-main',
+        mainGenerationPresentation: { streamId: 'stream-main', admissionId: 'admission-main' },
+        destinations: [{ surface: 'telegram', telegramChatId: 'chat-main' }],
+      },
+    });
+    expect(result.deliveries[0].fullText).toBe(text);
+    expect(result.deliveries[0].text).toBe(text.trim());
+    expect(result.deliveries[0].mainGenerationPresentation.responseDigest).toBe(
+      'sha256:' + require('crypto').createHash('sha256').update(text).digest('hex'),
+    );
+  });
+
   test('Main presentation identity excludes raw callback rows and cannot rewrite a sent receipt', async () => {
     const rows = new Map();
     const rawKey = `owner:origin:telegram:${canonicalCallbackRef('same-callback')}`;

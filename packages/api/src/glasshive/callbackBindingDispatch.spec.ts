@@ -164,6 +164,76 @@ test.each(['current', 'historical', 'foreign', 'replay', 'no-write', 'wrapped-no
   },
 );
 
+test('scheduled callback retains its topic and resolves only its stored owner mapping', async () => {
+  const { dependencies } = fixture();
+  let binding:
+    | {
+        originRef?: string;
+        configuredDestinations?: Array<{ surface: string; telegramMessageThreadId?: string }>;
+      }
+    | undefined;
+  dependencies.mongoose.connection.collection = (name) => ({
+    updateOne: async (_filter, update) => {
+      if (name === 'viventium_glasshive_callback_bindings' && update.$setOnInsert)
+        binding = update.$setOnInsert;
+      return { acknowledged: true, matchedCount: 1 };
+    },
+    findOne: async () => binding,
+  });
+  const mapping = jest.fn(async () => ({
+    telegramChatId: 'owner-chat',
+    telegramUserId: 'owner-user',
+  }));
+  dependencies.resolveTelegramMappingByUserId = mapping;
+  dependencies.requestAccountApi = async () => ({
+    valid: true,
+    originRef: binding?.originRef,
+    workRef: 'work',
+  });
+  const service = createGlassHiveCallbackBindingService(dependencies);
+  const launch = await service.registerGlassHiveLaunchContext({
+    user: { id: 'stored-owner' },
+    requestBody: {
+      conversationId: 'conversation',
+      messageId: 'answer',
+      parentMessageId: 'input',
+      viventiumSourceEventId: 'due-event',
+      viventiumSchedulerDeliveryChannels: ['telegram', 'librechat'],
+      viventiumTelegramMessageThreadId: '42',
+      viventiumSchedulerOccurrenceKey: 'due-occurrence',
+    },
+    toolName: 'workspace_launch',
+    toolArguments: { goal: 'Synthetic future task' },
+    toolCall: { id: 'native-call' },
+  });
+  expect(binding?.configuredDestinations).toEqual([
+    { surface: 'telegram', telegramMessageThreadId: '42' },
+    { surface: 'librechat' },
+  ]);
+  const context = await service.resolveGlassHiveCallbackContext(
+    {
+      origin_ref: launch?.originRef,
+      work_ref: 'work',
+      worker_id: 'worker',
+      run_id: 'run',
+      user_id: 'forged-owner',
+      telegram_chat_id: 'forged-chat',
+      telegramMessageThreadId: 'forged-topic',
+    },
+    { deferConfirmation: true },
+  );
+  expect(context?.destinations).toEqual([
+    {
+      surface: 'telegram',
+      telegramChatId: 'owner-chat',
+      telegramUserId: 'owner-user',
+      telegramMessageThreadId: '42',
+    },
+    { surface: 'librechat' },
+  ]);
+  expect(mapping).toHaveBeenCalledWith({ libreChatUserId: 'stored-owner' });
+});
+
 test('admits provider dispatch only after both exact prepared rows transition', async () => {
   const { service, launch, rows, positiveFence } = fixture();
   await expect(service.markGlassHiveLaunchDispatchReady(launch)).resolves.toEqual({
@@ -326,39 +396,138 @@ test.each(['', 'Read the selected source.'])(
 
 /* === VIVENTIUM END === */
 
-
 test('launch signature binds only the trusted inherited conversation with stable exact content', () => {
   const { service, launch } = fixture();
-  const context = { version: 1, conversation_id: 'conversation', sources: [{ id: 'source', text: 'Exact é\ncontent.' }] };
-  const trustedLaunch = { ...launch, delegationPacket: undefined, delegationIdentity: {
-    version: 1, idempotency_key: 'a'.repeat(64), goal_digest: 'b'.repeat(64),
-    call_identity_digest: 'c'.repeat(64), source_event_id: 'source', objective_ordinal: 0,
-  }, delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] } };
-  const attach = (bundle: object, modelBundle: object = {}) => service.attachGlassHiveTrustedLaunchMetadata(
-    { title: 'Task', instruction: 'Use the source.', bootstrap_bundle_json: modelBundle }, trustedLaunch, bundle,
-  ) as { bootstrap_bundle_json: { inherited_conversation?: string; viventium_delegation_identity: { launch_payload_digest: string } } };
+  const context = {
+    version: 1,
+    conversation_id: 'conversation',
+    sources: [{ id: 'source', text: 'Exact é\ncontent.' }],
+  };
+  const trustedLaunch = {
+    ...launch,
+    delegationPacket: undefined,
+    delegationIdentity: {
+      version: 1,
+      idempotency_key: 'a'.repeat(64),
+      goal_digest: 'b'.repeat(64),
+      call_identity_digest: 'c'.repeat(64),
+      source_event_id: 'source',
+      objective_ordinal: 0,
+    },
+    delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] },
+  };
+  const attach = (bundle: object, modelBundle: object = {}) =>
+    service.attachGlassHiveTrustedLaunchMetadata(
+      { title: 'Task', instruction: 'Use the source.', bootstrap_bundle_json: modelBundle },
+      trustedLaunch,
+      bundle,
+    ) as {
+      bootstrap_bundle_json: {
+        inherited_conversation?: string;
+        viventium_delegation_identity: { launch_payload_digest: string };
+      };
+    };
   const original = attach({ inherited_conversation: context });
-  const changed = attach({ inherited_conversation: { ...context, sources: [{ id: 'source', text: 'Different content.' }] } });
+  const changed = attach({
+    inherited_conversation: { ...context, sources: [{ id: 'source', text: 'Different content.' }] },
+  });
   expect(JSON.parse(original.bootstrap_bundle_json.inherited_conversation!)).toEqual(context);
-  expect(original.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest)
-    .not.toEqual(changed.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest);
+  expect(
+    original.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest,
+  ).not.toEqual(changed.bootstrap_bundle_json.viventium_delegation_identity.launch_payload_digest);
   expect(attach({}, { inherited_conversation: context })).toEqual(attach({}));
 });
 
-
 test('trusted history crosses the signed hop as one exact JSON string without routing-key scrubbing', () => {
   const { service, launch } = fixture();
-  const context = { version: 1, conversation_id: 'conversation', sources: [{ id: 'prior', text: 'Exact original.',
-    tool_calls: [{ name: 'original_tool', args: { small: 0.00005, exponent: 1e-7, lone: '\ud800',
-      telegramUserId: 'historical value', callbackUrl: 'historical value' } }] }] };
-  const attached = service.attachGlassHiveTrustedLaunchMetadata({ title: 'Task', instruction: 'Use the source.' },
-    { ...launch, delegationPacket: undefined, delegationIdentity: {
-      version: 1, idempotency_key: 'a'.repeat(64), goal_digest: 'b'.repeat(64), call_identity_digest: 'c'.repeat(64),
-      source_event_id: 'source', objective_ordinal: 0,
-    }, delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] } },
+  const context = {
+    version: 1,
+    conversation_id: 'conversation',
+    sources: [
+      {
+        id: 'prior',
+        text: 'Exact original.',
+        tool_calls: [
+          {
+            name: 'original_tool',
+            args: {
+              small: 0.00005,
+              exponent: 1e-7,
+              lone: '\ud800',
+              telegramUserId: 'historical value',
+              callbackUrl: 'historical value',
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const attached = service.attachGlassHiveTrustedLaunchMetadata(
+    { title: 'Task', instruction: 'Use the source.' },
+    {
+      ...launch,
+      delegationPacket: undefined,
+      delegationIdentity: {
+        version: 1,
+        idempotency_key: 'a'.repeat(64),
+        goal_digest: 'b'.repeat(64),
+        call_identity_digest: 'c'.repeat(64),
+        source_event_id: 'source',
+        objective_ordinal: 0,
+      },
+      delegationContext: { version: 1, source_event_id: 'source', triggering_source_segments: [] },
+    },
     { inherited_conversation: context, callbackUrl: 'not trusted routing' },
   ) as { bootstrap_bundle_json: { inherited_conversation: string; callbackUrl?: string } };
   expect(attached.bootstrap_bundle_json.inherited_conversation).toBe(JSON.stringify(context));
   expect(JSON.parse(attached.bootstrap_bundle_json.inherited_conversation)).toEqual(context);
   expect(attached.bootstrap_bundle_json.callbackUrl).toBeUndefined();
 });
+
+/* === VIVENTIUM START === Scheduled Main keeps its own clock's result state. === */
+test.each(['schedule_due', 'legacy', 'not-found'])(
+  'notifies only the owning scheduler for external work (%s)',
+  async (kind) => {
+    const { dependencies } = fixture();
+    const originalCollection = dependencies.mongoose.connection.collection;
+    const readIntent = jest.fn(async () =>
+      kind === 'not-found' ? null : { kind, userId: 'owner' },
+    );
+    dependencies.mongoose.connection.collection = (name) =>
+      name === 'viventium_scheduler_dispatch_intents'
+        ? { ...originalCollection(name), findOne: readIntent }
+        : originalCollection(name);
+    const send = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ accepted: true }) });
+    dependencies.fetchImpl = send;
+    const priorUrl = process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL;
+    const priorSecret = process.env.VIVENTIUM_SCHEDULER_SECRET;
+    process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL =
+      'https://scheduler.example.invalid/callback';
+    process.env.VIVENTIUM_SCHEDULER_SECRET = 'synthetic-test-signing-key';
+    try {
+      await createGlassHiveCallbackBindingService(dependencies).notifySchedulerExternalWorkSummary({
+        binding: {
+          ownerId: 'owner',
+          schedulerDispatchDocumentId: 'admission',
+          scheduleOccurrenceKey: 'occurrence',
+        },
+        summary: {
+          requiredTotal: 1,
+          requiredTerminal: 1,
+          requiredFailed: 0,
+          allRequiredTerminal: true,
+          state: 'completed',
+          items: [],
+        },
+      });
+      expect(readIntent).toHaveBeenCalledWith({ _id: 'admission', userId: 'owner' });
+      expect(send).toHaveBeenCalledTimes(kind === 'schedule_due' ? 0 : 1);
+    } finally {
+      if (priorUrl == null) delete process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL;
+      else process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL = priorUrl;
+      if (priorSecret == null) delete process.env.VIVENTIUM_SCHEDULER_SECRET;
+      else process.env.VIVENTIUM_SCHEDULER_SECRET = priorSecret;
+    }
+  },
+);
+/* === VIVENTIUM END === */

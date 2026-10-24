@@ -55,3 +55,22 @@ test.each([
   expect(delivery(receipt).validateSync()).toBeDefined();
 });
 /* === VIVENTIUM END === */
+
+test('retains exact immutable Main admission proof without a fabricated worker result', () => {
+  const doc = delivery(available);
+  doc.mainGenerationPresentation = {
+    version: 1,
+    streamId: 'scheduled-stream',
+    admissionId: 'scheduled-admission',
+    responseMessageId: 'synthetic-response',
+    responseDigest: 'sha256:' + 'a'.repeat(64),
+  };
+  expect(doc.validateSync()).toBeUndefined();
+  expect(doc.toObject().mainGenerationPresentation).toEqual({
+    version: 1,
+    streamId: 'scheduled-stream',
+    admissionId: 'scheduled-admission',
+    responseMessageId: 'synthetic-response',
+    responseDigest: 'sha256:' + 'a'.repeat(64),
+  });
+});

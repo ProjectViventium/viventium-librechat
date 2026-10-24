@@ -67,7 +67,7 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
     instruction: {
       type: 'string',
       description:
-        'Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call.',
+        'Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call. With inheritContext=true, this optional value must be an exact verbatim clause from a selected original input for this one assignment. Omit it to use the whole selected input; do not summarize or paraphrase it. Full conversation context stays available.',
       minLength: 1,
       maxLength: MAIN_DELEGATION_STRING_LIMITS.instruction,
     },
@@ -366,14 +366,26 @@ export function canonicalConversationOrchestrationArguments(
     return output;
   }
   if (toolName === 'active_work_action') {
-    if (Object.prototype.hasOwnProperty.call(input, 'nativeHumanInput') || Object.prototype.hasOwnProperty.call(input, 'ownerInputControl')) {
+    if (
+      Object.prototype.hasOwnProperty.call(input, 'nativeHumanInput') ||
+      Object.prototype.hasOwnProperty.call(input, 'ownerInputControl')
+    ) {
       throw new TypeError('native owner input authority is server-owned');
     }
-    if (input.inheritContext === true && typeof input.instruction === 'string' && input.instruction.length > 100000) {
-      throw Object.assign(new TypeError('Inherited action input exceeds the native instruction limit.'),
-        { code: 'inherited_instruction_too_large' });
+    if (
+      input.inheritContext === true &&
+      typeof input.instruction === 'string' &&
+      input.instruction.length > 100000
+    ) {
+      throw Object.assign(
+        new TypeError('Inherited action input exceeds the native instruction limit.'),
+        { code: 'inherited_instruction_too_large' },
+      );
     }
-    const instruction = boundedString(input.instruction, input.inheritContext === true ? 100000 : 8000);
+    const instruction = boundedString(
+      input.instruction,
+      input.inheritContext === true ? 100000 : 8000,
+    );
     const fileIds = input.fileIds;
     const nativeInput =
       input.nativeInput === undefined
@@ -404,9 +416,12 @@ export function canonicalConversationOrchestrationArguments(
     return {
       workRef: boundedString(input.workRef, 160),
       action: boundedString(input.action, 32).toLowerCase(),
-      ...(input.inheritContext === true ? {
-        inheritContext: true, sourceOrdinals: canonicalSourceOrdinals(input.sourceOrdinals),
-      } : {}),
+      ...(input.inheritContext === true
+        ? {
+            inheritContext: true,
+            sourceOrdinals: canonicalSourceOrdinals(input.sourceOrdinals),
+          }
+        : {}),
       ...(instruction ? { instruction } : {}),
       ...(nativeInput ? { nativeInput } : {}),
       ...(Array.isArray(fileIds) && fileIds.length ? { fileIds: [...(fileIds as string[])] } : {}),

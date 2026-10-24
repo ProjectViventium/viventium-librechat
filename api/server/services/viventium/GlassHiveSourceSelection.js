@@ -7,11 +7,13 @@
 const {
   canonicalSourceOrdinals,
   selectTrustedLaunchRequestBody,
+  selectTrustedSourceInstruction,
   trustedUploadedFilesFromRequestBody,
 } = require('@librechat/api');
 
 module.exports = {
   canonicalSourceOrdinals,
   selectTrustedLaunchRequestBody,
+  selectTrustedSourceInstruction,
   trustedUploadedFilesFromRequestBody,
 };

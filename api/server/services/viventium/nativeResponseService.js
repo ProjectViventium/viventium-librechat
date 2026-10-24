@@ -36,10 +36,11 @@ const { logger } = require('@librechat/data-schemas');
 const { voiceLatencyNow, logVoiceLatencyNumericStage } = require('./voiceLatencyTiming');
 
 function observeNativeResponsePhase(req, stage, operation) {
-  if (req?.viventiumVoiceLogLatency !== true) return operation();
   const startedAt = voiceLatencyNow();
+  const voiceTiming = req?.viventiumVoiceLogLatency === true;
   let outcome = 'failed';
   const record = () => {
+    if (!voiceTiming) return;
     try {
       const requestHash = createHash('sha256')
         .update(String(req.viventiumVoiceRequestId || 'unknown'))
@@ -56,15 +57,53 @@ function observeNativeResponsePhase(req, stage, operation) {
       // Passive diagnostics must preserve the exact admission or transport outcome.
     }
   };
+  const recordFailure = (error) => {
+    try {
+      const frames = String(error?.stack || '')
+        .split('\n')
+        .slice(1, 7)
+        .map((line) => {
+          const match = line.match(/([^/\s():]+):(\d+):(\d+)\)?$/);
+          return match
+            ? { file: match[1], line: Number(match[2]), column: Number(match[3]) }
+            : null;
+        })
+        .filter(Boolean);
+      logger.warn(
+        `[VIVENTIUM][native-response-failure] ${JSON.stringify({
+          phase: stage,
+          errorType: ['TimeoutError', 'AbortError', 'TypeError', 'Error'].includes(error?.name)
+            ? error.name
+            : 'OtherError',
+          elapsedMs: Math.round((voiceLatencyNow() - startedAt) * 1000) / 1000,
+          sourceFrames: frames,
+        })}`,
+      );
+    } catch {
+      // Diagnostics must not change transport results.
+    }
+  };
   try {
-    return Promise.resolve(operation())
-      .then((result) => {
-        outcome = 'completed';
-        return result;
-      })
+    const result = operation();
+    if (!voiceTiming) {
+      Promise.resolve(result).catch(recordFailure);
+      return result;
+    }
+    return Promise.resolve(result)
+      .then(
+        (result) => {
+          outcome = 'completed';
+          return result;
+        },
+        (error) => {
+          recordFailure(error);
+          throw error;
+        },
+      )
       .finally(record);
   } catch (error) {
     record();
+    recordFailure(error);
     throw error;
   }
 }
@@ -474,7 +513,7 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
       return baseFetch(input, { ...init, headers });
     };
   }
-  return createNativeResponseFetch(
+  const nativeFetch = createNativeResponseFetch(
     (input, init) =>
       observeNativeResponsePhase(req, 'provider_response_headers', () => baseFetch(input, init)),
     async () => {
@@ -526,7 +565,9 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
       };
     },
     (identity) =>
-      observeNativeResponsePhase(req, 'host_native_admission', () => getService().admit(identity)),
+      observeNativeResponsePhase(req, 'host_native_admission', () =>
+        getService().admit(identity, req._viventiumNativeResponseIdentity),
+      ),
     (identity) => {
       req._viventiumNativeResponseIdentity = identity;
     },
@@ -537,7 +578,14 @@ function wrapNativeResponseFetch(req, primaryAgentId, baseFetch, route) {
       req._viventiumNativeResponseUnaccepted = identity;
     },
     /* === VIVENTIUM END === */
+    async (identity) => {
+      const previous = req._viventiumNativeResponseIdentity;
+      // A first dispatch has nothing to release; retain its original single admission read.
+      return previous ? getService().prepareInvocation(identity, previous) : true;
+    },
   );
+  return (input, init) =>
+    observeNativeResponsePhase(req, 'request_dispatch', () => nativeFetch(input, init));
 }
 
 /* VIVENTIUM: The original native Main may have handed off before its cohort sealed. Later
@@ -711,10 +759,26 @@ async function markNativeResponseReplayStored(identity, mode) {
 }
 
 async function recoverNativeResponse(identity) {
-  const row = await require('~/models').getNativeResponse(
+  let row = await require('~/models').getNativeResponse(
     identity.userId,
     identity.responseMessageId,
   );
+  if (['pending', 'prepared'].includes(row?.nativeResponse?.status)) {
+    const store = GenerationJobManager.getJobStore();
+    const failure = recordedNativeFailure(identity, await store.getJob(identity.streamId));
+    if (failure) {
+      const saved = await persistNativeResponseFailure(identity, {
+        error: true,
+        unfinished: false,
+        content: [failure],
+      });
+      if (!saved || !(await store.isCurrentLogicalTurn(identity.streamId))) return false;
+      row = await require('~/models').getNativeResponse(
+        identity.userId,
+        identity.responseMessageId,
+      );
+    }
+  }
   if (
     row?.nativeResponse?.status === 'cancelled' &&
     typeof row.nativeResponse.stopSnapshotStoredAt === 'number' &&
@@ -826,6 +890,87 @@ async function persistNativeResponseCancellation(identity, snapshot, mode) {
     'system',
   );
 }
+
+/* === VIVENTIUM START === A host failure ends its Native attempt without accepting stale text. === */
+function recordedNativeFailure(identity, job) {
+  if (
+    !nativeJobMatches(job, identity) ||
+    !job.nativeResponse ||
+    nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity) ||
+    job.status !== 'error' ||
+    job.nativeResponseCancelled !== true ||
+    job.nativeResponseFinished ||
+    typeof job.error !== 'string' ||
+    !job.error ||
+    typeof job.errorClass !== 'string' ||
+    !job.errorClass
+  )
+    return null;
+  return { type: 'error', error_class: job.errorClass, error: job.error };
+}
+
+async function persistNativeResponseFailure(identity, snapshot, onRevoked) {
+  const failure =
+    Array.isArray(snapshot?.content) &&
+    snapshot.content.find(
+      (part) =>
+        part?.type === 'error' &&
+        typeof part.error_class === 'string' &&
+        part.error_class &&
+        typeof part.error === 'string' &&
+        part.error,
+    );
+  if (snapshot?.error !== true || snapshot.unfinished !== false || !failure) return null;
+  const store = GenerationJobManager.getJobStore();
+  let recordedOwner = false;
+  const current = async (revoked = false) => {
+    const job = await store.getJob(identity.streamId);
+    const recorded = recordedNativeFailure(identity, job);
+    const receipt = await store.getNativeResponseCommit(identity);
+    recordedOwner = Boolean(
+      recorded &&
+      receipt.status === 'revoked' &&
+      recorded.error_class === failure.error_class &&
+      recorded.error === failure.error,
+    );
+    return (
+      nativeJobMatches(job, identity) &&
+      job.nativeResponse &&
+      nativeIdentityJson(job.nativeResponse) === nativeIdentityJson(identity) &&
+      (revoked || recordedOwner || !job.nativeResponseCancelled) &&
+      !job.nativeResponseFinished &&
+      (recordedOwner || (await store.isCurrentLogicalTurn(identity.streamId))) &&
+      (revoked || recordedOwner
+        ? receipt.status === 'revoked'
+        : !['committed', 'revoked'].includes(receipt.status))
+    );
+  };
+  if (!(await current())) return null;
+  let authorized = recordedOwner;
+  const saved = await require('~/models').materializeNativeResponseTerminal(
+    identity,
+    'failed',
+    async () => {
+      if (authorized) return current(true);
+      if (!(await current())) return false;
+      authorized =
+        (await GenerationJobManager.revokeNativeResponse(identity, true)).status === 'revoked';
+      if (authorized) onRevoked?.(identity);
+      return authorized;
+    },
+    runNativeResponseTransaction,
+    (message) => projectNativeMessage(identity, {}, message, 'terminal'),
+    failure.error_class,
+    { error_class: failure.error_class, error: failure.error },
+  );
+  if (!saved) return null;
+  const visible = { ...saved };
+  delete visible.nativeResponse;
+  delete visible.hostFinal;
+  delete visible.savedMemoryWrite;
+  return visible;
+}
+/* === VIVENTIUM END === */
 
 async function installNativeResponseRecovery() {
   await require('~/models').ensureNativeResponseIndexes();
@@ -1072,6 +1217,7 @@ module.exports = {
   recoverNativeResponse,
   recoverNativeResponses,
   installNativeResponseRecovery,
+  persistNativeResponseFailure,
   mutateNativeResponseSources,
 };
 /* === VIVENTIUM END === */

@@ -2,6 +2,8 @@ const { VOICE_TASK_TOOL_NAME } = require('./VoiceTaskManagementTool');
 const {
   backgroundWorkerResources,
   createNativeToolCatalog,
+  NATIVE_TOOL_CATALOG_MAX_BYTES,
+  NATIVE_TOOL_CATALOG_MAX_TOOLS,
   nativeToolCatalogFitsBootstrap,
 } = require('@librechat/api');
 /* === VIVENTIUM START ===
@@ -863,10 +865,48 @@ function brokerContextBrief(
     deferredServers = [],
     allowedHostTools = [],
     conversationToolMode = 'full',
+    nativeToolCatalog,
   } = {},
 ) {
   if (conversationToolMode === 'coordination') {
-    return 'Declared conversation tools: hand_off_to, list_workers. Their contracts own action work and current worker state. Other authorized capabilities belong to the configured workers.';
+    const hostTools = allowedHostTools.filter(
+      (name) => name !== VOICE_TASK_TOOL_NAME && !isConversationOrchestrationTool(name),
+    );
+    const discovery = {
+      scope_source: 'current_host_authorization',
+      service_scopes: allowedServers,
+      host_tools: hostTools,
+      worker_scope: 'resolved_independently_at_launch',
+      live_connection_status: 'not_established_by_this_scope',
+    };
+    const catalogTools =
+      nativeToolCatalog?.version === 1 &&
+      Array.isArray(nativeToolCatalog.tools) &&
+      nativeToolCatalog.tools.length <= NATIVE_TOOL_CATALOG_MAX_TOOLS
+        ? nativeToolCatalog.tools
+        : [];
+    const descriptionsByName = new Map(
+      catalogTools
+        .filter((tool) => hostTools.includes(tool?.name) && typeof tool.description === 'string')
+        .map(({ name, description }) => [name, description]),
+    );
+    const descriptions = hostTools
+      .filter((name) => descriptionsByName.has(name))
+      .map((name) => ({ name, description: descriptionsByName.get(name) }));
+    const encode = (facts) =>
+      JSON.stringify({ worker_capability_discovery: facts })
+        .replace(/&/g, '\\u0026')
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e');
+    const described = descriptions.length
+      ? encode({ ...discovery, host_tool_descriptions: descriptions })
+      : '';
+    return [
+      'Declared conversation tools: hand_off_to, list_workers. Their contracts own action work and current worker state. Other authorized capabilities belong to the configured workers.',
+      described && Buffer.byteLength(described, 'utf8') <= NATIVE_TOOL_CATALOG_MAX_BYTES
+        ? described
+        : encode(discovery),
+    ].join('\n');
   }
   const serverList = allowedServers.length ? allowedServers.join(', ') : 'none';
   const deferredServerList = deferredServers.length ? deferredServers.join(', ') : 'none';
@@ -874,7 +914,7 @@ function brokerContextBrief(
   return [
     'GlassHive connected capability broker [v2]:',
     '- A broker MCP named `glasshive-user-capabilities` is available in this workspace when the local MCP client loads project MCP config.',
-    '- The broker catalog exposes exactly the current user/run authorized host capabilities. Treat the catalog as capability truth; do not infer availability from this prose.',
+    '- The broker catalog exposes exactly the current user/run authorized host capabilities. Treat it as truth for this broker only. Native harness tools and other MCP servers have independent inventories; a missing broker entry does not establish their absence.',
     '- Prefer callable broker tools for live connected-service facts and actions when they can satisfy the task. Use browser or computer UI when those tools are missing, unavailable, auth-blocked, explicitly required, or when visual/manual QA is genuinely the better route.',
     '- If a non-broker host connector is also available, including a built-in Codex app connector, prefer the brokered `glasshive-user-capabilities` tool when it covers the same connected-account provider. Use non-broker connectors only after the broker path is missing, unavailable, auth-blocked, or explicitly required.',
     '- Do not treat memory, recall, or prior chat text as live connected-service evidence. Ask the broker when current provider truth is needed.',
@@ -1070,6 +1110,7 @@ function mergeBrokerBundle({
   workerMemory = '',
   workerFeelings = '',
   conversationToolMode = 'full',
+  nativeToolCatalog,
 }) {
   const bundle = mergeWorkerContextBundle({ existingBundle, workerMemory, workerFeelings });
   const codexTokenEnvVar = 'GLASSHIVE_CAPABILITY_BROKER_TOKEN';
@@ -1121,6 +1162,7 @@ function mergeBrokerBundle({
     deferredServers,
     allowedHostTools,
     conversationToolMode,
+    nativeToolCatalog,
   });
   bundle.agents_md = appendText(bundle.agents_md, instruction);
   bundle.claude_md = appendText(bundle.claude_md, instruction);
@@ -1334,6 +1376,15 @@ async function maybeInjectGlassHiveCapabilityBroker({
     if (inheritedConversation) {
       args.bootstrap_bundle_json.inherited_conversation = inheritedConversation;
     }
+    /* === VIVENTIUM START === Prepare schedule authority only for actual native work. === */
+    if (process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED === 'true') {
+      await require('./ScheduleDueService').applyConversationScheduleAccess({
+        bundle: args.bootstrap_bundle_json,
+        user: config?.configurable?.user,
+        requestBody: config?.configurable?.requestBody,
+      });
+    }
+    /* === VIVENTIUM END === */
     const trustedLaunchArgs = attachGlassHiveTrustedLaunchMetadata(
       args,
       launchContext,
@@ -1764,7 +1815,7 @@ async function buildConversationProviderBootstrapBundle({
   } catch {
     // A diagnostic failure must not turn a valid capability grant into an unavailable one.
   }
-  const bundle = mergeBrokerBundle({
+  const bundleOptions = {
     existingBundle: {},
     brokerUrl: resolveBrokerUrl(executionMode),
     grantToken: mintedGrant.token,
@@ -1775,7 +1826,8 @@ async function buildConversationProviderBootstrapBundle({
     allowedHostTools: allProviderHostTools,
     contentReadScope,
     conversationToolMode,
-  });
+  };
+  let bundle = mergeBrokerBundle(bundleOptions);
   if (conversationToolMode === 'coordination') bundle.conversation_tool_mode = 'coordination';
   /* === VIVENTIUM START === Reuse the current authorized MCP catalog as bounded factual data. === */
   const catalogStartedAt = Date.now();
@@ -1796,7 +1848,18 @@ async function buildConversationProviderBootstrapBundle({
       tools: definitions,
     });
     if (toolCatalog && !nativeToolCatalogFitsBootstrap(bundle, toolCatalog)) toolCatalog = null;
-    if (toolCatalog) bundle.glasshive_capability_broker.tool_catalog = toolCatalog;
+    if (toolCatalog) {
+      const describedBundle =
+        conversationToolMode === 'coordination'
+          ? mergeBrokerBundle({ ...bundleOptions, nativeToolCatalog: toolCatalog })
+          : bundle;
+      if (nativeToolCatalogFitsBootstrap(describedBundle, toolCatalog)) {
+        bundle = describedBundle;
+        if (conversationToolMode === 'coordination') bundle.conversation_tool_mode = 'coordination';
+      }
+      // Optional descriptions must not evict the authorized catalog that already fit.
+      bundle.glasshive_capability_broker.tool_catalog = toolCatalog;
+    }
     logger.info(
       JSON.stringify({
         event: 'glasshive_native_tool_catalog',

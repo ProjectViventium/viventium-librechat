@@ -188,7 +188,7 @@ async function resolveReusableConversationState({
     messages =
       (await getMessages(
         { conversationId },
-        'messageId parentMessageId createdAt metadata.viventium.type metadata.viventium.mode metadata.viventium.actorTrust metadata.viventium.telegramInput.state',
+        'messageId parentMessageId createdAt isCreatedByUser unfinished finish_reason metadata.viventium.type metadata.viventium.mode metadata.viventium.actorTrust metadata.viventium.telegramInput.state',
       )) ?? [];
   } catch (err) {
     logger.warn(
@@ -242,7 +242,16 @@ async function resolveReusableConversationState({
 
   return {
     conversationId,
-    parentMessageId: resolveLatestLeafMessageId(messages),
+    /* === VIVENTIUM START === Exclude live drafts; retain authored interrupted parents. === */
+    parentMessageId: resolveLatestLeafMessageId(
+      messages.filter(
+        (message) =>
+          message.isCreatedByUser !== false ||
+          message.unfinished !== true ||
+          message.finish_reason === 'incomplete',
+      ),
+    ),
+    /* === VIVENTIUM END === */
     messages,
     reason: 'existing',
   };

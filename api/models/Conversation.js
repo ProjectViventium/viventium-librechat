@@ -1,7 +1,10 @@
 /* === VIVENTIUM START === General saves cannot set or clear explicit title authority. === */
 const { logger, omitUserTitleMarker } = require('@librechat/data-schemas');
 /* === VIVENTIUM END === */
-const { createTempChatExpirationDate } = require('@librechat/api');
+const {
+  createTempChatExpirationDate,
+  scheduledConversationBindingDeletionFilter,
+} = require('@librechat/api');
 const { getMessages, deleteMessages } = require('./Message');
 const { Conversation } = require('~/db/models');
 /* === VIVENTIUM START ===
@@ -384,6 +387,12 @@ module.exports = {
       }
 
       const deleteConvoResult = await Conversation.deleteMany(userFilter);
+
+      /* === VIVENTIUM START === Deleted source or selected destination revokes its schedule bindings. === */
+      await Conversation.db
+        .collection('viventium_glasshive_callback_bindings')
+        .deleteMany(scheduledConversationBindingDeletionFilter(String(user), conversationIds));
+      /* === VIVENTIUM END === */
 
       const deleteMessagesResult = await deleteMessages({
         conversationId: { $in: conversationIds },

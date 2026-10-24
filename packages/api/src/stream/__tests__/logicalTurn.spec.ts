@@ -159,18 +159,24 @@ describe('GenerationJobManager logical turns', () => {
         deliveryPolicy: externalDelivery,
       });
       const authority = {
-        version: 1 as const, callSessionId: 'call-1', userId: 'owner-1',
-        kind: 'participant_text' as const, fingerprint: 'a'.repeat(64), turnIds: [],
+        version: 1 as const,
+        callSessionId: 'call-1',
+        userId: 'owner-1',
+        kind: 'participant_text' as const,
+        fingerprint: 'a'.repeat(64),
+        turnIds: [],
       };
       await manager.updateMetadata('typed-voice-authority', {
         viventiumCallSessionId: 'call-1',
         viventiumVoiceWorkAuthority: authority,
       });
       expect(await store.getJob('typed-voice-authority')).toMatchObject({
-        viventiumCallSessionId: 'call-1', viventiumVoiceWorkAuthority: authority,
+        viventiumCallSessionId: 'call-1',
+        viventiumVoiceWorkAuthority: authority,
       });
       expect((await manager.getJob('typed-voice-authority'))?.metadata).toMatchObject({
-        viventiumCallSessionId: 'call-1', viventiumVoiceWorkAuthority: authority,
+        viventiumCallSessionId: 'call-1',
+        viventiumVoiceWorkAuthority: authority,
       });
     } finally {
       await manager.destroy();
@@ -523,11 +529,16 @@ describe('GenerationJobManager logical turns', () => {
       supersede_scope: 'response_only' as const,
     };
     try {
-      const old = await manager.createJob('telegram-old-conversation', 'user-1', 'conversation-old', {
-        interactionContext: orderedContext('conversation-old', 'old-replay', 1),
-        adapterCapabilities: responseOnly,
-        deliveryPolicy: externalDelivery,
-      });
+      const old = await manager.createJob(
+        'telegram-old-conversation',
+        'user-1',
+        'conversation-old',
+        {
+          interactionContext: orderedContext('conversation-old', 'old-replay', 1),
+          adapterCapabilities: responseOnly,
+          deliveryPolicy: externalDelivery,
+        },
+      );
       const fresh = await manager.createJob(
         'telegram-reset-conversation',
         'user-1',
@@ -587,7 +598,10 @@ describe('GenerationJobManager logical turns', () => {
       deliveryPolicy: externalDelivery,
     });
     try {
-      await manager.observeSourceOrder({ source_order_scope: sourceOrderScope, source_sequence: 2 });
+      await manager.observeSourceOrder({
+        source_order_scope: sourceOrderScope,
+        source_sequence: 2,
+      });
       await manager.createJob(
         'telegram-newer-active',
         'user-1',
@@ -721,6 +735,92 @@ describe('GenerationJobManager logical turns', () => {
       }),
     ).resolves.toMatchObject({ latest_source_sequence: 12347, stale: true });
     await store.destroy();
+  });
+
+  test.each([false, true])(
+    'Memory rollback does not revive a deleted predecessor; previously admitted=%s',
+    async (previouslyAdmitted) => {
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+      try {
+        const first = await store.claimLogicalTurn(
+          'memory-prior',
+          'owner',
+          telegramContext('memory-prior-chat', 'a'),
+        );
+        if (previouslyAdmitted) {
+          await store.createJob('memory-prior', 'owner', 'memory-prior-chat', {
+            interactionContext: first.interactionContext,
+          });
+          await store.deleteJob('memory-prior');
+        }
+        const candidate = await store.claimLogicalTurn(
+          'memory-candidate',
+          'owner',
+          telegramContext('memory-prior-chat', 'b'),
+        );
+        expect(
+          await store.rollbackLogicalTurnClaim('memory-candidate', candidate.interactionContext),
+        ).toBe(true);
+        const next = await store.claimLogicalTurn('memory-ready', 'owner', {
+          ...telegramContext('memory-prior-chat', 'c'),
+          ready_input_continuation: {
+            source_message_id: 'input-c',
+            presentation_source_sequence: 3,
+          },
+        });
+        expect(next.status).toBe(previouslyAdmitted ? 'claimed' : 'busy');
+      } finally {
+        await store.destroy();
+      }
+    },
+  );
+
+  test('Memory pending rollback survives completed TTL while an empty completed turn still expires', async () => {
+    let now = 1_725_000_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = new InMemoryJobStore({ ttlAfterComplete: 100 });
+    const context = (id: string): InteractionContext => ({
+      ...telegramContext('memory-retained-chat', id),
+      source_segments: [{ ordinal: 0, source_event_id: id, source_index: 0, text: id }],
+    });
+    try {
+      const first = await store.claimLogicalTurn('memory-a', 'owner', context('a'));
+      await store.createJob('memory-a', 'owner', 'memory-retained-chat', {
+        interactionContext: first.interactionContext,
+      });
+      const candidate = await store.claimLogicalTurn('memory-b', 'owner', context('b'));
+      await store.acknowledgeDelivery({
+        logical_turn_id: first.interactionContext.logical_turn_id!,
+        revision: first.interactionContext.revision,
+        state: 'failed',
+      });
+      await store.updateJob('memory-a', { status: 'superseded', completedAt: now });
+      expect(await store.rollbackLogicalTurnClaim('memory-b', candidate.interactionContext)).toBe(
+        true,
+      );
+      const empty = await store.claimLogicalTurn(
+        'memory-empty',
+        'owner',
+        telegramContext('memory-empty-chat', 'empty'),
+      );
+      await store.createJob('memory-empty', 'owner', 'memory-empty-chat', {
+        interactionContext: empty.interactionContext,
+      });
+      await store.updateJob('memory-empty', { status: 'complete', completedAt: now });
+      await store.completeLogicalTurn('memory-empty');
+      now += 101;
+      await store.cleanup();
+      expect(
+        await store.resolveDeliveryOwner(empty.interactionContext.logical_turn_id!, 1),
+      ).toBeNull();
+      const next = await store.claimLogicalTurn('memory-c', 'owner', context('c'));
+      expect(
+        next.interactionContext.source_segments?.map((source) => source.source_event_id),
+      ).toEqual(['b', 'c']);
+    } finally {
+      await store.destroy();
+      clock.mockRestore();
+    }
   });
 
   test('InMemory expires inactive source watermarks but retains them while a turn is active', async () => {
@@ -2102,7 +2202,8 @@ describe('GenerationJobManager logical turns', () => {
         expect(terminals[0]).toMatchObject(
           lateReceipt
             ? {
-                final: true, superseded: true,
+                final: true,
+                superseded: true,
                 durableEffectReceipt: { effect_ref: 'effect-old' },
               }
             : { final: true, superseded: true },
@@ -2512,8 +2613,12 @@ describe('GenerationJobManager logical turns', () => {
     await create('telegram-release-b', 'event-b');
     const c = await create('telegram-release-c', 'event-c');
 
-    expect((await store.getJob('telegram-release-b'))?.nativeReleaseTargets).toEqual(['response-a']);
-    expect((await store.getJob('telegram-release-c'))?.nativeReleaseTargets).toEqual(['response-a']);
+    expect((await store.getJob('telegram-release-b'))?.nativeReleaseTargets).toEqual([
+      'response-a',
+    ]);
+    expect((await store.getJob('telegram-release-c'))?.nativeReleaseTargets).toEqual([
+      'response-a',
+    ]);
     expect((await store.getJob('telegram-release-c'))?.nativePredecessor).toBeUndefined();
     expect(c.metadata.interactionContext).toMatchObject({ revision: 3 });
     expect(a.abortController.signal.reason).toBe('superseded');
@@ -2952,7 +3057,8 @@ describe('GenerationJobManager logical turns', () => {
     ).resolves.toBe(true);
 
     expect((await store.getJob('telegram-action-a'))?.durableEffectReceipt).toMatchObject({
-      confirmation_pending: true, effect_kind: 'durable_work_action_accepted',
+      confirmation_pending: true,
+      effect_kind: 'durable_work_action_accepted',
     });
 
     expect(terminals).toEqual([
@@ -2981,7 +3087,8 @@ describe('GenerationJobManager logical turns', () => {
       });
       await manager.initialize();
       const claim = await store.claimLogicalTurn('legacy-stream', 'owner', {
-        ...telegramContext('conversation', 'source'), surface,
+        ...telegramContext('conversation', 'source'),
+        surface,
       });
       const context = claim.interactionContext;
       await store.createJob('legacy-stream', 'owner', 'conversation', {
@@ -2990,22 +3097,40 @@ describe('GenerationJobManager logical turns', () => {
         deliveryPolicy: externalDelivery,
       });
       const receipt = {
-        effect_kind: 'durable_work_accepted' as const, effect_ref: 'work-existing',
-        source_event_id: 'source', response_message_id: 'answer-old', committed_at: 1,
+        effect_kind: 'durable_work_accepted' as const,
+        effect_ref: 'work-existing',
+        source_event_id: 'source',
+        response_message_id: 'answer-old',
+        committed_at: 1,
       };
       await store.updateJob('legacy-stream', {
-        status: 'superseded', responseMessageId: 'answer-old',
-        durableEffectReceipt: receipt, durableEffectReceipts: [receipt],
-        finalEvent: JSON.stringify({ final: true, responseMessage: {
-          messageId: 'answer-old', text: 'Legacy generated operation receipt.',
-        } }),
+        status: 'superseded',
+        responseMessageId: 'answer-old',
+        durableEffectReceipt: receipt,
+        durableEffectReceipts: [receipt],
+        finalEvent: JSON.stringify({
+          final: true,
+          responseMessage: {
+            messageId: 'answer-old',
+            text: 'Legacy generated operation receipt.',
+          },
+        }),
       });
       try {
-        const expected = { final: true, superseded: true, logical_turn_id: context.logical_turn_id, revision: 1,
-          durableEffectReceipt: { effect_ref: 'work-existing' } };
+        const expected = {
+          final: true,
+          superseded: true,
+          logical_turn_id: context.logical_turn_id,
+          revision: 1,
+          durableEffectReceipt: { effect_ref: 'work-existing' },
+        };
         expect((await manager.getResumeState('legacy-stream'))?.finalEvent).toEqual(expected);
         const terminals: unknown[] = [];
-        await manager.subscribe('legacy-stream', () => {}, (event) => terminals.push(event));
+        await manager.subscribe(
+          'legacy-stream',
+          () => {},
+          (event) => terminals.push(event),
+        );
         await new Promise((resolve) => setImmediate(resolve));
         expect(terminals).toEqual([expected]);
         expect((await store.getJob('legacy-stream'))?.durableEffectReceipts).toEqual([receipt]);

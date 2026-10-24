@@ -6,7 +6,10 @@
  * === VIVENTIUM END === */
 const { EModelEndpoint } = require('librechat-data-provider');
 const mockGetMessages = jest.fn();
-jest.mock('~/models', () => ({ getMessages: (...args) => mockGetMessages(...args) }));
+jest.mock('~/models', () => ({
+  getMessages: (...args) => mockGetMessages(...args),
+  getConvo: async () => ({ conversationId: CONVERSATION, endpoint: 'agents' }),
+}));
 jest.mock('~/server/services/Files/strategies', () => ({ getStrategyFunctions: jest.fn() }));
 jest.mock('~/models/balanceMethods', () => ({ checkBalance: jest.fn() }));
 const BaseClient = require('../BaseClient');
@@ -135,6 +138,60 @@ function admit(req, instance, carried) {
 
 beforeEach(() => {
   mockGetMessages.mockReset();
+});
+
+test('an automatic parent at a scheduler envelope preserves every visible ancestor without its live draft', async () => {
+  const envelope = {
+    user: OWNER,
+    conversationId: CONVERSATION,
+    messageId: 'next-envelope',
+    parentMessageId: 'hidden-1',
+    isCreatedByUser: true,
+    createdAt: '2026-03-26T20:00:00.000Z',
+    text: 'Private scheduler transport.',
+    metadata: {
+      viventium: {
+        visibility: 'internal',
+        interactionContext: { actor_kind: 'system', origin: 'scheduler', surface: 'workbench' },
+      },
+    },
+  };
+  mockGetMessages.mockResolvedValue([
+    ...legacyScheduledThread(2),
+    envelope,
+    {
+      user: OWNER,
+      conversationId: CONVERSATION,
+      messageId: 'live-draft',
+      parentMessageId: envelope.messageId,
+      isCreatedByUser: false,
+      unfinished: true,
+      createdAt: '2026-03-26T20:00:01.000Z',
+      text: '',
+    },
+  ]);
+  const {
+    resolveReusableConversationState,
+  } = require('~/server/services/viventium/conversationThreading');
+  const selected = await resolveReusableConversationState({
+    conversationId: CONVERSATION,
+    userId: OWNER,
+    surface: 'telegram',
+  });
+  expect(selected.parentMessageId).toBe(envelope.messageId);
+  expect(selected.messages).toHaveLength(8);
+  const req = { user: { id: OWNER }, body: { conversationId: CONVERSATION } };
+  const instance = client(req);
+  const history = await instance.loadHistory(CONVERSATION, selected.parentMessageId);
+  const carried = carriedToMain(req, history, selected.parentMessageId);
+  expect(carried.map((row) => row.messageId)).toEqual(['answer-0', 'answer-1', 'current-prompt']);
+  expect(instance._viventiumHistoryAncestryV1).toMatchObject({ complete: true });
+  expect(instance._viventiumHistoryAncestryV1.skippedMessageIds).toContain(envelope.messageId);
+  expect(admit(req, instance, carried).visibleMessageChain.map((row) => row.id)).toEqual([
+    'answer-0',
+    'answer-1',
+    'current-prompt',
+  ]);
 });
 
 test('a trusted scheduler wake carries every prior answer and omits only transport rows', async () => {

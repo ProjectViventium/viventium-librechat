@@ -28,6 +28,7 @@ let mockInputService;
 let mockSaveInput;
 let mockInputMessageUpdate;
 let mockInputMessageRead;
+let mockInputSourceHistory;
 let mockReplyReceiptFindOne;
 let mockRetainLogicalTurnInput;
 let mockMutateNativeResponseSources;
@@ -354,6 +355,7 @@ jest.mock('@librechat/api', () => ({
 jest.mock('~/db/models', () => ({
   Message: {
     findOne: (...args) => mockInputMessageRead(...args),
+    find: (...args) => ({ select: () => ({ lean: () => mockInputSourceHistory(...args) }) }),
     exists: jest.fn().mockResolvedValue(false),
     updateOne: (...args) => mockInputMessageUpdate(...args),
   },
@@ -620,6 +622,7 @@ describe('/api/viventium/telegram', () => {
     mockMutateNativeResponseSources = jest.fn(async (_filter, operation) => operation());
     mockSaveInput = jest.fn().mockResolvedValue({});
     mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => null }) }));
+    mockInputSourceHistory = jest.fn().mockResolvedValue([]);
     mockInputMessageUpdate = jest.fn().mockResolvedValue({ matchedCount: 1 });
     mockLastPreparedBody = null;
     lastAgentId = null;
@@ -1429,6 +1432,213 @@ describe('/api/viventium/telegram', () => {
     });
     expect(res.body.prepared.text).toBe('Original voice goal');
   });
+  /* === VIVENTIUM START === Pending singleton ancestry uses existing owned history and native source fences. === */
+  test.each([
+    'owned base',
+    'healthy original',
+    'already repaired',
+    'descendant head',
+    'missing head',
+    'foreign head',
+    'foreign conversation head',
+    'deleted head',
+    'deleted ancestor',
+    'cyclic head',
+    'admitted source',
+    'failed source',
+    'deleted source',
+    'foreign source',
+    'wrong source event',
+    'native fence',
+    'raced source',
+    'missing source parent',
+  ])('prepared singleton recovery preserves the protected source carrier with %s', async (mode) => {
+    const row = { ...inputIdentity(), state: 'ready' };
+    const original = mode === 'healthy original' ? 'base-answer' : 'unpublished-answer';
+    const baseUser = {
+      user: 'user_1',
+      conversationId: row.conversationId,
+      messageId: 'base-user',
+      parentMessageId: '',
+      sender: 'User',
+      isCreatedByUser: true,
+      text: 'Earlier user goal.',
+      createdAt: new Date(1000),
+    };
+    const baseAnswer = {
+      user: 'user_1',
+      conversationId: row.conversationId,
+      messageId: 'base-answer',
+      parentMessageId: 'base-user',
+      sender: 'Assistant',
+      isCreatedByUser: false,
+      text: 'Earlier actual answer.',
+      createdAt: new Date(2000),
+    };
+    const source = {
+      user: 'user_1',
+      conversationId: row.conversationId,
+      messageId: row.sourceMessageId,
+      parentMessageId: original,
+      sender: 'User',
+      isCreatedByUser: true,
+      text: 'Original retained goal.',
+      createdAt: new Date(3000),
+      metadata: {
+        viventium: {
+          telegramInput: {
+            state: 'ready',
+            sourceEventId: row.sourceEventId,
+            originalParentMessageId: original,
+          },
+          interactionContext: { source_event_id: row.sourceEventId },
+        },
+      },
+    };
+    const history = mode === 'missing head' ? [source] : [baseUser, baseAnswer, source];
+    if (['healthy original', 'descendant head', 'already repaired'].includes(mode))
+      history.push({
+        user: 'user_1',
+        conversationId: row.conversationId,
+        messageId: 'transient-answer',
+        parentMessageId: row.sourceMessageId,
+        isCreatedByUser: false,
+        sender: 'Assistant',
+        text: 'Transient response.',
+        createdAt: new Date(4000),
+        // A stable descendant exercises the ancestry fence; a live draft is skipped by design.
+        unfinished: mode !== 'descendant head',
+      });
+    if (mode === 'already repaired') source.parentMessageId = 'base-answer';
+    if (mode === 'foreign head') baseAnswer.user = 'other-owner';
+    if (mode === 'foreign conversation head') baseAnswer.conversationId = 'other-conversation';
+    if (mode === 'deleted head') baseAnswer.deletedAt = new Date();
+    if (mode === 'deleted ancestor') baseUser.deletedAt = new Date();
+    if (mode === 'cyclic head') {
+      baseUser.parentMessageId = 'base-answer';
+      baseAnswer.parentMessageId = 'base-user';
+    }
+    if (mode === 'admitted source') source.metadata.viventium.telegramInput.state = 'admitted';
+    if (mode === 'failed source') source.metadata.viventium.telegramInput.state = 'failed';
+    if (mode === 'deleted source') source.deletedAt = new Date();
+    if (mode === 'foreign source') source.user = 'other-owner';
+    if (mode === 'missing source parent') delete source.parentMessageId;
+    if (mode === 'wrong source event')
+      source.metadata.viventium.telegramInput.sourceEventId = 'different-source';
+    mockInputSourceHistory.mockImplementation(async (filter) =>
+      history.filter(
+        (entry) => entry.user === filter.user && entry.conversationId === filter.conversationId,
+      ),
+    );
+    if (mode === 'native fence')
+      mockMutateNativeResponseSources.mockRejectedValueOnce(
+        Object.assign(new Error('Native source cannot change'), { code: 'native_source_conflict' }),
+      );
+    mockInputService.read.mockResolvedValue(row);
+    mockInputService.ready.mockResolvedValue(row);
+    mockInputService.inputEnvelope.mockResolvedValue({
+      ...row,
+      preparation: { message: { date: 1700000000 } },
+    });
+    mockInputService.readPrepared.mockResolvedValue({
+      text: source.text,
+      fileIds: [],
+      imageUrls: [],
+    });
+    mockObserveSourceOrder.mockResolvedValue({
+      latest_source_sequence: 13,
+      observed_at: 1700000000000,
+      stale: true,
+    });
+    mockGetConvo.mockResolvedValue({
+      conversationId: row.conversationId,
+      endpoint: 'agents',
+      agent_id: 'agent_default',
+    });
+    mockGetMessages.mockResolvedValue(history);
+    mockInputMessageRead = jest.fn((filter) => ({
+      select: () => ({
+        lean: async () => history.find((entry) => entry.messageId === filter.messageId) || null,
+      }),
+    }));
+    mockInputMessageUpdate.mockImplementation(async (filter, update) => {
+      const entry = history.find((candidate) => candidate.messageId === filter.messageId);
+      if (!entry) return { matchedCount: 0 };
+      if (mode === 'raced source' && update.$set?.parentMessageId) return { matchedCount: 0 };
+      if (update.$set?.parentMessageId) entry.parentMessageId = update.$set.parentMessageId;
+      return { matchedCount: 1 };
+    });
+    mockClaimedLogicalTurn = { logical_turn_id: 'singleton-turn', revision: 1 };
+    let captured;
+    mockAfterAdmission = async (req) => {
+      const {
+        captureMainContextSnapshot,
+        traceMainHistoryAncestry,
+      } = require('~/server/services/viventium/ViventiumMainContextService');
+      const { formatMessage, formatAgentMessages } = require('@librechat/agents');
+      const proof = traceMainHistoryAncestry({
+        messages: history,
+        headId: req.body.parentMessageId,
+        ownerId: 'user_1',
+        conversationId: row.conversationId,
+      });
+      const visible = [
+        ...(proof.messageIds || []).map((id) => history.find((entry) => entry.messageId === id)),
+        source,
+      ];
+      captured = captureMainContextSnapshot(req, {
+        agent: {
+          id: 'main',
+          model_parameters: {
+            configuration: { defaultHeaders: { 'X-GlassHive-Agent-Id': 'main' } },
+          },
+        },
+        visibleMessages: visible,
+        messages: formatAgentMessages(
+          visible.map((message) => ({
+            ...formatMessage({ message }),
+            messageId: message.messageId,
+          })),
+        ).messages,
+        historyAncestry: proof,
+        protectUnreconciledHistory: true,
+        nativeBodyCarrier: true,
+      });
+    };
+    const res = createMockRes();
+    const run = dispatch(
+      createTestApp(require('../telegram')),
+      createMockReq({
+        url: '/api/viventium/telegram/inputs/continue',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          telegramUserId: 'tg-1',
+          inputClaim: { sourceEventId: row.sourceEventId, claimToken: row.claimToken },
+        },
+      }),
+      res,
+    );
+    if (!['owned base', 'healthy original', 'already repaired'].includes(mode)) {
+      await expect(run).rejects.toMatchObject(
+        mode === 'native fence'
+          ? { code: 'native_source_conflict' }
+          : { code: 'source_context_unavailable', status: 413 },
+      );
+      expect(source.parentMessageId).toBe(mode === 'missing source parent' ? undefined : original);
+      return;
+    }
+    await run;
+    expect(res.statusCode).toBe(200);
+    expect(lastParentMessageId).toBe('base-answer');
+    expect(source.parentMessageId).toBe('base-answer');
+    expect(
+      captured.visibleMessageChain.filter((entry) => entry.current_input).map((entry) => entry.id),
+    ).toEqual([row.sourceMessageId]);
+    expect(source.text).toBe('Original retained goal.');
+    if (mode === 'healthy original') expect(mockInputSourceHistory).not.toHaveBeenCalled();
+    if (mode === 'already repaired') expect(mockMutateNativeResponseSources).not.toHaveBeenCalled();
+  });
+  /* === VIVENTIUM END === */
   test('prepared recovery does not reparent a source under its own transient response', async () => {
     const row = { ...inputIdentity(), state: 'ready' };
     mockInputService.read.mockResolvedValue(row);
@@ -1453,6 +1663,7 @@ describe('/api/viventium/telegram', () => {
       agent_id: 'agent_default',
     });
     mockGetMessages.mockResolvedValue([
+      { messageId: 'original-answer', parentMessageId: '', createdAt: new Date(0) },
       {
         messageId: 'transient-response',
         parentMessageId: row.sourceMessageId,
@@ -1981,6 +2192,7 @@ describe('/api/viventium/telegram', () => {
     // A later source's answer is the head; re-anchoring under it would make this source its own
     // ancestor once that later source already descends from it.
     mockGetMessages.mockResolvedValue([
+      { messageId: 'original-answer', parentMessageId: '', createdAt: new Date(0) },
       { messageId: 'later-answer', parentMessageId: 'later-source', createdAt: new Date() },
     ]);
     mockInputMessageRead = jest.fn(() => ({
@@ -3469,7 +3681,9 @@ describe('/api/viventium/telegram', () => {
       endpoint: 'agents',
       agent_id: 'agent_default',
     });
-    mockGetMessages.mockResolvedValue([]);
+    mockGetMessages.mockResolvedValue(
+      source ? [{ messageId: 'original-answer', parentMessageId: '', createdAt: new Date(0) }] : [],
+    );
     mockInputMessageRead = jest.fn(() => ({ select: () => ({ lean: async () => source }) }));
     const app = createTestApp(require('../telegram')),
       res = createMockRes();

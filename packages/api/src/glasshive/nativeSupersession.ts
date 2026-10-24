@@ -25,37 +25,57 @@ export function nativeSourceRecoveryUnconfirmed(
   const ref = current?.nativePredecessor;
   const native = previous?.nativeResponse;
   const ack = previous?.deliveryAcknowledgement;
-  logger.warn(`[GenerationJobManager] Native source recovery decision ${JSON.stringify({
-    stage,
-    currentPresent: Boolean(current), previousPresent: Boolean(previous),
-    currentStatus: current?.status ?? null, previousStatus: previous?.status ?? null,
-    previousCancelled: previous?.nativeResponseCancelled === true,
-    previousFinished: previous?.nativeResponseFinished === true,
-    previousSettled: previous?.nativeResponseSettled === true,
-    previousGenerationCompleted: previous?.generationCompleted === true,
-    predecessorPresent: Boolean(ref), nativePresent: Boolean(native),
-    previousCreatedAtType: typeof previous?.createdAt, nativeCreatedAtType: typeof native?.jobCreatedAt,
-    nativeCreatedAtMatches: Boolean(native && previous && native.jobCreatedAt === previous.createdAt),
-    predecessorCreatedAtMatches: Boolean(ref && previous && ref.createdAt === previous.createdAt),
-    predecessorStreamMatches: Boolean(ref && previous && ref.streamId === previous.streamId),
-    predecessorResponseMatches: Boolean(ref && native && ref.responseMessageId === native.responseMessageId),
-    predecessorInvocationMatches: Boolean(ref && native && ref.invocationId === native.invocationId),
-    sameOwner: Boolean(current && previous && current.userId === previous.userId),
-    sameConversation: Boolean(current && previous && current.conversationId === previous.conversationId),
-    sameLogicalTurn: Boolean(current?.interactionContext?.logical_turn_id &&
-      current.interactionContext.logical_turn_id === previous?.interactionContext?.logical_turn_id),
-    currentRevision: current?.interactionContext?.revision ?? null,
-    previousRevision: previous?.interactionContext?.revision ?? null,
-    nativeRevision: native?.revision ?? null,
-    acknowledgement: ack?.state ?? null,
-    acknowledgementTurnMatches: Boolean(ack && native && ack.logical_turn_id === native.logicalTurnId),
-    acknowledgementRevisionMatches: Boolean(ack && native && ack.revision === native.revision),
-    acceptedSourceCount: previous?.nativeAcceptedSources?.sources.length ?? 0,
-    acceptedSourceInvocationMatches: Boolean(native &&
-      previous?.nativeAcceptedSources?.invocationId === native.invocationId),
-    ...(currentLogicalTurn === undefined ? {} : { currentLogicalTurn }),
-    ...captureIdentity,
-  })}`);
+  logger.warn(
+    `[GenerationJobManager] Native source recovery decision ${JSON.stringify({
+      stage,
+      currentPresent: Boolean(current),
+      previousPresent: Boolean(previous),
+      currentStatus: current?.status ?? null,
+      previousStatus: previous?.status ?? null,
+      previousCancelled: previous?.nativeResponseCancelled === true,
+      previousFinished: previous?.nativeResponseFinished === true,
+      previousSettled: previous?.nativeResponseSettled === true,
+      previousGenerationCompleted: previous?.generationCompleted === true,
+      predecessorPresent: Boolean(ref),
+      nativePresent: Boolean(native),
+      previousCreatedAtType: typeof previous?.createdAt,
+      nativeCreatedAtType: typeof native?.jobCreatedAt,
+      nativeCreatedAtMatches: Boolean(
+        native && previous && native.jobCreatedAt === previous.createdAt,
+      ),
+      predecessorCreatedAtMatches: Boolean(ref && previous && ref.createdAt === previous.createdAt),
+      predecessorStreamMatches: Boolean(ref && previous && ref.streamId === previous.streamId),
+      predecessorResponseMatches: Boolean(
+        ref && native && ref.responseMessageId === native.responseMessageId,
+      ),
+      predecessorInvocationMatches: Boolean(
+        ref && native && ref.invocationId === native.invocationId,
+      ),
+      sameOwner: Boolean(current && previous && current.userId === previous.userId),
+      sameConversation: Boolean(
+        current && previous && current.conversationId === previous.conversationId,
+      ),
+      sameLogicalTurn: Boolean(
+        current?.interactionContext?.logical_turn_id &&
+        current.interactionContext.logical_turn_id ===
+          previous?.interactionContext?.logical_turn_id,
+      ),
+      currentRevision: current?.interactionContext?.revision ?? null,
+      previousRevision: previous?.interactionContext?.revision ?? null,
+      nativeRevision: native?.revision ?? null,
+      acknowledgement: ack?.state ?? null,
+      acknowledgementTurnMatches: Boolean(
+        ack && native && ack.logical_turn_id === native.logicalTurnId,
+      ),
+      acknowledgementRevisionMatches: Boolean(ack && native && ack.revision === native.revision),
+      acceptedSourceCount: previous?.nativeAcceptedSources?.sources.length ?? 0,
+      acceptedSourceInvocationMatches: Boolean(
+        native && previous?.nativeAcceptedSources?.invocationId === native.invocationId,
+      ),
+      ...(currentLogicalTurn === undefined ? {} : { currentLogicalTurn }),
+      ...captureIdentity,
+    })}`,
+  );
   return Object.assign(new Error('native_source_recovery_unconfirmed'), {
     code: 'native_source_recovery_unconfirmed',
   });
@@ -75,12 +95,21 @@ export function getVerifiedNativeSources(init?: RequestInit): NativeAcceptedSour
   return init ? verifiedSources.get(init)?.map((item) => ({ ...item })) : undefined;
 }
 
-function nativeRevisionContinuity(current: SerializableJobData, previous: SerializableJobData): boolean {
+function nativeRevisionContinuity(
+  current: SerializableJobData,
+  previous: SerializableJobData,
+): boolean {
   const revision = current.interactionContext?.revision;
   const before = previous.nativeResponse?.revision;
   const skipped = current.nativePredecessor?.unadmittedRevisions ?? [];
-  return Boolean(revision && before && revision > before && revision - before <= 9 &&
-    skipped.length === revision - before - 1 && skipped.every((value, index) => value === before + index + 1));
+  return Boolean(
+    revision &&
+    before &&
+    revision > before &&
+    revision - before <= 9 &&
+    skipped.length === revision - before - 1 &&
+    skipped.every((value, index) => value === before + index + 1),
+  );
 }
 
 export function nativePredecessorSupersession(
@@ -128,18 +157,19 @@ export function nativePredecessorSupersession(
     revision: turn.revision,
     disposition: 'partial_removed' as const,
     accepted_sources: retained.sources.map((source) => ({ ...source })),
-    ...(ref.unadmittedRevisions?.length ? { unadmitted_revisions: [...ref.unadmittedRevisions] } : {}),
+    ...(ref.unadmittedRevisions?.length
+      ? { unadmitted_revisions: [...ref.unadmittedRevisions] }
+      : {}),
   };
 }
 
-/** Delivery removal and native cancellation permit moving only the unanswered input obligation. */
+/** Exact native cancellation and delivery removal return unanswered input on every surface. */
 export function nativePredecessorSourceRecovery(
   current: SerializableJobData,
   previous: SerializableJobData | null | undefined,
 ): previous is SerializableJobData {
   return Boolean(
     current.status === 'running' &&
-    current.adapterCapabilities?.supersede_scope === 'response_only' &&
     previous?.nativeResponseCancelled === true &&
     previous.interactionContext?.source_event_id &&
     previous.interactionContext.logical_turn_id === current.interactionContext?.logical_turn_id &&
@@ -149,15 +179,30 @@ export function nativePredecessorSourceRecovery(
 }
 
 /** A positive persisted cancellation tombstone fences both native bind calls before dispatch. */
-export function unboundPredecessorSourceRecovery(current: SerializableJobData, previous: SerializableJobData | null | undefined, unboundCancelled = false): previous is SerializableJobData {
+export function unboundPredecessorSourceRecovery(
+  current: SerializableJobData,
+  previous: SerializableJobData | null | undefined,
+  unboundCancelled = false,
+): previous is SerializableJobData {
   const turn = current.interactionContext;
   const old = previous?.interactionContext;
-  return Boolean(current.status === 'running' && current.adapterCapabilities?.supersede_scope === 'response_only' &&
+  return Boolean(
+    current.status === 'running' &&
     previous?.status === 'superseded' &&
-    previous.nativeResponseCancelled === true && unboundCancelled && previous.userId === current.userId &&
-    previous.conversationId === current.conversationId && old?.logical_turn_id === turn?.logical_turn_id &&
-    old && turn && old.revision < turn.revision && turn.source_segments?.some((source) =>
-      source.source_event_id === old.source_event_id && source.authoring_revision === old.revision));
+    previous.nativeResponseCancelled === true &&
+    unboundCancelled &&
+    previous.userId === current.userId &&
+    previous.conversationId === current.conversationId &&
+    old?.logical_turn_id === turn?.logical_turn_id &&
+    old &&
+    turn &&
+    old.revision < turn.revision &&
+    turn.source_segments?.some(
+      (source) =>
+        source.source_event_id === old.source_event_id &&
+        source.authoring_revision === old.revision,
+    ),
+  );
 }
 
 /** Fresh Core facts are taken only after the exact cancelled Native family released. */
@@ -190,7 +235,6 @@ export async function prepareNativeSourceRecovery(
     const pendingRemoval =
       live?.status === 'running' &&
       live.createdAt === current.createdAt &&
-      live.adapterCapabilities?.supersede_scope === 'response_only' &&
       stopped?.status === 'superseded' &&
       stopped.nativeResponseCancelled === true &&
       !unboundCancelled &&
@@ -217,7 +261,8 @@ export async function prepareNativeSourceRecovery(
       !live ||
       live.createdAt !== current.createdAt ||
       stopped?.createdAt !== previous.createdAt ||
-      (!nativePredecessorSourceRecovery(live, stopped) && !unboundPredecessorSourceRecovery(live, stopped, unboundCancelled))
+      (!nativePredecessorSourceRecovery(live, stopped) &&
+        !unboundPredecessorSourceRecovery(live, stopped, unboundCancelled))
     ) {
       throw nativeSourceRecoveryUnconfirmed('capture', live, stopped, undefined, {
         currentCreatedAtMatches: live?.createdAt === current.createdAt,

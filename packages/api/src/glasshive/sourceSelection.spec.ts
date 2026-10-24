@@ -1,5 +1,6 @@
 import {
   selectTrustedLaunchRequestBody,
+  selectTrustedSourceInstruction,
   trustedUploadedFilesFromRequestBody,
 } from './sourceSelection';
 
@@ -61,5 +62,63 @@ describe('trusted upload text representation', () => {
         source_index: 0,
       },
     ]);
+  });
+});
+
+describe('exact inherited instruction selection', () => {
+  const original = 'Update the packing file. Keep the original browser task too. 😀';
+  test('preserves a verbatim clause and leaves the complete original source intact', () => {
+    const sources = Object.freeze([original]);
+    expect(selectTrustedSourceInstruction(sources, 'Keep the original browser task too. 😀')).toBe(
+      'Keep the original browser task too. 😀',
+    );
+    expect(sources).toEqual([original]);
+    expect(selectTrustedSourceInstruction(sources)).toBeUndefined();
+  });
+  test.each([
+    'Invented recap.',
+    'Foreign historical task.',
+    '',
+    '  ',
+    17,
+    null,
+    ' Keep the original browser task too.',
+    'Keep the ORIGINAL browser task too.',
+  ])('rejects malformed or nonverbatim selection %p', (instruction) => {
+    expect(() => selectTrustedSourceInstruction([original], instruction)).toThrow(
+      expect.objectContaining({ code: 'invalid_source_instruction_selection' }),
+    );
+  });
+  test('does not match a fabricated join across separate original sources or clip oversized text', () => {
+    expect(() =>
+      selectTrustedSourceInstruction(['First.', 'Second.'], 'First.\n\nSecond.'),
+    ).toThrow('invalid_source_instruction_selection');
+    const large = 'x'.repeat(100001);
+    expect(() => selectTrustedSourceInstruction([large], large)).toThrow(
+      'invalid_source_instruction_selection',
+    );
+  });
+  test('keeps remote shared conditions in original context without accepting a fabricated quote', () => {
+    const first = 'Add a raincoat to the packing file.';
+    const second = 'Separately, open the public reference page.';
+    const condition = 'For both tasks, use only synthetic data and do not publish anything.';
+    const source = `${first} ${second} ${condition}`;
+    expect(selectTrustedSourceInstruction([source], first)).toBe(first);
+    expect(selectTrustedSourceInstruction([source], second)).toBe(second);
+    expect(() => selectTrustedSourceInstruction([source], `${first} ${condition}`)).toThrow(
+      'invalid_source_instruction_selection',
+    );
+    const selected = selectTrustedLaunchRequestBody(
+      {
+        viventiumTriggeringSourceSegments: [{ source_event_id: 'synthetic-source', text: source }],
+      },
+      [1],
+    );
+    expect(selected).toEqual({
+      sourceOrdinals: [1],
+      requestBody: {
+        viventiumTriggeringSourceSegments: [{ source_event_id: 'synthetic-source', text: source }],
+      },
+    });
   });
 });

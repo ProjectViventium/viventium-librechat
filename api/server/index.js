@@ -245,7 +245,18 @@ const startServer = async () => {
     }
   }
   const jsonLimit = `${jsonLimitMb}mb`;
-  app.use(express.json({ limit: jsonLimit }));
+  /* === VIVENTIUM START === Preserve exact signed due bytes before JSON parsing. === */
+  app.use(
+    express.json({
+      limit: jsonLimit,
+      verify: (req, _res, body) => {
+        if (req.originalUrl?.split('?')[0] === '/api/viventium/scheduler/due') {
+          req.viventiumScheduleDueRawBody = Buffer.from(body);
+        }
+      },
+    }),
+  );
+  /* === VIVENTIUM END === */
   app.use(express.urlencoded({ extended: true, limit: jsonLimit }));
   app.use(handleJsonParseError);
   /* === VIVENTIUM END === */
@@ -416,6 +427,11 @@ const startServer = async () => {
       reconcileGlassHiveSchedulerCallbackOutbox().catch((error) => {
         logger.error('[glasshiveCallbackOutbox] Startup recovery failed:', error);
       });
+      require('./services/viventium/ScheduleDueService')
+        .reconcileScheduleDueAdmissions()
+        .catch((error) => {
+          logger.error('[scheduleDue] Startup recovery failed:', error?.code || error?.name);
+        });
       startGlassHiveLaunchReconciliation();
       startOrchestrationReadinessWatcher();
 
@@ -439,6 +455,11 @@ const startServer = async () => {
           reconcileGlassHiveSchedulerCallbackOutbox().catch((error) => {
             logger.error('[glasshiveCallbackOutbox] Periodic recovery failed:', error);
           });
+          require('./services/viventium/ScheduleDueService')
+            .reconcileScheduleDueAdmissions()
+            .catch((error) => {
+              logger.error('[scheduleDue] Recovery failed:', error?.code || error?.name);
+            });
         }, staleCortexRecoveryIntervalMs).unref?.();
       }
 

@@ -15,6 +15,8 @@ related_config:
       - worker.grok_output_projection
       - worker.grok_output_authority
     main.tools:
+      - worker.native_coordination_tools
+      - main.native_work_source
       - main.native_work_input
       - worker.conversation_output_contract
       - worker.conversation_output_rendering
@@ -33,6 +35,7 @@ related_config:
     worker.native_capability_inventory:
       - worker.compiled_bootstrap
       - worker.native_composition
+      - worker.native_schedule_tools
     worker.grok_mcp_tool_access:
       - worker.compiled_bootstrap
       - worker.native_tool_access
@@ -66,6 +69,24 @@ related_config:
       - scheduling.main_agent_tools
       - scheduling.mcp_server
   refs:
+    worker.native_coordination_tools:
+      title: Direct Queen Handoff Tool Contract
+      summary: Two generic controls retain original conversation context. An optional source-owned exact clause selects one objective inside a compound message without a generated brief.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/prompts/coordination-tools.json
+      selector: hand_off_to
+      source: worker.compiled_prompt_contract
+    worker.native_schedule_tools:
+      title: Native Scheduling Tool Contract
+      summary: The native MCP server owns schedule discovery and lifecycle wording. A manual start creates one occurrence whose saved target executes the instruction; the caller manages the schedule without repeating that work.
+      path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/prompts/schedule-tools.json
+      selector: schedule_run_now
+      source: worker.compiled_prompt_contract
+    main.native_work_source:
+      title: Original Source Task Selection
+      summary: The native work schema keeps full inherited conversation while allowing an exact selected source clause as the task. The client validates source ownership before dispatch.
+      path: viventium_v0_4/LibreChat/packages/api/src/glasshive/conversationOrchestration.ts
+      selector: MAIN_DELEGATION_JSON_SCHEMA
+      source: native.current_work_input_contract
     main.native_work_input:
       title: Native Queen Current Work Input
       summary: The existing work-action schema exposes exact native clarification answers and offered single-operation permission choices; server input provenance and the native owner preserve request authority.

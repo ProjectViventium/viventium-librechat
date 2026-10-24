@@ -127,9 +127,14 @@ function coerceTextToString(text) {
 
 /** Historical attachment DATA grants no current file access or action authority. */
 function attachmentHistoryData(message) {
+  // A stopped reply can retain completed retrieval DATA without an authored answer.
+  const retrievalOnly =
+    Array.isArray(message?.attachments) &&
+    message.attachments.length > 0 &&
+    message.attachments.every((attachment) => attachment?.type === Tools.file_search);
   if (
     message?.isCreatedByUser !== false ||
-    message.unfinished === true ||
+    (message.unfinished === true && !retrievalOnly) ||
     message.error === true ||
     typeof message.messageId !== 'string' ||
     !message.messageId ||
@@ -157,7 +162,7 @@ function attachmentHistoryData(message) {
   const retrieval = [];
   const nativeIds = new Set();
   for (const attachment of message.attachments) {
-    // Retrieval receipts can be the only surviving evidence of a settled assistant turn.
+    // Retrieval receipts can be the only surviving evidence of an assistant turn.
     // The same DATA projection feeds provider history and its source-integrity digest.
     if (attachment?.type === Tools.file_search) {
       if (

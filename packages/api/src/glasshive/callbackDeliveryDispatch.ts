@@ -1,5 +1,9 @@
 /* === VIVENTIUM START === Durable surface-delivery dispatch permit owner. === */
 
+import { randomUUID } from 'crypto';
+import { mainGenerationPresentation } from './mainGenerationPresentation';
+import type { MainGenerationDelivery } from './mainGenerationPresentation';
+
 import type {
   GlassHiveTerminalCallbackAcceptedOperationReference,
   GlassHiveTerminalCallbackEffectLease,
@@ -23,7 +27,7 @@ interface GlassHiveCallbackDeliveryWorkerCompletionPresentation {
   bindings: ReadonlyArray<GlassHiveCallbackDeliveryWorkerCompletionBinding>;
 }
 
-export interface GlassHiveCallbackDeliveryDispatchRow {
+export interface GlassHiveCallbackDeliveryDispatchRow extends MainGenerationDelivery {
   deliveryId: string;
   claimId: string;
   surface: string;
@@ -120,6 +124,10 @@ export type GlassHiveCallbackDeliverySentSettlement =
 
 export interface GlassHiveCallbackDeliveryDispatchDependencies {
   DeliveryModel: GlassHiveCallbackDeliveryDispatchModel;
+  mainPresentationCurrent?(
+    row: GlassHiveCallbackDeliveryDispatchRow,
+    session?: object,
+  ): Promise<boolean>;
   resultExists(filter: object): Promise<boolean>;
   acquireEffectLease(input: {
     reference: GlassHiveTerminalCallbackAcceptedOperationReference;
@@ -322,6 +330,28 @@ function toDispatchPermit(
   row: GlassHiveCallbackDeliveryDispatchRow | null,
 ): GlassHiveCallbackDeliveryDispatchPermit | null {
   if (!row) return null;
+  const main = mainGenerationPresentation(row);
+  if (main) {
+    const expires = row.dispatchPermitExpiresAt ? new Date(row.dispatchPermitExpiresAt) : null;
+    if (
+      !/^[a-f0-9]{32}$/.test(row.dispatchPermitId || '') ||
+      !Number.isSafeInteger(row.dispatchPermitGeneration) ||
+      Number(row.dispatchPermitGeneration) < 1 ||
+      !expires ||
+      !Number.isFinite(expires.getTime())
+    )
+      return null;
+    return {
+      deliveryId: row.deliveryId,
+      claimId: row.claimId,
+      surface: row.surface,
+      permitId: row.dispatchPermitId!,
+      permitGeneration: row.dispatchPermitGeneration!,
+      resultRevision: 1,
+      resultDigest: main.responseDigest,
+      expiresAt: expires.toISOString(),
+    };
+  }
   const lease = dispatchPermitLeases(row)[0];
   const expiresAt = row.dispatchPermitExpiresAt ? new Date(row.dispatchPermitExpiresAt) : null;
   if (!lease || !expiresAt || !Number.isFinite(expiresAt.getTime())) return null;
@@ -387,7 +417,43 @@ export function createGlassHiveCallbackDeliveryDispatchService(
     fenceEffectTransaction,
     releaseEffectLease,
     runTransaction,
+    mainPresentationCurrent,
   } = dependencies;
+
+  const mainIsCurrent = (row: GlassHiveCallbackDeliveryDispatchRow, session?: object) =>
+    mainPresentationCurrent ? mainPresentationCurrent(row, session) : Promise.resolve(false);
+
+  async function authorizeMain(constraint: object, now: Date, durationMs: number) {
+    return runTransaction(async (session) => {
+      const current = await DeliveryModel.findOne(constraint).session(session).lean();
+      if (
+        !current ||
+        !mainGenerationPresentation(current) ||
+        !(await mainIsCurrent(current, session))
+      )
+        return null;
+      const expiresAt = current.dispatchPermitExpiresAt
+        ? new Date(current.dispatchPermitExpiresAt)
+        : null;
+      if (expiresAt && expiresAt > now) return toDispatchPermit(current);
+      const row = await DeliveryModel.findOneAndUpdate(
+        {
+          ...constraint,
+          dispatchPermitId: current.dispatchPermitId || '',
+          dispatchPermitGeneration: current.dispatchPermitGeneration || 0,
+        },
+        {
+          $set: {
+            dispatchPermitId: randomUUID().replaceAll('-', ''),
+            dispatchPermitGeneration: (current.dispatchPermitGeneration || 0) + 1,
+            dispatchPermitExpiresAt: new Date(now.getTime() + durationMs),
+          },
+        },
+        { new: true, session },
+      ).lean();
+      return toDispatchPermit(row);
+    });
+  }
 
   function observedSupersedeFence(
     row: GlassHiveCallbackDeliveryDispatchRow,
@@ -472,6 +538,7 @@ export function createGlassHiveCallbackDeliveryDispatchService(
     const constraint = constraintFilter(input);
     const initial = await DeliveryModel.findOne(constraint).lean();
     if (!initial) return null;
+    if (mainGenerationPresentation(initial)) return authorizeMain(constraint, now, durationMs);
     if (await existingPermitIsCurrent(initial, now)) return toDispatchPermit(initial);
     const reference = terminalCallbackReference(initial);
     const initialWorkerReferences = workerCompletionReferences(initial);
@@ -569,8 +636,12 @@ export function createGlassHiveCallbackDeliveryDispatchService(
         if (!current || !permitMatches(current, input.dispatchPermit)) {
           throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
         }
-        const leases = dispatchPermitLeases(current);
-        if (leases.length === 0) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const main = mainGenerationPresentation(current);
+        if (main && !(await mainIsCurrent(current, session)))
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const leases = main ? [] : dispatchPermitLeases(current);
+        if (!main && leases.length === 0)
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
         for (const lease of leases) {
           const renewed = await renewEffectLease({
             lease,
@@ -607,8 +678,12 @@ export function createGlassHiveCallbackDeliveryDispatchService(
       return await runTransaction(async (session) => {
         const current = await DeliveryModel.findOne(constraint).session(session).lean();
         if (!current || !permitMatches(current, input.dispatchPermit)) return false;
-        const leases = dispatchPermitLeases(current);
-        if (leases.length === 0) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const main = mainGenerationPresentation(current);
+        if (main && !(await mainIsCurrent(current, session)))
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const leases = main ? [] : dispatchPermitLeases(current);
+        if (!main && leases.length === 0)
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
         for (const lease of leases) {
           const released = await releaseEffectLease({ lease, session });
           if (!released) throw new Error('glasshive_callback_delivery_dispatch_fenced');
@@ -622,7 +697,7 @@ export function createGlassHiveCallbackDeliveryDispatchService(
           {
             $set: {
               dispatchPermitId: '',
-              dispatchPermitGeneration: 0,
+              dispatchPermitGeneration: main ? current.dispatchPermitGeneration : 0,
               dispatchPermitExpiresAt: null,
               workerCompletionEffectLeases: [],
             },
@@ -646,7 +721,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
     const now = new Date();
     const constraint = constraintFilter(input);
     const initial = await DeliveryModel.findOne(constraint).lean();
-    if (!initial || !terminalCallbackReference(initial)) return { handled: false };
+    if (!initial || (!terminalCallbackReference(initial) && !mainGenerationPresentation(initial)))
+      return { handled: false };
     if (workerCompletionReferences(initial) !== null) return { handled: true, row: null };
     const dispatchPermit = input.dispatchPermit;
     if (!dispatchPermit || !permitMatches(initial, dispatchPermit)) {
@@ -669,13 +745,16 @@ export function createGlassHiveCallbackDeliveryDispatchService(
         if (!current || !permitMatches(current, dispatchPermit)) {
           throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
         }
-        const lease = dispatchPermitLease(current);
-        if (!lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const main = mainGenerationPresentation(current);
+        if (main && !(await mainIsCurrent(current, session)))
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const lease = main ? null : dispatchPermitLease(current);
+        if (!main && !lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const updated = await DeliveryModel.findOneAndUpdate(
           {
             ...constraint,
-            dispatchPermitId: lease.leaseId,
-            dispatchPermitGeneration: lease.generation,
+            dispatchPermitId: current.dispatchPermitId,
+            dispatchPermitGeneration: current.dispatchPermitGeneration,
             dispatchPermitExpiresAt: { $gt: now },
           },
           {
@@ -699,6 +778,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
           { new: true, session },
         ).lean();
         if (!updated) throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
+        if (main) return updated;
+        if (!lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const fenced = await fenceEffectTransaction({ lease, now, session });
         if (!fenced) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const released = await releaseEffectLease({ lease, session });
@@ -719,7 +800,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
     const now = new Date();
     const constraint = constraintFilter(input);
     const initial = await DeliveryModel.findOne(constraint).lean();
-    if (!initial || !terminalCallbackReference(initial)) return { handled: false };
+    if (!initial || (!terminalCallbackReference(initial) && !mainGenerationPresentation(initial)))
+      return { handled: false };
     if (workerCompletionReferences(initial) !== null) return { handled: true, row: null };
     const dispatchPermit = input.dispatchPermit;
     if (!dispatchPermit || !permitMatches(initial, dispatchPermit)) {
@@ -741,13 +823,16 @@ export function createGlassHiveCallbackDeliveryDispatchService(
         if (!current || !permitMatches(current, dispatchPermit)) {
           throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
         }
-        const lease = dispatchPermitLease(current);
-        if (!lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const main = mainGenerationPresentation(current);
+        if (main && !(await mainIsCurrent(current, session)))
+          throw new Error('glasshive_callback_delivery_dispatch_fenced');
+        const lease = main ? null : dispatchPermitLease(current);
+        if (!main && !lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const updated = await DeliveryModel.findOneAndUpdate(
           {
             ...constraint,
-            dispatchPermitId: lease.leaseId,
-            dispatchPermitGeneration: lease.generation,
+            dispatchPermitId: current.dispatchPermitId,
+            dispatchPermitGeneration: current.dispatchPermitGeneration,
             dispatchPermitExpiresAt: { $gt: now },
           },
           {
@@ -767,6 +852,8 @@ export function createGlassHiveCallbackDeliveryDispatchService(
           { new: true, session },
         ).lean();
         if (!updated) throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
+        if (main) return updated;
+        if (!lease) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const fenced = await fenceEffectTransaction({ lease, now, session });
         if (!fenced) throw new Error('glasshive_callback_delivery_dispatch_fenced');
         const released = await releaseEffectLease({ lease, session });

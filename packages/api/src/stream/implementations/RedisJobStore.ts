@@ -857,6 +857,15 @@ export class RedisJobStore implements IJobStore {
         'logicalTurnId',
       );
       const newLogicalTurnId = KEYS.logicalTurnId(userId, interactionContext);
+      const previousContext =
+        previous && interactionContext.ready_input_continuation
+          ? (JSON.parse(previous) as InteractionContext)
+          : undefined;
+      const previousNativeKey = previousContext
+        ? `stream:native:{${scopeDigest}}:${createHash('sha256')
+            .update(JSON.stringify([turnId, previousContext.revision]))
+            .digest('hex')}`
+        : key;
       /* === VIVENTIUM START ===
        * Fix: pending sources of another conversation never enter this conversation's claim.
        */
@@ -895,8 +904,29 @@ export class RedisJobStore implements IJobStore {
          return {'duplicate', decoded.streamId, cjson.encode(decoded.interactionContext), '', ''}
        end
        local incoming = cjson.decode(ARGV[4])
-       if incoming.ready_input_continuation and ARGV[9] == '1' then
-         return {'busy', ARGV[1], ARGV[4], '', ''}
+       local before_logical = redis.call('HGET', KEYS[1], 'logicalTurnId')
+       local before_revision = redis.call('HGET', KEYS[1], 'revision') or '0'
+       local before_ack = before_logical and redis.call('HGET', KEYS[1],
+         'deliveryAck:' .. before_logical .. ':' .. before_revision)
+       local before_state = before_ack and cjson.decode(before_ack).state or ''
+       local failed_predecessor = before_state == 'failed'
+       if incoming.ready_input_continuation and ARGV[9] == '1' and not failed_predecessor then
+         local encoded_identity = redis.call('HGET', KEYS[5], 'identity')
+         local identity = encoded_identity and cjson.decode(encoded_identity) or nil
+         local previous = ARGV[8] ~= '' and cjson.decode(ARGV[8]) or {}
+         local presentation = previous.ready_input_continuation
+         local previous_sequence = presentation and presentation.presentation_source_sequence or previous.source_sequence
+         local removed_predecessor = before_state == 'partial_removed'
+           and redis.call('HGET', KEYS[5], 'state') == 'revoked' and identity
+           and identity.userId == ARGV[15]
+           and identity.conversationId == incoming.conversation_id
+           and identity.streamId == redis.call('HGET', KEYS[1], 'currentStreamId')
+           and identity.logicalTurnId == before_logical
+           and tonumber(identity.revision) == tonumber(before_revision)
+           and identity.sourceOrderScope == previous.source_order_scope
+           and identity.sourceSequence == previous_sequence
+         -- Native release and accepted-source recovery still fence execution in the manager.
+         if not removed_predecessor then return {'busy', ARGV[1], ARGV[4], '', ''} end
        end
        if ARGV[11] ~= '' and not incoming.ready_input_continuation
           and redis.call('EXISTS', KEYS[1]) == 0 then
@@ -932,9 +962,16 @@ export class RedisJobStore implements IJobStore {
        local logical_id = redis.call('HGET', KEYS[1], 'logicalTurnId')
        local revision = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
        local current = redis.call('HGET', KEYS[1], 'currentStreamId') or ''
-       local active = redis.call('HGET', KEYS[1], 'active') == '1'
+       local active = redis.call('HGET', KEYS[1], 'active') == '1' and not failed_predecessor
        local superseded = ''
        local superseded_identity = ''
+       local failed_sources = {}
+       if failed_predecessor then
+         local previous_sources = redis.call('HGET', KEYS[1], 'sourceSegments')
+         for _, source in ipairs(previous_sources and cjson.decode(previous_sources) or {}) do
+           failed_sources[source.source_event_id .. ':' .. tostring(source.source_index or 0)] = true
+         end
+       end
        -- A newer source from another conversation supersedes the active stream but starts its
        -- own logical turn without the other turn's sources.
        local same_conversation = true
@@ -949,7 +986,20 @@ export class RedisJobStore implements IJobStore {
          ) or ''
          superseded = current
        end
-       if active and current ~= '' and same_conversation then
+       local continues_pending = false
+       if logical_id and revision > 0 and not active and before_state ~= 'committed'
+           and not failed_predecessor
+           and same_conversation and ARGV[7] ~= '' then
+         for _, input in ipairs(cjson.decode(ARGV[7])) do
+           if input.conversation_id == incoming.conversation_id
+               and input.logical_turn_id == logical_id
+               and tonumber(input.revision or '0') > revision then
+             continues_pending = true
+             break
+           end
+         end
+       end
+       if (active and current ~= '' and same_conversation) or continues_pending then
          revision = revision + 1
        else
          -- Retiring a turn keeps each revision claimed before author ledgers existed decidable.
@@ -975,7 +1025,7 @@ export class RedisJobStore implements IJobStore {
        local seen_events = {}
        local total_bytes = 0
        local overflow_count = tonumber(context.source_segments_overflow_count or '0') or 0
-       if active then
+       if active or continues_pending then
          overflow_count = overflow_count + tonumber(
            redis.call('HGET', KEYS[1], 'sourceSegmentsOverflowCount') or '0'
          )
@@ -995,7 +1045,8 @@ export class RedisJobStore implements IJobStore {
            local event_id = segment.source_event_id
            local identity = event_id and (string.len(event_id) .. ':' .. event_id .. ':' ..
              tostring(segment.source_index or 0)) or nil
-           if event_id and not seen_events[identity] then
+           local failed_source = event_id and failed_sources[event_id .. ':' .. tostring(segment.source_index or 0)]
+           if event_id and not seen_events[identity] and not failed_source then
              -- A source this claim first admits is provisionally this revision's until a commit.
              segment.authoring_revision = revision
              table.insert(accumulated, segment)
@@ -1057,13 +1108,14 @@ export class RedisJobStore implements IJobStore {
          end
        end
        return {'claimed', ARGV[1], encoded_context, superseded, superseded_identity}`,
-        4,
+        5,
         key,
         interactionContext.source_order_scope
           ? KEYS.sourceOrder(interactionContext.source_order_scope)
           : KEYS.sourceOrderFromScopeDigest(scopeDigest),
         KEYS.authorLedger(scopeDigest, turnId || newLogicalTurnId),
         KEYS.authorLedger(scopeDigest, newLogicalTurnId),
+        previousNativeKey,
         streamId,
         interactionContext.source_event_id,
         newLogicalTurnId,
@@ -1083,6 +1135,7 @@ export class RedisJobStore implements IJobStore {
         SOURCE_SEGMENTS_MAX_COUNT,
         SOURCE_SEGMENTS_MAX_BYTES,
         turnId ?? '',
+        userId,
       )) as [string, string, string, string, string];
       if (result[0] !== 'retry') break;
     }
@@ -1481,6 +1534,9 @@ export class RedisJobStore implements IJobStore {
       return false;
     }
     const scopeDigest = logicalTurnScopeDigestFromKey(ownerScopeKey);
+    const previousNativeId = createHash('sha256')
+      .update(JSON.stringify([interactionContext.logical_turn_id, interactionContext.revision - 1]))
+      .digest('hex');
     const rolledBack = await this.redis.eval(
       `if redis.call('HGET', KEYS[1], 'logicalTurnId') ~= ARGV[1]
           or tonumber(redis.call('HGET', KEYS[1], 'revision') or '0') ~= tonumber(ARGV[2])
@@ -1509,7 +1565,15 @@ export class RedisJobStore implements IJobStore {
          'cortexPresentation:' .. ARGV[2]
        )
        local pending = cjson.decode(redis.call('HGET', KEYS[1], 'pendingInputs') or '[]')
-       table.insert(pending, cjson.decode(ARGV[5]))
+       local returned = cjson.decode(ARGV[5])
+       local returned_sources = {}
+       for _, source in ipairs(returned.source_segments or {}) do
+         if not source.authoring_revision or source.authoring_revision == tonumber(ARGV[2]) then
+           table.insert(returned_sources, source)
+         end
+       end
+       returned.source_segments = #returned_sources > 0 and returned_sources or nil
+       table.insert(pending, returned)
        redis.call('HSET', KEYS[1], 'pendingInputs', cjson.encode(pending))
        local previous_revision = tonumber(ARGV[2]) - 1
        if previous_revision > 0 then
@@ -1518,11 +1582,18 @@ export class RedisJobStore implements IJobStore {
            KEYS[1],
            'streamForRevision:' .. tostring(previous_revision)
          ) or ''
+         local previous_ack = redis.call('HGET', KEYS[1],
+           'deliveryAck:' .. ARGV[1] .. ':' .. tostring(previous_revision))
+         local previous_state = previous_ack and cjson.decode(previous_ack).state or ''
+         local previous_publication = redis.call('HGET', KEYS[3], 'state')
+         local previous_active = previous_stream ~= ''
+           and previous_state ~= 'committed' and previous_state ~= 'failed'
+           and previous_publication ~= 'revoked' and previous_publication ~= 'committed'
          redis.call('HSET', KEYS[1],
            'revision', tostring(previous_revision),
            'currentStreamId', previous_stream,
            'currentContext', redis.call('HGET', KEYS[1], 'contextForRevision:' .. tostring(previous_revision)) or '',
-           'active', previous_stream ~= '' and '1' or '0')
+           'active', previous_active and '1' or '0')
          local previous_segments = redis.call(
            'HGET', KEYS[1], 'sourceSegmentsForRevision:' .. tostring(previous_revision)
          )
@@ -1545,11 +1616,12 @@ export class RedisJobStore implements IJobStore {
          redis.call('HSET', KEYS[1], 'sourceSegmentsOverflowCount', '0')
        end
        return 1`,
-      2,
+      3,
       ownerScopeKey,
       scopeDigest
         ? KEYS.authorLedger(scopeDigest, interactionContext.logical_turn_id)
         : ownerScopeKey,
+      scopeDigest ? `stream:native:{${scopeDigest}}:${previousNativeId}` : ownerScopeKey,
       interactionContext.logical_turn_id,
       interactionContext.revision,
       streamId,

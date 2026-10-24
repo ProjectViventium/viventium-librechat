@@ -294,9 +294,13 @@ async function applyGlassHiveVoiceTaskCallback(body = {}, task, { resultMessageI
     });
   }
   if (event === 'run.cancelled' || event === 'run.interrupted') {
+    const workContinues = body.work_terminal === false;
     return await confirmVoiceTaskOwnerCancellation(
       task.taskId,
-      sanitizeCallbackMessage(body.message) || 'The GlassHive worker confirmed it stopped.',
+      workContinues
+        ? 'This earlier run stopped. The same work is still active.'
+        : sanitizeCallbackMessage(body.message) || 'The GlassHive worker confirmed it stopped.',
+      workContinues ? { label: 'Work continues' } : undefined,
     );
   }
   return null;

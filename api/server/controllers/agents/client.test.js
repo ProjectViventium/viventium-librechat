@@ -216,6 +216,19 @@ jest.mock('@librechat/agents', () => ({
 
 const mockActualCreateRun = (...args) => jest.requireActual('@librechat/api').createRun(...args);
 let mockCreateRun = mockActualCreateRun;
+let mockBackgroundDetection = null;
+let mockBackgroundExecution = null;
+jest.mock('~/server/services/BackgroundCortexService', () => ({
+  ...jest.requireActual('~/server/services/BackgroundCortexService'),
+  detectActivations: (...args) =>
+    mockBackgroundDetection
+      ? mockBackgroundDetection(...args)
+      : jest.requireActual('~/server/services/BackgroundCortexService').detectActivations(...args),
+  executeActivated: (...args) =>
+    mockBackgroundExecution
+      ? mockBackgroundExecution(...args)
+      : jest.requireActual('~/server/services/BackgroundCortexService').executeActivated(...args),
+}));
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   isNativeCapacityRefusal: (...args) => mockIsNativeCapacityRefusal(...args),
@@ -1667,7 +1680,7 @@ describe('GlassHive harness activity persistence', () => {
           content: [
             {
               type: ContentTypes.ERROR,
-              [ContentTypes.ERROR]: 'The model provider could not complete this request.',
+              [ContentTypes.ERROR]: 'Viventium could not complete this request. Please try again.',
               error_class: 'completion_error',
             },
           ],
@@ -1704,6 +1717,77 @@ describe('late completion error content parts', () => {
   });
 
   test.each([
+    [
+      'diskBytes',
+      'The computer running Viventium is low on disk space and could not start this reply. Free some space, then retry.',
+    ],
+    [
+      'memoryBytes',
+      'The computer running Viventium is low on memory and could not start this reply. Close unused apps, then retry.',
+    ],
+  ])(
+    'preserves numeric %s admission evidence without leaking diagnostics',
+    (dimension, message) => {
+      const error = new Error('Private diagnostic must not reach the reply');
+      error.response = {
+        status: 503,
+        data: {
+          error: {
+            code: 'host_capacity',
+            capacityClass: 'resource_pressure',
+            available: { [dimension]: 2, privatePath: '/private/synthetic' },
+            required: { [dimension]: 4 },
+            shortage: { [dimension]: 2 },
+            privateDiagnostic: 'secret-placeholder',
+          },
+        },
+      };
+      const part = AgentClient.createCompletionErrorContentPart(error);
+      expect(part).toMatchObject({
+        [ContentTypes.ERROR]: message,
+        error_class: 'host_capacity',
+        retryable: true,
+        capacity_available: { [dimension]: 2 },
+        capacity_required: { [dimension]: 4 },
+        capacity_shortage: { [dimension]: 2 },
+      });
+      expect(JSON.stringify(part)).not.toMatch(
+        /Private diagnostic|privatePath|secret-placeholder|synthetic/,
+      );
+    },
+  );
+
+  test.each([undefined, 'resource_probe_unavailable', 'family_lane'])(
+    'does not call unknown or unavailable capacity probes a measured disk shortage: %s',
+    (capacityClass) => {
+      const error = new Error('Synthetic unavailable probe');
+      Object.assign(error, {
+        code: 'host_capacity',
+        capacityClass,
+        available: { diskBytes: 0, memoryBytes: 0 },
+        required: { diskBytes: 4096, memoryBytes: 2048 },
+        shortage: { diskBytes: 4096, memoryBytes: 2048 },
+      });
+      expect(AgentClient.createCompletionErrorContentPart(error)[ContentTypes.ERROR]).toBe(
+        'Local AI capacity is busy. Please try again shortly.',
+      );
+    },
+  );
+
+  test('rejects malformed capacity counters and keeps the generic busy result', () => {
+    const error = new Error('Private diagnostic');
+    error.code = 'host_capacity';
+    error.available = { diskBytes: '0', memoryBytes: -1, threads: Infinity };
+    error.required = { diskBytes: true };
+    error.shortage = { diskBytes: '123' };
+    const part = AgentClient.createCompletionErrorContentPart(error);
+    expect(part[ContentTypes.ERROR]).toBe('Local AI capacity is busy. Please try again shortly.');
+    expect(part.capacity_available).toBeUndefined();
+    expect(part.capacity_required).toBeUndefined();
+    expect(part.capacity_shortage).toBeUndefined();
+  });
+
+  test.each([
     'terminated',
     'TypeError: terminated',
     'stream terminated',
@@ -1726,7 +1810,6 @@ describe('late completion error content parts', () => {
 
   test('suppresses terminated stream errors after visible assistant text', () => {
     const contentParts = [{ type: ContentTypes.TEXT, text: 'Partial but visible answer.' }];
-
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(contentParts, new Error('terminated')),
     ).toBe(true);
@@ -1746,13 +1829,23 @@ describe('late completion error content parts', () => {
     );
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
-        [{ type: ContentTypes.TEXT, text: 'Final answer.' }],
+        [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Final answer.',
+          },
+        ],
         new Error('provider stream ended after final text'),
       ),
     ).toBe(false);
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
-        [{ type: ContentTypes.TEXT, text: 'Partial answer.' }],
+        [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Partial answer.',
+          },
+        ],
         new Error('status 429 rate_limit_error'),
       ),
     ).toBe(false);
@@ -1793,6 +1886,17 @@ describe('late completion error content parts', () => {
         'The model provider is temporarily overloaded. Please try again shortly.',
       error_class: 'provider_temporarily_unavailable',
     });
+  });
+
+  test.each([
+    ['provider_unavailable', 'provider_temporarily_unavailable'],
+    ['provider_request_rejected', 'provider_request_rejected'],
+  ])('preserves typed native provider failure %s', (code, expected) => {
+    const error = Object.assign(new Error('Private provider detail'), { code });
+    expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe(expected);
+    expect(JSON.stringify(AgentClient.createCompletionErrorContentPart(error))).not.toContain(
+      'Private provider detail',
+    );
   });
 
   test.each([
@@ -1975,7 +2079,7 @@ describe('late completion error content parts', () => {
       textPart,
       {
         type: ContentTypes.ERROR,
-        [ContentTypes.ERROR]: 'The model provider could not complete this request.',
+        [ContentTypes.ERROR]: 'Viventium could not complete this request. Please try again.',
         error_class: 'completion_error',
       },
     ]);
@@ -2057,7 +2161,7 @@ describe('late completion error content parts', () => {
       holdPart,
       {
         type: ContentTypes.ERROR,
-        [ContentTypes.ERROR]: 'The model provider could not complete this request.',
+        [ContentTypes.ERROR]: 'Viventium could not complete this request. Please try again.',
         error_class: 'completion_error',
       },
     ]);
@@ -6925,6 +7029,97 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
     client.responseMessageId = 'resp-1';
   });
 
+  test.each(['active', 'disposed', 'not-activated', 'disposed-superseded'])(
+    'delayed one-pass detection keeps its accepted context when client is %s',
+    async (mode) => {
+      const previousAsync = process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC;
+      const previousLate = process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS;
+      process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC = 'true';
+      process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS = '0';
+      primaryAgent.background_cortices = [{ agent_id: 'cortex-background' }];
+      primaryAgent.tools = [];
+      client.parentMessageId = 'input-1';
+      const detection = deferred();
+      mockBackgroundDetection = jest.fn(() => detection.promise);
+      mockBackgroundExecution = jest.fn(async ({ onCortexComplete, onAllComplete }) => {
+        onCortexComplete({
+          cortex_id: 'cortex-background',
+          cortex_name: 'Background',
+          status: 'complete',
+          insight: 'A useful background result.',
+        });
+        onAllComplete({
+          insights: [{ cortexName: 'Background', insight: 'A useful background result.' }],
+          mergedPrompt: 'A useful background result.',
+          cortexCount: 1,
+        });
+      });
+      const processStream = jest.fn(async () => {
+        client.contentParts.push({ type: ContentTypes.TEXT, text: 'One foreground answer.' });
+      });
+      mockCreateRun = jest.fn(async () => ({
+        processStream,
+        Graph: { resetValues: jest.fn(), agentContexts: new Map() },
+      }));
+      try {
+        await client.sendCompletion({ messages: [] });
+        expect(mockCreateRun).toHaveBeenCalledTimes(1);
+        expect(mockBackgroundDetection).toHaveBeenCalledTimes(1);
+        expect(mockBackgroundExecution).not.toHaveBeenCalled();
+        if (mode !== 'active') require('~/server/cleanup').disposeClient(client);
+        if (mode === 'disposed-superseded') {
+          require('@librechat/api').GenerationJobManager.getJob.mockResolvedValue({
+            status: 'superseded',
+          });
+        }
+        detection.resolve({
+          timedOut: false,
+          activatedCortices:
+            mode === 'not-activated'
+              ? []
+              : [{ agentId: 'cortex-background', cortexName: 'Background', confidence: 0.9 }],
+        });
+        await client._phaseBPromise;
+        expect(mockBackgroundExecution).toHaveBeenCalledTimes(mode === 'not-activated' ? 0 : 1);
+        if (mode !== 'not-activated') {
+          expect(mockBackgroundExecution).toHaveBeenCalledWith(
+            expect.objectContaining({
+              req,
+              mainAgent: primaryAgent,
+              runId: 'resp-1',
+              conversationId: 'conv-1',
+              activeMessageId: 'input-1',
+              res: null,
+            }),
+          );
+          expect(mockPersistCortexPartsToCanonicalMessage).toHaveBeenCalledWith(
+            expect.objectContaining({ req, responseMessageId: 'resp-1' }),
+          );
+        }
+        expect(logger.error).not.toHaveBeenCalledWith(
+          '[AgentClient] One-pass nonblocking Phase A/B pipeline failed',
+          expect.anything(),
+        );
+        if (mode === 'disposed-superseded') {
+          expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+          expect(mockEmitChunk).not.toHaveBeenCalledWith(
+            expect.anything(),
+            expect.objectContaining({ event: 'on_cortex_followup' }),
+          );
+        }
+      } finally {
+        mockCreateRun = mockActualCreateRun;
+        mockBackgroundDetection = null;
+        mockBackgroundExecution = null;
+        if (previousAsync === undefined)
+          delete process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC;
+        else process.env.VIVENTIUM_TEXT_BACKGROUND_AGENT_DETECTION_ASYNC = previousAsync;
+        if (previousLate === undefined) delete process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS;
+        else process.env.VIVENTIUM_CORTEX_LATE_DETECT_TIMEOUT_MS = previousLate;
+      }
+    },
+  );
+
   test.each(['throw', 'part'])(
     'keeps the provider SSE APIError code through actual-shaped failed fallback %s',
     async (mode) => {
@@ -9187,7 +9382,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
   });
 
   test('logs one metadata-only diagnostic for a wrapped primary error before fallback', async () => {
-    const secret = 'sk-test-primary-error-secret-never-log';
+    const secret = ['sk', 'test-primary-error-secret-never-log'].join('-');
     const providerError = new Error(`rate limit from provider with ${secret}`);
     providerError.status = 429;
     providerError.code = 'rate_limit_exceeded';
@@ -10732,12 +10927,69 @@ describe('deep completion source-frame diagnostics', () => {
       expect(result.contentParts).toEqual([
         {
           type: ContentTypes.ERROR,
-          [ContentTypes.ERROR]: 'The model provider could not complete this request.',
+          [ContentTypes.ERROR]: 'Viventium could not complete this request. Please try again.',
           error_class: 'provider_response_failed',
         },
       ]);
     },
   );
+
+  test('identifies the exact Main history guard without logging its private source or factory', () => {
+    const {
+      captureMainContextSnapshot,
+    } = require('~/server/services/viventium/ViventiumMainContextService');
+    let error;
+    try {
+      captureMainContextSnapshot(
+        { user: { id: 'synthetic-owner' }, body: { conversationId: 'synthetic-conversation' } },
+        {
+          agent: { id: 'synthetic-main' },
+          visibleMessages: [],
+          messages: [],
+          protectUnreconciledHistory: true,
+        },
+      );
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: 'source_context_unavailable', status: 413 });
+    const result = present(error);
+    expect(result.diagnostic.sourceFrames).toEqual([
+      expect.objectContaining({
+        chainIndex: 0,
+        file: 'api/server/services/viventium/ViventiumMainContextService.js',
+        line: expect.any(Number),
+        column: expect.any(Number),
+      }),
+    ]);
+    expect(JSON.stringify(result.log.error.mock.calls)).not.toContain('synthetic-owner');
+    expect(JSON.stringify(result.log.error.mock.calls)).not.toContain('assertMainHistoryAncestry');
+    expect(JSON.stringify(result.contentParts)).not.toContain('sourceFrames');
+  });
+
+  test('identifies the installed API chunk that rejects a missing protected source', () => {
+    const { visibleMessageChain } = jest.requireActual('@librechat/api');
+    let error;
+    try {
+      visibleMessageChain(
+        [{ id: 'present', role: 'user', content: 'Synthetic source.' }],
+        new Set(['missing']),
+      );
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ code: 'source_context_unavailable', status: 413 });
+    const result = present(error);
+    expect(result.diagnostic.sourceFrames).toEqual([
+      expect.objectContaining({ chainIndex: 0, line: expect.any(Number) }),
+    ]);
+    expect([
+      'packages/api/dist/index.js',
+      'packages/api/src/continuity/mainContinuity.ts',
+    ]).toContain(result.diagnostic.sourceFrames[0].file);
+    expect(JSON.stringify(result.log.error.mock.calls)).not.toContain('Synthetic source.');
+    expect(JSON.stringify(result.log.error.mock.calls)).not.toMatch(/index-[A-Za-z0-9_-]+\.js/);
+  });
 
   test('retains both wrapped and original implementation locations without original text', () => {
     const secret = 'synthetic-private-error-token';

@@ -1699,13 +1699,73 @@ router.post(
      * source its own ancestor and removes it from its original branch.
      */
     let retainedSourceParent;
+    let retainedParentRecovery = false;
     if (retainedInput) {
       const source = await Message.findOne(TelegramInput.messageFilter(retainedInput))
-        .select('parentMessageId metadata.viventium.telegramInput.originalParentMessageId')
+        .select(
+          'messageId parentMessageId user conversationId isCreatedByUser deletedAt metadata.viventium.telegramInput.originalParentMessageId metadata.viventium.telegramInput.state metadata.viventium.telegramInput.sourceEventId metadata.viventium.interactionContext.source_event_id',
+        )
         .lean();
       retainedSourceParent = source?.parentMessageId;
       const originalParent = source?.metadata?.viventium?.telegramInput?.originalParentMessageId;
-      if (typeof originalParent === 'string' && originalParent) parentMessageId = originalParent;
+      if (typeof originalParent === 'string' && originalParent) {
+        parentMessageId = originalParent;
+        if (
+          retainedInput.state === 'ready' &&
+          !recoveredStreamId &&
+          originalParent !== Constants.NO_PARENT &&
+          !conversationState.messages.some((message) => message.messageId === originalParent)
+        ) {
+          const rows = await Message.find({ user: req.user.id, conversationId })
+            .select('messageId parentMessageId user conversationId deletedAt')
+            .lean();
+          const original = rows.find((message) => message.messageId === originalParent);
+          if (!original || original.deletedAt != null) {
+            const currentParent = rows.find(
+              (message) => message.messageId === retainedSourceParent,
+            );
+            const base = currentParent ? retainedSourceParent : conversationState.parentMessageId;
+            const {
+              traceMainHistoryAncestry,
+            } = require('~/server/services/viventium/ViventiumMainContextService');
+            const ancestry = traceMainHistoryAncestry({
+              messages: rows.filter((message) => message.deletedAt == null),
+              headId: base,
+              ownerId: req.user.id,
+              conversationId,
+            });
+            if (
+              original ||
+              !base ||
+              base === Constants.NO_PARENT ||
+              typeof retainedSourceParent !== 'string' ||
+              !retainedSourceParent ||
+              String(source?.user || '') !== String(req.user.id) ||
+              source?.conversationId !== conversationId ||
+              source?.messageId !== retainedInput.sourceMessageId ||
+              source?.isCreatedByUser !== true ||
+              source?.deletedAt != null ||
+              source?.metadata?.viventium?.telegramInput?.state !== 'ready' ||
+              source.metadata.viventium.telegramInput.sourceEventId !==
+                retainedInput.sourceEventId ||
+              source.metadata.viventium.interactionContext?.source_event_id !==
+                retainedInput.sourceEventId ||
+              !ancestry.complete ||
+              ancestry.messageIds.includes(retainedInput.sourceMessageId)
+            ) {
+              throw Object.assign(
+                new Error('The retained input has no valid conversation anchor.'),
+                {
+                  code: 'source_context_unavailable',
+                  status: 413,
+                },
+              );
+            }
+            parentMessageId = base;
+            retainedParentRecovery = true;
+          }
+        }
+      }
     }
     /* === VIVENTIUM END === */
     parentMessageId = normalizeGatewayParentMessageId({ conversationId, parentMessageId });
@@ -1994,20 +2054,38 @@ router.post(
     });
     if (retainedInput) {
       req.body.overrideUserMessageId = `${retainedInput.sourceMessageId}${Constants.COMMON_DIVIDER}1`;
-      const sourceFilter = TelegramInput.messageFilter(retainedInput);
+      const sourceFilter = {
+        ...TelegramInput.messageFilter(retainedInput),
+        ...(retainedParentRecovery
+          ? {
+              parentMessageId: retainedSourceParent,
+              'metadata.viventium.telegramInput.state': 'ready',
+            }
+          : {}),
+      };
       /* === VIVENTIUM START ===
        * Fix: an unchanged parent is not a source edit. Re-anchoring it through the native source
        * fence would revoke the live native answer of a newer input that descends from this source.
        */
       if (retainedSourceParent !== (parentMessageId || Constants.NO_PARENT)) {
         /* === VIVENTIUM END === */
-        await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
-          sourceFilter,
-          () =>
-            Message.updateOne(sourceFilter, {
-              $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
-            }),
-        );
+        const changed =
+          await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+            sourceFilter,
+            () =>
+              Message.updateOne(sourceFilter, {
+                $set: { parentMessageId: parentMessageId || Constants.NO_PARENT },
+              }),
+          );
+        if (retainedParentRecovery && changed?.matchedCount !== 1) {
+          throw Object.assign(
+            new Error('The retained input changed before conversation recovery.'),
+            {
+              code: 'source_context_unavailable',
+              status: 413,
+            },
+          );
+        }
       }
       const enriched = bindInteractionSourceSegments(req, text, uploadedFiles, {
         messageId: retainedInput.sourceMessageId,

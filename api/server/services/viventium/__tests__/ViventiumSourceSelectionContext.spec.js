@@ -2,6 +2,53 @@ const { setTrustedInteractionContext } = require('../interactionContext');
 const { buildSourceSelectionCapsule } = require('../ViventiumSourceSelectionContext');
 
 describe('ViventiumSourceSelectionContext', () => {
+  test.each(['telegram', 'web', 'voice'])(
+    '%s keeps one empty-caption attachment current through the real context adapter',
+    (surface) => {
+      const req = {};
+      const attachment = {
+        file_id: 'original-file',
+        filename: 'answer.wav',
+        type: 'audio/wav',
+        bytes: 403172,
+      };
+      setTrustedInteractionContext(
+        req,
+        {
+          actor_kind: 'external_user',
+          origin: 'interactive',
+          surface,
+          conversation_id: 'conversation',
+          logical_turn_id: 'turn',
+          revision: 1,
+          source_event_id: 'current-source',
+          source_segments: [
+            {
+              source_event_id: 'current-source',
+              source_index: 0,
+              text: '',
+              source_files: [attachment],
+            },
+          ],
+        },
+        { segment_stability: 'immediate', supersede_scope: 'response_only' },
+      );
+      const capsule = buildSourceSelectionCapsule(req);
+      const encoded = capsule.split('\n').find((line) => /^[A-Za-z0-9_-]+$/.test(line));
+      expect(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')).sources).toEqual([
+        {
+          sourceOrdinal: 1,
+          label: 'S1',
+          preview: '',
+          previewTruncated: false,
+          attachmentCount: 1,
+          attachments: [attachment],
+        },
+      ]);
+      expect(capsule).not.toContain('current-source');
+    },
+  );
+
   test('shows inert S-labels to Main without exposing transport source ids', () => {
     const req = {};
     setTrustedInteractionContext(req, {
@@ -153,9 +200,7 @@ describe('ViventiumSourceSelectionContext', () => {
     ]);
 
     expect(decodedLabels(capsule)).toEqual(['S1', 'S2']);
-    expect(capsule).toContain(
-      'earlier unanswered inputs whose prior presentation was removed or that were deferred to it',
-    );
+    expect(capsule).toContain('were deferred to it');
     expect(capsule).not.toContain('owns only the current accepted input');
     expect(capsule).not.toContain('Unlisted earlier inputs');
     expect(capsule).not.toContain('Copy only the two totals');

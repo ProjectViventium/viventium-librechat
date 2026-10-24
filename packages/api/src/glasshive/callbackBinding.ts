@@ -309,7 +309,10 @@ export interface GlassHiveCallbackBindingService {
   ) => Promise<GlassHiveCallbackContext | null>;
   isGlassHiveNonterminalAttentionCallback: (body?: GlassHiveCallbackBody) => boolean;
   fenceGlassHiveCallbackRunState: (input: {
-    binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef' | 'currentRunId' | 'currentRunState'>;
+    binding: Pick<
+      GlassHiveCallbackContext,
+      'ownerId' | 'originRef' | 'workRef' | 'currentRunId' | 'currentRunState'
+    >;
     body: GlassHiveCallbackBody;
     effectSession: ClientSession;
   }) => Promise<void>;
@@ -361,14 +364,20 @@ export interface GlassHiveCallbackBindingService {
     errorCode?: string;
     effectSession?: ClientSession;
   }) => Promise<object | null>;
-  reconcileGlassHiveSurfaceDeliveryOutcome: (input: { originRef: string }) => Promise<object | null>;
+  reconcileGlassHiveSurfaceDeliveryOutcome: (input: {
+    originRef: string;
+  }) => Promise<object | null>;
   recordGlassHiveSurfaceDeliveryOutcome: (input?: {
     originRef?: string;
     state?: 'enqueued' | 'sent' | 'failed' | 'suppressed' | 'unresolved' | 'unknown';
     body?: GlassHiveCallbackBody;
     effectFence?: GlassHiveCallbackEffectFence;
     effectSession?: ClientSession;
-    workerCompletion?: { ownerId: string; responseMessageId: string; binding: VoiceWorkerPresentationBindingV1 };
+    workerCompletion?: {
+      ownerId: string;
+      responseMessageId: string;
+      binding: VoiceWorkerPresentationBindingV1;
+    };
   }) => Promise<object | null>;
   recordGlassHiveCallbackExternalState: (
     input?: GlassHiveCallbackMutationInput,
@@ -396,9 +405,10 @@ export interface GlassHiveCallbackBindingDependencies {
   }) => Promise<TelegramDestinationMapping | null>;
   getMessages: (filter: object, projection: string) => Promise<CallbackMessage[]>;
   markUserParallelWorkKnown: (ownerId: string) => Promise<boolean>;
-  buildTrustedDelegationIdentity: (
-    input: TrustedDelegationInput,
-  ) => { idempotencyKey: string; goalDigest: string };
+  buildTrustedDelegationIdentity: (input: TrustedDelegationInput) => {
+    idempotencyKey: string;
+    goalDigest: string;
+  };
   requestAccountApi: (input: GlassHiveAccountApiInput) => Promise<GlassHiveAccountApiResult>;
   signTrustedDelegationIdentity: (
     identity: TrustedDelegationIdentityInput,
@@ -457,454 +467,469 @@ export function createGlassHiveCallbackBindingService(
     fetchImpl = (...args: Parameters<typeof fetch>) => fetch(...args),
   } = dependencies;
 
-const BINDING_COLLECTION = 'viventium_glasshive_callback_bindings';
-const EXTERNAL_WORK_COLLECTION = 'viventium_external_work';
-const DEFAULT_LAUNCH_PREPARATION_LEASE_MS = 2 * 60 * 1000;
-const DEFAULT_LAUNCH_DISPATCH_AMBIGUITY_LEASE_MS = 2 * 60 * 1000;
-const TERMINAL_STATES = Object.freeze(['completed', 'failed', 'cancelled']);
-const SETTLED_DELIVERY_STATES = Object.freeze([
-  'sent',
-  'delivered',
-  'acknowledged',
-  'silent',
-  'suppressed',
-]);
-const PROTECTED_DELIVERY_STATES = Object.freeze([
-  ...SETTLED_DELIVERY_STATES,
-  'unknown',
-  'unresolved',
-  'failed',
-]);
-const STATE_RECONCILIATION_BATCH = 10;
-const HOST_CAPACITY_CODES = new Set([
-  'active_worker_conflict',
-  'active_worker_limit',
-  'host_worker_already_active',
-  'host_capacity',
-]);
-const DESTINATION_SURFACES = new Set(['librechat', 'telegram', 'voice', 'workbench']);
-const DELEGATION_CONSTRAINT_FIELDS = Object.freeze([
-  'success_criteria',
-  'additional_instructions',
-  'context',
-]);
-const OBJECTIVE_IDENTITY_FIELDS = Object.freeze([
-  'description',
-  'success_criteria',
-  'context',
-  'title',
-  'goal',
-  'instruction',
-  'additional_instructions',
-  'uploaded_files',
-  'files',
-  'file_ids',
-  'project_id',
-  'worker_id',
-  'workspace_alias',
-  'reuse_existing_workspace',
-  'run_at',
-  'schedule_text',
-  'delay_seconds',
-]);
+  const BINDING_COLLECTION = 'viventium_glasshive_callback_bindings';
+  const EXTERNAL_WORK_COLLECTION = 'viventium_external_work';
+  const DEFAULT_LAUNCH_PREPARATION_LEASE_MS = 2 * 60 * 1000;
+  const DEFAULT_LAUNCH_DISPATCH_AMBIGUITY_LEASE_MS = 2 * 60 * 1000;
+  const TERMINAL_STATES = Object.freeze(['completed', 'failed', 'cancelled']);
+  const SETTLED_DELIVERY_STATES = Object.freeze([
+    'sent',
+    'delivered',
+    'acknowledged',
+    'silent',
+    'suppressed',
+  ]);
+  const PROTECTED_DELIVERY_STATES = Object.freeze([
+    ...SETTLED_DELIVERY_STATES,
+    'unknown',
+    'unresolved',
+    'failed',
+  ]);
+  const STATE_RECONCILIATION_BATCH = 10;
+  const HOST_CAPACITY_CODES = new Set([
+    'active_worker_conflict',
+    'active_worker_limit',
+    'host_worker_already_active',
+    'host_capacity',
+  ]);
+  const DESTINATION_SURFACES = new Set(['librechat', 'telegram', 'voice', 'workbench']);
+  const DELEGATION_CONSTRAINT_FIELDS = Object.freeze([
+    'success_criteria',
+    'additional_instructions',
+    'context',
+  ]);
+  const OBJECTIVE_IDENTITY_FIELDS = Object.freeze([
+    'description',
+    'success_criteria',
+    'context',
+    'title',
+    'goal',
+    'instruction',
+    'additional_instructions',
+    'uploaded_files',
+    'files',
+    'file_ids',
+    'project_id',
+    'worker_id',
+    'workspace_alias',
+    'reuse_existing_workspace',
+    'run_at',
+    'schedule_text',
+    'delay_seconds',
+  ]);
 
-async function requireParallelWorkPositiveFence(ownerId: unknown) {
-  if (await markUserParallelWorkKnown(normalizeText(ownerId, 160))) return;
-  throw Object.assign(new Error('parallel_work_positive_fence_failed'), {
-    code: 'parallel_work_positive_fence_failed',
-  });
-}
-
-const MISSION_ROUTING_IDENTITY_KEYS = new Set([
-  'telegramchatid',
-  'telegramuserid',
-  'telegrammessageid',
-  'voicecallsessionid',
-  'voicerequestid',
-  'callbackurl',
-  'callbackhmac',
-  'callbackhmacsecret',
-  'viventiumdelegationassertion',
-]);
-
-function normalizeText(value: unknown, maxLength = 512): string {
-  return String(value || '')
-    .trim()
-    .slice(0, maxLength);
-}
-
-function callbackEffectFenceError(code = 'glasshive_callback_effect_fenced'): RuntimeError {
-  return Object.assign(new Error(code), { code });
-}
-
-function terminalCallbackEffectFence(
-  body: RuntimeRecord = {},
-  effectFence?: RuntimeRecord | null,
-): RuntimeRecord | null {
-  const hasTerminalIdentity =
-    normalizeText(body.callback_id, 512).startsWith('cb_terminal_') ||
-    body.result_revision != null ||
-    body.result_digest != null;
-  if (!hasTerminalIdentity) return null;
-  const callbackId = normalizeText(effectFence?.callbackId, 512);
-  const resultKey = normalizeText(effectFence?.resultKey, 80);
-  const resultDigest = normalizeText(effectFence?.resultDigest, 80);
-  const runId = normalizeText(body.run_id, 160);
-  const resultEndedAt = new Date(normalizeText(body.result_ended_at, 128));
-  const acceptedOperationId = normalizeText(effectFence?.acceptedOperationId, 64);
-  const leaseId = normalizeText(effectFence?.leaseId, 64);
-  const resultRevision = Number(effectFence?.resultRevision);
-  const generation = Number(effectFence?.generation);
-  const acceptedOperationGeneration = Number(
-    effectFence?.acceptedOperationGeneration ?? effectFence?.generation,
-  );
-  if (
-    !/^ghtr_[a-f0-9]{64}$/.test(resultKey) ||
-    !/^cb_terminal_[a-f0-9]{64}$/.test(callbackId) ||
-    !/^sha256:[a-f0-9]{64}$/.test(resultDigest) ||
-    !runId ||
-    !Number.isFinite(resultEndedAt.getTime()) ||
-    !/^[a-f0-9]{32}$/.test(acceptedOperationId) ||
-    !/^[a-f0-9]{32}$/.test(leaseId) ||
-    !Number.isSafeInteger(resultRevision) ||
-    resultRevision < 1 ||
-    !Number.isSafeInteger(generation) ||
-    generation < 1 ||
-    !Number.isSafeInteger(acceptedOperationGeneration) ||
-    acceptedOperationGeneration < 1 ||
-    callbackId !== normalizeText(body.callback_id, 512) ||
-    resultDigest !== normalizeText(body.result_digest, 80) ||
-    resultRevision !== Number(body.result_revision)
-  ) {
-    throw callbackEffectFenceError('glasshive_callback_effect_fence_invalid');
+  async function requireParallelWorkPositiveFence(ownerId: unknown) {
+    if (await markUserParallelWorkKnown(normalizeText(ownerId, 160))) return;
+    throw Object.assign(new Error('parallel_work_positive_fence_failed'), {
+      code: 'parallel_work_positive_fence_failed',
+    });
   }
-  return Object.freeze({
-    resultKey,
-    callbackId,
-    resultDigest,
-    runId,
-    resultEndedAt,
-    acceptedOperationId,
-    leaseId,
-    resultRevision,
-    generation: acceptedOperationGeneration,
-    leaseGeneration: generation,
-  });
-}
 
-function terminalCallbackDestinationFilter(
-  filter: RuntimeRecord,
-  fence: RuntimeRecord | null,
-): RuntimeRecord {
-  if (!fence) return filter;
-  return {
-    $and: [
-      filter,
-      {
-        $or: [
-          { terminalCallbackResultRevision: { $exists: false } },
-          {
-            terminalCallbackResultRevision: fence.resultRevision,
-            terminalCallbackId: fence.callbackId,
-            terminalCallbackResultDigest: fence.resultDigest,
-            terminalCallbackAcceptedOperationId: fence.acceptedOperationId,
-            $or: [
-              { terminalCallbackEffectLeaseGeneration: { $exists: false } },
-              { terminalCallbackEffectLeaseGeneration: { $lte: fence.generation } },
-            ],
-          },
-          { terminalCallbackResultEndedAt: { $lt: fence.resultEndedAt } },
-          {
-            terminalCallbackResultEndedAt: fence.resultEndedAt,
-            terminalCallbackResultRevision: { $lt: fence.resultRevision },
-          },
-          {
-            terminalCallbackResultEndedAt: { $exists: false },
-            $or: [{ updatedAt: { $exists: false } }, { updatedAt: { $lt: fence.resultEndedAt } }],
-          },
-        ],
-      },
-    ],
-  };
-}
+  const MISSION_ROUTING_IDENTITY_KEYS = new Set([
+    'telegramchatid',
+    'telegramuserid',
+    'telegrammessageid',
+    'voicecallsessionid',
+    'voicerequestid',
+    'callbackurl',
+    'callbackhmac',
+    'callbackhmacsecret',
+    'viventiumdelegationassertion',
+  ]);
 
-function terminalCallbackDestinationFields(fence: RuntimeRecord | null): RuntimeRecord {
-  if (!fence) return {};
-  return {
-    terminalCallbackResultRevision: fence.resultRevision,
-    terminalCallbackId: fence.callbackId,
-    terminalCallbackResultDigest: fence.resultDigest,
-    terminalCallbackRunId: fence.runId,
-    terminalCallbackResultEndedAt: fence.resultEndedAt,
-    terminalCallbackAcceptedOperationId: fence.acceptedOperationId,
-    terminalCallbackEffectLeaseId: fence.leaseId,
-    terminalCallbackEffectLeaseGeneration: fence.generation,
-  };
-}
-
-function requireFencedDestinationWrite<T extends RuntimeRecord>(
-  result: T,
-  fence: RuntimeRecord | null,
-): T {
-  if (fence && Number(result?.matchedCount) === 0) {
-    throw callbackEffectFenceError();
+  function normalizeText(value: unknown, maxLength = 512): string {
+    return String(value || '')
+      .trim()
+      .slice(0, maxLength);
   }
-  return result;
-}
 
-function requireFencedDestinationDocument(
-  result: RuntimeRecord | null,
-  fence: RuntimeRecord | null,
-): RuntimeRecord | null {
-  const document =
-    result && Object.prototype.hasOwnProperty.call(result, 'value') ? result.value : result;
-  if (fence && !document) throw callbackEffectFenceError();
-  return document;
-}
-
-function truthyFlag(value: unknown): boolean {
-  if (value === true || value === 1) return true;
-  return ['1', 'true', 'yes', 'on'].includes(normalizeText(value, 16).toLowerCase());
-}
-
-function launchPreparationLeaseMs() {
-  const configured = Number(process.env.VIVENTIUM_GLASSHIVE_LAUNCH_PREPARATION_LEASE_MS);
-  if (!Number.isFinite(configured) || configured <= 0) {
-    return DEFAULT_LAUNCH_PREPARATION_LEASE_MS;
+  function callbackEffectFenceError(code = 'glasshive_callback_effect_fenced'): RuntimeError {
+    return Object.assign(new Error(code), { code });
   }
-  return Math.max(10_000, Math.min(Math.floor(configured), 10 * 60 * 1000));
-}
 
-function launchDispatchAmbiguityLeaseMs() {
-  const configured = Number(process.env.VIVENTIUM_GLASSHIVE_LAUNCH_DISPATCH_LEASE_MS);
-  if (!Number.isFinite(configured) || configured <= 0) {
-    return DEFAULT_LAUNCH_DISPATCH_AMBIGUITY_LEASE_MS;
+  function terminalCallbackEffectFence(
+    body: RuntimeRecord = {},
+    effectFence?: RuntimeRecord | null,
+  ): RuntimeRecord | null {
+    const hasTerminalIdentity =
+      normalizeText(body.callback_id, 512).startsWith('cb_terminal_') ||
+      body.result_revision != null ||
+      body.result_digest != null;
+    if (!hasTerminalIdentity) return null;
+    const callbackId = normalizeText(effectFence?.callbackId, 512);
+    const resultKey = normalizeText(effectFence?.resultKey, 80);
+    const resultDigest = normalizeText(effectFence?.resultDigest, 80);
+    const runId = normalizeText(body.run_id, 160);
+    const resultEndedAt = new Date(normalizeText(body.result_ended_at, 128));
+    const acceptedOperationId = normalizeText(effectFence?.acceptedOperationId, 64);
+    const leaseId = normalizeText(effectFence?.leaseId, 64);
+    const resultRevision = Number(effectFence?.resultRevision);
+    const generation = Number(effectFence?.generation);
+    const acceptedOperationGeneration = Number(
+      effectFence?.acceptedOperationGeneration ?? effectFence?.generation,
+    );
+    if (
+      !/^ghtr_[a-f0-9]{64}$/.test(resultKey) ||
+      !/^cb_terminal_[a-f0-9]{64}$/.test(callbackId) ||
+      !/^sha256:[a-f0-9]{64}$/.test(resultDigest) ||
+      !runId ||
+      !Number.isFinite(resultEndedAt.getTime()) ||
+      !/^[a-f0-9]{32}$/.test(acceptedOperationId) ||
+      !/^[a-f0-9]{32}$/.test(leaseId) ||
+      !Number.isSafeInteger(resultRevision) ||
+      resultRevision < 1 ||
+      !Number.isSafeInteger(generation) ||
+      generation < 1 ||
+      !Number.isSafeInteger(acceptedOperationGeneration) ||
+      acceptedOperationGeneration < 1 ||
+      callbackId !== normalizeText(body.callback_id, 512) ||
+      resultDigest !== normalizeText(body.result_digest, 80) ||
+      resultRevision !== Number(body.result_revision)
+    ) {
+      throw callbackEffectFenceError('glasshive_callback_effect_fence_invalid');
+    }
+    return Object.freeze({
+      resultKey,
+      callbackId,
+      resultDigest,
+      runId,
+      resultEndedAt,
+      acceptedOperationId,
+      leaseId,
+      resultRevision,
+      generation: acceptedOperationGeneration,
+      leaseGeneration: generation,
+    });
   }
-  return Math.max(10_000, Math.min(Math.floor(configured), 10 * 60 * 1000));
-}
 
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
+  function terminalCallbackDestinationFilter(
+    filter: RuntimeRecord,
+    fence: RuntimeRecord | null,
+  ): RuntimeRecord {
+    if (!fence) return filter;
+    return {
+      $and: [
+        filter,
+        {
+          $or: [
+            { terminalCallbackResultRevision: { $exists: false } },
+            {
+              terminalCallbackResultRevision: fence.resultRevision,
+              terminalCallbackId: fence.callbackId,
+              terminalCallbackResultDigest: fence.resultDigest,
+              terminalCallbackAcceptedOperationId: fence.acceptedOperationId,
+              $or: [
+                { terminalCallbackEffectLeaseGeneration: { $exists: false } },
+                { terminalCallbackEffectLeaseGeneration: { $lte: fence.generation } },
+              ],
+            },
+            { terminalCallbackResultEndedAt: { $lt: fence.resultEndedAt } },
+            {
+              terminalCallbackResultEndedAt: fence.resultEndedAt,
+              terminalCallbackResultRevision: { $lt: fence.resultRevision },
+            },
+            {
+              terminalCallbackResultEndedAt: { $exists: false },
+              $or: [{ updatedAt: { $exists: false } }, { updatedAt: { $lt: fence.resultEndedAt } }],
+            },
+          ],
+        },
+      ],
+    };
   }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+
+  function terminalCallbackDestinationFields(fence: RuntimeRecord | null): RuntimeRecord {
+    if (!fence) return {};
+    return {
+      terminalCallbackResultRevision: fence.resultRevision,
+      terminalCallbackId: fence.callbackId,
+      terminalCallbackResultDigest: fence.resultDigest,
+      terminalCallbackRunId: fence.runId,
+      terminalCallbackResultEndedAt: fence.resultEndedAt,
+      terminalCallbackAcceptedOperationId: fence.acceptedOperationId,
+      terminalCallbackEffectLeaseId: fence.leaseId,
+      terminalCallbackEffectLeaseGeneration: fence.generation,
+    };
   }
-  const record = value as RuntimeRecord;
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
-    .join(',')}}`;
-}
 
-function opaqueRef(prefix: string, ...parts: unknown[]): string {
-  const digest = crypto
-    .createHash('sha256')
-    .update(parts.map((part) => normalizeText(part, 4096)).join('\0'))
-    .digest('hex')
-    .slice(0, 32);
-  return `${prefix}_${digest}`;
-}
+  function requireFencedDestinationWrite<T extends RuntimeRecord>(
+    result: T,
+    fence: RuntimeRecord | null,
+  ): T {
+    if (fence && Number(result?.matchedCount) === 0) {
+      throw callbackEffectFenceError();
+    }
+    return result;
+  }
 
-function callbackBindingCollection() {
-  return mongoose.connection.collection(BINDING_COLLECTION);
-}
+  function requireFencedDestinationDocument(
+    result: RuntimeRecord | null,
+    fence: RuntimeRecord | null,
+  ): RuntimeRecord | null {
+    const document =
+      result && Object.prototype.hasOwnProperty.call(result, 'value') ? result.value : result;
+    if (fence && !document) throw callbackEffectFenceError();
+    return document;
+  }
 
-function externalWorkCollection() {
-  return mongoose.connection.collection(EXTERNAL_WORK_COLLECTION);
-}
+  function truthyFlag(value: unknown): boolean {
+    if (value === true || value === 1) return true;
+    return ['1', 'true', 'yes', 'on'].includes(normalizeText(value, 16).toLowerCase());
+  }
 
-function callbackTraceAt(body: RuntimeRecord = {}): Date | null {
-  const value = body.callback_ts;
-  if (value == null || value === '') return null;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric)) {
-    const parsed = new Date(numeric < 1_000_000_000_000 ? numeric * 1000 : numeric);
+  function launchPreparationLeaseMs() {
+    const configured = Number(process.env.VIVENTIUM_GLASSHIVE_LAUNCH_PREPARATION_LEASE_MS);
+    if (!Number.isFinite(configured) || configured <= 0) {
+      return DEFAULT_LAUNCH_PREPARATION_LEASE_MS;
+    }
+    return Math.max(10_000, Math.min(Math.floor(configured), 10 * 60 * 1000));
+  }
+
+  function launchDispatchAmbiguityLeaseMs() {
+    const configured = Number(process.env.VIVENTIUM_GLASSHIVE_LAUNCH_DISPATCH_LEASE_MS);
+    if (!Number.isFinite(configured) || configured <= 0) {
+      return DEFAULT_LAUNCH_DISPATCH_AMBIGUITY_LEASE_MS;
+    }
+    return Math.max(10_000, Math.min(Math.floor(configured), 10 * 60 * 1000));
+  }
+
+  function stableStringify(value: unknown): string {
+    if (value === null || typeof value !== 'object') {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+    }
+    const record = value as RuntimeRecord;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+      .join(',')}}`;
+  }
+
+  function opaqueRef(prefix: string, ...parts: unknown[]): string {
+    const digest = crypto
+      .createHash('sha256')
+      .update(parts.map((part) => normalizeText(part, 4096)).join('\0'))
+      .digest('hex')
+      .slice(0, 32);
+    return `${prefix}_${digest}`;
+  }
+
+  function callbackBindingCollection() {
+    return mongoose.connection.collection(BINDING_COLLECTION);
+  }
+
+  function externalWorkCollection() {
+    return mongoose.connection.collection(EXTERNAL_WORK_COLLECTION);
+  }
+
+  function callbackTraceAt(body: RuntimeRecord = {}): Date | null {
+    const value = body.callback_ts;
+    if (value == null || value === '') return null;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      const parsed = new Date(numeric < 1_000_000_000_000 ? numeric * 1000 : numeric);
+      return Number.isFinite(parsed.getTime()) ? parsed : null;
+    }
+    const parsed = new Date(value);
     return Number.isFinite(parsed.getTime()) ? parsed : null;
   }
-  const parsed = new Date(value);
-  return Number.isFinite(parsed.getTime()) ? parsed : null;
-}
 
-function callbackTraceIdentity(
-  body: RuntimeRecord = {},
-  trustedIdentity: RuntimeRecord | null = null,
-): Readonly<RuntimeRecord> | null {
-  const callbackId = normalizeText(body.callback_id, 512);
-  const event = normalizeText(body.event, 64).toLowerCase();
-  const workState = canonicalGlassHiveWorkState(body) || callbackWorkState(body);
-  const preRuntimeTerminal =
-    body.attempt_number == null &&
-    isGlassHiveWorkTerminalCallback(body) &&
-    ['failed', 'cancelled'].includes(workState) &&
-    ['run.failed', 'run.cancelled', 'run.interrupted'].includes(event);
-  const attemptNumber = preRuntimeTerminal ? null : Number(body.attempt_number);
-  if (
-    !callbackId ||
-    (!preRuntimeTerminal && (!Number.isSafeInteger(attemptNumber) || Number(attemptNumber) < 1))
-  )
-    return null;
-  const callbackRef = canonicalizeGlassHiveCallbackRef(callbackId);
-  if (
-    trustedIdentity &&
-    (normalizeText(trustedIdentity.callbackRef, 96) !== callbackRef ||
-      (trustedIdentity.attemptNumber == null
-        ? attemptNumber !== null
-        : Number(trustedIdentity.attemptNumber) !== attemptNumber))
-  ) {
-    return null;
-  }
-  return Object.freeze({
-    callbackRef: trustedIdentity ? normalizeText(trustedIdentity.callbackRef, 96) : callbackRef,
-    attemptNumber:
-      trustedIdentity && trustedIdentity.attemptNumber != null
-        ? Number(trustedIdentity.attemptNumber)
-        : attemptNumber,
-  });
-}
-
-function normalizedChannels(value: unknown): string[] {
-  const values = Array.isArray(value) ? value : value == null ? [] : [value];
-  const seen = new Set();
-  const channels = [];
-  for (const item of values) {
-    const surface = normalizeText(item, 32).toLowerCase();
-    if (!DESTINATION_SURFACES.has(surface) || seen.has(surface)) continue;
-    seen.add(surface);
-    channels.push(surface);
-  }
-  return channels;
-}
-
-function configuredDestinationsFromRequest(requestBody: RuntimeRecord = {}): RuntimeRecord[] {
-  const scheduledChannels = normalizedChannels(
-    requestBody.viventiumSchedulerDeliveryChannels || requestBody.deliveryChannels,
-  );
-  if (scheduledChannels.length) {
-    return scheduledChannels.map((surface) => ({ surface }));
-  }
-
-  const surface = normalizeText(requestBody.viventiumSurface, 32).toLowerCase();
-  const destinations = [];
-  if (surface === 'telegram') {
-    destinations.push({
-      surface: 'telegram',
-      telegramChatId: normalizeText(requestBody.viventiumTelegramChatId),
-      telegramUserId: normalizeText(requestBody.viventiumTelegramUserId),
-      telegramMessageId: normalizeText(requestBody.viventiumTelegramMessageId),
-      telegramMessageThreadId: normalizeText(requestBody.viventiumTelegramMessageThreadId),
-    });
-  } else if (surface === 'voice') {
-    destinations.push({
-      surface: 'voice',
-      voiceCallSessionId: normalizeText(requestBody.viventiumVoiceCallSessionId),
-      voiceRequestId: normalizeText(requestBody.viventiumVoiceRequestId),
+  function callbackTraceIdentity(
+    body: RuntimeRecord = {},
+    trustedIdentity: RuntimeRecord | null = null,
+  ): Readonly<RuntimeRecord> | null {
+    const callbackId = normalizeText(body.callback_id, 512);
+    const event = normalizeText(body.event, 64).toLowerCase();
+    const workState = canonicalGlassHiveWorkState(body) || callbackWorkState(body);
+    const preRuntimeTerminal =
+      body.attempt_number == null &&
+      isGlassHiveWorkTerminalCallback(body) &&
+      ['failed', 'cancelled'].includes(workState) &&
+      ['run.failed', 'run.cancelled', 'run.interrupted'].includes(event);
+    const attemptNumber = preRuntimeTerminal ? null : Number(body.attempt_number);
+    if (
+      !callbackId ||
+      (!preRuntimeTerminal && (!Number.isSafeInteger(attemptNumber) || Number(attemptNumber) < 1))
+    )
+      return null;
+    const callbackRef = canonicalizeGlassHiveCallbackRef(callbackId);
+    if (
+      trustedIdentity &&
+      (normalizeText(trustedIdentity.callbackRef, 96) !== callbackRef ||
+        (trustedIdentity.attemptNumber == null
+          ? attemptNumber !== null
+          : Number(trustedIdentity.attemptNumber) !== attemptNumber))
+    ) {
+      return null;
+    }
+    return Object.freeze({
+      callbackRef: trustedIdentity ? normalizeText(trustedIdentity.callbackRef, 96) : callbackRef,
+      attemptNumber:
+        trustedIdentity && trustedIdentity.attemptNumber != null
+          ? Number(trustedIdentity.attemptNumber)
+          : attemptNumber,
     });
   }
-  destinations.push({ surface: 'librechat' });
-  return destinations;
-}
 
-function fingerprintObjectiveValue(value: unknown): { bytes: number; sha256: string } {
-  const canonical = stableStringify(value);
-  const serialized = typeof canonical === 'string' ? canonical : String(canonical);
-  return {
-    bytes: Buffer.byteLength(serialized, 'utf8'),
-    sha256: crypto.createHash('sha256').update(serialized, 'utf8').digest('hex'),
-  };
-}
-
-function delegationLaunchPayloadDigest(args: RuntimeRecord = {}, inheritedConversationJson?: string): string {
-  const canonical = stableStringify({
-    alias: normalizeText(args.alias),
-    backend: normalizeText(args.backend),
-    bootstrap_profile: normalizeText(args.bootstrap_profile || args.bootstrapProfile),
-    connected_account_content_intent: truthyFlag(args.connected_account_content_intent),
-    effort: normalizeText(args.effort),
-    execution_mode: normalizeText(args.execution_mode || args.executionMode),
-    expose_diagnostics: truthyFlag(args.expose_diagnostics),
-    goal: normalizeText(args.goal, 100_000),
-    instruction: normalizeText(args.instruction, 100_000),
-    ...(inheritedConversationJson ? { inherited_conversation_sha256: crypto.createHash('sha256')
-      .update(inheritedConversationJson, 'utf8').digest('hex') } : {}),
-    owner_id: normalizeText(args.owner_id, 160),
-    profile: normalizeText(args.profile, 160),
-    project_id: normalizeText(args.project_id, 160),
-    require_callback: truthyFlag(args.require_callback),
-    reuse_existing_workspace: truthyFlag(args.reuse_existing_workspace),
-    title: normalizeText(args.title, 10_000),
-    worker_name: normalizeText(args.worker_name || args.workerName, 10_000),
-    worker_role: normalizeText(args.worker_role || args.workerRole, 10_000),
-    workspace_root: normalizeText(args.workspace_root || args.workspaceRoot, 10_000),
-  });
-  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
-}
-
-/** Bind all user-objective and file-reference fields while storing no raw objective text. */
-function canonicalObjectiveIdentity(toolName: unknown, args: RuntimeRecord = {}): string {
-  const fields: RuntimeRecord = {};
-  for (const key of OBJECTIVE_IDENTITY_FIELDS) {
-    if (args[key] == null) continue;
-    fields[key] = fingerprintObjectiveValue(args[key]);
+  function normalizedChannels(value: unknown): string[] {
+    const values = Array.isArray(value) ? value : value == null ? [] : [value];
+    const seen = new Set();
+    const channels = [];
+    for (const item of values) {
+      const surface = normalizeText(item, 32).toLowerCase();
+      if (!DESTINATION_SURFACES.has(surface) || seen.has(surface)) continue;
+      seen.add(surface);
+      channels.push(surface);
+    }
+    return channels;
   }
-  return stableStringify({
-    version: 1,
-    tool_name: normalizeText(toolName, 80),
-    fields,
-  });
-}
 
-function trustedSourceEventId(requestBody: RuntimeRecord = {}): string {
-  return normalizeText(
-    requestBody.viventiumSourceEventId ||
-      requestBody.viventiumLogicalTurnId ||
-      requestBody.viventiumSchedulerOccurrenceKey ||
-      requestBody.messageId ||
-      requestBody.message_id,
-    512,
-  );
-}
+  function configuredDestinationsFromRequest(requestBody: RuntimeRecord = {}): RuntimeRecord[] {
+    const scheduledChannels = normalizedChannels(
+      requestBody.viventiumSchedulerDeliveryChannels || requestBody.deliveryChannels,
+    );
+    if (scheduledChannels.length) {
+      return scheduledChannels.map((surface) => ({
+        surface,
+        ...(surface === 'telegram' && requestBody.viventiumTelegramMessageThreadId
+          ? { telegramMessageThreadId: normalizeText(requestBody.viventiumTelegramMessageThreadId) }
+          : {}),
+      }));
+    }
 
-function trustedCallKey(toolCall: RuntimeRecord = {}): string {
-  const id = normalizeText(
-    toolCall.id || toolCall.tool_call_id || toolCall.toolCallId || toolCall.call_id,
-    256,
-  );
-  const stepId = normalizeText(toolCall.stepId || toolCall.step_id, 256);
-  if (!id && !stepId) return '';
-  // The provider call id is the durable identity. A generated UI step is only a fallback for
-  // harnesses that cannot expose one; invocation counters are presentation metadata, not identity.
-  return stableStringify(id ? { id } : { step_id: stepId });
-}
-
-/**
- * Provider call identifiers are runtime-owned metadata, not model tool arguments. The digest is
- * stable across reconstructed requests; separate provider calls stay distinct even with identical
- * tool arguments. Ordinal is presentation metadata and never the durable idempotency anchor.
- */
-function resolveTrustedGlassHiveCallIdentity(
-  { requestBody = {}, toolCall = {} }: RuntimeRecord = {},
-): RuntimeRecord {
-  if (!requestBody || typeof requestBody !== 'object' || Array.isArray(requestBody)) {
-    throw new Error('glasshive_trusted_request_identity_missing');
+    const surface = normalizeText(requestBody.viventiumSurface, 32).toLowerCase();
+    const destinations = [];
+    if (surface === 'telegram') {
+      destinations.push({
+        surface: 'telegram',
+        telegramChatId: normalizeText(requestBody.viventiumTelegramChatId),
+        telegramUserId: normalizeText(requestBody.viventiumTelegramUserId),
+        telegramMessageId: normalizeText(requestBody.viventiumTelegramMessageId),
+        telegramMessageThreadId: normalizeText(requestBody.viventiumTelegramMessageThreadId),
+      });
+    } else if (surface === 'voice') {
+      destinations.push({
+        surface: 'voice',
+        voiceCallSessionId: normalizeText(requestBody.viventiumVoiceCallSessionId),
+        voiceRequestId: normalizeText(requestBody.viventiumVoiceRequestId),
+      });
+    }
+    destinations.push({ surface: 'librechat' });
+    return destinations;
   }
-  const sourceEventId = trustedSourceEventId(requestBody);
-  const callKey = trustedCallKey(toolCall);
-  if (!sourceEventId || !callKey) {
-    throw new Error('glasshive_trusted_call_identity_missing');
+
+  function fingerprintObjectiveValue(value: unknown): { bytes: number; sha256: string } {
+    const canonical = stableStringify(value);
+    const serialized = typeof canonical === 'string' ? canonical : String(canonical);
+    return {
+      bytes: Buffer.byteLength(serialized, 'utf8'),
+      sha256: crypto.createHash('sha256').update(serialized, 'utf8').digest('hex'),
+    };
   }
-  const callIdentityDigest = crypto.createHash('sha256').update(callKey, 'utf8').digest('hex');
-  const providerTurn = Number(toolCall?.turn);
-  const objectiveOrdinal =
-    Number.isInteger(providerTurn) && providerTurn >= 0
-      ? providerTurn
-      : Number.parseInt(callIdentityDigest.slice(0, 8), 16);
-  return {
-    sourceEventId,
-    objectiveOrdinal,
-    callIdentityDigest,
-  };
-}
+
+  function delegationLaunchPayloadDigest(
+    args: RuntimeRecord = {},
+    inheritedConversationJson?: string,
+  ): string {
+    const canonical = stableStringify({
+      alias: normalizeText(args.alias),
+      backend: normalizeText(args.backend),
+      bootstrap_profile: normalizeText(args.bootstrap_profile || args.bootstrapProfile),
+      connected_account_content_intent: truthyFlag(args.connected_account_content_intent),
+      effort: normalizeText(args.effort),
+      execution_mode: normalizeText(args.execution_mode || args.executionMode),
+      expose_diagnostics: truthyFlag(args.expose_diagnostics),
+      goal: normalizeText(args.goal, 100_000),
+      instruction: normalizeText(args.instruction, 100_000),
+      ...(inheritedConversationJson
+        ? {
+            inherited_conversation_sha256: crypto
+              .createHash('sha256')
+              .update(inheritedConversationJson, 'utf8')
+              .digest('hex'),
+          }
+        : {}),
+      owner_id: normalizeText(args.owner_id, 160),
+      profile: normalizeText(args.profile, 160),
+      project_id: normalizeText(args.project_id, 160),
+      require_callback: truthyFlag(args.require_callback),
+      reuse_existing_workspace: truthyFlag(args.reuse_existing_workspace),
+      title: normalizeText(args.title, 10_000),
+      worker_name: normalizeText(args.worker_name || args.workerName, 10_000),
+      worker_role: normalizeText(args.worker_role || args.workerRole, 10_000),
+      workspace_root: normalizeText(args.workspace_root || args.workspaceRoot, 10_000),
+    });
+    return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+  }
+
+  /** Bind all user-objective and file-reference fields while storing no raw objective text. */
+  function canonicalObjectiveIdentity(toolName: unknown, args: RuntimeRecord = {}): string {
+    const fields: RuntimeRecord = {};
+    for (const key of OBJECTIVE_IDENTITY_FIELDS) {
+      if (args[key] == null) continue;
+      fields[key] = fingerprintObjectiveValue(args[key]);
+    }
+    return stableStringify({
+      version: 1,
+      tool_name: normalizeText(toolName, 80),
+      fields,
+    });
+  }
+
+  function trustedSourceEventId(requestBody: RuntimeRecord = {}): string {
+    return normalizeText(
+      requestBody.viventiumSourceEventId ||
+        requestBody.viventiumLogicalTurnId ||
+        requestBody.viventiumSchedulerOccurrenceKey ||
+        requestBody.messageId ||
+        requestBody.message_id,
+      512,
+    );
+  }
+
+  function trustedCallKey(toolCall: RuntimeRecord = {}): string {
+    const id = normalizeText(
+      toolCall.id || toolCall.tool_call_id || toolCall.toolCallId || toolCall.call_id,
+      256,
+    );
+    const stepId = normalizeText(toolCall.stepId || toolCall.step_id, 256);
+    if (!id && !stepId) return '';
+    // The provider call id is the durable identity. A generated UI step is only a fallback for
+    // harnesses that cannot expose one; invocation counters are presentation metadata, not identity.
+    return stableStringify(id ? { id } : { step_id: stepId });
+  }
+
+  /**
+   * Provider call identifiers are runtime-owned metadata, not model tool arguments. The digest is
+   * stable across reconstructed requests; separate provider calls stay distinct even with identical
+   * tool arguments. Ordinal is presentation metadata and never the durable idempotency anchor.
+   */
+  function resolveTrustedGlassHiveCallIdentity({
+    requestBody = {},
+    toolCall = {},
+  }: RuntimeRecord = {}): RuntimeRecord {
+    if (!requestBody || typeof requestBody !== 'object' || Array.isArray(requestBody)) {
+      throw new Error('glasshive_trusted_request_identity_missing');
+    }
+    const sourceEventId = trustedSourceEventId(requestBody);
+    const callKey = trustedCallKey(toolCall);
+    if (!sourceEventId || !callKey) {
+      throw new Error('glasshive_trusted_call_identity_missing');
+    }
+    const callIdentityDigest = crypto.createHash('sha256').update(callKey, 'utf8').digest('hex');
+    const providerTurn = Number(toolCall?.turn);
+    const objectiveOrdinal =
+      Number.isInteger(providerTurn) && providerTurn >= 0
+        ? providerTurn
+        : Number.parseInt(callIdentityDigest.slice(0, 8), 16);
+    return {
+      sourceEventId,
+      objectiveOrdinal,
+      callIdentityDigest,
+    };
+  }
 
   function projectTriggeringTextSegments(
     segments: readonly RuntimeRecord[],
@@ -925,208 +950,209 @@ function resolveTrustedGlassHiveCallIdentity(
     }));
   }
 
-function trustedTriggeringSourceSegments(requestBody: RuntimeRecord = {}): RuntimeRecord {
-  const candidates = Array.isArray(requestBody.viventiumTriggeringSourceSegments)
-    ? requestBody.viventiumTriggeringSourceSegments
-    : [];
-  const fallbackSourceEventId = trustedSourceEventId(requestBody);
-  const normalized = normalizeInteractionSourceSegments(
-    candidates.map((candidate: RuntimeRecord, sourceIndex: number) => ({
-      ...candidate,
-      source_event_id: normalizeText(candidate?.source_event_id, 160) || fallbackSourceEventId,
-      source_index: Number.isInteger(Number(candidate?.source_index))
-        ? Number(candidate.source_index)
-        : Number.isInteger(Number(candidate?.ordinal))
-          ? Number(candidate.ordinal)
-          : sourceIndex,
-    })),
-    requestBody.viventiumTriggeringSourceSegmentsOverflowCount,
-  );
-  return {
+  function trustedTriggeringSourceSegments(requestBody: RuntimeRecord = {}): RuntimeRecord {
+    const candidates = Array.isArray(requestBody.viventiumTriggeringSourceSegments)
+      ? requestBody.viventiumTriggeringSourceSegments
+      : [];
+    const fallbackSourceEventId = trustedSourceEventId(requestBody);
+    const normalized = normalizeInteractionSourceSegments(
+      candidates.map((candidate: RuntimeRecord, sourceIndex: number) => ({
+        ...candidate,
+        source_event_id: normalizeText(candidate?.source_event_id, 160) || fallbackSourceEventId,
+        source_index: Number.isInteger(Number(candidate?.source_index))
+          ? Number(candidate.source_index)
+          : Number.isInteger(Number(candidate?.ordinal))
+            ? Number(candidate.ordinal)
+            : sourceIndex,
+      })),
+      requestBody.viventiumTriggeringSourceSegmentsOverflowCount,
+    );
+    return {
       segments: projectTriggeringTextSegments(normalized.segments, fallbackSourceEventId),
-    overflowCount: normalized.overflowCount,
-  };
-}
-
-function exactMessageById(messages: unknown): RuntimeRecord | null {
-  const byId = new Map<string, RuntimeRecord>();
-  for (const message of Array.isArray(messages) ? messages : []) {
-    const messageId = normalizeText(message?.messageId, 160);
-    if (messageId) byId.set(messageId, message);
+      overflowCount: normalized.overflowCount,
+    };
   }
-  return byId.size === 1 ? Array.from(byId.values())[0] : null;
-}
 
-function selectedSourceAnchorUnavailable(): RuntimeError {
-  return Object.assign(new Error('glasshive_selected_source_anchor_unavailable'), {
-    code: 'glasshive_selected_source_anchor_unavailable',
-  });
-}
+  function exactMessageById(messages: unknown): RuntimeRecord | null {
+    const byId = new Map<string, RuntimeRecord>();
+    for (const message of Array.isArray(messages) ? messages : []) {
+      const messageId = normalizeText(message?.messageId, 160);
+      if (messageId) byId.set(messageId, message);
+    }
+    return byId.size === 1 ? Array.from(byId.values())[0] : null;
+  }
 
-async function resolveTrustedCurrentRevisionAnchor({
-  ownerId,
-  conversationId,
-  requestBody,
-  sourceEventId,
-  authoringSourceEventId,
-  currentAnchorMessageId,
-  currentParentMessageId,
-}: RuntimeRecord): Promise<RuntimeRecord> {
-  const selectedSourceIsInCurrentRevision = trustedTriggeringSourceSegments(
+  function selectedSourceAnchorUnavailable(): RuntimeError {
+    return Object.assign(new Error('glasshive_selected_source_anchor_unavailable'), {
+      code: 'glasshive_selected_source_anchor_unavailable',
+    });
+  }
+
+  async function resolveTrustedCurrentRevisionAnchor({
+    ownerId,
+    conversationId,
     requestBody,
-  ).segments.some((segment: RuntimeRecord) => segment.source_event_id === sourceEventId);
-  if (
-    !selectedSourceIsInCurrentRevision ||
-    !authoringSourceEventId ||
-    !currentAnchorMessageId ||
-    !currentParentMessageId
-  ) {
-    throw selectedSourceAnchorUnavailable();
-  }
+    sourceEventId,
+    authoringSourceEventId,
+    currentAnchorMessageId,
+    currentParentMessageId,
+  }: RuntimeRecord): Promise<RuntimeRecord> {
+    const selectedSourceIsInCurrentRevision = trustedTriggeringSourceSegments(
+      requestBody,
+    ).segments.some((segment: RuntimeRecord) => segment.source_event_id === sourceEventId);
+    if (
+      !selectedSourceIsInCurrentRevision ||
+      !authoringSourceEventId ||
+      !currentAnchorMessageId ||
+      !currentParentMessageId
+    ) {
+      throw selectedSourceAnchorUnavailable();
+    }
 
-  const currentUsers = await getMessages(
-    {
-      user: ownerId,
-      conversationId,
-      messageId: currentParentMessageId,
-      isCreatedByUser: true,
-      'metadata.viventium.interactionContext.source_event_id': authoringSourceEventId,
-    },
-    'messageId parentMessageId isCreatedByUser createdAt',
-  );
-  const currentUser = exactMessageById(currentUsers);
-  if (normalizeText(currentUser?.messageId, 160) !== currentParentMessageId) {
-    throw selectedSourceAnchorUnavailable();
-  }
+    const currentUsers = await getMessages(
+      {
+        user: ownerId,
+        conversationId,
+        messageId: currentParentMessageId,
+        isCreatedByUser: true,
+        'metadata.viventium.interactionContext.source_event_id': authoringSourceEventId,
+      },
+      'messageId parentMessageId isCreatedByUser createdAt',
+    );
+    const currentUser = exactMessageById(currentUsers);
+    if (normalizeText(currentUser?.messageId, 160) !== currentParentMessageId) {
+      throw selectedSourceAnchorUnavailable();
+    }
 
-  const currentAssistants = await getMessages(
-    {
-      user: ownerId,
-      conversationId,
-      messageId: currentAnchorMessageId,
-      parentMessageId: currentParentMessageId,
-      isCreatedByUser: false,
-    },
-    'messageId parentMessageId isCreatedByUser createdAt',
-  );
-  const currentAssistant = exactMessageById(currentAssistants);
-  if (normalizeText(currentAssistant?.messageId, 160) !== currentAnchorMessageId) {
-    throw selectedSourceAnchorUnavailable();
-  }
-  return {
-    anchorMessageId: currentAnchorMessageId,
-    requestedParentMessageId: currentParentMessageId,
-  };
-}
-
-async function resolveTrustedLaunchAnchor({
-  ownerId,
-  conversationId,
-  requestBody,
-  sourceEventId,
-}: RuntimeRecord): Promise<RuntimeRecord> {
-  const currentAnchorMessageId = normalizeText(
-    requestBody.messageId || requestBody.message_id,
-    160,
-  );
-  const currentParentMessageId = normalizeText(
-    requestBody.parentMessageId || requestBody.parent_message_id,
-    160,
-  );
-  const authoringSourceEventId = normalizeText(requestBody.viventiumAuthoringSourceEventId, 160);
-  if (!authoringSourceEventId || authoringSourceEventId === sourceEventId) {
+    const currentAssistants = await getMessages(
+      {
+        user: ownerId,
+        conversationId,
+        messageId: currentAnchorMessageId,
+        parentMessageId: currentParentMessageId,
+        isCreatedByUser: false,
+      },
+      'messageId parentMessageId isCreatedByUser createdAt',
+    );
+    const currentAssistant = exactMessageById(currentAssistants);
+    if (normalizeText(currentAssistant?.messageId, 160) !== currentAnchorMessageId) {
+      throw selectedSourceAnchorUnavailable();
+    }
     return {
       anchorMessageId: currentAnchorMessageId,
       requestedParentMessageId: currentParentMessageId,
     };
   }
 
-  const selectedUsers = await getMessages(
-    {
-      user: ownerId,
-      conversationId,
-      isCreatedByUser: true,
-      'metadata.viventium.interactionContext.source_event_id': sourceEventId,
-    },
-    'messageId parentMessageId isCreatedByUser createdAt',
-  );
-  const selectedUser = exactMessageById(selectedUsers);
-  const selectedUserMessageId = normalizeText(selectedUser?.messageId, 160);
-  if (!selectedUserMessageId) {
-    return resolveTrustedCurrentRevisionAnchor({
-      ownerId,
-      conversationId,
-      requestBody,
-      sourceEventId,
-      authoringSourceEventId,
-      currentAnchorMessageId,
-      currentParentMessageId,
-    });
+  async function resolveTrustedLaunchAnchor({
+    ownerId,
+    conversationId,
+    requestBody,
+    sourceEventId,
+  }: RuntimeRecord): Promise<RuntimeRecord> {
+    const currentAnchorMessageId = normalizeText(
+      requestBody.messageId || requestBody.message_id,
+      160,
+    );
+    const currentParentMessageId = normalizeText(
+      requestBody.parentMessageId || requestBody.parent_message_id,
+      160,
+    );
+    const authoringSourceEventId = normalizeText(requestBody.viventiumAuthoringSourceEventId, 160);
+    if (!authoringSourceEventId || authoringSourceEventId === sourceEventId) {
+      return {
+        anchorMessageId: currentAnchorMessageId,
+        requestedParentMessageId: currentParentMessageId,
+      };
+    }
+
+    const selectedUsers = await getMessages(
+      {
+        user: ownerId,
+        conversationId,
+        isCreatedByUser: true,
+        'metadata.viventium.interactionContext.source_event_id': sourceEventId,
+      },
+      'messageId parentMessageId isCreatedByUser createdAt',
+    );
+    const selectedUser = exactMessageById(selectedUsers);
+    const selectedUserMessageId = normalizeText(selectedUser?.messageId, 160);
+    if (!selectedUserMessageId) {
+      return resolveTrustedCurrentRevisionAnchor({
+        ownerId,
+        conversationId,
+        requestBody,
+        sourceEventId,
+        authoringSourceEventId,
+        currentAnchorMessageId,
+        currentParentMessageId,
+      });
+    }
+
+    const selectedAssistants = await getMessages(
+      {
+        user: ownerId,
+        conversationId,
+        isCreatedByUser: false,
+        parentMessageId: selectedUserMessageId,
+      },
+      'messageId parentMessageId isCreatedByUser createdAt',
+    );
+    const selectedAssistant = exactMessageById(selectedAssistants);
+    const selectedAssistantMessageId = normalizeText(selectedAssistant?.messageId, 160);
+    if (!selectedAssistantMessageId) {
+      return resolveTrustedCurrentRevisionAnchor({
+        ownerId,
+        conversationId,
+        requestBody,
+        sourceEventId,
+        authoringSourceEventId,
+        currentAnchorMessageId,
+        currentParentMessageId,
+      });
+    }
+    return {
+      anchorMessageId: selectedAssistantMessageId,
+      requestedParentMessageId: selectedUserMessageId,
+    };
   }
 
-  const selectedAssistants = await getMessages(
-    {
-      user: ownerId,
-      conversationId,
-      isCreatedByUser: false,
-      parentMessageId: selectedUserMessageId,
-    },
-    'messageId parentMessageId isCreatedByUser createdAt',
-  );
-  const selectedAssistant = exactMessageById(selectedAssistants);
-  const selectedAssistantMessageId = normalizeText(selectedAssistant?.messageId, 160);
-  if (!selectedAssistantMessageId) {
-    return resolveTrustedCurrentRevisionAnchor({
-      ownerId,
-      conversationId,
-      requestBody,
-      sourceEventId,
-      authoringSourceEventId,
-      currentAnchorMessageId,
-      currentParentMessageId,
-    });
+  function buildTrustedDelegationContext(
+    requestBody: RuntimeRecord = {},
+    sourceEventId: unknown,
+  ): RuntimeRecord {
+    const logicalTurnId = normalizeText(requestBody.viventiumLogicalTurnId, 512);
+    const surface = normalizeText(requestBody.viventiumSurface, 32).toLowerCase();
+    const triggeringSources = trustedTriggeringSourceSegments(requestBody);
+    return {
+      version: 1,
+      source_event_id: sourceEventId,
+      ...(logicalTurnId ? { logical_turn_id: logicalTurnId } : {}),
+      ...(DESTINATION_SURFACES.has(surface) ? { surface } : {}),
+      triggering_source_segments: triggeringSources.segments,
+      ...(triggeringSources.overflowCount > 0
+        ? { source_segments_overflow_count: triggeringSources.overflowCount }
+        : {}),
+    };
   }
-  return {
-    anchorMessageId: selectedAssistantMessageId,
-    requestedParentMessageId: selectedUserMessageId,
-  };
-}
 
-function buildTrustedDelegationContext(
-  requestBody: RuntimeRecord = {},
-  sourceEventId: unknown,
-): RuntimeRecord {
-  const logicalTurnId = normalizeText(requestBody.viventiumLogicalTurnId, 512);
-  const surface = normalizeText(requestBody.viventiumSurface, 32).toLowerCase();
-  const triggeringSources = trustedTriggeringSourceSegments(requestBody);
-  return {
-    version: 1,
-    source_event_id: sourceEventId,
-    ...(logicalTurnId ? { logical_turn_id: logicalTurnId } : {}),
-    ...(DESTINATION_SURFACES.has(surface) ? { surface } : {}),
-    triggering_source_segments: triggeringSources.segments,
-    ...(triggeringSources.overflowCount > 0
-      ? { source_segments_overflow_count: triggeringSources.overflowCount }
-      : {}),
-  };
-}
+  function normalizedPacketText(value: unknown, maxLength = 100_000): string {
+    return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
+  }
 
-function normalizedPacketText(value: unknown, maxLength = 100_000): string {
-  return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
-}
-
-function packetSourceSegments(context: RuntimeRecord = {}): RuntimeRecord[] {
-  return (
-    Array.isArray(context.triggering_source_segments) ? context.triggering_source_segments : []
-  ).map((segment: RuntimeRecord, ordinal: number) => ({
-    ordinal,
-    text: typeof segment?.text === 'string' ? segment.text : '',
-    ...(segment?.truncated === true ? { truncated: true } : {}),
-    ...(segment?.truncated === true && /^[a-f0-9]{64}$/.test(String(segment.original_sha256 || ''))
-      ? { original_sha256: String(segment.original_sha256).toLowerCase() }
-      : {}),
-  }));
-}
+  function packetSourceSegments(context: RuntimeRecord = {}): RuntimeRecord[] {
+    return (
+      Array.isArray(context.triggering_source_segments) ? context.triggering_source_segments : []
+    ).map((segment: RuntimeRecord, ordinal: number) => ({
+      ordinal,
+      text: typeof segment?.text === 'string' ? segment.text : '',
+      ...(segment?.truncated === true ? { truncated: true } : {}),
+      ...(segment?.truncated === true &&
+      /^[a-f0-9]{64}$/.test(String(segment.original_sha256 || ''))
+        ? { original_sha256: String(segment.original_sha256).toLowerCase() }
+        : {}),
+    }));
+  }
 
   function packetSelectedFiles(args: RuntimeRecord = {}): RuntimeRecord[] {
     const candidates = [
@@ -1150,403 +1176,417 @@ function packetSourceSegments(context: RuntimeRecord = {}): RuntimeRecord[] {
     }, []);
   }
 
-function packetExplicitConstraints(args: RuntimeRecord = {}): RuntimeRecord[] {
-  return DELEGATION_CONSTRAINT_FIELDS.reduce<RuntimeRecord[]>((constraints, kind) => {
-    const text = normalizedPacketText(args[kind]);
-    if (text) constraints.push({ kind, text });
-    return constraints;
-  }, []);
-}
-
-function buildTrustedDelegationPacket(
-  args: RuntimeRecord = {},
-  context: RuntimeRecord = {},
-): RuntimeRecord {
-  const instruction = normalizedPacketText(args.instruction || args.description);
-  const task = {
-    ...(normalizedPacketText(args.title, 10_000)
-      ? { title: normalizedPacketText(args.title, 10_000) }
-      : {}),
-    ...(instruction ? { instruction } : {}),
-    ...(normalizedPacketText(args.goal) ? { goal: normalizedPacketText(args.goal) } : {}),
-    source_segments: packetSourceSegments(context),
-  };
-  return {
-    version: 1,
-    task,
-    explicit_constraints: packetExplicitConstraints(args),
-    selected_files: packetSelectedFiles(args),
-  };
-}
-
-function authorizedToolContext(bundle: RuntimeRecord = {}): RuntimeRecord | null {
-  const broker =
-    bundle.glasshive_capability_broker &&
-    typeof bundle.glasshive_capability_broker === 'object' &&
-    !Array.isArray(bundle.glasshive_capability_broker)
-      ? bundle.glasshive_capability_broker
-      : null;
-  if (!broker) return null;
-  const uniqueTextList = (value: unknown): string[] =>
-    Array.from(
-      new Set(
-        (Array.isArray(value) ? value : [])
-          .map((item: unknown) => normalizedPacketText(item, 160))
-          .filter(Boolean),
-      ),
-    ).sort();
-  const status = normalizedPacketText(broker.status, 40).toLowerCase();
-  return {
-    broker: normalizedPacketText(broker.name, 160) || 'glasshive-user-capabilities',
-    status: status || 'available',
-    servers: uniqueTextList(broker.allowed_servers),
-    host_tools: uniqueTextList(broker.allowed_host_tools),
-    content_read: broker.scopes?.content_read === true || broker.scopes?.contentRead === true,
-  };
-}
-
-function finalizeTrustedDelegationPacket(
-  packet: RuntimeRecord = {},
-  bundle: RuntimeRecord = {},
-): RuntimeRecord {
-  const toolContext = authorizedToolContext(bundle);
-  return {
-    version: 1,
-    task: packet.task || {},
-    explicit_constraints: Array.isArray(packet.explicit_constraints)
-      ? packet.explicit_constraints
-      : [],
-    selected_files: Array.isArray(packet.selected_files) ? packet.selected_files : [],
-    ...(toolContext ? { authorized_tool_context: toolContext } : {}),
-  };
-}
-
-async function registerGlassHiveLaunchContext({
-  user,
-  requestBody = {},
-  toolName = '',
-  toolArguments = {},
-  toolCall = {},
-  signal,
-}: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
-  const ownerId = normalizeText(user?.id || user?._id);
-  const conversationId = normalizeText(requestBody.conversationId || requestBody.conversation_id);
-  const currentAnchorMessageId = normalizeText(requestBody.messageId || requestBody.message_id);
-  if (!ownerId || !conversationId || !currentAnchorMessageId) {
-    return null;
+  function packetExplicitConstraints(args: RuntimeRecord = {}): RuntimeRecord[] {
+    return DELEGATION_CONSTRAINT_FIELDS.reduce<RuntimeRecord[]>((constraints, kind) => {
+      const text = normalizedPacketText(args[kind]);
+      if (text) constraints.push({ kind, text });
+      return constraints;
+    }, []);
   }
 
-  const destinations = configuredDestinationsFromRequest(requestBody);
-  const args =
-    toolArguments && typeof toolArguments === 'object' && !Array.isArray(toolArguments)
-      ? toolArguments
-      : {};
-  const trustedCallIdentity = resolveTrustedGlassHiveCallIdentity({ requestBody, toolCall });
-  const { sourceEventId, objectiveOrdinal, callIdentityDigest } = trustedCallIdentity;
-  const { anchorMessageId, requestedParentMessageId } = await resolveTrustedLaunchAnchor({
-    ownerId,
-    conversationId,
-    requestBody,
-    sourceEventId,
-  });
-  const canonicalObjective = canonicalObjectiveIdentity(toolName, args);
-  const trustedDelegation = buildTrustedDelegationIdentity({
-    ownerId,
-    sourceEventId,
-    objectiveOrdinal,
-    callIdentityDigest,
-    goal: canonicalObjective,
-  });
-  const objectiveDigest = trustedDelegation.goalDigest;
-  const delegationIdentity = {
-    version: 1,
-    idempotency_key: trustedDelegation.idempotencyKey,
-    goal_digest: objectiveDigest,
-    source_event_id: sourceEventId,
-    objective_ordinal: objectiveOrdinal,
-    call_identity_digest: callIdentityDigest,
-  };
-  const delegationContext = buildTrustedDelegationContext(requestBody, sourceEventId);
-  const delegationPacket = buildTrustedDelegationPacket(args, delegationContext);
-  /* === VIVENTIUM START ===
-   * Feature: Durable launch intent identity.
-   * Purpose: This Core-owned ref identifies the dispatch intent and delivery contract only. It is
-   * never presented as GlassHive work identity; the authoritative workRef is bound after dispatch
-   * or repaired from a verified callback when the launch response was lost.
-   * === VIVENTIUM END === */
-  const originRef = opaqueRef('ghi', ownerId, sourceEventId, callIdentityDigest, objectiveDigest);
-  const bindingId = originRef;
-  const schedulerDispatchDocumentId = normalizeText(
-    requestBody.viventiumSchedulerDispatchDocumentId,
-  );
-  const scheduleOccurrenceKey = normalizeText(requestBody.viventiumSchedulerOccurrenceKey);
-  const scheduleId = normalizeText(requestBody.viventiumScheduleId || requestBody.scheduleId);
-  const requiredExternalWork =
-    Boolean(schedulerDispatchDocumentId || scheduleOccurrenceKey) &&
-    requestBody.viventiumSchedulerExternalWorkRequired === true;
-  const now = new Date();
-  const preparationExpiresAt = new Date(now.getTime() + launchPreparationLeaseMs());
-  // VIVENTIUM START: Anchor resolution may outlive the exact authoring request.
-  signal?.throwIfAborted();
-  // VIVENTIUM END
-  await callbackBindingCollection().updateOne(
-    { _id: bindingId },
-    {
-      $setOnInsert: {
-        _id: bindingId,
-        bindingId,
-        ownerId,
-        conversationId,
-        anchorMessageId,
-        requestedParentMessageId,
-        configuredDestinations: destinations,
-        schedulerDispatchDocumentId,
-        scheduleOccurrenceKey,
-        scheduleId,
-        originRef,
-        workRef: '',
-        launchState: 'prepared',
-        preparationExpiresAt,
-        sourceEventId,
-        objectiveOrdinal,
-        objectiveDigest,
-        callIdentityDigest,
-        mainAgentId: normalizeText(
-          requestBody.agent_id || requestBody.agentId || requestBody.endpointOption?.agent_id,
-          160,
+  function buildTrustedDelegationPacket(
+    args: RuntimeRecord = {},
+    context: RuntimeRecord = {},
+  ): RuntimeRecord {
+    const instruction = normalizedPacketText(args.instruction || args.description);
+    const task = {
+      ...(normalizedPacketText(args.title, 10_000)
+        ? { title: normalizedPacketText(args.title, 10_000) }
+        : {}),
+      ...(instruction ? { instruction } : {}),
+      ...(normalizedPacketText(args.goal) ? { goal: normalizedPacketText(args.goal) } : {}),
+      source_segments: packetSourceSegments(context),
+    };
+    return {
+      version: 1,
+      task,
+      explicit_constraints: packetExplicitConstraints(args),
+      selected_files: packetSelectedFiles(args),
+    };
+  }
+
+  function authorizedToolContext(bundle: RuntimeRecord = {}): RuntimeRecord | null {
+    const broker =
+      bundle.glasshive_capability_broker &&
+      typeof bundle.glasshive_capability_broker === 'object' &&
+      !Array.isArray(bundle.glasshive_capability_broker)
+        ? bundle.glasshive_capability_broker
+        : null;
+    if (!broker) return null;
+    const uniqueTextList = (value: unknown): string[] =>
+      Array.from(
+        new Set(
+          (Array.isArray(value) ? value : [])
+            .map((item: unknown) => normalizedPacketText(item, 160))
+            .filter(Boolean),
         ),
-        ...(isFeelingsReadIsolated(requestBody)
-          ? { feelingsIsolated: true } : {}),
-        createdAt: now,
+      ).sort();
+    const status = normalizedPacketText(broker.status, 40).toLowerCase();
+    return {
+      broker: normalizedPacketText(broker.name, 160) || 'glasshive-user-capabilities',
+      status: status || 'available',
+      servers: uniqueTextList(broker.allowed_servers),
+      host_tools: uniqueTextList(broker.allowed_host_tools),
+      content_read: broker.scopes?.content_read === true || broker.scopes?.contentRead === true,
+    };
+  }
+
+  function finalizeTrustedDelegationPacket(
+    packet: RuntimeRecord = {},
+    bundle: RuntimeRecord = {},
+  ): RuntimeRecord {
+    const toolContext = authorizedToolContext(bundle);
+    return {
+      version: 1,
+      task: packet.task || {},
+      explicit_constraints: Array.isArray(packet.explicit_constraints)
+        ? packet.explicit_constraints
+        : [],
+      selected_files: Array.isArray(packet.selected_files) ? packet.selected_files : [],
+      ...(toolContext ? { authorized_tool_context: toolContext } : {}),
+    };
+  }
+
+  async function registerGlassHiveLaunchContext({
+    user,
+    requestBody = {},
+    toolName = '',
+    toolArguments = {},
+    toolCall = {},
+    signal,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
+    const ownerId = normalizeText(user?.id || user?._id);
+    const conversationId = normalizeText(requestBody.conversationId || requestBody.conversation_id);
+    const currentAnchorMessageId = normalizeText(requestBody.messageId || requestBody.message_id);
+    if (!ownerId || !conversationId || !currentAnchorMessageId) {
+      return null;
+    }
+
+    const destinations = configuredDestinationsFromRequest(requestBody);
+    const args =
+      toolArguments && typeof toolArguments === 'object' && !Array.isArray(toolArguments)
+        ? toolArguments
+        : {};
+    const trustedCallIdentity = resolveTrustedGlassHiveCallIdentity({ requestBody, toolCall });
+    const { sourceEventId, objectiveOrdinal, callIdentityDigest } = trustedCallIdentity;
+    const { anchorMessageId, requestedParentMessageId } = await resolveTrustedLaunchAnchor({
+      ownerId,
+      conversationId,
+      requestBody,
+      sourceEventId,
+    });
+    const canonicalObjective = canonicalObjectiveIdentity(toolName, args);
+    const trustedDelegation = buildTrustedDelegationIdentity({
+      ownerId,
+      sourceEventId,
+      objectiveOrdinal,
+      callIdentityDigest,
+      goal: canonicalObjective,
+    });
+    const objectiveDigest = trustedDelegation.goalDigest;
+    const delegationIdentity = {
+      version: 1,
+      idempotency_key: trustedDelegation.idempotencyKey,
+      goal_digest: objectiveDigest,
+      source_event_id: sourceEventId,
+      objective_ordinal: objectiveOrdinal,
+      call_identity_digest: callIdentityDigest,
+    };
+    const delegationContext = buildTrustedDelegationContext(requestBody, sourceEventId);
+    const delegationPacket = buildTrustedDelegationPacket(args, delegationContext);
+    /* === VIVENTIUM START ===
+     * Feature: Durable launch intent identity.
+     * Purpose: This Core-owned ref identifies the dispatch intent and delivery contract only. It is
+     * never presented as GlassHive work identity; the authoritative workRef is bound after dispatch
+     * or repaired from a verified callback when the launch response was lost.
+     * === VIVENTIUM END === */
+    const originRef = opaqueRef('ghi', ownerId, sourceEventId, callIdentityDigest, objectiveDigest);
+    const bindingId = originRef;
+    const schedulerDispatchDocumentId = normalizeText(
+      requestBody.viventiumSchedulerDispatchDocumentId,
+    );
+    const scheduleOccurrenceKey = normalizeText(requestBody.viventiumSchedulerOccurrenceKey);
+    const scheduleId = normalizeText(requestBody.viventiumScheduleId || requestBody.scheduleId);
+    const requiredExternalWork =
+      Boolean(schedulerDispatchDocumentId || scheduleOccurrenceKey) &&
+      requestBody.viventiumSchedulerExternalWorkRequired === true;
+    const now = new Date();
+    const preparationExpiresAt = new Date(now.getTime() + launchPreparationLeaseMs());
+    // VIVENTIUM START: Anchor resolution may outlive the exact authoring request.
+    signal?.throwIfAborted();
+    // VIVENTIUM END
+    await callbackBindingCollection().updateOne(
+      { _id: bindingId },
+      {
+        $setOnInsert: {
+          _id: bindingId,
+          bindingId,
+          ownerId,
+          conversationId,
+          anchorMessageId,
+          requestedParentMessageId,
+          configuredDestinations: destinations,
+          schedulerDispatchDocumentId,
+          scheduleOccurrenceKey,
+          scheduleId,
+          originRef,
+          workRef: '',
+          launchState: 'prepared',
+          preparationExpiresAt,
+          sourceEventId,
+          objectiveOrdinal,
+          objectiveDigest,
+          callIdentityDigest,
+          mainAgentId: normalizeText(
+            requestBody.agent_id || requestBody.agentId || requestBody.endpointOption?.agent_id,
+            160,
+          ),
+          ...(isFeelingsReadIsolated(requestBody) ? { feelingsIsolated: true } : {}),
+          createdAt: now,
+        },
+        $set: {
+          updatedAt: now,
+        },
       },
-      $set: {
-        updatedAt: now,
+      { upsert: true },
+    );
+
+    await externalWorkCollection().updateOne(
+      { _id: originRef },
+      {
+        $setOnInsert: {
+          _id: originRef,
+          originRef,
+          workRef: '',
+          ownerId,
+          conversationId,
+          anchorMessageId,
+          requestedParentMessageId,
+          deliveryBindingId: originRef,
+          schedulerDispatchDocumentId,
+          scheduleOccurrenceKey,
+          scheduleId,
+          sourceEventId,
+          objectiveOrdinal,
+          objectiveDigest,
+          callIdentityDigest,
+          required: requiredExternalWork,
+          configuredDestinations: destinations.map(({ surface }) => surface),
+          externalState: 'preparing',
+          launchState: 'prepared',
+          preparationExpiresAt,
+          workerId: '',
+          runId: '',
+          createdAt: now,
+        },
+        $set: { updatedAt: now },
       },
-    },
-    { upsert: true },
-  );
+      { upsert: true },
+    );
 
-  await externalWorkCollection().updateOne(
-    { _id: originRef },
-    {
-      $setOnInsert: {
-        _id: originRef,
-        originRef,
-        workRef: '',
-        ownerId,
-        conversationId,
-        anchorMessageId,
-        requestedParentMessageId,
-        deliveryBindingId: originRef,
-        schedulerDispatchDocumentId,
-        scheduleOccurrenceKey,
-        scheduleId,
-        sourceEventId,
-        objectiveOrdinal,
-        objectiveDigest,
-        callIdentityDigest,
-        required: requiredExternalWork,
-        configuredDestinations: destinations.map(({ surface }) => surface),
-        externalState: 'preparing',
-        launchState: 'prepared',
-        preparationExpiresAt,
-        workerId: '',
-        runId: '',
-        createdAt: now,
-      },
-      $set: { updatedAt: now },
-    },
-    { upsert: true },
-  );
+    await recordOrchestrationTraceLaunch({
+      ownerId,
+      originRef,
+      sourceEventRef: sourceEventId,
+      logicalTurnRef: normalizeText(
+        requestBody.viventiumLogicalTurnId ||
+          requestBody?.viventiumInteractionContext?.logical_turn_id,
+        512,
+      ),
+      promptLayers: promptLayerIntegritySnapshot(),
+      at: now,
+    });
 
-  await recordOrchestrationTraceLaunch({
-    ownerId,
-    originRef,
-    sourceEventRef: sourceEventId,
-    logicalTurnRef: normalizeText(
-      requestBody.viventiumLogicalTurnId ||
-        requestBody?.viventiumInteractionContext?.logical_turn_id,
-      512,
-    ),
-    promptLayers: promptLayerIntegritySnapshot(),
-    at: now,
-  });
+    logger.info('[VIVENTIUM][glasshive-binding] launch bound', {
+      bindingId,
+      originRef,
+      ownerId,
+      sourceEventId,
+      objectiveOrdinal,
+      scheduled: Boolean(scheduleOccurrenceKey),
+      required: requiredExternalWork,
+      destinations: destinations.map(({ surface }) => surface),
+    });
+    return {
+      bindingId,
+      originRef,
+      sourceEventId,
+      objectiveOrdinal,
+      objectiveDigest,
+      callIdentityDigest,
+      delegationIdentity,
+      delegationContext,
+      delegationPacket,
+      ownerId,
+      schedulerDispatchDocumentId,
+      scheduleOccurrenceKey,
+      required: requiredExternalWork,
+    };
+  }
 
-  logger.info('[VIVENTIUM][glasshive-binding] launch bound', {
-    bindingId,
-    originRef,
-    ownerId,
-    sourceEventId,
-    objectiveOrdinal,
-    scheduled: Boolean(scheduleOccurrenceKey),
-    required: requiredExternalWork,
-    destinations: destinations.map(({ surface }) => surface),
-  });
-  return {
-    bindingId,
-    originRef,
-    sourceEventId,
-    objectiveOrdinal,
-    objectiveDigest,
-    callIdentityDigest,
-    delegationIdentity,
-    delegationContext,
-    delegationPacket,
-    ownerId,
-    schedulerDispatchDocumentId,
-    scheduleOccurrenceKey,
-    required: requiredExternalWork,
-  };
-}
-
-async function resolveTelegramDestination(
-  ownerId: unknown,
-  destination: RuntimeRecord = {},
-): Promise<RuntimeRecord> {
-  const boundChatId = normalizeText(destination.telegramChatId);
-  const boundUserId = normalizeText(destination.telegramUserId);
-  if (boundChatId || boundUserId) {
+  async function resolveTelegramDestination(
+    ownerId: unknown,
+    destination: RuntimeRecord = {},
+  ): Promise<RuntimeRecord> {
+    const boundChatId = normalizeText(destination.telegramChatId);
+    const boundUserId = normalizeText(destination.telegramUserId);
+    if (boundChatId || boundUserId) {
+      return {
+        surface: 'telegram',
+        telegramChatId: boundChatId || boundUserId,
+        telegramUserId: boundUserId || boundChatId,
+        ...(destination.telegramMessageThreadId
+          ? { telegramMessageThreadId: normalizeText(destination.telegramMessageThreadId) }
+          : {}),
+        ...(destination.telegramMessageId
+          ? { telegramMessageId: normalizeText(destination.telegramMessageId) }
+          : {}),
+      };
+    }
+    const mapping = await resolveTelegramMappingByUserId({
+      libreChatUserId: normalizeText(ownerId, 160),
+    });
+    const telegramUserId = normalizeText(mapping?.telegramUserId);
+    const telegramChatId = normalizeText(mapping?.telegramChatId || telegramUserId);
+    if (!telegramUserId || !telegramChatId) {
+      return { surface: 'telegram', unresolvedReason: 'telegram_mapping_not_found' };
+    }
     return {
       surface: 'telegram',
-      telegramChatId: boundChatId || boundUserId,
-      telegramUserId: boundUserId || boundChatId,
+      telegramChatId,
+      telegramUserId,
       ...(destination.telegramMessageThreadId
         ? { telegramMessageThreadId: normalizeText(destination.telegramMessageThreadId) }
         : {}),
-      ...(destination.telegramMessageId
-        ? { telegramMessageId: normalizeText(destination.telegramMessageId) }
-        : {}),
     };
   }
-  const mapping = await resolveTelegramMappingByUserId({
-    libreChatUserId: normalizeText(ownerId, 160),
-  });
-  const telegramUserId = normalizeText(mapping?.telegramUserId);
-  const telegramChatId = normalizeText(mapping?.telegramChatId || telegramUserId);
-  if (!telegramUserId || !telegramChatId) {
-    return { surface: 'telegram', unresolvedReason: 'telegram_mapping_not_found' };
-  }
-  return { surface: 'telegram', telegramChatId, telegramUserId };
-}
 
-function parseJsonObject(value: unknown): RuntimeRecord | null {
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
-  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 256 * 1024) return null;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
+  function parseJsonObject(value: unknown): RuntimeRecord | null {
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+    if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 256 * 1024) return null;
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
   }
-}
 
-function stripMissionRoutingIdentity(value: unknown, depth = 0): unknown {
-  if (depth > 12 || value == null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) {
-    return value.map((item) => stripMissionRoutingIdentity(item, depth + 1));
+  function stripMissionRoutingIdentity(value: unknown, depth = 0): unknown {
+    if (depth > 12 || value == null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+      return value.map((item) => stripMissionRoutingIdentity(item, depth + 1));
+    }
+    const clean: RuntimeRecord = {};
+    for (const [key, child] of Object.entries(value)) {
+      const canonicalKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (MISSION_ROUTING_IDENTITY_KEYS.has(canonicalKey)) continue;
+      clean[key] = stripMissionRoutingIdentity(child, depth + 1);
+    }
+    return clean;
   }
-  const clean: RuntimeRecord = {};
-  for (const [key, child] of Object.entries(value)) {
-    const canonicalKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (MISSION_ROUTING_IDENTITY_KEYS.has(canonicalKey)) continue;
-    clean[key] = stripMissionRoutingIdentity(child, depth + 1);
+
+  function glassHiveLaunchOriginFromArguments(toolArguments: unknown): string {
+    const args = parseJsonObject(toolArguments);
+    if (!args) return '';
+    const bundle = parseJsonObject(args.bootstrap_bundle_json);
+    return normalizeText(bundle?.callbacks?.origin_ref, 160);
   }
-  return clean;
-}
 
-function glassHiveLaunchOriginFromArguments(toolArguments: unknown): string {
-  const args = parseJsonObject(toolArguments);
-  if (!args) return '';
-  const bundle = parseJsonObject(args.bootstrap_bundle_json);
-  return normalizeText(bundle?.callbacks?.origin_ref, 160);
-}
-
-/** Attach the Core-owned launch intent after reading any model-provided bundle. */
-function attachGlassHiveLaunchOrigin(toolArguments: unknown, originRef: unknown): unknown {
-  const args = parseJsonObject(toolArguments);
-  const normalizedOriginRef = normalizeText(originRef, 160);
-  if (!args || !normalizedOriginRef) return toolArguments;
-  args.bootstrap_bundle_json = {
-    // Callback URL, HMAC, surface identity, and anchors come only from trusted server config.
-    // This lower-level boundary preserves no model-supplied bundle fields.
-    callbacks: { origin_ref: normalizedOriginRef },
-  };
-  return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
-}
-
-/**
- * Overwrite every launch-security field after parsing the model's bundle. This is the sole helper
- * used by the MCP dispatch path; protected values always come from Core registration.
- */
-function attachGlassHiveTrustedLaunchMetadata(
-  toolArguments: unknown,
-  launchContext: RuntimeRecord = {},
-  trustedBootstrapBundle: RuntimeRecord = {},
-): unknown {
-  const originRef = normalizeText(launchContext.originRef, 160);
-  const identity = launchContext.delegationIdentity;
-  const context = launchContext.delegationContext;
-  const ordinal = Number(identity?.objective_ordinal);
-  const callIdentityDigest = normalizeText(identity?.call_identity_digest, 64).toLowerCase();
-  if (
-    !originRef ||
-    identity?.version !== 1 ||
-    !/^[a-f0-9]{64}$/.test(normalizeText(identity.idempotency_key, 64).toLowerCase()) ||
-    !/^[a-f0-9]{64}$/.test(normalizeText(identity.goal_digest, 64).toLowerCase()) ||
-    !/^[a-f0-9]{64}$/.test(callIdentityDigest) ||
-    !normalizeText(identity.source_event_id, 512) ||
-    !Number.isInteger(ordinal) ||
-    ordinal < 0 ||
-    context?.version !== 1 ||
-    normalizeText(context.source_event_id, 512) !== normalizeText(identity.source_event_id, 512) ||
-    !Array.isArray(context.triggering_source_segments)
-  ) {
-    throw new Error('glasshive_trusted_launch_metadata_invalid');
+  /** Attach the Core-owned launch intent after reading any model-provided bundle. */
+  function attachGlassHiveLaunchOrigin(toolArguments: unknown, originRef: unknown): unknown {
+    const args = parseJsonObject(toolArguments);
+    const normalizedOriginRef = normalizeText(originRef, 160);
+    if (!args || !normalizedOriginRef) return toolArguments;
+    args.bootstrap_bundle_json = {
+      // Callback URL, HMAC, surface identity, and anchors come only from trusted server config.
+      // This lower-level boundary preserves no model-supplied bundle fields.
+      callbacks: { origin_ref: normalizedOriginRef },
+    };
+    return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
   }
-  const args = parseJsonObject(toolArguments);
-  if (!args) throw new Error('glasshive_launch_arguments_invalid');
-  // The model-supplied bundle is never a prompt authority. The caller must pass the exact
-  // server-built capability/Feelings bundle separately after trusted projection is complete.
-  const bundle = parseJsonObject(trustedBootstrapBundle) || {};
+
+  /**
+   * Overwrite every launch-security field after parsing the model's bundle. This is the sole helper
+   * used by the MCP dispatch path; protected values always come from Core registration.
+   */
+  function attachGlassHiveTrustedLaunchMetadata(
+    toolArguments: unknown,
+    launchContext: RuntimeRecord = {},
+    trustedBootstrapBundle: RuntimeRecord = {},
+  ): unknown {
+    const originRef = normalizeText(launchContext.originRef, 160);
+    const identity = launchContext.delegationIdentity;
+    const context = launchContext.delegationContext;
+    const ordinal = Number(identity?.objective_ordinal);
+    const callIdentityDigest = normalizeText(identity?.call_identity_digest, 64).toLowerCase();
+    if (
+      !originRef ||
+      identity?.version !== 1 ||
+      !/^[a-f0-9]{64}$/.test(normalizeText(identity.idempotency_key, 64).toLowerCase()) ||
+      !/^[a-f0-9]{64}$/.test(normalizeText(identity.goal_digest, 64).toLowerCase()) ||
+      !/^[a-f0-9]{64}$/.test(callIdentityDigest) ||
+      !normalizeText(identity.source_event_id, 512) ||
+      !Number.isInteger(ordinal) ||
+      ordinal < 0 ||
+      context?.version !== 1 ||
+      normalizeText(context.source_event_id, 512) !==
+        normalizeText(identity.source_event_id, 512) ||
+      !Array.isArray(context.triggering_source_segments)
+    ) {
+      throw new Error('glasshive_trusted_launch_metadata_invalid');
+    }
+    const args = parseJsonObject(toolArguments);
+    if (!args) throw new Error('glasshive_launch_arguments_invalid');
+    // The model-supplied bundle is never a prompt authority. The caller must pass the exact
+    // server-built capability/Feelings bundle separately after trusted projection is complete.
+    const bundle = parseJsonObject(trustedBootstrapBundle) || {};
     // Registration already bounded these text-only segments before building the matching packet.
     // Re-normalizing without their separate file descriptors would drop file-only authored sources.
-  const cleanBundle = stripMissionRoutingIdentity(bundle) as RuntimeRecord;
-  // Preserve trusted conversation data byte-for-byte on this signed hop. Re-serializing numbers
-  // or lone surrogates in another language must not invalidate an otherwise exact source.
-  // Historical tool arguments are data, not bootstrap routing/security authority.
-  if (bundle.inherited_conversation !== undefined) {
-    if (!bundle.inherited_conversation || typeof bundle.inherited_conversation !== 'object' ||
-        Array.isArray(bundle.inherited_conversation)) {
-      throw new Error('inherited_conversation_invalid');
+    const cleanBundle = stripMissionRoutingIdentity(bundle) as RuntimeRecord;
+    // Preserve trusted conversation data byte-for-byte on this signed hop. Re-serializing numbers
+    // or lone surrogates in another language must not invalidate an otherwise exact source.
+    // Historical tool arguments are data, not bootstrap routing/security authority.
+    if (bundle.inherited_conversation !== undefined) {
+      if (
+        !bundle.inherited_conversation ||
+        typeof bundle.inherited_conversation !== 'object' ||
+        Array.isArray(bundle.inherited_conversation)
+      ) {
+        throw new Error('inherited_conversation_invalid');
+      }
+      cleanBundle.inherited_conversation = JSON.stringify(bundle.inherited_conversation);
     }
-    cleanBundle.inherited_conversation = JSON.stringify(bundle.inherited_conversation);
-  }
-  const packetBase = launchContext.delegationPacket || buildTrustedDelegationPacket(args, context);
-  const trustedIdentity = {
-    version: 2,
-    idempotency_key: normalizeText(identity.idempotency_key, 64).toLowerCase(),
-    goal_digest: normalizeText(identity.goal_digest, 64).toLowerCase(),
-    launch_payload_digest: delegationLaunchPayloadDigest(args, cleanBundle.inherited_conversation),
-    source_event_id: normalizeText(identity.source_event_id, 512),
-    objective_ordinal: ordinal,
-    call_identity_digest: callIdentityDigest,
-  };
-  args.bootstrap_bundle_json = {
-    ...cleanBundle,
-    callbacks: { origin_ref: originRef },
-    viventium_delegation_identity: trustedIdentity,
-    viventium_delegation_assertion: signTrustedDelegationIdentity(trustedIdentity, {
-      ownerId: launchContext.ownerId,
-    }),
-    viventium_delegation_context: {
-      version: 1,
-      source_event_id: normalizeText(context.source_event_id, 512),
-      ...(normalizeText(context.logical_turn_id, 512)
-        ? { logical_turn_id: normalizeText(context.logical_turn_id, 512) }
-        : {}),
-      ...(DESTINATION_SURFACES.has(normalizeText(context.surface, 32).toLowerCase())
-        ? { surface: normalizeText(context.surface, 32).toLowerCase() }
-        : {}),
+    const packetBase =
+      launchContext.delegationPacket || buildTrustedDelegationPacket(args, context);
+    const trustedIdentity = {
+      version: 2,
+      idempotency_key: normalizeText(identity.idempotency_key, 64).toLowerCase(),
+      goal_digest: normalizeText(identity.goal_digest, 64).toLowerCase(),
+      launch_payload_digest: delegationLaunchPayloadDigest(
+        args,
+        cleanBundle.inherited_conversation,
+      ),
+      source_event_id: normalizeText(identity.source_event_id, 512),
+      objective_ordinal: ordinal,
+      call_identity_digest: callIdentityDigest,
+    };
+    args.bootstrap_bundle_json = {
+      ...cleanBundle,
+      callbacks: { origin_ref: originRef },
+      viventium_delegation_identity: trustedIdentity,
+      viventium_delegation_assertion: signTrustedDelegationIdentity(trustedIdentity, {
+        ownerId: launchContext.ownerId,
+      }),
+      viventium_delegation_context: {
+        version: 1,
+        source_event_id: normalizeText(context.source_event_id, 512),
+        ...(normalizeText(context.logical_turn_id, 512)
+          ? { logical_turn_id: normalizeText(context.logical_turn_id, 512) }
+          : {}),
+        ...(DESTINATION_SURFACES.has(normalizeText(context.surface, 32).toLowerCase())
+          ? { surface: normalizeText(context.surface, 32).toLowerCase() }
+          : {}),
         triggering_source_segments: projectTriggeringTextSegments(
           context.triggering_source_segments,
           normalizeText(context.source_event_id, 160),
@@ -1554,341 +1594,401 @@ function attachGlassHiveTrustedLaunchMetadata(
         ...(context.source_segments_overflow_count > 0
           ? { source_segments_overflow_count: context.source_segments_overflow_count }
           : {}),
-    },
-    viventium_delegation_packet: finalizeTrustedDelegationPacket(
-      packetBase as RuntimeRecord,
-      cleanBundle,
-    ),
-  };
-  return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
-}
+      },
+      viventium_delegation_packet: finalizeTrustedDelegationPacket(
+        packetBase as RuntimeRecord,
+        cleanBundle,
+      ),
+    };
+    return typeof toolArguments === 'string' ? JSON.stringify(args) : args;
+  }
 
-function findAuthoritativeWorkRef(
-  value: unknown,
-  depth = 0,
-  visited = new Set<object>(),
-): string {
-  if (depth > 8 || value == null) return '';
-  if (typeof value === 'string') {
-    const parsed = parseJsonObject(value);
-    return parsed ? findAuthoritativeWorkRef(parsed, depth + 1, visited) : '';
+  function findAuthoritativeWorkRef(
+    value: unknown,
+    depth = 0,
+    visited = new Set<object>(),
+  ): string {
+    if (depth > 8 || value == null) return '';
+    if (typeof value === 'string') {
+      const parsed = parseJsonObject(value);
+      return parsed ? findAuthoritativeWorkRef(parsed, depth + 1, visited) : '';
+    }
+    if (typeof value !== 'object' || visited.has(value)) return '';
+    visited.add(value);
+    if (!Array.isArray(value)) {
+      const record = value as RuntimeRecord;
+      const direct = normalizeText(record.work_ref || record.workRef, 160);
+      if (direct) return direct;
+    }
+    for (const child of Array.isArray(value) ? value : Object.values(value)) {
+      const found = findAuthoritativeWorkRef(child, depth + 1, visited);
+      if (found) return found;
+    }
+    return '';
   }
-  if (typeof value !== 'object' || visited.has(value)) return '';
-  visited.add(value);
-  if (!Array.isArray(value)) {
-    const record = value as RuntimeRecord;
-    const direct = normalizeText(record.work_ref || record.workRef, 160);
-    if (direct) return direct;
-  }
-  for (const child of Array.isArray(value) ? value : Object.values(value)) {
-    const found = findAuthoritativeWorkRef(child, depth + 1, visited);
-    if (found) return found;
-  }
-  return '';
-}
 
-async function reconcileGlassHiveLaunchResult(
-  { toolArguments, result }: RuntimeRecord = {},
-): Promise<RuntimeRecord | null> {
-  const originRef = glassHiveLaunchOriginFromArguments(toolArguments);
-  const workRef = findAuthoritativeWorkRef(result);
-  if (!originRef || !workRef) return null;
-  const now = new Date();
-  const filter = { _id: originRef, $or: [{ workRef: '' }, { workRef }] };
-  const binding = await callbackBindingCollection().findOne({ _id: originRef });
-  await callbackBindingCollection().updateOne(filter, {
-    $set: { workRef, launchState: 'accepted', updatedAt: now },
-    $unset: { dispatchExpiresAt: 1 },
-  });
-  await externalWorkCollection().updateOne(filter, {
-    $set: { workRef, launchState: 'accepted', updatedAt: now },
-    $unset: { dispatchExpiresAt: 1 },
-  });
-  if (binding?.ownerId) {
-    await recordOrchestrationTraceAcceptedLaunch({
-      ownerId: normalizeText(binding.ownerId, 160),
-      originRef,
-      workRef,
-      at: now,
+  async function reconcileGlassHiveLaunchResult({
+    toolArguments,
+    result,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
+    const originRef = glassHiveLaunchOriginFromArguments(toolArguments);
+    const workRef = findAuthoritativeWorkRef(result);
+    if (!originRef || !workRef) return null;
+    const now = new Date();
+    const filter = { _id: originRef, $or: [{ workRef: '' }, { workRef }] };
+    const binding = await callbackBindingCollection().findOne({ _id: originRef });
+    await callbackBindingCollection().updateOne(filter, {
+      $set: { workRef, launchState: 'accepted', updatedAt: now },
+      $unset: { dispatchExpiresAt: 1 },
     });
-  }
-  return { originRef, workRef };
-}
-
-/** Mark a fully prepared launch immediately before the MCP transport may observe it. */
-async function markGlassHiveLaunchDispatchReady(
-  launchContext: RuntimeRecord = {},
-): Promise<RuntimeRecord | null> {
-  const originRef = normalizeText(launchContext.originRef, 160);
-  const ownerId = normalizeText(launchContext.ownerId, 160);
-  if (!originRef || !ownerId) return null;
-  const now = new Date();
-  const dispatchExpiresAt = new Date(now.getTime() + launchDispatchAmbiguityLeaseMs());
-  const filter = {
-    _id: originRef,
-    ownerId,
-    workRef: '',
-    launchState: 'prepared',
-  };
-  const bindingUpdate = {
-    $set: { launchState: 'dispatch_ready', dispatchExpiresAt, updatedAt: now },
-    $unset: { preparationExpiresAt: 1, preDispatchFailureCode: 1, preDispatchFailedAt: 1 },
-  };
-  const workUpdate = {
-    $set: {
-      launchState: 'dispatch_ready',
-      externalState: 'accepted',
-      dispatchExpiresAt,
-      updatedAt: now,
-    },
-    $unset: {
-      preparationExpiresAt: 1,
-      preDispatchFailureCode: 1,
-      preDispatchFailedAt: 1,
-      terminalAt: 1,
-    },
-  };
-  /* === VIVENTIUM START === A closed reservation cannot regain dispatch authority. === */
-  const bindingResult = await callbackBindingCollection().updateOne(filter, bindingUpdate);
-  if (bindingResult.acknowledged !== true || bindingResult.matchedCount !== 1) {
-    throw Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
-      code: 'glasshive_launch_dispatch_fenced',
-      retryable: false,
+    await externalWorkCollection().updateOne(filter, {
+      $set: { workRef, launchState: 'accepted', updatedAt: now },
+      $unset: { dispatchExpiresAt: 1 },
     });
-  }
-  const workResult = await externalWorkCollection().updateOne(filter, workUpdate);
-  if (workResult.acknowledged !== true || workResult.matchedCount !== 1) {
-    throw Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
-      code: 'glasshive_launch_dispatch_fenced',
-      retryable: false,
-    });
-  }
-  /* === VIVENTIUM END === */
-  // This hint is set only after every Core-side prerequisite has succeeded. From here onward an
-  // MCP transport error is ambiguous and the ordinary dispatch_unknown reconciler owns it.
-  await requireParallelWorkPositiveFence(ownerId);
-  return { originRef, launchState: 'dispatch_ready' };
-}
-
-/** Close a launch that provably failed before dispatch or was verified absent after its lease. */
-async function markGlassHiveLaunchPreDispatchFailed(
-  launchContext: RuntimeRecord = {},
-  error?: RuntimeError | RuntimeRecord,
-): Promise<RuntimeRecord | null> {
-  const originRef = normalizeText(launchContext.originRef, 160);
-  const ownerId = normalizeText(launchContext.ownerId, 160);
-  if (!originRef || !ownerId) return null;
-  const now = new Date();
-  const failureCode = normalizeText(
-    error?.code || error?.name || 'launch_pre_dispatch_failed',
-    120,
-  );
-  const filter = {
-    _id: originRef,
-    workRef: '',
-    launchState: { $in: ['prepared', 'dispatch_ready', 'dispatch_unknown'] },
-  };
-  const common = {
-    launchState: 'not_dispatched',
-    preDispatchFailureCode: failureCode,
-    preDispatchFailedAt: now,
-    updatedAt: now,
-  };
-  await callbackBindingCollection().updateOne(filter, {
-    $set: common,
-    $unset: { preparationExpiresAt: 1, dispatchExpiresAt: 1 },
-  });
-  await externalWorkCollection().updateOne(filter, {
-    $set: {
-      ...common,
-      externalState: 'failed',
-      terminalAt: now,
-      attentionPending: true,
-      deliveryState: 'failed',
-    },
-    $unset: { preparationExpiresAt: 1, dispatchExpiresAt: 1 },
-  });
-
-  await recordOrchestrationTraceFailedLaunch({ ownerId, originRef, at: now });
-
-  // No GlassHive workRef exists, but the failed launch itself is durable account work that needs
-  // acknowledgement. Publish the positive hint after its attention row commits; only a fresh
-  // owner-scoped roster after dismissal may clear the account-global hint.
-  await requireParallelWorkPositiveFence(ownerId);
-
-  if (
-    launchContext.required === true &&
-    (launchContext.schedulerDispatchDocumentId || launchContext.scheduleOccurrenceKey)
-  ) {
-    try {
-      const binding = {
-        ownerId,
-        schedulerDispatchDocumentId: normalizeText(launchContext.schedulerDispatchDocumentId, 160),
-        scheduleOccurrenceKey: normalizeText(launchContext.scheduleOccurrenceKey, 160),
-      };
-      const summary = await getSchedulerExternalWorkSummary(binding);
-      await notifySchedulerExternalWorkSummary({ binding, summary });
-    } catch (schedulerError) {
-      const runtimeError = schedulerError as RuntimeError;
-      logger.warn('[VIVENTIUM][glasshive-binding] Pre-dispatch schedule reconciliation failed', {
+    if (binding?.ownerId) {
+      await recordOrchestrationTraceAcceptedLaunch({
+        ownerId: normalizeText(binding.ownerId, 160),
         originRef,
-        code: normalizeText(runtimeError.code || runtimeError.name, 120),
+        workRef,
+        at: now,
       });
     }
+    return { originRef, workRef };
   }
-  return { originRef, launchState: 'not_dispatched', externalState: 'failed' };
-}
 
-async function markGlassHiveLaunchDispatchUnknown(
-  toolArguments: unknown,
-): Promise<RuntimeRecord | null> {
-  const originRef = glassHiveLaunchOriginFromArguments(toolArguments);
-  if (!originRef) return null;
-  const now = new Date();
-  const update = {
-    $set: {
-      launchState: 'dispatch_unknown',
-      dispatchExpiresAt: new Date(now.getTime() + launchDispatchAmbiguityLeaseMs()),
+  /** Mark a fully prepared launch immediately before the MCP transport may observe it. */
+  async function markGlassHiveLaunchDispatchReady(
+    launchContext: RuntimeRecord = {},
+  ): Promise<RuntimeRecord | null> {
+    const originRef = normalizeText(launchContext.originRef, 160);
+    const ownerId = normalizeText(launchContext.ownerId, 160);
+    if (!originRef || !ownerId) return null;
+    const now = new Date();
+    const dispatchExpiresAt = new Date(now.getTime() + launchDispatchAmbiguityLeaseMs());
+    const filter = {
+      _id: originRef,
+      ownerId,
+      workRef: '',
+      launchState: 'prepared',
+    };
+    const bindingUpdate = {
+      $set: { launchState: 'dispatch_ready', dispatchExpiresAt, updatedAt: now },
+      $unset: { preparationExpiresAt: 1, preDispatchFailureCode: 1, preDispatchFailedAt: 1 },
+    };
+    const workUpdate = {
+      $set: {
+        launchState: 'dispatch_ready',
+        externalState: 'accepted',
+        dispatchExpiresAt,
+        updatedAt: now,
+      },
+      $unset: {
+        preparationExpiresAt: 1,
+        preDispatchFailureCode: 1,
+        preDispatchFailedAt: 1,
+        terminalAt: 1,
+      },
+    };
+    /* === VIVENTIUM START === A closed reservation cannot regain dispatch authority. === */
+    const bindingResult = await callbackBindingCollection().updateOne(filter, bindingUpdate);
+    if (bindingResult.acknowledged !== true || bindingResult.matchedCount !== 1) {
+      throw Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
+        code: 'glasshive_launch_dispatch_fenced',
+        retryable: false,
+      });
+    }
+    const workResult = await externalWorkCollection().updateOne(filter, workUpdate);
+    if (workResult.acknowledged !== true || workResult.matchedCount !== 1) {
+      throw Object.assign(new Error('glasshive_launch_dispatch_fenced'), {
+        code: 'glasshive_launch_dispatch_fenced',
+        retryable: false,
+      });
+    }
+    /* === VIVENTIUM END === */
+    // This hint is set only after every Core-side prerequisite has succeeded. From here onward an
+    // MCP transport error is ambiguous and the ordinary dispatch_unknown reconciler owns it.
+    await requireParallelWorkPositiveFence(ownerId);
+    return { originRef, launchState: 'dispatch_ready' };
+  }
+
+  /** Close a launch that provably failed before dispatch or was verified absent after its lease. */
+  async function markGlassHiveLaunchPreDispatchFailed(
+    launchContext: RuntimeRecord = {},
+    error?: RuntimeError | RuntimeRecord,
+  ): Promise<RuntimeRecord | null> {
+    const originRef = normalizeText(launchContext.originRef, 160);
+    const ownerId = normalizeText(launchContext.ownerId, 160);
+    if (!originRef || !ownerId) return null;
+    const now = new Date();
+    const failureCode = normalizeText(
+      error?.code || error?.name || 'launch_pre_dispatch_failed',
+      120,
+    );
+    const filter = {
+      _id: originRef,
+      workRef: '',
+      launchState: { $in: ['prepared', 'dispatch_ready', 'dispatch_unknown'] },
+    };
+    const common = {
+      launchState: 'not_dispatched',
+      preDispatchFailureCode: failureCode,
+      preDispatchFailedAt: now,
       updatedAt: now,
-    },
-  };
-  const filter = { _id: originRef, launchState: { $in: ['prepared', 'dispatch_ready'] } };
-  await callbackBindingCollection().updateOne(filter, update);
-  await externalWorkCollection().updateOne(filter, update);
-  return { originRef, launchState: 'dispatch_unknown' };
-}
+    };
+    await callbackBindingCollection().updateOne(filter, {
+      $set: common,
+      $unset: { preparationExpiresAt: 1, dispatchExpiresAt: 1 },
+    });
+    await externalWorkCollection().updateOne(filter, {
+      $set: {
+        ...common,
+        externalState: 'failed',
+        terminalAt: now,
+        attentionPending: true,
+        deliveryState: 'failed',
+      },
+      $unset: { preparationExpiresAt: 1, dispatchExpiresAt: 1 },
+    });
 
-/** Close an authoritative GlassHive blocked/rejected response that proves no mission was created. */
-async function markGlassHiveLaunchDispatchRejected(
-  toolArguments: unknown,
-  error?: RuntimeError | RuntimeRecord,
-): Promise<RuntimeRecord | null> {
-  const originRef = glassHiveLaunchOriginFromArguments(toolArguments);
-  if (!originRef) return null;
-  const binding = await callbackBindingCollection().findOne({ _id: originRef });
-  if (!binding?.ownerId || binding?.workRef) return null;
-  return markGlassHiveLaunchPreDispatchFailed(binding, error);
-}
+    await recordOrchestrationTraceFailedLaunch({ ownerId, originRef, at: now });
 
-function isGlassHiveNonterminalAttentionCallback(body: GlassHiveCallbackBody = {}): boolean {
-  return (
-    body.work_terminal !== true &&
-    ['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'].includes(
-      normalizeText(body.event, 64),
-    )
-  );
-}
+    // No GlassHive workRef exists, but the failed launch itself is durable account work that needs
+    // acknowledgement. Publish the positive hint after its attention row commits; only a fresh
+    // owner-scoped roster after dismissal may clear the account-global hint.
+    await requireParallelWorkPositiveFence(ownerId);
 
-/** Advance the current projection only from the existing owner-verified generation snapshot. */
-async function projectVerifiedGlassHiveCallbackGeneration({
-  binding, body, effectSession,
-}: RuntimeRecord): Promise<void> {
-  const runId = normalizeText(body.run_id, 160);
-  const currentRunId = normalizeText(binding?.currentRunId, 160);
-  const state = canonicalGlassHiveWorkState({ work_state: binding?.currentRunState });
-  if (!runId || currentRunId !== runId || !state) return;
-  const scope = { _id: normalizeText(binding.originRef, 160),
-    ownerId: normalizeText(binding.ownerId), workRef: normalizeText(binding.workRef, 160) };
-  if (!scope._id || !scope.ownerId || !scope.workRef) return;
-  const collection = externalWorkCollection();
-  const options = effectSession ? { session: effectSession } : undefined;
-  const work = await collection.findOne(scope, options);
-  if (!work || work.terminalCallbackRunId === runId) return;
-  const inheritedTerminal = TERMINAL_STATES.includes(normalizeText(work.externalState, 32)) &&
-    Boolean(normalizeText(work.terminalCallbackRunId, 160)) && work.terminalCallbackRunId !== runId;
-  if (work.runId === runId && !inheritedTerminal) return;
-  const exact = (key: string) => work[key] === undefined ? { $exists: false } : work[key];
-  const written = await collection.updateOne({ ...scope,
-    runId: exact('runId'), externalState: exact('externalState'),
-    terminalCallbackRunId: exact('terminalCallbackRunId'),
-  }, {
-    $set: { runId, externalState: state,
-      workerId: normalizeText(body.worker_id, 160), launchState: 'callback_confirmed',
-      attentionPending: state === 'needs_input' || TERMINAL_STATES.includes(state), updatedAt: new Date() },
-    $unset: { terminalAt: 1, deliveryState: 1, adjudicationState: 1,
-      adjudicationErrorCode: 1, adjudicatedAt: 1 },
-  }, options);
-  if (Number(written.matchedCount) !== 1) throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
-}
+    if (
+      launchContext.required === true &&
+      (launchContext.schedulerDispatchDocumentId || launchContext.scheduleOccurrenceKey)
+    ) {
+      try {
+        const binding = {
+          ownerId,
+          schedulerDispatchDocumentId: normalizeText(
+            launchContext.schedulerDispatchDocumentId,
+            160,
+          ),
+          scheduleOccurrenceKey: normalizeText(launchContext.scheduleOccurrenceKey, 160),
+        };
+        const summary = await getSchedulerExternalWorkSummary(binding);
+        await notifySchedulerExternalWorkSummary({ binding, summary });
+      } catch (schedulerError) {
+        const runtimeError = schedulerError as RuntimeError;
+        logger.warn('[VIVENTIUM][glasshive-binding] Pre-dispatch schedule reconciliation failed', {
+          originRef,
+          code: normalizeText(runtimeError.code || runtimeError.name, 120),
+        });
+      }
+    }
+    return { originRef, launchState: 'not_dispatched', externalState: 'failed' };
+  }
 
-async function fenceGlassHiveCallbackRunState({
-  binding,
-  body,
-  effectSession,
-}: {
-  binding: Pick<GlassHiveCallbackContext, 'ownerId' | 'originRef' | 'workRef' | 'currentRunId' | 'currentRunState'>;
-  body: GlassHiveCallbackBody;
-  effectSession: ClientSession;
-}): Promise<void> {
-  const ownerId = normalizeText(binding.ownerId);
-  const originRef = normalizeText(binding.originRef, 160);
-  const workRef = normalizeText(binding.workRef, 160);
-  const workerId = normalizeText(body.worker_id, 160);
-  const runId = normalizeText(body.run_id, 160);
-  if (!effectSession.inTransaction() || !ownerId || !originRef || !workRef || !workerId || !runId) {
+  async function markGlassHiveLaunchDispatchUnknown(
+    toolArguments: unknown,
+  ): Promise<RuntimeRecord | null> {
+    const originRef = glassHiveLaunchOriginFromArguments(toolArguments);
+    if (!originRef) return null;
+    const now = new Date();
+    const update = {
+      $set: {
+        launchState: 'dispatch_unknown',
+        dispatchExpiresAt: new Date(now.getTime() + launchDispatchAmbiguityLeaseMs()),
+        updatedAt: now,
+      },
+    };
+    const filter = { _id: originRef, launchState: { $in: ['prepared', 'dispatch_ready'] } };
+    await callbackBindingCollection().updateOne(filter, update);
+    await externalWorkCollection().updateOne(filter, update);
+    return { originRef, launchState: 'dispatch_unknown' };
+  }
+
+  /** Close an authoritative GlassHive blocked/rejected response that proves no mission was created. */
+  async function markGlassHiveLaunchDispatchRejected(
+    toolArguments: unknown,
+    error?: RuntimeError | RuntimeRecord,
+  ): Promise<RuntimeRecord | null> {
+    const originRef = glassHiveLaunchOriginFromArguments(toolArguments);
+    if (!originRef) return null;
+    const binding = await callbackBindingCollection().findOne({ _id: originRef });
+    if (!binding?.ownerId || binding?.workRef) return null;
+    return markGlassHiveLaunchPreDispatchFailed(binding, error);
+  }
+
+  function isGlassHiveNonterminalAttentionCallback(body: GlassHiveCallbackBody = {}): boolean {
+    return (
+      body.work_terminal !== true &&
+      ['run.needs_input', 'run.blocked', 'checkpoint.ready', 'takeover.requested'].includes(
+        normalizeText(body.event, 64),
+      )
+    );
+  }
+
+  /** Advance the current projection only from the existing owner-verified generation snapshot. */
+  async function projectVerifiedGlassHiveCallbackGeneration({
+    binding,
+    body,
+    effectSession,
+  }: RuntimeRecord): Promise<void> {
+    const runId = normalizeText(body.run_id, 160);
+    const currentRunId = normalizeText(binding?.currentRunId, 160);
+    const state = canonicalGlassHiveWorkState({ work_state: binding?.currentRunState });
+    if (!runId || currentRunId !== runId || !state) return;
+    const scope = {
+      _id: normalizeText(binding.originRef, 160),
+      ownerId: normalizeText(binding.ownerId),
+      workRef: normalizeText(binding.workRef, 160),
+    };
+    if (!scope._id || !scope.ownerId || !scope.workRef) return;
+    const collection = externalWorkCollection();
+    const options = effectSession ? { session: effectSession } : undefined;
+    const work = await collection.findOne(scope, options);
+    if (!work || work.terminalCallbackRunId === runId) return;
+    const inheritedTerminal =
+      TERMINAL_STATES.includes(normalizeText(work.externalState, 32)) &&
+      Boolean(normalizeText(work.terminalCallbackRunId, 160)) &&
+      work.terminalCallbackRunId !== runId;
+    if (work.runId === runId && !inheritedTerminal) return;
+    const exact = (key: string) => (work[key] === undefined ? { $exists: false } : work[key]);
+    const written = await collection.updateOne(
+      {
+        ...scope,
+        runId: exact('runId'),
+        externalState: exact('externalState'),
+        terminalCallbackRunId: exact('terminalCallbackRunId'),
+      },
+      {
+        $set: {
+          runId,
+          externalState: state,
+          workerId: normalizeText(body.worker_id, 160),
+          launchState: 'callback_confirmed',
+          attentionPending: state === 'needs_input' || TERMINAL_STATES.includes(state),
+          updatedAt: new Date(),
+        },
+        $unset: {
+          terminalAt: 1,
+          deliveryState: 1,
+          adjudicationState: 1,
+          adjudicationErrorCode: 1,
+          adjudicatedAt: 1,
+        },
+      },
+      options,
+    );
+    if (Number(written.matchedCount) !== 1)
+      throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
+  }
+
+  async function fenceGlassHiveCallbackRunState({
+    binding,
+    body,
+    effectSession,
+  }: {
+    binding: Pick<
+      GlassHiveCallbackContext,
+      'ownerId' | 'originRef' | 'workRef' | 'currentRunId' | 'currentRunState'
+    >;
+    body: GlassHiveCallbackBody;
+    effectSession: ClientSession;
+  }): Promise<void> {
+    const ownerId = normalizeText(binding.ownerId);
+    const originRef = normalizeText(binding.originRef, 160);
+    const workRef = normalizeText(binding.workRef, 160);
+    const workerId = normalizeText(body.worker_id, 160);
+    const runId = normalizeText(body.run_id, 160);
+    if (
+      !effectSession.inTransaction() ||
+      !ownerId ||
+      !originRef ||
+      !workRef ||
+      !workerId ||
+      !runId
+    ) {
+      throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
+    }
+    const attention = isGlassHiveNonterminalAttentionCallback(body);
+    const currentRunId = normalizeText(binding.currentRunId, 160);
+    if (attention && currentRunId && currentRunId !== runId) {
+      throw callbackEffectFenceError('glasshive_callback_notice_superseded');
+    }
+    await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
+    if (attention) {
+      const terminal = await mongoose.connection
+        .collection('viventium_glasshive_callback_results')
+        .findOne(
+          { ownerId, originRef, workRef, workerId, runId, resultRevision: { $gte: 1 } },
+          { session: effectSession },
+        );
+      if (terminal) throw callbackEffectFenceError('glasshive_callback_notice_superseded');
+    }
+    const scope = { _id: originRef, ownerId, $or: [{ workRef: '' }, { workRef }] };
+    const filter = attention
+      ? {
+          $and: [
+            scope,
+            {
+              $nor: [
+                { terminalCallbackRunId: runId },
+                { runId, externalState: { $in: TERMINAL_STATES } },
+              ],
+            },
+          ],
+        }
+      : scope;
+    const written = await externalWorkCollection().updateOne(
+      filter,
+      { $set: { updatedAt: new Date() } },
+      { session: effectSession },
+    );
+    if (Number(written.matchedCount) === 1) return;
+    const current = await externalWorkCollection().findOne(scope, { session: effectSession });
+    if (
+      attention &&
+      current &&
+      (current.terminalCallbackRunId === runId ||
+        (current.runId === runId &&
+          TERMINAL_STATES.includes(normalizeText(current.externalState, 32))))
+    ) {
+      throw callbackEffectFenceError('glasshive_callback_notice_superseded');
+    }
     throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
   }
-  const attention = isGlassHiveNonterminalAttentionCallback(body);
-  const currentRunId = normalizeText(binding.currentRunId, 160);
-  if (attention && currentRunId && currentRunId !== runId) {
-    throw callbackEffectFenceError('glasshive_callback_notice_superseded');
-  }
-  await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
-  if (attention) {
-    const terminal = await mongoose.connection.collection('viventium_glasshive_callback_results')
-      .findOne(
-        { ownerId, originRef, workRef, workerId, runId, resultRevision: { $gte: 1 } },
-        { session: effectSession },
-      );
-    if (terminal) throw callbackEffectFenceError('glasshive_callback_notice_superseded');
-  }
-  const scope = { _id: originRef, ownerId, $or: [{ workRef: '' }, { workRef }] };
-  const filter = attention
-    ? {
-        $and: [scope, { $nor: [
-          { terminalCallbackRunId: runId },
-          { runId, externalState: { $in: TERMINAL_STATES } },
-        ] }],
-      }
-    : scope;
-  const written = await externalWorkCollection().updateOne(
-    filter, { $set: { updatedAt: new Date() } }, { session: effectSession },
-  );
-  if (Number(written.matchedCount) === 1) return;
-  const current = await externalWorkCollection().findOne(scope, { session: effectSession });
-  if (
-    attention && current && (
-      current.terminalCallbackRunId === runId ||
-      current.runId === runId && TERMINAL_STATES.includes(normalizeText(current.externalState, 32))
-    )
-  ) {
-    throw callbackEffectFenceError('glasshive_callback_notice_superseded');
-  }
-  throw callbackEffectFenceError('glasshive_callback_run_binding_not_ready');
-}
 
-async function confirmGlassHiveCallbackContext({
-  binding,
-  body = {},
-  effectFence,
-  effectSession,
-}: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
-  const ownerId = normalizeText(binding?.ownerId);
-  const originRef = normalizeText(binding?.originRef, 160);
-  const workRef = normalizeText(binding?.workRef, 160);
-  const workerId = normalizeText(body.worker_id, 160);
-  const runId = normalizeText(body.run_id, 160);
-  if (!ownerId || !originRef || !workRef || !workerId || !runId) return null;
-  await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
-  const currentRunId = normalizeText(binding.currentRunId, 160);
-  const projectsCurrentRun = !currentRunId || currentRunId === runId;
-  const fence = terminalCallbackEffectFence(body, effectFence);
-  const now = new Date();
-  const bindFilter = { _id: originRef, $or: [{ workRef: '' }, { workRef }] };
-  const externalUpdate = effectSession
-    ? externalWorkCollection().updateOne(
-        terminalCallbackDestinationFilter(bindFilter, fence),
-        {
+  async function confirmGlassHiveCallbackContext({
+    binding,
+    body = {},
+    effectFence,
+    effectSession,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
+    const ownerId = normalizeText(binding?.ownerId);
+    const originRef = normalizeText(binding?.originRef, 160);
+    const workRef = normalizeText(binding?.workRef, 160);
+    const workerId = normalizeText(body.worker_id, 160);
+    const runId = normalizeText(body.run_id, 160);
+    if (!ownerId || !originRef || !workRef || !workerId || !runId) return null;
+    await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
+    const currentRunId = normalizeText(binding.currentRunId, 160);
+    const projectsCurrentRun = !currentRunId || currentRunId === runId;
+    const fence = terminalCallbackEffectFence(body, effectFence);
+    const now = new Date();
+    const bindFilter = { _id: originRef, $or: [{ workRef: '' }, { workRef }] };
+    const externalUpdate = effectSession
+      ? externalWorkCollection().updateOne(
+          terminalCallbackDestinationFilter(bindFilter, fence),
+          {
+            $set: {
+              workRef,
+              workerId,
+              ...(projectsCurrentRun ? { runId } : {}),
+              launchState: 'callback_confirmed',
+              updatedAt: now,
+              ...terminalCallbackDestinationFields(fence),
+            },
+            $unset: { dispatchExpiresAt: 1 },
+          },
+          { session: effectSession },
+        )
+      : externalWorkCollection().updateOne(terminalCallbackDestinationFilter(bindFilter, fence), {
           $set: {
             workRef,
             workerId,
@@ -1898,801 +1998,922 @@ async function confirmGlassHiveCallbackContext({
             ...terminalCallbackDestinationFields(fence),
           },
           $unset: { dispatchExpiresAt: 1 },
-        },
-        { session: effectSession },
-      )
-    : externalWorkCollection().updateOne(terminalCallbackDestinationFilter(bindFilter, fence), {
-        $set: {
-          workRef,
-          workerId,
-          ...(projectsCurrentRun ? { runId } : {}),
-          launchState: 'callback_confirmed',
-          updatedAt: now,
-          ...terminalCallbackDestinationFields(fence),
-        },
-        $unset: { dispatchExpiresAt: 1 },
-      });
-  requireFencedDestinationWrite(await externalUpdate, fence);
-  const bindingUpdate = effectSession
-    ? callbackBindingCollection().updateOne(
-        terminalCallbackDestinationFilter(bindFilter, fence),
-        {
-          $set: {
-            workRef,
-            launchState: 'callback_confirmed',
-            updatedAt: now,
-            ...terminalCallbackDestinationFields(fence),
+        });
+    requireFencedDestinationWrite(await externalUpdate, fence);
+    const bindingUpdate = effectSession
+      ? callbackBindingCollection().updateOne(
+          terminalCallbackDestinationFilter(bindFilter, fence),
+          {
+            $set: {
+              workRef,
+              launchState: 'callback_confirmed',
+              updatedAt: now,
+              ...terminalCallbackDestinationFields(fence),
+            },
+            $unset: { dispatchExpiresAt: 1 },
           },
-          $unset: { dispatchExpiresAt: 1 },
-        },
-        { session: effectSession },
-      )
-    : callbackBindingCollection().updateOne(terminalCallbackDestinationFilter(bindFilter, fence), {
-        $set: {
-          workRef,
-          launchState: 'callback_confirmed',
-          updatedAt: now,
-          ...terminalCallbackDestinationFields(fence),
-        },
-        $unset: { dispatchExpiresAt: 1 },
-      });
-  requireFencedDestinationWrite(await bindingUpdate, fence);
-  await recordOrchestrationTraceAcceptedLaunch({
-    ownerId,
-    originRef,
-    workRef,
-    at: now,
-    ...(effectSession ? { session: effectSession } : {}),
-  });
-  return binding;
-}
-
-async function resolveGlassHiveCallbackContext(
-  body: RuntimeRecord = {},
-  { deferConfirmation = false }: { deferConfirmation?: boolean } = {},
-): Promise<RuntimeRecord | null> {
-  const originRef = normalizeText(body.origin_ref, 160);
-  const workRef = normalizeText(body.work_ref, 160);
-  const workerId = normalizeText(body.worker_id, 160);
-  const runId = normalizeText(body.run_id, 160);
-  if (!originRef || !workRef || !workerId || !runId) {
-    return null;
-  }
-  const binding = await callbackBindingCollection().findOne({ _id: originRef });
-  if (!binding) {
-    return null;
-  }
-  const ownerId = normalizeText(binding.ownerId);
-  const conversationId = normalizeText(binding.conversationId);
-  const anchorMessageId = normalizeText(binding.anchorMessageId);
-  if (!ownerId || !conversationId || !anchorMessageId) return null;
-  const boundWorkRef = normalizeText(binding.workRef, 160);
-  if (boundWorkRef && boundWorkRef !== workRef) return null;
-
-  let association;
-  try {
-    association = await requestAccountApi({
+          { session: effectSession },
+        )
+      : callbackBindingCollection().updateOne(
+          terminalCallbackDestinationFilter(bindFilter, fence),
+          {
+            $set: {
+              workRef,
+              launchState: 'callback_confirmed',
+              updatedAt: now,
+              ...terminalCallbackDestinationFields(fence),
+            },
+            $unset: { dispatchExpiresAt: 1 },
+          },
+        );
+    requireFencedDestinationWrite(await bindingUpdate, fence);
+    await recordOrchestrationTraceAcceptedLaunch({
       ownerId,
-      path: '/v1/callback-associations/verify',
-      method: 'POST',
-      body: { originRef, workRef, workerId, runId },
-      timeoutMs: 3000,
+      originRef,
+      workRef,
+      at: now,
+      ...(effectSession ? { session: effectSession } : {}),
     });
-  } catch (error) {
-    if (Number((error as RuntimeError).status) === 404) return null;
-    throw error;
+    return binding;
   }
-  if (
-    association?.valid !== true ||
-    normalizeText(association?.originRef, 160) !== originRef ||
-    normalizeText(association?.workRef, 160) !== workRef
-  ) {
-    return null;
-  }
-  if (body.output_files != null && (
-    normalizeText(association?.runId, 160) !== runId ||
-    !normalizeText(body.attempt_id, 160) ||
-    normalizeText(association?.attemptId, 160) !== normalizeText(body.attempt_id, 160)
-  )) return null;
 
-  const destinations = [];
-  for (const destination of Array.isArray(binding.configuredDestinations)
-    ? binding.configuredDestinations
-    : []) {
-    const surface = normalizeText(destination?.surface, 32).toLowerCase();
-    if (surface === 'telegram') {
-      destinations.push(await resolveTelegramDestination(ownerId, destination));
-    } else if (surface === 'voice') {
-      const voiceCallSessionId = normalizeText(destination.voiceCallSessionId);
-      destinations.push(
-        voiceCallSessionId
-          ? {
-              surface: 'voice',
-              voiceCallSessionId,
-              voiceRequestId: normalizeText(destination.voiceRequestId),
-            }
-          : { surface: 'voice', unresolvedReason: 'voice_session_not_bound' },
-      );
-    } else if (surface === 'librechat' || surface === 'workbench') {
-      destinations.push({ surface });
+  async function resolveGlassHiveCallbackContext(
+    body: RuntimeRecord = {},
+    { deferConfirmation = false }: { deferConfirmation?: boolean } = {},
+  ): Promise<RuntimeRecord | null> {
+    const originRef = normalizeText(body.origin_ref, 160);
+    const workRef = normalizeText(body.work_ref, 160);
+    const workerId = normalizeText(body.worker_id, 160);
+    const runId = normalizeText(body.run_id, 160);
+    if (!originRef || !workRef || !workerId || !runId) {
+      return null;
     }
+    const binding = await callbackBindingCollection().findOne({ _id: originRef });
+    if (!binding) {
+      return null;
+    }
+    const ownerId = normalizeText(binding.ownerId);
+    const conversationId = normalizeText(binding.conversationId);
+    const anchorMessageId = normalizeText(binding.anchorMessageId);
+    if (!ownerId || !conversationId || !anchorMessageId) return null;
+    const boundWorkRef = normalizeText(binding.workRef, 160);
+    if (boundWorkRef && boundWorkRef !== workRef) return null;
+
+    let association;
+    try {
+      association = await requestAccountApi({
+        ownerId,
+        path: '/v1/callback-associations/verify',
+        method: 'POST',
+        body: { originRef, workRef, workerId, runId },
+        timeoutMs: 3000,
+      });
+    } catch (error) {
+      if (Number((error as RuntimeError).status) === 404) return null;
+      throw error;
+    }
+    if (
+      association?.valid !== true ||
+      normalizeText(association?.originRef, 160) !== originRef ||
+      normalizeText(association?.workRef, 160) !== workRef
+    ) {
+      return null;
+    }
+    if (
+      body.output_files != null &&
+      (normalizeText(association?.runId, 160) !== runId ||
+        !normalizeText(body.attempt_id, 160) ||
+        normalizeText(association?.attemptId, 160) !== normalizeText(body.attempt_id, 160))
+    )
+      return null;
+
+    const destinations = [];
+    for (const destination of Array.isArray(binding.configuredDestinations)
+      ? binding.configuredDestinations
+      : []) {
+      const surface = normalizeText(destination?.surface, 32).toLowerCase();
+      if (surface === 'telegram') {
+        destinations.push(await resolveTelegramDestination(ownerId, destination));
+      } else if (surface === 'voice') {
+        const voiceCallSessionId = normalizeText(destination.voiceCallSessionId);
+        destinations.push(
+          voiceCallSessionId
+            ? {
+                surface: 'voice',
+                voiceCallSessionId,
+                voiceRequestId: normalizeText(destination.voiceRequestId),
+              }
+            : { surface: 'voice', unresolvedReason: 'voice_session_not_bound' },
+        );
+      } else if (surface === 'librechat' || surface === 'workbench') {
+        destinations.push({ surface });
+      }
+    }
+
+    const traceIdentity = callbackTraceIdentity(body);
+    const context = {
+      bindingId: normalizeText(binding.bindingId || binding._id),
+      originRef,
+      workRef,
+      ownerId,
+      conversationId,
+      anchorMessageId,
+      requestedParentMessageId: normalizeText(binding.requestedParentMessageId),
+      schedulerDispatchDocumentId: normalizeText(binding.schedulerDispatchDocumentId),
+      scheduleOccurrenceKey: normalizeText(binding.scheduleOccurrenceKey),
+      scheduleId: normalizeText(binding.scheduleId),
+      mainAgentId: normalizeText(binding.mainAgentId, 160),
+      currentRunId: normalizeText(association?.currentRunId, 160),
+      currentRunState: normalizeText(association?.currentRunState, 32),
+      ...(binding.feelingsIsolated === true ? { feelingsIsolated: true } : {}),
+      ...((body.output_files != null || body.native_media != null) &&
+      normalizeText(association?.runId, 160) === runId &&
+      normalizeText(association?.attemptId, 160)
+        ? { runId, attemptId: normalizeText(association?.attemptId, 160) }
+        : {}),
+      ...(traceIdentity ? { traceIdentity } : {}),
+      destinations,
+    };
+    if (!deferConfirmation) {
+      await confirmGlassHiveCallbackContext({ binding: context, body });
+    }
+    return context;
   }
 
-  const traceIdentity = callbackTraceIdentity(body);
-  const context = {
-    bindingId: normalizeText(binding.bindingId || binding._id),
-    originRef,
-    workRef,
-    ownerId,
-    conversationId,
-    anchorMessageId,
-    requestedParentMessageId: normalizeText(binding.requestedParentMessageId),
-    schedulerDispatchDocumentId: normalizeText(binding.schedulerDispatchDocumentId),
-    scheduleOccurrenceKey: normalizeText(binding.scheduleOccurrenceKey),
-    scheduleId: normalizeText(binding.scheduleId),
-    mainAgentId: normalizeText(binding.mainAgentId, 160),
-    currentRunId: normalizeText(association?.currentRunId, 160),
-    currentRunState: normalizeText(association?.currentRunState, 32),
-    ...(binding.feelingsIsolated === true ? { feelingsIsolated: true } : {}),
-    ...((body.output_files != null || body.native_media != null) &&
-        normalizeText(association?.runId, 160) === runId &&
-        normalizeText(association?.attemptId, 160)
-      ? { runId, attemptId: normalizeText(association?.attemptId, 160) } : {}),
-    ...(traceIdentity ? { traceIdentity } : {}),
-    destinations,
-  };
-  if (!deferConfirmation) {
-    await confirmGlassHiveCallbackContext({ binding: context, body });
-  }
-  return context;
-}
-
-function callbackStateForEvent(body: RuntimeRecord = {}): string {
-  const event = normalizeText(body.event, 64);
-  const failureCode = normalizeText(
-    body.failure_code || body.failure_class || body.error_code || body?.error?.code,
-    80,
-  ).toLowerCase();
-  if (event === 'run.failed' && HOST_CAPACITY_CODES.has(failureCode)) {
-    return 'queued';
-  }
-  switch (event) {
-    case 'run.completed':
-      return 'completed';
-    case 'run.failed':
-      return 'failed';
-    case 'run.cancelled':
-    case 'run.interrupted':
-      return 'cancelled';
-    case 'checkpoint.ready':
-    case 'takeover.requested':
-    case 'run.needs_input':
-    case 'run.blocked':
-      return 'needs_input';
-    case 'run.paused':
-    case 'worker.paused':
-      return 'paused';
-    case 'run.queued':
-    case 'run.requeued':
-    case 'run.capacity_waiting':
-    case 'run.waiting_capacity':
-    case 'run.waiting_on_capacity':
+  function callbackStateForEvent(body: RuntimeRecord = {}): string {
+    const event = normalizeText(body.event, 64);
+    const failureCode = normalizeText(
+      body.failure_code || body.failure_class || body.error_code || body?.error?.code,
+      80,
+    ).toLowerCase();
+    if (event === 'run.failed' && HOST_CAPACITY_CODES.has(failureCode)) {
       return 'queued';
-    case 'run.stopping':
-      return 'stopping';
-    case 'run.started':
-    case 'run.resumed':
-    case 'worker.resumed_by_alias':
-      return 'running';
-    default:
-      return '';
-  }
-}
-
-/* === VIVENTIUM START ===
- * Feature: Canonical WorkRef lifecycle callbacks.
- * Purpose: A run is only one execution inside a durable work root. Queue/Message can create a
- * sibling run, so a terminal run event must not complete the WorkRef unless GlassHive's verified
- * callback also asserts the canonical work is terminal. Legacy terminal callbacks fail
- * nonterminal; the authoritative account snapshot/reconciliation path can safely repair them.
- * === VIVENTIUM END === */
-function canonicalGlassHiveWorkState(body: RuntimeRecord = {}): string {
-  const state = normalizeText(body.work_state, 32).toLowerCase();
-  return [
-    'queued',
-    'running',
-    'paused',
-    'needs_input',
-    'stopping',
-    'settling',
-    'completed',
-    'failed',
-    'cancelled',
-  ].includes(state)
-    ? state
-    : '';
-}
-
-function isGlassHiveWorkTerminalCallback(body: RuntimeRecord = {}): boolean {
-  const state = canonicalGlassHiveWorkState(body);
-  return body.work_terminal === true && TERMINAL_STATES.includes(state);
-}
-
-function callbackWorkState(body: RuntimeRecord = {}): string {
-  const runState = callbackStateForEvent(body);
-  const workState = canonicalGlassHiveWorkState(body);
-  const hasWorkContract = typeof body.work_terminal === 'boolean' && Boolean(workState);
-  if (hasWorkContract) {
-    if (body.work_terminal === true) {
-      return TERMINAL_STATES.includes(workState) ? workState : '';
     }
-    return TERMINAL_STATES.includes(workState)
-      ? ''
-      : workState === 'settling'
-        ? 'running'
-        : workState;
+    switch (event) {
+      case 'run.completed':
+        return 'completed';
+      case 'run.failed':
+        return 'failed';
+      case 'run.cancelled':
+      case 'run.interrupted':
+        return 'cancelled';
+      case 'checkpoint.ready':
+      case 'takeover.requested':
+      case 'run.needs_input':
+      case 'run.blocked':
+        return 'needs_input';
+      case 'run.paused':
+      case 'worker.paused':
+        return 'paused';
+      case 'run.queued':
+      case 'run.requeued':
+      case 'run.capacity_waiting':
+      case 'run.waiting_capacity':
+      case 'run.waiting_on_capacity':
+        return 'queued';
+      case 'run.stopping':
+        return 'stopping';
+      case 'run.started':
+      case 'run.resumed':
+      case 'worker.resumed_by_alias':
+        return 'running';
+      default:
+        return '';
+    }
   }
-  // Nonterminal legacy events cannot prematurely finish the WorkRef and remain safe to project.
-  return TERMINAL_STATES.includes(runState) ? '' : runState;
-}
 
-function externalWorkFilter(
-  { ownerId, schedulerDispatchDocumentId, scheduleOccurrenceKey }: RuntimeRecord = {},
-): RuntimeRecord {
-  const filter: RuntimeRecord = { ownerId: normalizeText(ownerId) };
-  if (schedulerDispatchDocumentId) {
-    filter.schedulerDispatchDocumentId = normalizeText(schedulerDispatchDocumentId);
-  } else if (scheduleOccurrenceKey) {
-    filter.scheduleOccurrenceKey = normalizeText(scheduleOccurrenceKey);
+  /* === VIVENTIUM START ===
+   * Feature: Canonical WorkRef lifecycle callbacks.
+   * Purpose: A run is only one execution inside a durable work root. Queue/Message can create a
+   * sibling run, so a terminal run event must not complete the WorkRef unless GlassHive's verified
+   * callback also asserts the canonical work is terminal. Legacy terminal callbacks fail
+   * nonterminal; the authoritative account snapshot/reconciliation path can safely repair them.
+   * === VIVENTIUM END === */
+  function canonicalGlassHiveWorkState(body: RuntimeRecord = {}): string {
+    const state = normalizeText(body.work_state, 32).toLowerCase();
+    return [
+      'queued',
+      'running',
+      'paused',
+      'needs_input',
+      'stopping',
+      'settling',
+      'completed',
+      'failed',
+      'cancelled',
+    ].includes(state)
+      ? state
+      : '';
   }
-  return filter;
-}
 
-async function getSchedulerExternalWorkSummary({
-  ownerId,
-  schedulerDispatchDocumentId = '',
-  scheduleOccurrenceKey = '',
-  effectSession,
-}: RuntimeRecord = {}): Promise<RuntimeRecord> {
-  const filter = externalWorkFilter({
+  function isGlassHiveWorkTerminalCallback(body: RuntimeRecord = {}): boolean {
+    const state = canonicalGlassHiveWorkState(body);
+    return body.work_terminal === true && TERMINAL_STATES.includes(state);
+  }
+
+  function callbackWorkState(body: RuntimeRecord = {}): string {
+    const runState = callbackStateForEvent(body);
+    const workState = canonicalGlassHiveWorkState(body);
+    const hasWorkContract = typeof body.work_terminal === 'boolean' && Boolean(workState);
+    if (hasWorkContract) {
+      if (body.work_terminal === true) {
+        return TERMINAL_STATES.includes(workState) ? workState : '';
+      }
+      return TERMINAL_STATES.includes(workState)
+        ? ''
+        : workState === 'settling'
+          ? 'running'
+          : workState;
+    }
+    // Nonterminal legacy events cannot prematurely finish the WorkRef and remain safe to project.
+    return TERMINAL_STATES.includes(runState) ? '' : runState;
+  }
+
+  function externalWorkFilter({
     ownerId,
     schedulerDispatchDocumentId,
     scheduleOccurrenceKey,
-  });
-  if (!filter.ownerId || (!filter.schedulerDispatchDocumentId && !filter.scheduleOccurrenceKey)) {
+  }: RuntimeRecord = {}): RuntimeRecord {
+    const filter: RuntimeRecord = { ownerId: normalizeText(ownerId) };
+    if (schedulerDispatchDocumentId) {
+      filter.schedulerDispatchDocumentId = normalizeText(schedulerDispatchDocumentId);
+    } else if (scheduleOccurrenceKey) {
+      filter.scheduleOccurrenceKey = normalizeText(scheduleOccurrenceKey);
+    }
+    return filter;
+  }
+
+  async function getSchedulerExternalWorkSummary({
+    ownerId,
+    schedulerDispatchDocumentId = '',
+    scheduleOccurrenceKey = '',
+    effectSession,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord> {
+    const filter = externalWorkFilter({
+      ownerId,
+      schedulerDispatchDocumentId,
+      scheduleOccurrenceKey,
+    });
+    if (!filter.ownerId || (!filter.schedulerDispatchDocumentId && !filter.scheduleOccurrenceKey)) {
+      return {
+        requiredTotal: 0,
+        requiredTerminal: 0,
+        requiredFailed: 0,
+        allRequiredTerminal: true,
+        state: 'none',
+        items: [],
+      };
+    }
+    const rows = await externalWorkCollection()
+      .find(filter, effectSession ? { session: effectSession } : undefined)
+      .toArray();
+    const items = rows.map((row: RuntimeRecord) => ({
+      workRef: normalizeText(row.workRef || row._id),
+      required: row.required === true,
+      state: normalizeText(row.externalState, 32) || 'accepted',
+    }));
+    const required = items.filter((item: RuntimeRecord) => item.required);
+    const terminal = required.filter((item: RuntimeRecord) => TERMINAL_STATES.includes(item.state));
+    const requiredFailed = terminal.filter(
+      (item: RuntimeRecord) => item.state !== 'completed',
+    ).length;
+    const allRequiredTerminal = required.length === 0 || terminal.length === required.length;
     return {
-      requiredTotal: 0,
-      requiredTerminal: 0,
-      requiredFailed: 0,
-      allRequiredTerminal: true,
-      state: 'none',
-      items: [],
+      requiredTotal: required.length,
+      requiredTerminal: terminal.length,
+      requiredFailed,
+      allRequiredTerminal,
+      state:
+        required.length === 0
+          ? 'none'
+          : allRequiredTerminal
+            ? requiredFailed
+              ? 'failed'
+              : 'completed'
+            : 'waiting_external',
+      items,
     };
   }
-  const rows = await externalWorkCollection()
-    .find(filter, effectSession ? { session: effectSession } : undefined)
-    .toArray();
-  const items = rows.map((row: RuntimeRecord) => ({
-    workRef: normalizeText(row.workRef || row._id),
-    required: row.required === true,
-    state: normalizeText(row.externalState, 32) || 'accepted',
-  }));
-  const required = items.filter((item: RuntimeRecord) => item.required);
-  const terminal = required.filter((item: RuntimeRecord) => TERMINAL_STATES.includes(item.state));
-  const requiredFailed = terminal.filter((item: RuntimeRecord) => item.state !== 'completed').length;
-  const allRequiredTerminal = required.length === 0 || terminal.length === required.length;
-  return {
-    requiredTotal: required.length,
-    requiredTerminal: terminal.length,
-    requiredFailed,
-    allRequiredTerminal,
-    state:
-      required.length === 0
-        ? 'none'
-        : allRequiredTerminal
-          ? requiredFailed
-            ? 'failed'
-            : 'completed'
-          : 'waiting_external',
-    items,
-  };
-}
 
-/**
- * Prove that one exact assistant presentation corresponds to a Core-bound launch which already
- * returned an authoritative GlassHive work reference. This is intentionally server-held evidence:
- * presentation adapters cannot promote arbitrary stale prose into a committed mission receipt.
- */
-async function hasAcceptedGlassHiveLaunchForPresentation({
-  ownerId,
-  conversationId,
-  responseMessageId,
-  sourceEventId,
-}: RuntimeRecord = {}): Promise<boolean> {
-  const identity = {
-    ownerId: normalizeText(ownerId, 160),
-    conversationId: normalizeText(conversationId, 160),
-    anchorMessageId: normalizeText(responseMessageId, 160),
-    sourceEventId: normalizeText(sourceEventId, 512),
-  };
-  if (Object.values(identity).some((value) => !value)) return false;
-  const binding = await callbackBindingCollection().findOne(
-    {
-      ...identity,
-      launchState: { $in: ['accepted', 'callback_confirmed'] },
-      workRef: { $nin: ['', null] },
-    },
-    { projection: { _id: 1 } },
-  );
-  return Boolean(binding?._id);
-}
-
-/** Recover a confirmed Stop notification through the existing verified producer trace. */
-async function recoverRetainedStopCallback(row: RuntimeRecord): Promise<void> {
-  const ownerId = normalizeText(row.ownerId, 160);
-  const originRef = normalizeText(row.originRef || row._id, 160);
-  const workRef = normalizeText(row.workRef, 160);
-  const runId = normalizeText(row.runId, 160);
-  const workerId = normalizeText(row.workerId, 160);
-  if (row.externalState !== 'cancelled' || !workerId) return;
-  const detail = await requestAccountApi({
-    ownerId, path: `/v1/work/${encodeURIComponent(workRef)}`, timeoutMs: 3000,
-  });
-  if (detail?.workRef !== workRef || detail?.state !== 'cancelled') return;
-  const ingestion = await recordGlassHiveWorkDetailTrace({
-    ownerId, originRef, workRef, runRef: runId, detail,
-  });
-  if (ingestion?.accepted !== true) return;
-  const latest = new Map<string, RuntimeRecord>();
-  for (const delivery of Array.isArray(detail.callbackDeliveries) ? detail.callbackDeliveries : []) {
-    const ref = normalizeText(delivery?.callbackRef, 100);
-    if (!/^callback_sha256:[a-f0-9]{64}$/.test(ref)) continue;
-    if (Number(delivery.callbackRevision) > Number(latest.get(ref)?.callbackRevision || 0)) {
-      latest.set(ref, delivery);
-    }
-  }
-  const retained = [...latest.values()].find((delivery) =>
-    delivery.event === 'run.cancelled' && delivery.status === 'dead_lettered' &&
-    delivery.resultRevision === 0 && !delivery.resultDigest &&
-    /^sha256:[a-f0-9]{64}$/.test(String(delivery.payloadSha256 || '')) &&
-    /^sha256:[a-f0-9]{64}$/.test(String(delivery.authoritySha256 || '')),
-  );
-  if (!retained) return;
-  await requestAccountApi({
-    ownerId, path: '/v1/callback-associations/recover', method: 'POST', timeoutMs: 3000,
-    body: {
-      originRef, workRef, workerId, runId,
-      callbackRef: retained.callbackRef,
-      payloadSha256: retained.payloadSha256,
-      authoritySha256: retained.authoritySha256,
-    },
-  });
-  await externalWorkCollection().updateOne({ ownerId, originRef, workRef, runId }, {
-    $set: { stateReconciliationNextAt: new Date(Date.now() + 60_000) },
-  });
-}
-
-/** Request the sender's retained result only after Core accepted that exact authenticated identity. */
-async function recoverAcceptedTerminalResult(row: RuntimeRecord): Promise<void> {
-  const scope = {
-    ownerId: normalizeText(row.ownerId, 160),
-    originRef: normalizeText(row.originRef || row._id, 160),
-    workRef: normalizeText(row.workRef, 160),
-    runId: normalizeText(row.runId, 160),
-  };
-  if (Object.values(scope).some((value) => !value)) return;
-  const accepted = await mongoose.connection
-    .collection('viventium_glasshive_callback_results')
-    .findOne(scope, {
-      projection: {
-        workerId: 1,
-        callbackId: 1,
-        resultRevision: 1,
-        resultDigest: 1,
-        acceptedOperationId: 1,
-      },
-    });
-  if (!accepted) {
-    await recoverRetainedStopCallback(row);
-    return;
-  }
-  if (
-    !accepted?.workerId ||
-    !accepted.acceptedOperationId ||
-    !/^cb_terminal_[a-f0-9]{64}$/.test(String(accepted.callbackId || '')) ||
-    !/^sha256:[a-f0-9]{64}$/.test(String(accepted.resultDigest || '')) ||
-    !Number.isSafeInteger(accepted.resultRevision) ||
-    accepted.resultRevision < 1
-  )
-    return;
-  const evidence = await mongoose.connection
-    .collection('viventium_glasshive_mission_evidence')
-    .findOne(
+  /**
+   * Prove that one exact assistant presentation corresponds to a Core-bound launch which already
+   * returned an authoritative GlassHive work reference. This is intentionally server-held evidence:
+   * presentation adapters cannot promote arbitrary stale prose into a committed mission receipt.
+   */
+  async function hasAcceptedGlassHiveLaunchForPresentation({
+    ownerId,
+    conversationId,
+    responseMessageId,
+    sourceEventId,
+  }: RuntimeRecord = {}): Promise<boolean> {
+    const identity = {
+      ownerId: normalizeText(ownerId, 160),
+      conversationId: normalizeText(conversationId, 160),
+      anchorMessageId: normalizeText(responseMessageId, 160),
+      sourceEventId: normalizeText(sourceEventId, 512),
+    };
+    if (Object.values(identity).some((value) => !value)) return false;
+    const binding = await callbackBindingCollection().findOne(
       {
-        ...scope,
-        terminalCallbackId: accepted.callbackId,
-        terminalCallbackResultDigest: accepted.resultDigest,
-        terminalCallbackResultRevision: accepted.resultRevision,
-        terminalCallbackAcceptedOperationId: accepted.acceptedOperationId,
+        ...identity,
+        launchState: { $in: ['accepted', 'callback_confirmed'] },
+        workRef: { $nin: ['', null] },
       },
       { projection: { _id: 1 } },
     );
-  if (evidence) return;
-  await requestAccountApi({
-    ownerId: scope.ownerId,
-    path: '/v1/callback-associations/recover',
-    method: 'POST',
-    body: {
-      originRef: scope.originRef,
-      workRef: scope.workRef,
-      runId: scope.runId,
-      workerId: accepted.workerId,
-      callbackId: accepted.callbackId,
-      resultRevision: accepted.resultRevision,
-      resultDigest: accepted.resultDigest,
-    },
-    timeoutMs: 3000,
-  });
-  await externalWorkCollection().updateOne(scope, {
-    $set: {
-      stateReconciliationNextAt: new Date(Date.now() + 60_000),
-    },
-  });
-}
+    return Boolean(binding?._id);
+  }
 
-/**
- * Re-seed the conservative per-account hint after a Core restart or schema migration. Never clear
- * here: only a fresh authoritative GlassHive empty roster may prove that an account has no work.
- */
-async function reconcileKnownExternalWorkHints(
-  { limit = 100 }: RuntimeRecord = {},
-): Promise<RuntimeRecord> {
-  const boundedLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
-  const rows = await externalWorkCollection()
-    .find(
-      {
-        ownerId: { $nin: ['', null] },
-        $or: [
-          {
-            launchState: 'not_dispatched',
-            externalState: 'failed',
-            attentionPending: { $ne: false },
-          },
-          {
-            launchState: { $nin: ['prepared', 'not_dispatched'] },
-            $or: [
-              { externalState: { $nin: TERMINAL_STATES } },
-              { attentionPending: true },
-              {
-                deliveryState: { $in: ['pending', 'enqueued', 'failed', 'unresolved', 'unknown'] },
-              },
-            ],
-          },
-        ],
+  /** Recover a confirmed Stop notification through the existing verified producer trace. */
+  async function recoverRetainedStopCallback(row: RuntimeRecord): Promise<void> {
+    const ownerId = normalizeText(row.ownerId, 160);
+    const originRef = normalizeText(row.originRef || row._id, 160);
+    const workRef = normalizeText(row.workRef, 160);
+    const runId = normalizeText(row.runId, 160);
+    const workerId = normalizeText(row.workerId, 160);
+    if (row.externalState !== 'cancelled' || !workerId) return;
+    const detail = await requestAccountApi({
+      ownerId,
+      path: `/v1/work/${encodeURIComponent(workRef)}`,
+      timeoutMs: 3000,
+    });
+    if (detail?.workRef !== workRef || detail?.state !== 'cancelled') return;
+    const ingestion = await recordGlassHiveWorkDetailTrace({
+      ownerId,
+      originRef,
+      workRef,
+      runRef: runId,
+      detail,
+    });
+    if (ingestion?.accepted !== true) return;
+    const latest = new Map<string, RuntimeRecord>();
+    for (const delivery of Array.isArray(detail.callbackDeliveries)
+      ? detail.callbackDeliveries
+      : []) {
+      const ref = normalizeText(delivery?.callbackRef, 100);
+      if (!/^callback_sha256:[a-f0-9]{64}$/.test(ref)) continue;
+      if (Number(delivery.callbackRevision) > Number(latest.get(ref)?.callbackRevision || 0)) {
+        latest.set(ref, delivery);
+      }
+    }
+    const retained = [...latest.values()].find(
+      (delivery) =>
+        delivery.event === 'run.cancelled' &&
+        delivery.status === 'dead_lettered' &&
+        delivery.resultRevision === 0 &&
+        !delivery.resultDigest &&
+        /^sha256:[a-f0-9]{64}$/.test(String(delivery.payloadSha256 || '')) &&
+        /^sha256:[a-f0-9]{64}$/.test(String(delivery.authoritySha256 || '')),
+    );
+    if (!retained) return;
+    await requestAccountApi({
+      ownerId,
+      path: '/v1/callback-associations/recover',
+      method: 'POST',
+      timeoutMs: 3000,
+      body: {
+        originRef,
+        workRef,
+        workerId,
+        runId,
+        callbackRef: retained.callbackRef,
+        payloadSha256: retained.payloadSha256,
+        authoritySha256: retained.authoritySha256,
       },
+    });
+    await externalWorkCollection().updateOne(
+      { ownerId, originRef, workRef, runId },
       {
-        projection: {
-          _id: 1,
-          ownerId: 1,
-          originRef: 1,
-          workRef: 1,
-          runId: 1,
-          externalState: 1,
-          launchState: 1,
-          deliveryState: 1,
-          attentionPending: 1,
-          stateReconciliationPendingAt: 1,
-          stateReconciliationNextAt: 1,
-          stateReconciliationAttempts: 1,
-        },
+        $set: { stateReconciliationNextAt: new Date(Date.now() + 60_000) },
       },
+    );
+  }
+
+  /** Repair the old pending projection only from the current authenticated silent decision. */
+  async function reconcileSilentAdjudicationOutcome(row: RuntimeRecord): Promise<boolean> {
+    if (
+      row.deliveryState !== 'enqueued' ||
+      row.adjudicationState !== 'silent' ||
+      !TERMINAL_STATES.includes(row.externalState) ||
+      (row.terminalCallbackRunId && row.terminalCallbackRunId !== row.runId)
     )
-    .sort({ updatedAt: -1 })
-    .limit(boundedLimit * 10)
-    .toArray();
-  const ownerIds = Array.from(
-    new Set(rows.map((row: RuntimeRecord) => normalizeText(row?.ownerId, 160)).filter(Boolean)),
-  ).slice(0, boundedLimit);
-  const outcomes = await Promise.all(ownerIds.map((ownerId) => markUserParallelWorkKnown(ownerId)));
-  const now = Date.now();
-  const candidates = rows
-    .filter((row: RuntimeRecord) => {
-      const nextAttemptAt = row?.stateReconciliationNextAt
-        ? new Date(row.stateReconciliationNextAt).getTime()
-        : 0;
-      return Boolean(
-        normalizeText(row?.ownerId, 160) &&
-        normalizeText(row?.workRef, 160) &&
-        normalizeText(row?.runId, 160) &&
-        ['accepted', 'callback_confirmed'].includes(normalizeText(row?.launchState, 32)) &&
-        (!TERMINAL_STATES.includes(normalizeText(row?.externalState, 32)) ||
-          ['pending', 'enqueued', 'failed', 'unresolved', 'unknown'].includes(
-            normalizeText(row?.deliveryState, 32),
-          )) &&
-        (!Number.isFinite(nextAttemptAt) || nextAttemptAt <= now),
+      return false;
+    const scope = {
+      ownerId: normalizeText(row.ownerId, 160),
+      originRef: normalizeText(row.originRef || row._id, 160),
+      workRef: normalizeText(row.workRef, 160),
+      workerId: normalizeText(row.workerId, 160),
+      runId: normalizeText(row.runId, 160),
+    };
+    if (Object.values(scope).some((value) => !value)) return false;
+    const snapshotFilter: RuntimeRecord = { _id: row._id, ...scope };
+    const evidenceFilter: RuntimeRecord = {
+      ...scope,
+      state: 'silent',
+      workTerminal: true,
+      workState: row.externalState,
+      followUpMessageId: normalizeText(row.followUpMessageId, 160),
+      errorCode: normalizeText(row.adjudicationErrorCode, 120),
+    };
+    for (const [field, evidenceField] of [
+      ['terminalCallbackId', 'terminalCallbackId'],
+      ['terminalCallbackResultDigest', 'terminalCallbackResultDigest'],
+      ['terminalCallbackResultRevision', 'terminalCallbackResultRevision'],
+      ['terminalCallbackAcceptedOperationId', 'terminalCallbackAcceptedOperationId'],
+      ['terminalCallbackEffectLeaseGeneration', 'terminalCallbackEffectGeneration'],
+    ]) {
+      evidenceFilter[evidenceField] = Object.prototype.hasOwnProperty.call(row, field)
+        ? row[field]
+        : { $exists: false };
+    }
+    for (const field of [
+      'launchState',
+      'externalState',
+      'deliveryState',
+      'adjudicationState',
+      'adjudicationErrorCode',
+      'followUpMessageId',
+      'updatedAt',
+      'terminalCallbackRunId',
+      'terminalCallbackResultEndedAt',
+      'terminalCallbackId',
+      'terminalCallbackResultDigest',
+      'terminalCallbackResultRevision',
+      'terminalCallbackAcceptedOperationId',
+      'terminalCallbackEffectLeaseId',
+      'terminalCallbackEffectLeaseGeneration',
+    ])
+      snapshotFilter[field] = Object.prototype.hasOwnProperty.call(row, field)
+        ? row[field]
+        : { $exists: false };
+    const evidence = await mongoose.connection
+      .collection('viventium_glasshive_mission_evidence')
+      .findOne(evidenceFilter, { projection: { callbackRef: 1 } });
+    if (!/^callback_sha256:[a-f0-9]{64}$/.test(String(evidence?.callbackRef || ''))) return false;
+    const deliveryState =
+      row.adjudicationErrorCode === 'mission_origin_cleanup_tombstoned' ? 'suppressed' : 'silent';
+    const updated = await externalWorkCollection().findOneAndUpdate(
+      snapshotFilter,
+      {
+        $set: { deliveryState, attentionPending: false, updatedAt: new Date() },
+      },
+      { returnDocument: 'after' },
+    );
+    const document =
+      updated && Object.prototype.hasOwnProperty.call(updated, 'value') ? updated.value : updated;
+    if (!document)
+      throw Object.assign(new Error('glasshive_delivery_projection_snapshot_changed'), {
+        code: 'glasshive_delivery_projection_snapshot_changed',
+      });
+    invalidateActiveWorkSnapshot?.({ ownerId: scope.ownerId, fetchImpl });
+    return true;
+  }
+
+  /** Request the sender's retained result only after Core accepted that exact authenticated identity. */
+  async function recoverAcceptedTerminalResult(row: RuntimeRecord): Promise<void> {
+    if (await reconcileSilentAdjudicationOutcome(row)) return;
+    const scope = {
+      ownerId: normalizeText(row.ownerId, 160),
+      originRef: normalizeText(row.originRef || row._id, 160),
+      workRef: normalizeText(row.workRef, 160),
+      runId: normalizeText(row.runId, 160),
+    };
+    if (Object.values(scope).some((value) => !value)) return;
+    const accepted = await mongoose.connection
+      .collection('viventium_glasshive_callback_results')
+      .findOne(scope, {
+        projection: {
+          workerId: 1,
+          callbackId: 1,
+          resultRevision: 1,
+          resultDigest: 1,
+          acceptedOperationId: 1,
+        },
+      });
+    if (!accepted) {
+      await recoverRetainedStopCallback(row);
+      return;
+    }
+    if (
+      !accepted?.workerId ||
+      !accepted.acceptedOperationId ||
+      !/^cb_terminal_[a-f0-9]{64}$/.test(String(accepted.callbackId || '')) ||
+      !/^sha256:[a-f0-9]{64}$/.test(String(accepted.resultDigest || '')) ||
+      !Number.isSafeInteger(accepted.resultRevision) ||
+      accepted.resultRevision < 1
+    )
+      return;
+    const evidence = await mongoose.connection
+      .collection('viventium_glasshive_mission_evidence')
+      .findOne(
+        {
+          ...scope,
+          terminalCallbackId: accepted.callbackId,
+          terminalCallbackResultDigest: accepted.resultDigest,
+          terminalCallbackResultRevision: accepted.resultRevision,
+          terminalCallbackAcceptedOperationId: accepted.acceptedOperationId,
+        },
+        { projection: { _id: 1 } },
       );
-    })
-    .slice(0, Math.min(boundedLimit, STATE_RECONCILIATION_BATCH));
-  await Promise.all(
-    candidates.map(async (row: RuntimeRecord) => {
-      const ownerId = normalizeText(row.ownerId, 160);
-      const workRef = normalizeText(row.workRef, 160);
-      try {
-        if (TERMINAL_STATES.includes(normalizeText(row.externalState, 32))) {
-          await recoverAcceptedTerminalResult(row);
-          return;
+    if (evidence) return;
+    await requestAccountApi({
+      ownerId: scope.ownerId,
+      path: '/v1/callback-associations/recover',
+      method: 'POST',
+      body: {
+        originRef: scope.originRef,
+        workRef: scope.workRef,
+        runId: scope.runId,
+        workerId: accepted.workerId,
+        callbackId: accepted.callbackId,
+        resultRevision: accepted.resultRevision,
+        resultDigest: accepted.resultDigest,
+      },
+      timeoutMs: 3000,
+    });
+    await externalWorkCollection().updateOne(scope, {
+      $set: {
+        stateReconciliationNextAt: new Date(Date.now() + 60_000),
+      },
+    });
+  }
+
+  /**
+   * Re-seed the conservative per-account hint after a Core restart or schema migration. Never clear
+   * here: only a fresh authoritative GlassHive empty roster may prove that an account has no work.
+   */
+  async function reconcileKnownExternalWorkHints({
+    limit = 100,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord> {
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+    const rows = await externalWorkCollection()
+      .find(
+        {
+          ownerId: { $nin: ['', null] },
+          $or: [
+            {
+              launchState: 'not_dispatched',
+              externalState: 'failed',
+              attentionPending: { $ne: false },
+            },
+            {
+              launchState: { $nin: ['prepared', 'not_dispatched'] },
+              $or: [
+                { externalState: { $nin: TERMINAL_STATES } },
+                { attentionPending: true },
+                {
+                  deliveryState: {
+                    $in: ['pending', 'enqueued', 'failed', 'unresolved', 'unknown'],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          projection: {
+            _id: 1,
+            ownerId: 1,
+            originRef: 1,
+            workRef: 1,
+            workerId: 1,
+            runId: 1,
+            externalState: 1,
+            launchState: 1,
+            deliveryState: 1,
+            attentionPending: 1,
+            adjudicationState: 1,
+            adjudicationErrorCode: 1,
+            followUpMessageId: 1,
+            updatedAt: 1,
+            terminalCallbackRunId: 1,
+            terminalCallbackResultEndedAt: 1,
+            terminalCallbackId: 1,
+            terminalCallbackResultDigest: 1,
+            terminalCallbackResultRevision: 1,
+            terminalCallbackAcceptedOperationId: 1,
+            terminalCallbackEffectLeaseId: 1,
+            terminalCallbackEffectLeaseGeneration: 1,
+            stateReconciliationPendingAt: 1,
+            stateReconciliationNextAt: 1,
+            stateReconciliationAttempts: 1,
+          },
+        },
+      )
+      .sort({ updatedAt: -1 })
+      .limit(boundedLimit * 10)
+      .toArray();
+    const ownerIds = Array.from(
+      new Set(rows.map((row: RuntimeRecord) => normalizeText(row?.ownerId, 160)).filter(Boolean)),
+    ).slice(0, boundedLimit);
+    const outcomes = await Promise.all(
+      ownerIds.map((ownerId) => markUserParallelWorkKnown(ownerId)),
+    );
+    const now = Date.now();
+    const candidates = rows
+      .filter((row: RuntimeRecord) => {
+        const nextAttemptAt = row?.stateReconciliationNextAt
+          ? new Date(row.stateReconciliationNextAt).getTime()
+          : 0;
+        return Boolean(
+          normalizeText(row?.ownerId, 160) &&
+          normalizeText(row?.workRef, 160) &&
+          normalizeText(row?.runId, 160) &&
+          ['accepted', 'callback_confirmed'].includes(normalizeText(row?.launchState, 32)) &&
+          (!TERMINAL_STATES.includes(normalizeText(row?.externalState, 32)) ||
+            ['pending', 'enqueued', 'failed', 'unresolved', 'unknown'].includes(
+              normalizeText(row?.deliveryState, 32),
+            )) &&
+          (!Number.isFinite(nextAttemptAt) || nextAttemptAt <= now),
+        );
+      })
+      .slice(0, Math.min(boundedLimit, STATE_RECONCILIATION_BATCH));
+    await Promise.all(
+      candidates.map(async (row: RuntimeRecord) => {
+        const ownerId = normalizeText(row.ownerId, 160);
+        const workRef = normalizeText(row.workRef, 160);
+        try {
+          if (TERMINAL_STATES.includes(normalizeText(row.externalState, 32))) {
+            await recoverAcceptedTerminalResult(row);
+            return;
+          }
+          const detail = await requestAccountApi({
+            ownerId,
+            path: `/v1/work/${encodeURIComponent(workRef)}`,
+            timeoutMs: 3000,
+          });
+          if (normalizeText(detail?.workRef, 160) !== workRef) {
+            throw Object.assign(new Error('authoritative work identity did not match'), {
+              code: 'work_state_reconciliation_identity_mismatch',
+            });
+          }
+          if (!TERMINAL_STATES.includes(normalizeText(detail?.state, 32).toLowerCase())) {
+            return;
+          }
+          const ingestion = await recordGlassHiveWorkDetailTrace({
+            ownerId,
+            originRef: normalizeText(row.originRef || row._id, 160),
+            workRef,
+            runRef: normalizeText(row.runId, 160),
+            detail,
+          });
+          if (ingestion?.accepted !== true) {
+            throw Object.assign(new Error('authoritative producer trace was rejected'), {
+              code: 'glasshive_trace_producer_detail_rejected',
+            });
+          }
+          await reconcileAuthoritativeGlassHiveWorkState({ ownerId, item: detail, row });
+        } catch (error) {
+          await deferGlassHiveWorkStateReconciliation({ ownerId, row, error });
         }
-        const detail = await requestAccountApi({
-          ownerId,
-          path: `/v1/work/${encodeURIComponent(workRef)}`,
+      }),
+    );
+    return {
+      scanned: rows.length,
+      updatedOwners: outcomes.filter(Boolean).length,
+      failedOwners: outcomes.filter((updated) => !updated).length,
+    };
+  }
+
+  /** Reconcile launch intents whose MCP response was lost before Core learned the workRef. */
+  async function reconcileUnknownGlassHiveLaunches({
+    ownerId,
+    limit = 25,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord> {
+    const normalizedOwnerId = normalizeText(ownerId, 160);
+    const now = new Date();
+    const legacyPreparedBefore = new Date(now.getTime() - launchPreparationLeaseMs());
+    const filter = {
+      workRef: '',
+      ...(normalizedOwnerId ? { ownerId: normalizedOwnerId } : {}),
+      // A single persistently unavailable owner/row must not monopolize every bounded scan.
+      $nor: [{ reconciliationNextAt: { $gt: now } }],
+      $or: [
+        { launchState: 'dispatch_unknown' },
+        { launchState: 'dispatch_ready', dispatchExpiresAt: { $lte: now } },
+        {
+          launchState: 'dispatch_ready',
+          dispatchExpiresAt: { $exists: false },
+          updatedAt: { $lte: legacyPreparedBefore },
+        },
+        { launchState: 'prepared', preparationExpiresAt: { $lte: now } },
+        {
+          launchState: 'prepared',
+          preparationExpiresAt: { $exists: false },
+          updatedAt: { $lte: legacyPreparedBefore },
+        },
+      ],
+    };
+    const cursor = externalWorkCollection()
+      .find(filter)
+      .sort({ updatedAt: 1 })
+      .limit(Math.max(1, Math.min(Number(limit) || 25, 100)));
+    const rows = await cursor.toArray();
+    let repaired = 0;
+    let pending = 0;
+    for (const row of rows) {
+      if (row.launchState === 'prepared') {
+        await markGlassHiveLaunchPreDispatchFailed(
+          {
+            originRef: normalizeText(row.originRef || row._id, 160),
+            ownerId: normalizeText(row.ownerId, 160),
+            required: row.required === true,
+            schedulerDispatchDocumentId: normalizeText(row.schedulerDispatchDocumentId, 160),
+            scheduleOccurrenceKey: normalizeText(row.scheduleOccurrenceKey, 160),
+          },
+          Object.assign(new Error('launch_preparation_lease_expired'), {
+            code: 'launch_preparation_lease_expired',
+          }),
+        );
+        repaired += 1;
+        continue;
+      }
+      try {
+        const snapshot = await requestAccountApi({
+          ownerId: row.ownerId,
+          path: `/v1/delegations/by-origin/${encodeURIComponent(row.originRef || row._id)}`,
           timeoutMs: 3000,
         });
-        if (normalizeText(detail?.workRef, 160) !== workRef) {
-          throw Object.assign(new Error('authoritative work identity did not match'), {
-            code: 'work_state_reconciliation_identity_mismatch',
-          });
+        const workRef = normalizeText(snapshot?.workRef, 160);
+        if (!workRef) {
+          pending += 1;
+          continue;
         }
-        if (!TERMINAL_STATES.includes(normalizeText(detail?.state, 32).toLowerCase())) {
-          return;
-        }
-        const ingestion = await recordGlassHiveWorkDetailTrace({
-          ownerId,
-          originRef: normalizeText(row.originRef || row._id, 160),
-          workRef,
-          runRef: normalizeText(row.runId, 160),
-          detail,
-        });
-        if (ingestion?.accepted !== true) {
-          throw Object.assign(new Error('authoritative producer trace was rejected'), {
-            code: 'glasshive_trace_producer_detail_rejected',
-          });
-        }
-        await reconcileAuthoritativeGlassHiveWorkState({ ownerId, item: detail, row });
+        const now = new Date();
+        const bindFilter = { _id: row._id, $or: [{ workRef: '' }, { workRef }] };
+        const update = { $set: { workRef, launchState: 'accepted', updatedAt: now } };
+        await callbackBindingCollection().updateOne(bindFilter, update);
+        await externalWorkCollection().updateOne(bindFilter, update);
+        repaired += 1;
       } catch (error) {
-        await deferGlassHiveWorkStateReconciliation({ ownerId, row, error });
-      }
-    }),
-  );
-  return {
-    scanned: rows.length,
-    updatedOwners: outcomes.filter(Boolean).length,
-    failedOwners: outcomes.filter((updated) => !updated).length,
-  };
-}
-
-/** Reconcile launch intents whose MCP response was lost before Core learned the workRef. */
-async function reconcileUnknownGlassHiveLaunches(
-  { ownerId, limit = 25 }: RuntimeRecord = {},
-): Promise<RuntimeRecord> {
-  const normalizedOwnerId = normalizeText(ownerId, 160);
-  const now = new Date();
-  const legacyPreparedBefore = new Date(now.getTime() - launchPreparationLeaseMs());
-  const filter = {
-    workRef: '',
-    ...(normalizedOwnerId ? { ownerId: normalizedOwnerId } : {}),
-    // A single persistently unavailable owner/row must not monopolize every bounded scan.
-    $nor: [{ reconciliationNextAt: { $gt: now } }],
-    $or: [
-      { launchState: 'dispatch_unknown' },
-      { launchState: 'dispatch_ready', dispatchExpiresAt: { $lte: now } },
-      {
-        launchState: 'dispatch_ready',
-        dispatchExpiresAt: { $exists: false },
-        updatedAt: { $lte: legacyPreparedBefore },
-      },
-      { launchState: 'prepared', preparationExpiresAt: { $lte: now } },
-      {
-        launchState: 'prepared',
-        preparationExpiresAt: { $exists: false },
-        updatedAt: { $lte: legacyPreparedBefore },
-      },
-    ],
-  };
-  const cursor = externalWorkCollection()
-    .find(filter)
-    .sort({ updatedAt: 1 })
-    .limit(Math.max(1, Math.min(Number(limit) || 25, 100)));
-  const rows = await cursor.toArray();
-  let repaired = 0;
-  let pending = 0;
-  for (const row of rows) {
-    if (row.launchState === 'prepared') {
-      await markGlassHiveLaunchPreDispatchFailed(
-        {
-          originRef: normalizeText(row.originRef || row._id, 160),
-          ownerId: normalizeText(row.ownerId, 160),
-          required: row.required === true,
-          schedulerDispatchDocumentId: normalizeText(row.schedulerDispatchDocumentId, 160),
-          scheduleOccurrenceKey: normalizeText(row.scheduleOccurrenceKey, 160),
-        },
-        Object.assign(new Error('launch_preparation_lease_expired'), {
-          code: 'launch_preparation_lease_expired',
-        }),
-      );
-      repaired += 1;
-      continue;
-    }
-    try {
-      const snapshot = await requestAccountApi({
-        ownerId: row.ownerId,
-        path: `/v1/delegations/by-origin/${encodeURIComponent(row.originRef || row._id)}`,
-        timeoutMs: 3000,
-      });
-      const workRef = normalizeText(snapshot?.workRef, 160);
-      if (!workRef) {
+        const runtimeError = error as RuntimeError;
+        if (Number(runtimeError.status) === 404) {
+          const expiresAt = row.dispatchExpiresAt
+            ? new Date(row.dispatchExpiresAt)
+            : new Date(new Date(row.updatedAt || 0).getTime() + launchDispatchAmbiguityLeaseMs());
+          if (Number.isFinite(expiresAt.getTime()) && expiresAt <= now) {
+            await markGlassHiveLaunchPreDispatchFailed(
+              {
+                originRef: normalizeText(row.originRef || row._id, 160),
+                ownerId: normalizeText(row.ownerId, 160),
+                required: row.required === true,
+                schedulerDispatchDocumentId: normalizeText(row.schedulerDispatchDocumentId, 160),
+                scheduleOccurrenceKey: normalizeText(row.scheduleOccurrenceKey, 160),
+              },
+              Object.assign(new Error('launch_dispatch_not_found'), {
+                code: 'launch_dispatch_not_found',
+              }),
+            );
+            repaired += 1;
+          } else {
+            pending += 1;
+          }
+          continue;
+        }
+        const attempts = Math.max(0, Number(row.reconciliationAttempts) || 0) + 1;
+        const delayMs = Math.min(5 * 60 * 1000, 5_000 * 2 ** Math.min(attempts - 1, 6));
+        const errorCode =
+          normalizeText(runtimeError.code || runtimeError.name, 120) || 'reconciliation_failed';
+        await externalWorkCollection().updateOne(
+          {
+            _id: row._id,
+            workRef: '',
+            launchState: row.launchState,
+          },
+          {
+            $set: {
+              reconciliationAttemptedAt: now,
+              reconciliationNextAt: new Date(now.getTime() + delayMs),
+              reconciliationErrorCode: errorCode,
+            },
+            $inc: { reconciliationAttempts: 1 },
+          },
+        );
+        logger.warn('[VIVENTIUM][glasshive-binding] Launch reconciliation deferred', {
+          errorCode,
+          attempts,
+        });
         pending += 1;
         continue;
       }
-      const now = new Date();
-      const bindFilter = { _id: row._id, $or: [{ workRef: '' }, { workRef }] };
-      const update = { $set: { workRef, launchState: 'accepted', updatedAt: now } };
-      await callbackBindingCollection().updateOne(bindFilter, update);
-      await externalWorkCollection().updateOne(bindFilter, update);
-      repaired += 1;
-    } catch (error) {
-      const runtimeError = error as RuntimeError;
-      if (Number(runtimeError.status) === 404) {
-        const expiresAt = row.dispatchExpiresAt
-          ? new Date(row.dispatchExpiresAt)
-          : new Date(new Date(row.updatedAt || 0).getTime() + launchDispatchAmbiguityLeaseMs());
-        if (Number.isFinite(expiresAt.getTime()) && expiresAt <= now) {
-          await markGlassHiveLaunchPreDispatchFailed(
-            {
-              originRef: normalizeText(row.originRef || row._id, 160),
-              ownerId: normalizeText(row.ownerId, 160),
-              required: row.required === true,
-              schedulerDispatchDocumentId: normalizeText(row.schedulerDispatchDocumentId, 160),
-              scheduleOccurrenceKey: normalizeText(row.scheduleOccurrenceKey, 160),
-            },
-            Object.assign(new Error('launch_dispatch_not_found'), {
-              code: 'launch_dispatch_not_found',
-            }),
-          );
-          repaired += 1;
-        } else {
-          pending += 1;
-        }
-        continue;
-      }
-      const attempts = Math.max(0, Number(row.reconciliationAttempts) || 0) + 1;
-      const delayMs = Math.min(5 * 60 * 1000, 5_000 * 2 ** Math.min(attempts - 1, 6));
-      const errorCode = normalizeText(runtimeError.code || runtimeError.name, 120) || 'reconciliation_failed';
-      await externalWorkCollection().updateOne(
-        {
-          _id: row._id,
-          workRef: '',
-          launchState: row.launchState,
-        },
-        {
-          $set: {
-            reconciliationAttemptedAt: now,
-            reconciliationNextAt: new Date(now.getTime() + delayMs),
-            reconciliationErrorCode: errorCode,
-          },
-          $inc: { reconciliationAttempts: 1 },
-        },
-      );
-      logger.warn('[VIVENTIUM][glasshive-binding] Launch reconciliation deferred', {
-        errorCode,
-        attempts,
-      });
-      pending += 1;
-      continue;
     }
+    return { scanned: rows.length, repaired, pending };
   }
-  return { scanned: rows.length, repaired, pending };
-}
 
-async function recordGlassHiveCallbackExternalState({
-  binding,
-  body = {},
-  effectFence,
-  effectSession,
-}: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
-  if (!binding?.ownerId) return null;
-  const fence = terminalCallbackEffectFence(body, effectFence);
-  const callbackAcceptedAt = new Date();
-  const state = callbackWorkState(body);
-  const workerId = normalizeText(body.worker_id);
-  const runId = normalizeText(body.run_id);
-  const originRef = normalizeText(binding.originRef || binding.bindingId, 160);
-  const workRef = normalizeText(binding.workRef || body.work_ref, 160);
-  const callbackAt = callbackTraceAt(body);
-  const traceIdentity = binding.traceIdentity
-    ? callbackTraceIdentity(body, binding.traceIdentity)
-    : null;
-  if (traceIdentity && callbackAt && originRef && workRef && runId) {
-    // Callback authority and destination fencing are independent of the
-    // diagnostic producer trace. A trace gap must not strand an authorized result.
-    try {
-      const workState = canonicalGlassHiveWorkState(body) || state;
-      if (TERMINAL_STATES.includes(workState) && isGlassHiveWorkTerminalCallback(body)) {
-        const detail = await requestAccountApi({
-          ownerId: normalizeText(binding.ownerId, 160),
-          path: `/v1/work/${encodeURIComponent(workRef)}`,
-          timeoutMs: 3000,
-        });
-        const ingestion = await recordGlassHiveWorkDetailTrace({
+  async function recordGlassHiveCallbackExternalState({
+    binding,
+    body = {},
+    effectFence,
+    effectSession,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
+    if (!binding?.ownerId) return null;
+    const fence = terminalCallbackEffectFence(body, effectFence);
+    const callbackAcceptedAt = new Date();
+    const state = callbackWorkState(body);
+    const workerId = normalizeText(body.worker_id);
+    const runId = normalizeText(body.run_id);
+    const originRef = normalizeText(binding.originRef || binding.bindingId, 160);
+    const workRef = normalizeText(binding.workRef || body.work_ref, 160);
+    const callbackAt = callbackTraceAt(body);
+    const traceIdentity = binding.traceIdentity
+      ? callbackTraceIdentity(body, binding.traceIdentity)
+      : null;
+    if (traceIdentity && callbackAt && originRef && workRef && runId) {
+      // Callback authority and destination fencing are independent of the
+      // diagnostic producer trace. A trace gap must not strand an authorized result.
+      try {
+        const workState = canonicalGlassHiveWorkState(body) || state;
+        if (TERMINAL_STATES.includes(workState) && isGlassHiveWorkTerminalCallback(body)) {
+          const detail = await requestAccountApi({
+            ownerId: normalizeText(binding.ownerId, 160),
+            path: `/v1/work/${encodeURIComponent(workRef)}`,
+            timeoutMs: 3000,
+          });
+          const ingestion = await recordGlassHiveWorkDetailTrace({
+            ownerId: normalizeText(binding.ownerId, 160),
+            originRef,
+            workRef,
+            runRef: runId,
+            detail,
+          });
+          if (ingestion?.accepted !== true) {
+            throw Object.assign(new Error('glasshive_trace_producer_detail_rejected'), {
+              code: 'glasshive_trace_producer_detail_rejected',
+              traceErrors: ingestion?.errors || [],
+            });
+          }
+        }
+        await recordOrchestrationTraceCallback({
           ownerId: normalizeText(binding.ownerId, 160),
           originRef,
           workRef,
-          runRef: runId,
-          detail,
+          runRef: normalizeText(body.run_id, 160),
+          callbackRef: traceIdentity.callbackRef,
+          event: normalizeText(body.event, 64),
+          workState,
+          workTerminal: isGlassHiveWorkTerminalCallback(body),
+          callbackAt,
+          callbackAcceptedAt,
+          attemptNumber: traceIdentity.attemptNumber,
         });
-        if (ingestion?.accepted !== true) {
-          throw Object.assign(new Error('glasshive_trace_producer_detail_rejected'), {
-            code: 'glasshive_trace_producer_detail_rejected',
-            traceErrors: ingestion?.errors || [],
-          });
+      } catch (error) {
+        const traceError = error as Error & { code?: string; traceErrors?: unknown };
+        const codes = Array.isArray(traceError.traceErrors)
+          ? traceError.traceErrors
+          : [traceError.code];
+        logger.warn('[VIVENTIUM][glasshive-binding] Callback trace incomplete', {
+          codes: codes
+            .filter((code) => typeof code === 'string' && /^[a-z0-9_]{1,120}$/.test(code))
+            .slice(0, 16),
+        });
+      }
+    }
+    if (binding.currentRunId && binding.currentRunId !== runId) return null;
+    await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
+    const collection = externalWorkCollection();
+    const work = originRef
+      ? await collection.findOne(
+          { _id: originRef, ownerId: binding.ownerId },
+          effectSession ? { session: effectSession } : undefined,
+        )
+      : null;
+    if (work && state) {
+      const now = new Date();
+      const update: RuntimeRecord = {
+        $set: {
+          externalState: state,
+          workerId,
+          runId,
+          workRef,
+          launchState: 'callback_confirmed',
+          updatedAt: now,
+          ...terminalCallbackDestinationFields(fence),
+          ...(TERMINAL_STATES.includes(state) ? { terminalAt: now } : {}),
+          ...(state
+            ? {
+                attentionPending: state === 'needs_input' || TERMINAL_STATES.includes(state),
+                ...(TERMINAL_STATES.includes(state) ? { deliveryState: 'pending' } : {}),
+              }
+            : {}),
+        },
+      };
+      const filter: RuntimeRecord = { _id: work._id };
+      if (!TERMINAL_STATES.includes(normalizeText(work.externalState, 32))) {
+        filter.externalState = { $nin: TERMINAL_STATES };
+        const previousDeliveryState = normalizeText(work.deliveryState, 32);
+        if (
+          TERMINAL_STATES.includes(state) &&
+          PROTECTED_DELIVERY_STATES.includes(previousDeliveryState)
+        ) {
+          delete update.$set.deliveryState;
+          update.$set.attentionPending = work.attentionPending === true;
         }
-      }
-      await recordOrchestrationTraceCallback({
-        ownerId: normalizeText(binding.ownerId, 160),
-        originRef,
-        workRef,
-        runRef: normalizeText(body.run_id, 160),
-        callbackRef: traceIdentity.callbackRef,
-        event: normalizeText(body.event, 64),
-        workState,
-        workTerminal: isGlassHiveWorkTerminalCallback(body),
-        callbackAt,
-        callbackAcceptedAt,
-        attemptNumber: traceIdentity.attemptNumber,
-      });
-    } catch (error) {
-      const traceError = error as Error & { code?: string; traceErrors?: unknown };
-      const codes = Array.isArray(traceError.traceErrors) ? traceError.traceErrors : [traceError.code];
-      logger.warn('[VIVENTIUM][glasshive-binding] Callback trace incomplete', {
-        codes: codes.filter((code) => typeof code === 'string' && /^[a-z0-9_]{1,120}$/.test(code)).slice(0, 16),
-      });
-    }
-  }
-  if (binding.currentRunId && binding.currentRunId !== runId) return null;
-  await projectVerifiedGlassHiveCallbackGeneration({ binding, body, effectSession });
-  const collection = externalWorkCollection();
-  const work = originRef
-    ? await collection.findOne(
-        { _id: originRef, ownerId: binding.ownerId },
-        effectSession ? { session: effectSession } : undefined,
-      )
-    : null;
-  if (work && state) {
-    const now = new Date();
-    const update: RuntimeRecord = {
-      $set: {
-        externalState: state,
-        workerId,
-        runId,
-        workRef,
-        launchState: 'callback_confirmed',
-        updatedAt: now,
-        ...terminalCallbackDestinationFields(fence),
-        ...(TERMINAL_STATES.includes(state) ? { terminalAt: now } : {}),
-        ...(state
-          ? {
-              attentionPending: state === 'needs_input' || TERMINAL_STATES.includes(state),
-              ...(TERMINAL_STATES.includes(state) ? { deliveryState: 'pending' } : {}),
-            }
-          : {}),
-      },
-    };
-    const filter: RuntimeRecord = { _id: work._id };
-    if (!TERMINAL_STATES.includes(normalizeText(work.externalState, 32))) {
-      filter.externalState = { $nin: TERMINAL_STATES };
-      const previousDeliveryState = normalizeText(work.deliveryState, 32);
-      if (
-        TERMINAL_STATES.includes(state) &&
-        PROTECTED_DELIVERY_STATES.includes(previousDeliveryState)
-      ) {
+      } else {
+        delete update.$set.externalState;
+        delete update.$set.terminalAt;
         delete update.$set.deliveryState;
-        update.$set.attentionPending = work.attentionPending === true;
+        delete update.$set.attentionPending;
       }
-    } else {
-      delete update.$set.externalState;
-      delete update.$set.terminalAt;
-      delete update.$set.deliveryState;
-      delete update.$set.attentionPending;
-    }
       const written = await collection.findOneAndUpdate(
         terminalCallbackDestinationFilter(filter, fence),
         update,
@@ -2714,166 +2935,216 @@ async function recordGlassHiveCallbackExternalState({
       ) {
         invalidateActiveWorkSnapshot?.({ ownerId: normalizeText(committed.ownerId), fetchImpl });
       }
-  } else if (fence) {
-    throw callbackEffectFenceError();
+    } else if (fence) {
+      throw callbackEffectFenceError();
+    }
+
+    if (!binding.schedulerDispatchDocumentId && !binding.scheduleOccurrenceKey) {
+      return null;
+    }
+    return getSchedulerExternalWorkSummary({
+      ownerId: binding.ownerId,
+      schedulerDispatchDocumentId: binding.schedulerDispatchDocumentId,
+      scheduleOccurrenceKey: binding.scheduleOccurrenceKey,
+      effectSession,
+    });
   }
 
-  if (!binding.schedulerDispatchDocumentId && !binding.scheduleOccurrenceKey) {
-    return null;
-  }
-  return getSchedulerExternalWorkSummary({
-    ownerId: binding.ownerId,
-    schedulerDispatchDocumentId: binding.schedulerDispatchDocumentId,
-    scheduleOccurrenceKey: binding.scheduleOccurrenceKey,
+  async function recordGlassHiveAdjudicationOutcome({
+    originRef,
+    state,
+    followUpMessageId = '',
+    errorCode = '',
     effectSession,
-  });
-}
-
-async function recordGlassHiveAdjudicationOutcome({
-  originRef,
-  state,
-  followUpMessageId = '',
-  errorCode = '',
-  effectSession,
-}: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
-  const ref = normalizeText(originRef, 160);
-  const normalizedState = normalizeText(state, 32);
-  if (!ref || !['completed', 'silent', 'failed'].includes(normalizedState)) return null;
-  const normalizedErrorCode = normalizeText(errorCode, 120);
-  const unresolvedDelivery = normalizedErrorCode === 'mission_surface_delivery_unresolved';
-  const now = new Date();
-  const adjudicationFields = {
-    adjudicationState: normalizedState,
-    attentionPending: normalizedState === 'failed',
-    followUpMessageId: normalizeText(followUpMessageId, 160),
-    adjudicationErrorCode: normalizedErrorCode,
-    adjudicatedAt: now,
-    updatedAt: now,
-  };
-  const deliveryState = normalizedState === 'silent' && normalizedErrorCode === 'mission_origin_cleanup_tombstoned'
-    ? 'suppressed'
-    : normalizedState === 'failed' ? (unresolvedDelivery ? 'unresolved' : 'failed') : 'enqueued';
-  effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
-  const collection = externalWorkCollection();
-  const unsettledResult = await collection.findOneAndUpdate(
-    { _id: ref, deliveryState: { $nin: PROTECTED_DELIVERY_STATES } },
-    {
-      $set: {
-        ...adjudicationFields,
-        deliveryState,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
+    const ref = normalizeText(originRef, 160);
+    const normalizedState = normalizeText(state, 32);
+    if (!ref || !['completed', 'silent', 'failed'].includes(normalizedState)) return null;
+    const normalizedErrorCode = normalizeText(errorCode, 120);
+    const unresolvedDelivery = normalizedErrorCode === 'mission_surface_delivery_unresolved';
+    const now = new Date();
+    const adjudicationFields = {
+      adjudicationState: normalizedState,
+      attentionPending: normalizedState === 'failed',
+      followUpMessageId: normalizeText(followUpMessageId, 160),
+      adjudicationErrorCode: normalizedErrorCode,
+      adjudicatedAt: now,
+      updatedAt: now,
+    };
+    const deliveryState =
+      normalizedState === 'silent'
+        ? normalizedErrorCode === 'mission_origin_cleanup_tombstoned'
+          ? 'suppressed'
+          : 'silent'
+        : normalizedState === 'failed'
+          ? unresolvedDelivery
+            ? 'unresolved'
+            : 'failed'
+          : 'enqueued';
+    effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
+    const collection = externalWorkCollection();
+    const unsettledResult = await collection.findOneAndUpdate(
+      { _id: ref, deliveryState: { $nin: PROTECTED_DELIVERY_STATES } },
+      {
+        $set: {
+          ...adjudicationFields,
+          deliveryState,
+        },
       },
-    },
-    { returnDocument: 'after', ...(effectSession ? { session: effectSession } : {}) },
-  );
-  const unsettledRow =
-    unsettledResult && Object.prototype.hasOwnProperty.call(unsettledResult, 'value')
-      ? unsettledResult.value
-      : unsettledResult;
-  if (unsettledRow) return unsettledRow;
+      { returnDocument: 'after', ...(effectSession ? { session: effectSession } : {}) },
+    );
+    const unsettledRow =
+      unsettledResult && Object.prototype.hasOwnProperty.call(unsettledResult, 'value')
+        ? unsettledResult.value
+        : unsettledResult;
+    if (unsettledRow) return unsettledRow;
 
-  // Delivery is monotonic. A later adjudication pass may enrich mission metadata, but it must
-  // never turn an already-sent/acknowledged/silent surface back into a pending delivery.
-  const { attentionPending: _attentionPending, ...protectedAdjudicationFields } =
-    adjudicationFields;
-  const settledResult = await collection.findOneAndUpdate(
-    { _id: ref },
-    { $set: protectedAdjudicationFields },
-    { returnDocument: 'after', ...(effectSession ? { session: effectSession } : {}) },
-  );
-  return settledResult && Object.prototype.hasOwnProperty.call(settledResult, 'value')
-    ? settledResult.value
-    : settledResult || null;
-}
-
-async function reconcileGlassHiveSurfaceDeliveryOutcome({ originRef }: { originRef: string }): Promise<RuntimeRecord | null> {
-  const ref = normalizeText(originRef, 160);
-  if (!ref) return null;
-  const current = await externalWorkCollection().findOne({ _id: ref });
-  if (!current?.ownerId || !current.workRef) return null;
-  const runId = normalizeText(current.terminalCallbackRunId || current.runId, 160);
-  if (!runId) return null;
-  const deliveryFilter: RuntimeRecord = {
-    originRef: ref, userId: current.ownerId, workRef: current.workRef, runId,
-  };
-  const snapshotFilter: RuntimeRecord = { _id: ref, ownerId: current.ownerId, workRef: current.workRef };
-  // Read only receipts for the aggregate's current result identity. Match the
-  // same snapshot at write time so a correction that advances during this read wins.
-  for (const key of [
-    'runId', 'updatedAt', 'terminalCallbackRunId', 'terminalCallbackResultEndedAt',
-    'terminalCallbackId', 'terminalCallbackResultDigest', 'terminalCallbackResultRevision',
-    'terminalCallbackAcceptedOperationId', 'terminalCallbackEffectLeaseGeneration',
-  ]) snapshotFilter[key] = Object.prototype.hasOwnProperty.call(current, key) ? current[key] : { $exists: false };
-  for (const key of [
-    'terminalCallbackId', 'terminalCallbackResultDigest', 'terminalCallbackResultRevision',
-    'terminalCallbackAcceptedOperationId',
-  ]) {
-    if (current[key] != null) deliveryFilter[key] = current[key];
+    // Delivery is monotonic. A later adjudication pass may enrich mission metadata, but it must
+    // never turn an already-sent/acknowledged/silent surface back into a pending delivery.
+    const { attentionPending: _attentionPending, ...protectedAdjudicationFields } =
+      adjudicationFields;
+    const settledResult = await collection.findOneAndUpdate(
+      { _id: ref },
+      { $set: protectedAdjudicationFields },
+      { returnDocument: 'after', ...(effectSession ? { session: effectSession } : {}) },
+    );
+    return settledResult && Object.prototype.hasOwnProperty.call(settledResult, 'value')
+      ? settledResult.value
+      : settledResult || null;
   }
-  const rows = await mongoose.connection.collection('viventiumglasshivecallbackdeliveries')
-    .find(deliveryFilter, { projection: { status: 1 } }).toArray();
-  const statuses = new Set(rows.map((row) => row.status));
-  const state = statuses.has('delivery_unknown') ? 'unknown'
-    : statuses.has('unresolved') ? 'unresolved'
-    : statuses.has('failed') ? 'failed'
-    : statuses.has('pending') || statuses.has('claimed') ? 'enqueued'
-    : statuses.has('sent') ? 'sent'
-    : statuses.has('suppressed') ? 'suppressed' : '';
-  // Historical receipts do not invent a status for a current run with no receipts yet.
-  if (!state) return current;
-  const updated = await externalWorkCollection().findOneAndUpdate(snapshotFilter, {
-    $set: { deliveryState: state, attentionPending: ['failed', 'unresolved', 'unknown'].includes(state),
-      deliveryUpdatedAt: new Date(), updatedAt: new Date() },
-  }, { returnDocument: 'after' });
-  const document = updated && Object.prototype.hasOwnProperty.call(updated, 'value') ? updated.value : updated;
-  if (!document) throw Object.assign(new Error('glasshive_delivery_projection_snapshot_changed'), {
-    code: 'glasshive_delivery_projection_snapshot_changed',
-  });
-  return document;
-}
 
-async function recordGlassHiveSurfaceDeliveryOutcome({
-  originRef,
-  state,
-  body = {},
-  effectFence,
-  effectSession,
-  workerCompletion,
-}: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
-  const ref = normalizeText(originRef, 160);
-  const deliveryState = normalizeText(state, 32);
-  if (
-    !ref ||
-    !['enqueued', 'sent', 'failed', 'suppressed', 'unresolved', 'unknown'].includes(deliveryState)
-  ) {
-    return null;
+  async function reconcileGlassHiveSurfaceDeliveryOutcome({
+    originRef,
+  }: {
+    originRef: string;
+  }): Promise<RuntimeRecord | null> {
+    const ref = normalizeText(originRef, 160);
+    if (!ref) return null;
+    const current = await externalWorkCollection().findOne({ _id: ref });
+    if (!current?.ownerId || !current.workRef) return null;
+    const runId = normalizeText(current.terminalCallbackRunId || current.runId, 160);
+    if (!runId) return null;
+    const deliveryFilter: RuntimeRecord = {
+      originRef: ref,
+      userId: current.ownerId,
+      workRef: current.workRef,
+      runId,
+    };
+    const snapshotFilter: RuntimeRecord = {
+      _id: ref,
+      ownerId: current.ownerId,
+      workRef: current.workRef,
+    };
+    // Read only receipts for the aggregate's current result identity. Match the
+    // same snapshot at write time so a correction that advances during this read wins.
+    for (const key of [
+      'runId',
+      'updatedAt',
+      'terminalCallbackRunId',
+      'terminalCallbackResultEndedAt',
+      'terminalCallbackId',
+      'terminalCallbackResultDigest',
+      'terminalCallbackResultRevision',
+      'terminalCallbackAcceptedOperationId',
+      'terminalCallbackEffectLeaseGeneration',
+    ])
+      snapshotFilter[key] = Object.prototype.hasOwnProperty.call(current, key)
+        ? current[key]
+        : { $exists: false };
+    for (const key of [
+      'terminalCallbackId',
+      'terminalCallbackResultDigest',
+      'terminalCallbackResultRevision',
+      'terminalCallbackAcceptedOperationId',
+    ]) {
+      if (current[key] != null) deliveryFilter[key] = current[key];
+    }
+    const rows = await mongoose.connection
+      .collection('viventiumglasshivecallbackdeliveries')
+      .find(deliveryFilter, { projection: { status: 1 } })
+      .toArray();
+    const statuses = new Set(rows.map((row) => row.status));
+    const state = statuses.has('delivery_unknown')
+      ? 'unknown'
+      : statuses.has('unresolved')
+        ? 'unresolved'
+        : statuses.has('failed')
+          ? 'failed'
+          : statuses.has('pending') || statuses.has('claimed')
+            ? 'enqueued'
+            : statuses.has('sent')
+              ? 'sent'
+              : statuses.has('suppressed')
+                ? 'suppressed'
+                : '';
+    // Historical receipts do not invent a status for a current run with no receipts yet.
+    if (!state) return current;
+    const updated = await externalWorkCollection().findOneAndUpdate(
+      snapshotFilter,
+      {
+        $set: {
+          deliveryState: state,
+          attentionPending: ['failed', 'unresolved', 'unknown'].includes(state),
+          deliveryUpdatedAt: new Date(),
+          updatedAt: new Date(),
+        },
+      },
+      { returnDocument: 'after' },
+    );
+    const document =
+      updated && Object.prototype.hasOwnProperty.call(updated, 'value') ? updated.value : updated;
+    if (!document)
+      throw Object.assign(new Error('glasshive_delivery_projection_snapshot_changed'), {
+        code: 'glasshive_delivery_projection_snapshot_changed',
+      });
+    return document;
   }
-  effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
-  const fence = terminalCallbackEffectFence(body, effectFence);
-  const projectionFilter = {
-    _id: ref,
-    ...(workerCompletion
-      ? {
-          ownerId: workerCompletion.ownerId,
-          workRef: workerCompletion.binding.workRef,
-          ...(workerCompletion.binding.kind === 'nonterminal_attention'
-            ? {
-                workerId: workerCompletion.binding.workerId,
-                runId: workerCompletion.binding.runId,
-                externalState: 'needs_input',
-              }
-            : {
-                terminalCallbackRunId: workerCompletion.binding.runId,
-                terminalCallbackId: workerCompletion.binding.terminalCallbackId,
-                terminalCallbackResultDigest: workerCompletion.binding.resultDigest,
-                terminalCallbackResultRevision: workerCompletion.binding.resultRevision,
-                terminalCallbackAcceptedOperationId: workerCompletion.binding.acceptedOperationId,
-              }),
-          followUpMessageId: workerCompletion.responseMessageId,
-        }
-      : {}),
-    ...(deliveryState === 'enqueued' ? { deliveryState: { $nin: PROTECTED_DELIVERY_STATES } } : {}),
-  };
-  const updated = await externalWorkCollection().findOneAndUpdate(
+
+  async function recordGlassHiveSurfaceDeliveryOutcome({
+    originRef,
+    state,
+    body = {},
+    effectFence,
+    effectSession,
+    workerCompletion,
+  }: RuntimeRecord = {}): Promise<RuntimeRecord | null> {
+    const ref = normalizeText(originRef, 160);
+    const deliveryState = normalizeText(state, 32);
+    if (
+      !ref ||
+      !['enqueued', 'sent', 'failed', 'suppressed', 'unresolved', 'unknown'].includes(deliveryState)
+    ) {
+      return null;
+    }
+    effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
+    const fence = terminalCallbackEffectFence(body, effectFence);
+    const projectionFilter = {
+      _id: ref,
+      ...(workerCompletion
+        ? {
+            ownerId: workerCompletion.ownerId,
+            workRef: workerCompletion.binding.workRef,
+            ...(workerCompletion.binding.kind === 'nonterminal_attention'
+              ? {
+                  workerId: workerCompletion.binding.workerId,
+                  runId: workerCompletion.binding.runId,
+                  externalState: 'needs_input',
+                }
+              : {
+                  terminalCallbackRunId: workerCompletion.binding.runId,
+                  terminalCallbackId: workerCompletion.binding.terminalCallbackId,
+                  terminalCallbackResultDigest: workerCompletion.binding.resultDigest,
+                  terminalCallbackResultRevision: workerCompletion.binding.resultRevision,
+                  terminalCallbackAcceptedOperationId: workerCompletion.binding.acceptedOperationId,
+                }),
+            followUpMessageId: workerCompletion.responseMessageId,
+          }
+        : {}),
+      ...(deliveryState === 'enqueued'
+        ? { deliveryState: { $nin: PROTECTED_DELIVERY_STATES } }
+        : {}),
+    };
+    const updated = await externalWorkCollection().findOneAndUpdate(
       terminalCallbackDestinationFilter(projectionFilter, fence),
       {
         $set: {
@@ -2889,166 +3160,201 @@ async function recordGlassHiveSurfaceDeliveryOutcome({
         ...(effectSession ? { session: effectSession } : {}),
       },
     );
-  const document = updated && Object.prototype.hasOwnProperty.call(updated, 'value')
-    ? updated.value : updated;
-  if (!document && fence && deliveryState === 'sent' && effectSession?.inTransaction()) {
-    // An earlier run can finish delivering after a correction has already
-    // become the aggregate status owner. Keep its exact delivery receipt, but
-    // do not overwrite the newer run's status or bypass accepted-result authority.
-    const newer = await externalWorkCollection().findOne({
-      _id: ref,
-      terminalCallbackRunId: { $exists: true, $nin: ['', fence.runId] },
-      terminalCallbackResultEndedAt: { $gt: fence.resultEndedAt },
-    }, { session: effectSession });
-    if (newer) {
-      const accepted = await mongoose.connection.collection('viventium_glasshive_callback_results').findOne({
-        _id: fence.resultKey, ownerId: newer.ownerId, originRef: ref,
-        workRef: newer.workRef, runId: fence.runId,
-        acceptedOperationId: fence.acceptedOperationId,
-        acceptedOperationGeneration: fence.generation,
-        callbackId: fence.callbackId, resultDigest: fence.resultDigest,
-        resultRevision: fence.resultRevision,
-        effectLeaseId: fence.leaseId, effectLeaseGeneration: fence.leaseGeneration,
-        effectLeaseExpiresAt: { $gt: new Date() },
-      }, { session: effectSession });
-      if (accepted) {
-        logger.info('[VIVENTIUM][glasshive-delivery] Retained historical delivery; newer aggregate status preserved');
-        return newer;
+    const document =
+      updated && Object.prototype.hasOwnProperty.call(updated, 'value') ? updated.value : updated;
+    if (!document && fence && deliveryState === 'sent' && effectSession?.inTransaction()) {
+      // An earlier run can finish delivering after a correction has already
+      // become the aggregate status owner. Keep its exact delivery receipt, but
+      // do not overwrite the newer run's status or bypass accepted-result authority.
+      const newer = await externalWorkCollection().findOne(
+        {
+          _id: ref,
+          terminalCallbackRunId: { $exists: true, $nin: ['', fence.runId] },
+          terminalCallbackResultEndedAt: { $gt: fence.resultEndedAt },
+        },
+        { session: effectSession },
+      );
+      if (newer) {
+        const accepted = await mongoose.connection
+          .collection('viventium_glasshive_callback_results')
+          .findOne(
+            {
+              _id: fence.resultKey,
+              ownerId: newer.ownerId,
+              originRef: ref,
+              workRef: newer.workRef,
+              runId: fence.runId,
+              acceptedOperationId: fence.acceptedOperationId,
+              acceptedOperationGeneration: fence.generation,
+              callbackId: fence.callbackId,
+              resultDigest: fence.resultDigest,
+              resultRevision: fence.resultRevision,
+              effectLeaseId: fence.leaseId,
+              effectLeaseGeneration: fence.leaseGeneration,
+              effectLeaseExpiresAt: { $gt: new Date() },
+            },
+            { session: effectSession },
+          );
+        if (accepted) {
+          logger.info(
+            '[VIVENTIUM][glasshive-delivery] Retained historical delivery; newer aggregate status preserved',
+          );
+          return newer;
+        }
       }
     }
-  }
-  const result = requireFencedDestinationDocument(updated, fence);
+    const result = requireFencedDestinationDocument(updated, fence);
 
-  return result?.value || result || null;
-}
-
-function schedulingExternalCallbackUrl() {
-  const explicit = normalizeText(process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL, 2048);
-  if (explicit) return explicit;
-  const base = normalizeText(process.env.SCHEDULING_MCP_URL, 2048);
-  if (!base) return '';
-  return `${base.replace(/\/mcp\/?$/, '').replace(/\/$/, '')}/internal/scheduled-prompts/external-work-callback`;
-}
-
-async function notifySchedulerExternalWorkSummary(
-  { binding, summary }: RuntimeRecord = {},
-): Promise<unknown> {
-  if (!binding?.scheduleOccurrenceKey || !summary || summary.requiredTotal < 1) {
-    return null;
+    return result?.value || result || null;
   }
-  const url = schedulingExternalCallbackUrl();
-  const secret = normalizeText(
-    process.env.VIVENTIUM_SCHEDULER_SECRET || process.env.SCHEDULER_LIBRECHAT_SECRET,
-    4096,
-  );
-  if (!url || !secret) {
-    throw new Error('scheduler_external_work_callback_unavailable');
-  }
-  const response = await fetchImpl(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-VIVENTIUM-SCHEDULER-SECRET': secret,
-    },
-    body: JSON.stringify({
-      occurrence_key: binding.scheduleOccurrenceKey,
-      user_id: binding.ownerId,
-      required_total: summary.requiredTotal,
-      required_terminal: summary.requiredTerminal,
-      required_failed: summary.requiredFailed,
-      all_required_terminal: summary.allRequiredTerminal,
-      state: summary.state,
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`scheduler_external_work_callback_http_${response.status}`);
-  }
-  return response.json().catch(() => ({}));
-}
 
-const service: GlassHiveCallbackBindingService = {
-  isGlassHiveNonterminalAttentionCallback,
-  fenceGlassHiveCallbackRunState,
-  attachGlassHiveLaunchOrigin,
-  attachGlassHiveTrustedLaunchMetadata: (
-    toolArguments,
-    launchContext = {} as GlassHiveLaunchContext,
-    trustedBootstrapBundle = {},
-  ) =>
-    attachGlassHiveTrustedLaunchMetadata(
+  function schedulingExternalCallbackUrl() {
+    const explicit = normalizeText(
+      process.env.VIVENTIUM_SCHEDULING_EXTERNAL_WORK_CALLBACK_URL,
+      2048,
+    );
+    if (explicit) return explicit;
+    const base = normalizeText(process.env.SCHEDULING_MCP_URL, 2048);
+    if (!base) return '';
+    return `${base.replace(/\/mcp\/?$/, '').replace(/\/$/, '')}/internal/scheduled-prompts/external-work-callback`;
+  }
+
+  async function notifySchedulerExternalWorkSummary({
+    binding,
+    summary,
+  }: RuntimeRecord = {}): Promise<unknown> {
+    if (!binding?.scheduleOccurrenceKey || !summary || summary.requiredTotal < 1) {
+      return null;
+    }
+    if (binding.schedulerDispatchDocumentId) {
+      const dispatch = await mongoose.connection
+        .collection('viventium_scheduler_dispatch_intents')
+        .findOne({
+          _id: normalizeText(binding.schedulerDispatchDocumentId),
+          userId: normalizeText(binding.ownerId),
+        });
+      // This admission belongs to the application receiver, not the legacy clock.
+      if (dispatch?.kind === 'schedule_due') return null;
+    }
+    const url = schedulingExternalCallbackUrl();
+    const secret = normalizeText(
+      process.env.VIVENTIUM_SCHEDULER_SECRET || process.env.SCHEDULER_LIBRECHAT_SECRET,
+      4096,
+    );
+    if (!url || !secret) {
+      throw new Error('scheduler_external_work_callback_unavailable');
+    }
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-VIVENTIUM-SCHEDULER-SECRET': secret,
+      },
+      body: JSON.stringify({
+        occurrence_key: binding.scheduleOccurrenceKey,
+        user_id: binding.ownerId,
+        required_total: summary.requiredTotal,
+        required_terminal: summary.requiredTerminal,
+        required_failed: summary.requiredFailed,
+        all_required_terminal: summary.allRequiredTerminal,
+        state: summary.state,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`scheduler_external_work_callback_http_${response.status}`);
+    }
+    return response.json().catch(() => ({}));
+  }
+
+  const service: GlassHiveCallbackBindingService = {
+    isGlassHiveNonterminalAttentionCallback,
+    fenceGlassHiveCallbackRunState,
+    attachGlassHiveLaunchOrigin,
+    attachGlassHiveTrustedLaunchMetadata: (
       toolArguments,
-      launchContext as RuntimeRecord,
-      trustedBootstrapBundle as RuntimeRecord,
-    ),
-  confirmGlassHiveCallbackContext: async (input = {}) =>
-    (await confirmGlassHiveCallbackContext(input as RuntimeRecord)) as GlassHiveCallbackContext | null,
-  glassHiveLaunchOriginFromArguments,
-  getSchedulerExternalWorkSummary: async (input = {}) =>
-    (await getSchedulerExternalWorkSummary(
-      input as RuntimeRecord,
-    )) as GlassHiveSchedulerExternalWorkSummary,
-  hasAcceptedGlassHiveLaunchForPresentation: async (input = {}) =>
-    hasAcceptedGlassHiveLaunchForPresentation(input as RuntimeRecord),
-  launchDispatchAmbiguityLeaseMs,
-  launchPreparationLeaseMs,
-  markGlassHiveLaunchDispatchUnknown: async (toolArguments) =>
-    (await markGlassHiveLaunchDispatchUnknown(
-      toolArguments,
-    )) as GlassHiveLaunchTransitionResult | null,
-  markGlassHiveLaunchDispatchRejected: async (toolArguments, error) =>
-    (await markGlassHiveLaunchDispatchRejected(
-      toolArguments,
+      launchContext = {} as GlassHiveLaunchContext,
+      trustedBootstrapBundle = {},
+    ) =>
+      attachGlassHiveTrustedLaunchMetadata(
+        toolArguments,
+        launchContext as RuntimeRecord,
+        trustedBootstrapBundle as RuntimeRecord,
+      ),
+    confirmGlassHiveCallbackContext: async (input = {}) =>
+      (await confirmGlassHiveCallbackContext(
+        input as RuntimeRecord,
+      )) as GlassHiveCallbackContext | null,
+    glassHiveLaunchOriginFromArguments,
+    getSchedulerExternalWorkSummary: async (input = {}) =>
+      (await getSchedulerExternalWorkSummary(
+        input as RuntimeRecord,
+      )) as GlassHiveSchedulerExternalWorkSummary,
+    hasAcceptedGlassHiveLaunchForPresentation: async (input = {}) =>
+      hasAcceptedGlassHiveLaunchForPresentation(input as RuntimeRecord),
+    launchDispatchAmbiguityLeaseMs,
+    launchPreparationLeaseMs,
+    markGlassHiveLaunchDispatchUnknown: async (toolArguments) =>
+      (await markGlassHiveLaunchDispatchUnknown(
+        toolArguments,
+      )) as GlassHiveLaunchTransitionResult | null,
+    markGlassHiveLaunchDispatchRejected: async (toolArguments, error) =>
+      (await markGlassHiveLaunchDispatchRejected(
+        toolArguments,
+        error,
+      )) as GlassHiveLaunchTransitionResult | null,
+    markGlassHiveLaunchDispatchReady: async (launchContext = {} as GlassHiveLaunchContext) =>
+      (await markGlassHiveLaunchDispatchReady(
+        launchContext as RuntimeRecord,
+      )) as GlassHiveLaunchTransitionResult | null,
+    markGlassHiveLaunchPreDispatchFailed: async (
+      launchContext = {} as GlassHiveLaunchContext,
       error,
-    )) as GlassHiveLaunchTransitionResult | null,
-  markGlassHiveLaunchDispatchReady: async (launchContext = {} as GlassHiveLaunchContext) =>
-    (await markGlassHiveLaunchDispatchReady(
-      launchContext as RuntimeRecord,
-    )) as GlassHiveLaunchTransitionResult | null,
-  markGlassHiveLaunchPreDispatchFailed: async (
-    launchContext = {} as GlassHiveLaunchContext,
-    error,
-  ) =>
-    (await markGlassHiveLaunchPreDispatchFailed(
-      launchContext as RuntimeRecord,
-      error,
-    )) as GlassHiveLaunchTransitionResult | null,
-  notifySchedulerExternalWorkSummary: async (input = {}) =>
-    (await notifySchedulerExternalWorkSummary(input as RuntimeRecord)) as object | null,
-  reconcileKnownExternalWorkHints: async (input = {}) =>
-    (await reconcileKnownExternalWorkHints(input as RuntimeRecord)) as GlassHiveReconciliationSummary,
-  reconcileGlassHiveLaunchResult: async (input = {}) =>
-    (await reconcileGlassHiveLaunchResult(
-      input as RuntimeRecord,
-    )) as GlassHiveLaunchTransitionResult | null,
-  reconcileUnknownGlassHiveLaunches: async (input = {}) =>
-    (await reconcileUnknownGlassHiveLaunches(
-      input as RuntimeRecord,
-    )) as GlassHiveReconciliationSummary,
-  recordGlassHiveAdjudicationOutcome: async (input = {}) =>
-    recordGlassHiveAdjudicationOutcome(input as RuntimeRecord),
-  reconcileGlassHiveSurfaceDeliveryOutcome,
-  recordGlassHiveSurfaceDeliveryOutcome: async (input = {}) =>
-    recordGlassHiveSurfaceDeliveryOutcome(input as RuntimeRecord),
-  recordGlassHiveCallbackExternalState: async (input = {}) =>
-    (await recordGlassHiveCallbackExternalState(
-      input as RuntimeRecord,
-    )) as GlassHiveSchedulerExternalWorkSummary | null,
-  isGlassHiveWorkTerminalCallback: (body = {}) =>
-    isGlassHiveWorkTerminalCallback(body as RuntimeRecord),
-  registerGlassHiveLaunchContext: async (input = {}) =>
-    (await registerGlassHiveLaunchContext(input as RuntimeRecord)) as GlassHiveLaunchContext | null,
-  resolveTrustedGlassHiveCallIdentity: (input = {}) =>
-    resolveTrustedGlassHiveCallIdentity(input as RuntimeRecord) as {
-      sourceEventId: string;
-      objectiveOrdinal: number;
-      callIdentityDigest: string;
-    },
-  resolveGlassHiveCallbackContext: async (body = {}, options = {}) =>
-    (await resolveGlassHiveCallbackContext(
-      body as RuntimeRecord,
-      options,
-    )) as GlassHiveCallbackContext | null,
-};
+    ) =>
+      (await markGlassHiveLaunchPreDispatchFailed(
+        launchContext as RuntimeRecord,
+        error,
+      )) as GlassHiveLaunchTransitionResult | null,
+    notifySchedulerExternalWorkSummary: async (input = {}) =>
+      (await notifySchedulerExternalWorkSummary(input as RuntimeRecord)) as object | null,
+    reconcileKnownExternalWorkHints: async (input = {}) =>
+      (await reconcileKnownExternalWorkHints(
+        input as RuntimeRecord,
+      )) as GlassHiveReconciliationSummary,
+    reconcileGlassHiveLaunchResult: async (input = {}) =>
+      (await reconcileGlassHiveLaunchResult(
+        input as RuntimeRecord,
+      )) as GlassHiveLaunchTransitionResult | null,
+    reconcileUnknownGlassHiveLaunches: async (input = {}) =>
+      (await reconcileUnknownGlassHiveLaunches(
+        input as RuntimeRecord,
+      )) as GlassHiveReconciliationSummary,
+    recordGlassHiveAdjudicationOutcome: async (input = {}) =>
+      recordGlassHiveAdjudicationOutcome(input as RuntimeRecord),
+    reconcileGlassHiveSurfaceDeliveryOutcome,
+    recordGlassHiveSurfaceDeliveryOutcome: async (input = {}) =>
+      recordGlassHiveSurfaceDeliveryOutcome(input as RuntimeRecord),
+    recordGlassHiveCallbackExternalState: async (input = {}) =>
+      (await recordGlassHiveCallbackExternalState(
+        input as RuntimeRecord,
+      )) as GlassHiveSchedulerExternalWorkSummary | null,
+    isGlassHiveWorkTerminalCallback: (body = {}) =>
+      isGlassHiveWorkTerminalCallback(body as RuntimeRecord),
+    registerGlassHiveLaunchContext: async (input = {}) =>
+      (await registerGlassHiveLaunchContext(
+        input as RuntimeRecord,
+      )) as GlassHiveLaunchContext | null,
+    resolveTrustedGlassHiveCallIdentity: (input = {}) =>
+      resolveTrustedGlassHiveCallIdentity(input as RuntimeRecord) as {
+        sourceEventId: string;
+        objectiveOrdinal: number;
+        callIdentityDigest: string;
+      },
+    resolveGlassHiveCallbackContext: async (body = {}, options = {}) =>
+      (await resolveGlassHiveCallbackContext(
+        body as RuntimeRecord,
+        options,
+      )) as GlassHiveCallbackContext | null,
+  };
 
-return service;
+  return service;
 }

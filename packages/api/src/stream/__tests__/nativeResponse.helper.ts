@@ -2,6 +2,12 @@
 /* eslint-disable jest/no-conditional-expect -- The shared contract checks both supported stream-admission policies. */
 import type { NativeResponseIdentity } from '@librechat/data-schemas';
 import type { IJobStore } from '../interfaces/IJobStore';
+import {
+  createNativeResponseFetch,
+  createNativeResponseRecoveryService,
+  nativeResponseOrigin,
+} from '../../glasshive/nativeResponse';
+import { nativeIdentityJson, nativeJobMatches } from '../implementations/nativeResponse';
 
 const digest = 'a'.repeat(64);
 const scope = 'b'.repeat(64);
@@ -66,21 +72,124 @@ export function nativeStoreContract(
     await store?.destroy();
     jest.useRealTimers();
   });
+  test.each(['current', 'foreign_producer'])(
+    'same-revision fallback releases only its own binding before the real dispatch lease: %s',
+    async (mode) => {
+      const { identity } = await admitted(store);
+      identity.originSha256 = nativeResponseOrigin('http://native.test/v1');
+      let row: { nativeResponse: NativeResponseIdentity & { status: string } } | null = null;
+      let owned: NativeResponseIdentity | undefined;
+      const dependencies = {
+        db: {
+          getNativeResponse: async () => row,
+          admitNativeResponse: async (value: NativeResponseIdentity) => {
+            row = { nativeResponse: { ...value, status: 'pending' } };
+          },
+          settleNativeResponse: async (_value: NativeResponseIdentity, status: string) => {
+            row!.nativeResponse.status = status;
+            return { matchedCount: 1 };
+          },
+        },
+        bind: (value: NativeResponseIdentity) => store.bindNativeResponse(value),
+        revoke: (value: NativeResponseIdentity) => store.revokeNativeResponse(value),
+        release: (value: NativeResponseIdentity) =>
+          store.settleNativeResponse(value, 'unsupported'),
+        isCurrent: async (value: NativeResponseIdentity) => {
+          const job = await store.getJob(value.streamId);
+          return Boolean(
+            nativeJobMatches(job, value) &&
+            job?.nativeResponse &&
+            nativeIdentityJson(job.nativeResponse) === nativeIdentityJson(value),
+          );
+        },
+        resolveRoute: async () => ({ baseURL: 'http://native.test/v1', headers: {} }),
+      };
+      const recovery = createNativeResponseRecoveryService(dependencies as never);
+      const release = {
+        beforeDispatch: async () => {
+          if (
+            !(await store.claimNativeDispatchLease!(identity.streamId, {
+              createdAt: identity.jobCreatedAt,
+              owner: 'request-owned-producer',
+              leaseMs: 10000,
+              mode: 'renew',
+            }))
+          )
+            throw new Error('dispatch_lease_refused');
+        },
+        whileOccupied: async () => true,
+        isCurrent: () => store.isCurrentLogicalTurn(identity.streamId),
+      };
+      const wrap = (send: (input: unknown, init: unknown) => Promise<Response>) =>
+        createNativeResponseFetch(
+          send as never,
+          async () => identity,
+          (value) => recovery.admit(value, owned),
+          (value) => {
+            owned = value;
+          },
+          release,
+          undefined,
+          (value) => recovery.prepareInvocation(value, owned),
+        );
+      const primary = wrap(async () => {
+        throw new Error('synthetic_provider_failed_before_output');
+      });
+      await expect(
+        primary('http://native.test/v1/chat/completions', { body: '{"model":"primary"}' }),
+      ).rejects.toThrow('synthetic_provider_failed_before_output');
+      const original = owned!;
+      expect(
+        await store.claimNativeDispatchLease!(identity.streamId, {
+          createdAt: identity.jobCreatedAt,
+          owner: 'request-owned-producer',
+          leaseMs: 10000,
+          mode: 'renew',
+        }),
+      ).toBe(false);
+      if (mode === 'foreign_producer') owned = { ...original, invocationId: 'other-producer' };
+      const send = jest.fn(async () => new Response('{}'));
+      const next = wrap(send)('http://native.test/v1/chat/completions', {
+        body: '{"model":"fallback"}',
+      });
+      if (mode === 'current') {
+        await expect(next).resolves.toBeInstanceOf(Response);
+        expect(send).toHaveBeenCalledTimes(1);
+        expect((await store.getJob(identity.streamId))?.nativeResponse).toBeUndefined();
+        expect(row!.nativeResponse.status).toBe('unsupported');
+      } else {
+        await expect(next).rejects.toThrow('native_response_job_revoked');
+        expect(send).not.toHaveBeenCalled();
+        expect(nativeIdentityJson((await store.getJob(identity.streamId))!.nativeResponse!)).toBe(
+          nativeIdentityJson(original),
+        );
+        expect(row!.nativeResponse.status).toBe('pending');
+      }
+    },
+  );
   test('the native publication proves cancellation before any bind and refuses late admission', async () => {
     const { identity, job } = await admitted(store);
     await store.cancelNativeResponse(job);
     await store.updateJob(job.streamId, { status: 'superseded' });
-    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(true);
+    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(
+      true,
+    );
     expect(await store.bindNativeResponse(identity)).toBe(false);
-    expect(await store.isNativeResponseUnboundCancelled!({ ...job, createdAt: job.createdAt + 1 })).toBe(false);
-    expect(await store.isNativeResponseUnboundCancelled!({ ...job, userId: 'foreign-owner' })).toBe(false);
+    expect(
+      await store.isNativeResponseUnboundCancelled!({ ...job, createdAt: job.createdAt + 1 }),
+    ).toBe(false);
+    expect(await store.isNativeResponseUnboundCancelled!({ ...job, userId: 'foreign-owner' })).toBe(
+      false,
+    );
   });
   test('an actually bound publication cannot claim never-admitted cancellation', async () => {
     const { identity, job } = await admitted(store);
     expect(await store.bindNativeResponse(identity)).toBe(true);
     await store.cancelNativeResponse((await store.getJob(job.streamId))!);
     await store.updateJob(job.streamId, { status: 'superseded' });
-    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(false);
+    expect(await store.isNativeResponseUnboundCancelled!((await store.getJob(job.streamId))!)).toBe(
+      false,
+    );
   });
   test('identity-fenced updates reject a stale incarnation and accept the exact native owner', async () => {
     const { identity } = await admitted(store);
@@ -405,18 +514,28 @@ export function nativeStoreContract(
   test('cancelled native FINAL preserves supersession while retaining its exact revoked publication', async () => {
     const { identity } = await admitted(store);
     expect(await store.bindNativeResponse(identity)).toBe(true);
-    expect(await store.cancelNativeResponse((await store.getJob(identity.streamId))!)).toEqual({ status: 'revoked' });
+    expect(await store.cancelNativeResponse((await store.getJob(identity.streamId))!)).toEqual({
+      status: 'revoked',
+    });
     await store.updateJob(identity.streamId, { status: 'superseded' });
-    expect(await store.finishNativeResponse(identity, '', 'superseded-final', 'cancelled')).toBe(true);
+    expect(await store.finishNativeResponse(identity, '', 'superseded-final', 'cancelled')).toBe(
+      true,
+    );
     expect(await store.settleNativeResponse(identity, 'cancelled')).toBe(true);
     expect(await store.getJob(identity.streamId)).toMatchObject({
-      status: 'superseded', nativeResponseCancelled: true, nativeResponseFinished: true,
-      nativeResponseSettled: true, finalEvent: 'superseded-final',
+      status: 'superseded',
+      nativeResponseCancelled: true,
+      nativeResponseFinished: true,
+      nativeResponseSettled: true,
+      finalEvent: 'superseded-final',
     });
     expect(await store.getNativeResponseCommit(identity)).toEqual({ status: 'revoked' });
     expect(await store.finishNativeResponse(identity, digest, 'late-answer')).toBe(false);
     await store.updateJob(identity.streamId, { status: 'running', finalEvent: 'late-answer' });
-    expect(await store.getJob(identity.streamId)).toMatchObject({ status: 'superseded', finalEvent: 'superseded-final' });
+    expect(await store.getJob(identity.streamId)).toMatchObject({
+      status: 'superseded',
+      finalEvent: 'superseded-final',
+    });
   });
   test('same-stream replacement cannot inherit a cancelled FINAL or accept its late finish', async () => {
     const { identity } = await admitted(store);

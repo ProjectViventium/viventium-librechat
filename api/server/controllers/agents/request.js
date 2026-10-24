@@ -115,6 +115,7 @@ const {
 } = require('~/server/services/viventium/VoiceOrchestrationTraceService');
 const {
   attachMainContextSnapshotMetadata,
+  traceMainHistoryAncestry,
 } = require('~/server/services/viventium/ViventiumMainContextService');
 const {
   commitAcceptedMainTurnFromPresentation,
@@ -825,7 +826,85 @@ async function removeSupersededAssistantMessage(req, message, interactionContext
 }
 
 async function linkAcceptedInteractionSources(req, context) {
-  if (context?.ready_input_continuation) return;
+  const first = context?.source_segments?.find((segment) => segment.source_message_id);
+  if (
+    context?.source_segments?.length > 1 &&
+    Number.isSafeInteger(context.revision) &&
+    context.revision > 0 &&
+    first?.authoring_revision === context.revision
+  ) {
+    const sources = context.source_segments.filter((segment) => segment.source_message_id);
+    const rows = await Message.find({ user: req.user.id, conversationId: context.conversation_id })
+      .select(
+        'messageId parentMessageId user conversationId isCreatedByUser deletedAt metadata.viventium.telegramInput.state metadata.viventium.telegramInput.sourceEventId metadata.viventium.interactionContext.source_event_id',
+      )
+      .lean();
+    if (
+      first?.source_parent_message_id &&
+      first.source_parent_message_id !== Constants.NO_PARENT &&
+      !rows.some((row) => row.messageId === first.source_parent_message_id)
+    ) {
+      const base = String(req.body.parentMessageId || '');
+      const sourceRows = rows.filter((row) => row.messageId === first.source_message_id);
+      const source = sourceRows.length === 1 ? sourceRows[0] : null;
+      const anchor = rows.find((row) => row.messageId === base);
+      const ids = new Set(sources.map((segment) => segment.source_message_id));
+      const ancestry = traceMainHistoryAncestry({
+        messages: rows.filter((row) => row.deletedAt == null),
+        headId: base,
+        ownerId: req.user.id,
+        conversationId: context.conversation_id,
+      });
+      if (
+        !base ||
+        base === Constants.NO_PARENT ||
+        !anchor ||
+        anchor.deletedAt != null ||
+        first.source_persisted !== true ||
+        !source ||
+        String(source.user) !== String(req.user.id) ||
+        source.conversationId !== context.conversation_id ||
+        source.isCreatedByUser !== true ||
+        source.deletedAt != null ||
+        source.metadata?.viventium?.telegramInput?.state !== 'ready' ||
+        source.metadata.viventium.telegramInput.sourceEventId !== first.source_event_id ||
+        source.metadata.viventium.interactionContext?.source_event_id !== first.source_event_id ||
+        ![first.source_parent_message_id, base].includes(source.parentMessageId) ||
+        !ancestry.complete ||
+        ancestry.messageIds.some((id) => ids.has(id))
+      ) {
+        throw Object.assign(new Error('The retained input has no valid conversation anchor.'), {
+          code: 'source_context_unavailable',
+          status: 413,
+        });
+      }
+      if (source.parentMessageId !== base) {
+        const filter = {
+          user: req.user.id,
+          conversationId: context.conversation_id,
+          messageId: first.source_message_id,
+          isCreatedByUser: true,
+          parentMessageId: first.source_parent_message_id,
+          'metadata.viventium.interactionContext.source_event_id': first.source_event_id,
+          'metadata.viventium.telegramInput.state': 'ready',
+        };
+        const changed =
+          await require('~/server/services/viventium/nativeResponseService').mutateNativeResponseSources(
+            filter,
+            () => Message.updateOne(filter, { $set: { parentMessageId: base } }),
+          );
+        if (changed?.matchedCount !== 1) {
+          throw Object.assign(
+            new Error('The retained input changed before conversation recovery.'),
+            {
+              code: 'source_context_unavailable',
+              status: 413,
+            },
+          );
+        }
+      }
+    }
+  }
   const seen = new Set();
   let previous;
   for (const segment of context?.source_segments || []) {
@@ -1149,6 +1228,27 @@ function withCommittedDeliveryAudit(response, job) {
 /* === VIVENTIUM END === */
 /* === VIVENTIUM END === */
 
+/* === VIVENTIUM START === A canonical failure closes its exact revoked Native stream. === */
+async function finishFailedNativeResponse(req, streamId, failure, settled, error) {
+  const identity = req._viventiumNativeResponseIdentity;
+  const revoked = req._viventiumNativeFailureRevokedIdentity;
+  const ownsRevoke =
+    identity &&
+    revoked &&
+    require('@librechat/api').nativeIdentityJson(identity) ===
+      require('@librechat/api').nativeIdentityJson(revoked);
+  return Boolean(
+    (settled || ownsRevoke || error?.code === 'native_response_message_deleted') &&
+    identity?.streamId === streamId &&
+    (await GenerationJobManager.failRevokedNativeResponse(
+      identity,
+      failure.error,
+      failure.error_class,
+    )),
+  );
+}
+/* === VIVENTIUM END === */
+
 async function persistAssistantSnapshot({
   req,
   streamId,
@@ -1246,7 +1346,7 @@ async function persistAssistantSnapshot({
     error,
   });
 
-  await timedSaveMessage(
+  const saved = await timedSaveMessage(
     req,
     {
       messageId,
@@ -1267,7 +1367,22 @@ async function persistAssistantSnapshot({
     error ? 'db_save_error_response' : 'db_save_partial_response',
   );
 
-  return { persisted: true, fingerprint };
+  const nativeIdentity = req._viventiumNativeResponseIdentity;
+  const revokedIdentity = req._viventiumNativeFailureRevokedIdentity;
+  return {
+    persisted: true,
+    fingerprint,
+    nativeFailureSettled: Boolean(
+      nativeIdentity &&
+      revokedIdentity &&
+      require('@librechat/api').nativeIdentityJson(nativeIdentity) ===
+        require('@librechat/api').nativeIdentityJson(revokedIdentity) &&
+      nativeIdentity.responseMessageId === messageId &&
+      saved?.messageId === messageId &&
+      saved.error === true &&
+      saved.unfinished === false,
+    ),
+  };
 }
 
 /* === VIVENTIUM NOTE ===
@@ -2758,12 +2873,12 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
          * Fix: a revision replaced by newer input is finished as superseded, never persisted as a
          * failed answer, even when its obsolete operation ended with an error instead of an abort.
          */
-        const durableJob = await Promise.resolve()
-          .then(() => GenerationJobManager.getJob(streamId))
-          .catch(() => null);
         const wasSuperseded =
           job.abortController.signal.reason === 'superseded' ||
-          (durableJob?.status === 'superseded' && durableJob.createdAt === jobCreatedAt);
+          (!job.abortController.signal.aborted &&
+            (await GenerationJobManager.settleSupersededGeneration(streamId, jobCreatedAt).catch(
+              () => false,
+            )));
         await settleVoiceGenerationForRequest(req, wasSuperseded ? {} : { error });
         /* === VIVENTIUM END === */
 
@@ -2791,6 +2906,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
           logger.error(`[ResumableAgentController] Generation error for ${streamId}:`, error);
           const failure = require('./client').createCompletionErrorContentPart(error);
+          let nativeFailureSettled = false;
           try {
             const contentParts = Array.isArray(terminalFailureContent)
               ? terminalFailureContent.filter(Boolean)
@@ -2828,6 +2944,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             });
             if (snapshot.persisted) {
               lastAssistantSnapshotFingerprint = snapshot.fingerprint;
+              nativeFailureSettled = snapshot.nativeFailureSettled === true;
             }
           } catch (snapshotError) {
             logger.error(
@@ -2837,16 +2954,16 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           }
           // Use the same public typed failure as FINAL; raw internal diagnostics stay in logs.
           /* === VIVENTIUM START ===
-           * A deleted canonical Native row has no Stop FINAL owner. Reuse the exact revoked
-           * identity fence to end that stream; ordinary cancelled answers retain Stop ownership.
+           * A persisted failure or deleted Native row has no Stop FINAL owner. Reuse the exact
+           * revoked identity fence; ordinary cancelled answers retain Stop ownership.
            */
-          const revokedNativeFailed =
-            error?.code === 'native_response_message_deleted' &&
-            req._viventiumNativeResponseIdentity?.streamId === streamId &&
-            (await GenerationJobManager.failRevokedNativeResponse(
-              req._viventiumNativeResponseIdentity,
-              failure.error,
-            ));
+          const revokedNativeFailed = await finishFailedNativeResponse(
+            req,
+            streamId,
+            failure,
+            nativeFailureSettled,
+            error,
+          );
           if (!revokedNativeFailed) {
             await GenerationJobManager.emitError(streamId, failure.error, failure.error_class);
           }
@@ -2891,7 +3008,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         )
           ? contentParts
           : [...contentParts, failure];
-        await persistAssistantSnapshot({
+        const snapshot = await persistAssistantSnapshot({
           req,
           streamId,
           userId,
@@ -2906,6 +3023,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           error: true,
           context: 'api/server/controllers/agents/request.js - unhandled generation error snapshot',
         });
+        await finishFailedNativeResponse(
+          req,
+          streamId,
+          failure,
+          snapshot.nativeFailureSettled === true,
+          err,
+        );
       } catch (snapshotError) {
         logger.error(
           `[ResumableAgentController] Failed to persist unhandled generation error snapshot for ${streamId}:`,
@@ -3488,6 +3612,7 @@ module.exports.__testables = {
   normalizePersistedAssistantResponse,
   normalizeAssistantResponseForTransmit,
   persistAssistantSnapshot,
+  finishFailedNativeResponse,
   timedSaveMessage,
   getExactDurableEffectReceipt,
   isVoiceTaskOutputSuppressed: isVoiceTaskOutputSuppressedDurably,

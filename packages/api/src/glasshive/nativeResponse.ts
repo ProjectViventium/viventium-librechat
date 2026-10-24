@@ -47,7 +47,9 @@ const CORTEX_LIFECYCLE_PARTS = new Set<string>([
 ]);
 function nativeAnswerDigest(row: { text?: unknown; content?: unknown }): string {
   const content = Array.isArray(row.content)
-    ? convertHarnessActivityParts(row.content.filter((part) => !CORTEX_LIFECYCLE_PARTS.has(part?.type)))
+    ? convertHarnessActivityParts(
+        row.content.filter((part) => !CORTEX_LIFECYCLE_PARTS.has(part?.type)),
+      )
     : row.content;
   return nativeResponseDigest({ text: row.text, content });
 }
@@ -182,7 +184,10 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       throw new Error('native_response_handoff_unavailable');
     await releaseUnsupported(identity);
   }
-  async function admit(identity: NativeResponseIdentity): Promise<boolean> {
+  async function prepareInvocation(
+    identity: NativeResponseIdentity,
+    previousIdentity?: NativeResponseIdentity,
+  ): Promise<boolean> {
     await currentRoute(identity);
     const previous = await deps.db.getNativeResponse(identity.userId, identity.responseMessageId);
     if (previous?.nativeResponse?.status === 'unsupported') {
@@ -193,9 +198,23 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       previous?.nativeResponse &&
       previous.nativeResponse.invocationId !== identity.invocationId
     ) {
+      // A stale generator must not revoke a winner that this request never bound.
+      if (
+        !previousIdentity ||
+        nativeIdentityJson(previousIdentity) !== nativeIdentityJson(previous.nativeResponse) ||
+        !(await deps.isCurrent(previous.nativeResponse))
+      )
+        throw new Error('native_response_job_revoked');
       await releaseUnsupported(previous.nativeResponse);
       return false;
     }
+    return true;
+  }
+  async function admit(
+    identity: NativeResponseIdentity,
+    previousIdentity?: NativeResponseIdentity,
+  ): Promise<boolean> {
+    if (!(await prepareInvocation(identity, previousIdentity))) return false;
     if (!(await deps.bind(identity))) throw new Error('native_response_job_revoked');
     try {
       await deps.db.admitNativeResponse(identity, deps.transaction);
@@ -586,6 +605,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
   }
 
   return {
+    prepareInvocation,
     admit,
     rejectUnaccepted,
     readResult,
@@ -942,6 +962,7 @@ export function createNativeResponseFetch(
   onBound: (identity: NativeResponseIdentity) => void,
   release?: NativeResponseRelease,
   rejectUnaccepted?: (identity: NativeResponseIdentity) => Promise<void>,
+  prepareInvocation?: (identity: NativeResponseIdentity) => Promise<boolean>,
 ): MainContinuityFetch {
   let bound: NativeResponseIdentity | undefined;
   let boundPredecessor: Awaited<
@@ -972,7 +993,6 @@ export function createNativeResponseFetch(
         : {}),
     };
     if (typeof init?.body !== 'string') throw new Error('native_response_serialized_body_required');
-    if (!bound && release) await release.beforeDispatch(context);
     const predecessor = bound
       ? boundPredecessor
       : verifiedSources
@@ -1007,7 +1027,11 @@ export function createNativeResponseFetch(
             admittedAt,
             recoverUntil: admittedAt + NATIVE_RESPONSE_RECOVERY_WINDOW_MS,
           };
-    if (!(await admit(identity))) {
+    // Release this revision's earlier invocation before renewing its pre-dispatch lease.
+    // The exact recovery fence still refuses supersession, Stop and uncertain effects.
+    const prepared = bound || !prepareInvocation || (await prepareInvocation(identity));
+    if (!bound && release) await release.beforeDispatch(context);
+    if (!prepared || !(await admit(identity))) {
       // A later invocation of the current revision continues unbound; a revision replaced after
       // its release check makes no provider call.
       if (release && !(await release.isCurrent(context))) throw nativeDispatchSupersededError();

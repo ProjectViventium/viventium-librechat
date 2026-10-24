@@ -9,6 +9,7 @@ const { EventEmitter } = require('events');
 let mockGetUserById;
 let mockGetMessage;
 let mockGetMessages;
+let mockGetFiles;
 let mockGetConvo;
 let mockResolveTelegramMappingByUserId;
 let mockResolveUserVoiceRoute = jest
@@ -103,7 +104,7 @@ jest.mock('~/server/middleware', () => ({
 
 jest.mock(
   '~/server/controllers/agents/request',
-  () => (req, res, _next, _initialize, titleHandler) => {
+  () => async (req, res, _next, _initialize, titleHandler) => {
     agentControllerCalls += 1;
     lastSchedulerRequest = req;
     lastSchedulerTitleHandler = titleHandler;
@@ -116,6 +117,10 @@ jest.mock(
     lastExternalWorkRequired = req.viventiumSchedulerExternalWorkRequired ?? null;
     lastInteractionContext = req._viventiumInteractionContext ?? null;
     lastSchedulerMessageId = req.body.messageId ?? null;
+    await req._viventiumBeforeGenerationReceipt?.({
+      streamId: req.body.streamId,
+      conversationId: req.body.conversationId || 'new',
+    });
     res.json({ streamId: req.body.streamId, conversationId: req.body.conversationId || 'new' });
   },
 );
@@ -163,6 +168,7 @@ jest.mock('~/models', () => ({
     return mockGetMessages(filter, ...args);
   },
   getConvo: (...args) => mockGetConvo(...args),
+  getFiles: (...args) => mockGetFiles(...args),
 }));
 
 jest.mock('~/models/Agent', () => ({
@@ -686,6 +692,181 @@ describe('/api/viventium/scheduler/chat', () => {
     mockUpdateSchedulerConversation = jest.fn().mockResolvedValue({ modifiedCount: 1 });
     process.env.VIVENTIUM_SCHEDULER_SECRET = 'scheduler_secret';
     process.env.DOMAIN_SERVER = 'http://example.com';
+  });
+
+  test('a due wake cannot reset its deleted selected conversation to new', async () => {
+    const key = 'due-existing-selected';
+    const documentId = require('crypto')
+      .createHash('sha256')
+      .update(`user_1\0${key}`)
+      .digest('hex');
+    mockSchedulerDispatchIntents.set(documentId, {
+      _id: documentId,
+      kind: 'schedule_due',
+      status: 'reserved',
+      dueState: 'admitted',
+      streamId: 'scheduler-selected',
+      conversationId: 'selected-conversation',
+      conversationPolicy: 'same',
+    });
+    mockGetJob.mockResolvedValue(null);
+    const app = createTestApp(require('../scheduler'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body: {
+          userId: 'user_1',
+          conversationId: 'selected-conversation',
+          idempotencyKey: key,
+          text: 'Original task',
+          agentId: 'agent_test',
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(403);
+    expect(res.body.reason).toBe('schedule_due_binding_unavailable');
+    expect(agentControllerCalls).toBe(0);
+  });
+
+  test.each(['same', 'new'])(
+    'due %s destination retains exact original source context and files',
+    async (policy) => {
+      const sourceId = 'b1111111-1111-4111-8111-111111111111';
+      const destinationId = policy === 'new' ? 'new' : 'a1111111-1111-4111-8111-111111111111';
+      const key = `context-transfer-${policy}`;
+      const documentId = require('crypto')
+        .createHash('sha256')
+        .update(`user_1\0${key}`)
+        .digest('hex');
+      mockSchedulerDispatchIntents.set(documentId, {
+        _id: documentId,
+        kind: 'schedule_due',
+        status: 'reserved',
+        dueState: 'admitted',
+        streamId: 'scheduled-context-stream',
+        conversationId: destinationId,
+        conversationPolicy: policy,
+        bindingRef: 'source-binding',
+      });
+      mockSchedulerDispatchIntents.set('source-binding', {
+        _id: 'source-binding',
+        kind: 'schedule_binding',
+        ownerId: 'user_1',
+        active: true,
+        conversationId: destinationId,
+        sourceConversationId: sourceId,
+      });
+      mockGetConvo = jest.fn(async (_owner, id) => ({
+        conversationId: id,
+        user: 'user_1',
+        endpoint: 'agents',
+      }));
+      mockGetMessages = jest.fn(async ({ conversationId }) => [
+        {
+          messageId: `message-${conversationId}`,
+          parentMessageId: '00000000-0000-0000-0000-000000000000',
+          user: 'user_1',
+          conversationId,
+          isCreatedByUser: true,
+          text:
+            conversationId === sourceId
+              ? 'Exact original source context'
+              : 'Existing selected chat context',
+          files: conversationId === sourceId ? [{ file_id: 'source-file' }] : [],
+        },
+      ]);
+      mockGetFiles = jest.fn(async () => [
+        {
+          file_id: 'source-file',
+          user: 'user_1',
+          filename: 'source.txt',
+          source: 'text',
+          text: 'Exact original file',
+        },
+      ]);
+      mockGetJob.mockResolvedValue(null);
+      const app = createTestApp(require('../scheduler'));
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/scheduler/chat',
+          headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+          body: {
+            userId: 'user_1',
+            conversationId: destinationId,
+            idempotencyKey: key,
+            text: 'Specific due task',
+            agentId: 'agent_test',
+          },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(lastSchedulerRequest._viventiumInheritedConversationContext).toMatchObject({
+        conversation_id: sourceId,
+        sources: [expect.objectContaining({ role: 'user', text: 'Exact original source context' })],
+      });
+      expect(lastSchedulerRequest.viventiumSchedulerDueAdmissionId).toBe(documentId);
+      expect(lastSchedulerRequest.body.files).toContainEqual(
+        expect.objectContaining({ file_id: 'source-file' }),
+      );
+      expect(mockGetFiles).toHaveBeenCalledWith({
+        user: 'user_1',
+        file_id: { $in: ['source-file'] },
+      });
+      expect(Object.keys(lastSchedulerRequest)).not.toContain(
+        '_viventiumInheritedConversationContext',
+      );
+    },
+  );
+
+  test('only a durable new-conversation policy permits due materialization', async () => {
+    const key = 'due-new-selected';
+    const documentId = require('crypto')
+      .createHash('sha256')
+      .update(`user_1\0${key}`)
+      .digest('hex');
+    mockSchedulerDispatchIntents.set(documentId, {
+      _id: documentId,
+      kind: 'schedule_due',
+      status: 'reserved',
+      dueState: 'admitted',
+      streamId: 'scheduler-new-selected',
+      conversationId: 'new',
+      conversationPolicy: 'new',
+    });
+    mockGetJob.mockResolvedValue(null);
+    const app = createTestApp(require('../scheduler'));
+    const res = createMockRes();
+    const json = res.json.bind(res);
+    let durableBeforeReply = false;
+    res.json = (body) => {
+      durableBeforeReply = mockSchedulerDispatchIntents.get(documentId)?.status === 'accepted';
+      return json(body);
+    };
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/scheduler/chat',
+        headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+        body: {
+          userId: 'user_1',
+          conversationId: 'new',
+          idempotencyKey: key,
+          text: 'Original task',
+          agentId: 'agent_test',
+        },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(durableBeforeReply).toBe(true);
+    expect(agentControllerCalls).toBe(1);
   });
 
   test('defers before reserving a dispatch or creating a response while its conversation is active', async () => {

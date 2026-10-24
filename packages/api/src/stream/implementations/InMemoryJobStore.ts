@@ -426,9 +426,8 @@ export class InMemoryJobStore implements IJobStore {
     job.finalEvent = finalEvent;
     job.nativeResponseFinished = true;
     job.generationCompleted = true;
-    job.status = mode === 'cancelled'
-      ? job.status === 'superseded' ? 'superseded' : 'aborted'
-      : 'complete';
+    job.status =
+      mode === 'cancelled' ? (job.status === 'superseded' ? 'superseded' : 'aborted') : 'complete';
     job.completedAt = Date.now();
     delete job.error;
     delete job.errorClass;
@@ -637,9 +636,35 @@ export class InMemoryJobStore implements IJobStore {
         supersededStreamIds: [],
       };
     }
+    const failedPredecessor =
+      existing?.deliveryAcknowledgements.get(existing.revision)?.state === 'failed';
 
-    if (interactionContext.ready_input_continuation && existing?.active) {
-      return { status: 'busy', streamId, interactionContext, supersededStreamIds: [] };
+    if (interactionContext.ready_input_continuation && existing?.active && !failedPredecessor) {
+      const publication = this.nativePublications.get(
+        this.nativeKey({
+          logicalTurnId: existing.logicalTurnId,
+          revision: existing.revision,
+        }),
+      );
+      const identity = publication?.identity
+        ? (JSON.parse(publication.identity) as NativeResponseIdentity)
+        : undefined;
+      const removedPredecessor =
+        existing.deliveryAcknowledgements.get(existing.revision)?.state === 'partial_removed' &&
+        publication?.state === 'revoked' &&
+        identity &&
+        identity.userId === userId &&
+        identity.conversationId === interactionContext.conversation_id &&
+        identity.streamId === existing.currentStreamId &&
+        identity.logicalTurnId === existing.logicalTurnId &&
+        identity.revision === existing.revision &&
+        identity.sourceOrderScope === existing.currentContext?.source_order_scope &&
+        identity.sourceSequence === interactionPresentationSequence(existing.currentContext);
+      // Removal plus revoked native authority permits a durable retry. Native release and
+      // accepted-source recovery still fence execution in the manager.
+      if (!removedPredecessor) {
+        return { status: 'busy', streamId, interactionContext, supersededStreamIds: [] };
+      }
     }
     const observedSourceOrder = interactionContext.source_order_scope
       ? this.sourceOrderWatermarks.get(interactionContext.source_order_scope)
@@ -686,7 +711,24 @@ export class InMemoryJobStore implements IJobStore {
     ) {
       return { status: 'superseded', streamId, interactionContext, supersededStreamIds: [] };
     }
-    const pendingInputs = existing?.pendingInputs ?? [];
+    const failedSources = failedPredecessor
+      ? new Set(
+          (existing?.sourceSegments ?? []).map((source) =>
+            JSON.stringify([source.source_event_id, source.source_index]),
+          ),
+        )
+      : undefined;
+    const pendingInputs = (existing?.pendingInputs ?? []).map((input) =>
+      failedSources
+        ? {
+            ...input,
+            source_segments: input.source_segments?.filter(
+              (source) =>
+                !failedSources.has(JSON.stringify([source.source_event_id, source.source_index])),
+            ),
+          }
+        : input,
+    );
     const mergedInput = mergeLogicalTurnInput(pendingInputs, interactionContext);
     if (
       mergedInput.source_segments?.some(
@@ -710,7 +752,8 @@ export class InMemoryJobStore implements IJobStore {
       throw streamIdConflictError();
     }
 
-    const activeStreamId = existing?.active ? existing.currentStreamId : undefined;
+    const activeStreamId =
+      existing?.active && !failedPredecessor ? existing.currentStreamId : undefined;
     /* === VIVENTIUM START ===
      * Fix: a newer source from another conversation still supersedes the active stream in this
      * source-order scope, but it starts its own logical turn without the other turn's sources.
@@ -718,11 +761,20 @@ export class InMemoryJobStore implements IJobStore {
     const turnConversationId =
       existing?.currentContext?.conversation_id ?? existing?.pendingInputs?.[0]?.conversation_id;
     const sameConversation =
-      turnConversationId === undefined ||
-      turnConversationId === interactionContext.conversation_id;
+      turnConversationId === undefined || turnConversationId === interactionContext.conversation_id;
     const continuesTurn = activeStreamId != null && sameConversation;
     const continuesPending =
-      !continuesTurn && sameConversation && Boolean(existing?.pendingInputs?.length);
+      !continuesTurn &&
+      sameConversation &&
+      !failedPredecessor &&
+      existing?.deliveryAcknowledgements.get(existing.revision)?.state !== 'committed' &&
+      Boolean(
+        existing?.pendingInputs?.some(
+          (input) =>
+            input.logical_turn_id === existing!.logicalTurnId &&
+            input.revision > existing!.revision,
+        ),
+      );
     /* === VIVENTIUM END === */
     if (!continuesTurn && existing && !continuesPending) {
       this.retireLogicalTurnState(existing);
@@ -750,12 +802,12 @@ export class InMemoryJobStore implements IJobStore {
     // A source this claim first admits is provisionally this revision's until an admission commit
     // fixes its author; sources of earlier revisions keep their marks through the identity dedupe.
     const mergedSourceSegments = mergeSourceSegmentsWithOverflow(
-      continuesTurn ? state.sourceSegments : [],
+      continuesTurn || continuesPending ? state.sourceSegments : [],
       mergedInput.source_segments?.map((segment) => ({
         ...segment,
         authoring_revision: state.revision,
       })),
-      continuesTurn ? state.sourceSegmentsOverflowCount : 0,
+      continuesTurn || continuesPending ? state.sourceSegmentsOverflowCount : 0,
       mergedInput.source_segments_overflow_count,
     );
     state.sourceSegments = mergedSourceSegments.segments;
@@ -900,25 +952,45 @@ export class InMemoryJobStore implements IJobStore {
 
   async isNativeResponseUnboundCancelled(expected: SerializableJobData): Promise<boolean> {
     const job = this.jobs.get(expected.streamId);
-    if (!job || job.createdAt !== expected.createdAt || job.userId !== expected.userId ||
-      job.responseMessageId !== expected.responseMessageId || job.conversationId !== expected.conversationId ||
-      job.status !== 'superseded' || job.nativeResponseCancelled !== true ||
+    if (
+      !job ||
+      job.createdAt !== expected.createdAt ||
+      job.userId !== expected.userId ||
+      job.responseMessageId !== expected.responseMessageId ||
+      job.conversationId !== expected.conversationId ||
+      job.status !== 'superseded' ||
+      job.nativeResponseCancelled !== true ||
       job.interactionContext?.logical_turn_id !== expected.interactionContext?.logical_turn_id ||
-      job.interactionContext?.revision !== expected.interactionContext?.revision) return false;
-    const record = job.interactionContext?.logical_turn_id ? this.nativePublications.get(this.nativeKey({
-      logicalTurnId: job.interactionContext.logical_turn_id, revision: job.interactionContext.revision,
-    })) : undefined;
+      job.interactionContext?.revision !== expected.interactionContext?.revision
+    )
+      return false;
+    const record = job.interactionContext?.logical_turn_id
+      ? this.nativePublications.get(
+          this.nativeKey({
+            logicalTurnId: job.interactionContext.logical_turn_id,
+            revision: job.interactionContext.revision,
+          }),
+        )
+      : undefined;
     return record?.state === 'revoked' && record.identity === undefined;
   }
 
   async getLogicalTurnSourcePredecessors(
-    streamId: string, userId: string, interactionContext: InteractionContext,
+    streamId: string,
+    userId: string,
+    interactionContext: InteractionContext,
   ): Promise<SerializableJobData[]> {
     const current = this.jobs.get(streamId);
     const ledger = interactionContext.logical_turn_id
-      ? this.authorLedgers.get(interactionContext.logical_turn_id) : undefined;
-    if (!current || current.userId !== userId || current.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id ||
-      current.interactionContext?.revision !== interactionContext.revision || ledger?.reservations.get(interactionContext.revision) !== streamId) {
+      ? this.authorLedgers.get(interactionContext.logical_turn_id)
+      : undefined;
+    if (
+      !current ||
+      current.userId !== userId ||
+      current.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id ||
+      current.interactionContext?.revision !== interactionContext.revision ||
+      ledger?.reservations.get(interactionContext.revision) !== streamId
+    ) {
       throw streamIdConflictError();
     }
     const jobs: SerializableJobData[] = [];
@@ -926,12 +998,21 @@ export class InMemoryJobStore implements IJobStore {
       const reserved = ledger.reservations.get(revision);
       if (!reserved) continue;
       const job = this.jobs.get(reserved);
-      if (!job || job.userId !== userId || job.conversationId !== current.conversationId ||
-        job.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id || job.interactionContext?.revision !== revision ||
-        !interactionContext.source_segments?.some((source) => source.source_event_id === job.interactionContext?.source_event_id && source.authoring_revision === revision)) {
+      if (
+        !job ||
+        job.userId !== userId ||
+        job.conversationId !== current.conversationId ||
+        job.interactionContext?.logical_turn_id !== interactionContext.logical_turn_id ||
+        job.interactionContext?.revision !== revision ||
+        !interactionContext.source_segments?.some(
+          (source) =>
+            source.source_event_id === job.interactionContext?.source_event_id &&
+            source.authoring_revision === revision,
+        )
+      ) {
         throw nativeSourceRecoveryUnconfirmed('author_lookup', current, job);
       }
-      jobs.push(await this.getJob(reserved) as SerializableJobData);
+      jobs.push((await this.getJob(reserved)) as SerializableJobData);
     }
     return jobs;
   }
@@ -962,7 +1043,8 @@ export class InMemoryJobStore implements IJobStore {
       current?.conversation_id !== interactionContext.conversation_id ||
       current?.source_order_scope !== interactionContext.source_order_scope ||
       ledger?.reservations.get(revision) !== streamId
-    ) return;
+    )
+      return;
     /* === VIVENTIUM END === */
     ledger.authors.delete(revision);
     ledger.takenOver.add(revision);
@@ -983,20 +1065,31 @@ export class InMemoryJobStore implements IJobStore {
       receipt?.streamId !== streamId ||
       receipt.interactionContext.revision !== interactionContext.revision ||
       state.revisionStreams.get(interactionContext.revision) !== streamId ||
-      state.admittedRevisions.has(interactionContext.revision) ||
+      this.authorLedgers.get(state.logicalTurnId)?.authors.has(interactionContext.revision) ||
       this.jobs.has(streamId)
     ) {
       return false;
     }
+    const pendingInputs = retainLogicalTurnInput(state.pendingInputs ?? [], {
+      ...interactionContext,
+      source_segments: interactionContext.source_segments?.filter(
+        (source) =>
+          source.authoring_revision == null ||
+          source.authoring_revision === interactionContext.revision,
+      ),
+    });
     if (receipt?.streamId === streamId) {
       state.receipts.delete(interactionContext.source_event_id);
     }
     state.revisionStreams.delete(interactionContext.revision);
+    state.admittedRevisions.delete(interactionContext.revision);
     this.authorLedgers.get(state.logicalTurnId)?.reservations.delete(interactionContext.revision);
     state.revisionSourceSegments.delete(interactionContext.revision);
     state.revisionSourceSegmentsOverflowCounts.delete(interactionContext.revision);
     state.revisionSourceOrders.delete(interactionContext.revision);
     this.streamScopes.delete(streamId);
+    // Failed admission returns its exact input; a terminal predecessor stays terminal.
+    state.pendingInputs = pendingInputs;
     if (state.currentStreamId === streamId) {
       state.revision = Math.max(0, ...state.revisionStreams.keys());
     }
@@ -1007,9 +1100,20 @@ export class InMemoryJobStore implements IJobStore {
       );
       state.sourceSegmentsOverflowCount =
         state.revisionSourceSegmentsOverflowCounts.get(state.revision) || 0;
-      state.active = Boolean(state.currentStreamId);
+      const previousDelivery = state.deliveryAcknowledgements.get(state.revision)?.state;
+      const previousJob = state.currentStreamId ? this.jobs.get(state.currentStreamId) : undefined;
+      state.active =
+        Boolean(state.currentStreamId) &&
+        previousDelivery !== 'committed' &&
+        previousDelivery !== 'failed' &&
+        (previousJob
+          ? previousJob.status === 'running' &&
+            !previousJob.nativeResponseCancelled &&
+            !previousJob.nativeResponseSettled &&
+            !previousJob.generationCompleted
+          : !state.admittedRevisions.has(state.revision));
+      if (!state.active) state.completedAt = Date.now();
     } else {
-      state.pendingInputs = retainLogicalTurnInput(state.pendingInputs ?? [], interactionContext);
       state.currentStreamId = undefined;
       state.sourceSegments = [];
       state.sourceSegmentsOverflowCount = 0;
@@ -1447,6 +1551,7 @@ export class InMemoryJobStore implements IJobStore {
     for (const state of this.logicalTurns.values()) {
       if (
         !state.active &&
+        !state.pendingInputs?.length &&
         state.completedAt != null &&
         (this.ttlAfterComplete === 0 || now - state.completedAt > this.ttlAfterComplete)
       ) {

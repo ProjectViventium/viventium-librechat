@@ -7,6 +7,7 @@ const mockProjectionComplete = jest.fn();
 const mockRecover = jest.fn();
 const mockAdmit = jest.fn();
 const mockRejectUnaccepted = jest.fn();
+const mockPrepareInvocation = jest.fn();
 const mockConfig = jest.fn();
 const mockLoadAgent = jest.fn();
 const mockPermission = jest.fn();
@@ -50,6 +51,7 @@ jest.mock('@librechat/api', () => ({
     return {
       recover: mockRecover,
       admit: mockAdmit,
+      prepareInvocation: mockPrepareInvocation,
       rejectUnaccepted: mockRejectUnaccepted,
       projectForTransmit: async (_identity, message) => message,
     };
@@ -860,6 +862,27 @@ describe('native graph participant file identity', () => {
       isCurrentLogicalTurn: jest.fn(async () => current),
     });
     baseFetch = jest.fn(async () => new Response('{}'));
+  });
+
+  it('uses only this request bound identity and skips first-dispatch preparation', async () => {
+    mockPrepareInvocation.mockClear();
+    mockPrepareInvocation.mockResolvedValue(false);
+    mockCreateNativeResponseFetch.mockReturnValueOnce(baseFetch);
+    req.body = {
+      ...req.body,
+      _viventiumNativeResponseIdentity: { invocationId: 'untrusted-body' },
+    };
+    wrapNativeResponseFetch(req, 'specialist', baseFetch, route);
+    const callbacks = mockCreateNativeResponseFetch.mock.calls.at(-1);
+    const next = { invocationId: 'next' };
+    await expect(callbacks[6](next)).resolves.toBe(true);
+    expect(mockPrepareInvocation).not.toHaveBeenCalled();
+    const owned = { invocationId: 'actually-bound' };
+    callbacks[3](owned);
+    await expect(callbacks[6](next)).resolves.toBe(false);
+    expect(mockPrepareInvocation).toHaveBeenCalledWith(next, owned);
+    await callbacks[2](next);
+    expect(mockAdmit).toHaveBeenLastCalledWith(next, owned);
   });
 
   it.each(['native', 'unknown_route'])(
@@ -2029,6 +2052,21 @@ describe('passive native response phase timing', () => {
       await result;
     },
   );
+
+  test('non-voice failures keep their original promise and log no private content', async () => {
+    const error = new DOMException('SYNTHETIC_PRIVATE_FAILURE', 'TimeoutError');
+    const result = Promise.reject(error);
+    const operation = jest.fn(() => result);
+    const controls = phases(request(false), operation);
+    expect(controls.send('SYNTHETIC_PRIVATE_PAYLOAD')).toBe(result);
+    await expect(result).rejects.toBe(error);
+    const record = JSON.parse(logger.warn.mock.calls.at(-1)[0].split('] ').at(-1));
+    expect(record.phase).toBe('provider_response_headers');
+    expect(record.errorType).toBe('TimeoutError');
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toMatch(
+      /SYNTHETIC_PRIVATE|SYNTHETIC_SECRET/,
+    );
+  });
 
   test.each([false, true])(
     'logger failure never changes transport success or failure (rejected=%s)',

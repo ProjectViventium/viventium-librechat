@@ -540,6 +540,67 @@ describe('Conversation Operations', () => {
   });
 
   describe('deleteConvos', () => {
+    it('removes only owner schedule bindings linked to the deleted source or destination and retains receipts', async () => {
+      const bindings = mongoose.connection.collection('viventium_glasshive_callback_bindings');
+      const receipts = mongoose.connection.collection('viventium_scheduler_dispatch_intents');
+      await bindings.deleteMany({});
+      await receipts.deleteMany({});
+      await Conversation.create({
+        conversationId: 'deleted-conversation',
+        user: 'owner-schedule',
+        title: 'Disposable source',
+        endpoint: EModelEndpoint.openAI,
+      });
+      await bindings.insertMany([
+        {
+          _id: 'source-match',
+          kind: 'schedule_binding',
+          ownerId: 'owner-schedule',
+          sourceConversationId: 'deleted-conversation',
+          conversationId: 'other',
+        },
+        {
+          _id: 'destination-match',
+          kind: 'schedule_binding',
+          ownerId: 'owner-schedule',
+          sourceConversationId: 'other',
+          conversationId: 'deleted-conversation',
+        },
+        {
+          _id: 'foreign-owner',
+          kind: 'schedule_binding',
+          ownerId: 'foreign-owner',
+          sourceConversationId: 'deleted-conversation',
+        },
+        {
+          _id: 'unrelated',
+          kind: 'schedule_binding',
+          ownerId: 'owner-schedule',
+          conversationId: 'unrelated',
+        },
+        {
+          _id: 'worker-binding',
+          kind: 'worker_callback',
+          ownerId: 'owner-schedule',
+          conversationId: 'deleted-conversation',
+        },
+      ]);
+      await receipts.insertOne({
+        _id: 'accepted-receipt',
+        kind: 'schedule_due',
+        userId: 'owner-schedule',
+        bindingRef: 'source-match',
+        status: 'accepted',
+      });
+      await deleteConvos('owner-schedule', { conversationId: 'deleted-conversation' });
+      expect((await bindings.find().toArray()).map((binding) => binding._id).sort()).toEqual([
+        'foreign-owner',
+        'unrelated',
+        'worker-binding',
+      ]);
+      expect(await receipts.countDocuments({ _id: 'accepted-receipt' })).toBe(1);
+    });
+
     it('should delete conversations and associated messages', async () => {
       await Conversation.create({
         conversationId: mockConversationData.conversationId,

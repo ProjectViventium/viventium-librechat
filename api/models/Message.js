@@ -585,6 +585,23 @@ async function saveMessage(req, params, metadata) {
     const persist = async () => {
       const protectedUpdate = await preserveMessageMainContext(sourceFilter, update, mainContext);
       if (operationKind === 'system' && protectedUpdate.isCreatedByUser !== true) {
+        if (
+          protectedUpdate.error === true &&
+          protectedUpdate.unfinished === false &&
+          req._viventiumNativeResponseIdentity?.responseMessageId === params.messageId &&
+          req._viventiumNativeResponseIdentity.userId === String(req.user.id) &&
+          req._viventiumNativeResponseIdentity.conversationId === protectedUpdate.conversationId
+        ) {
+          const failed =
+            await require('~/server/services/viventium/nativeResponseService').persistNativeResponseFailure(
+              req._viventiumNativeResponseIdentity,
+              protectedUpdate,
+              (identity) => {
+                req._viventiumNativeFailureRevokedIdentity = identity;
+              },
+            );
+          if (failed) return failed;
+        }
         const guarded = await require('~/models').saveNativeResponseSnapshot(
           req.user.id,
           protectedUpdate,

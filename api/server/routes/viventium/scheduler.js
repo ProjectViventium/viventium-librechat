@@ -25,7 +25,7 @@ const {
 const { initializeClient } = require('~/server/services/Endpoints/agents');
 const addTitle = require('~/server/services/Endpoints/agents/title');
 const AgentController = require('~/server/controllers/agents/request');
-const { getUserById, getConvo } = require('~/models');
+const { getUserById, getConvo, getMessages, getFiles } = require('~/models');
 const { Message, Conversation } = require('~/db/models');
 /* === VIVENTIUM NOTE ===
  * Feature: Scheduler <-> Telegram mapping helper import.
@@ -524,6 +524,47 @@ function scheduledCapabilityError(res, error) {
   });
 }
 
+/* === VIVENTIUM START === Generic clock notice enters the normal Main dispatch owner. === */
+router.post('/targets', schedulerAuth, async (req, res) => {
+  try {
+    const {
+      ensureConversationScheduleTargets,
+    } = require('~/server/services/viventium/ScheduleDueService');
+    const targets = await ensureConversationScheduleTargets({
+      user: req.user,
+      requestBody: req.body,
+    });
+    return res.json({ targets });
+  } catch (error) {
+    return res.status(503).json({ error: error?.code || 'schedule_target_unavailable' });
+  }
+});
+
+router.post('/due', async (req, res) => {
+  const {
+    receiveScheduleDue,
+    reconcileScheduleDueAdmissions,
+  } = require('~/server/services/viventium/ScheduleDueService');
+  try {
+    const { admission, duplicate } = await receiveScheduleDue(req);
+    // Work release does not depend on the receiver keeping its HTTP response open.
+    setImmediate(() =>
+      reconcileScheduleDueAdmissions().catch((error) => {
+        logger.warn('[scheduleDue] Accepted admission recovery deferred', {
+          code: error?.code || error?.name,
+        });
+      }),
+    );
+    return res.status(202).json({ accepted: true, duplicate, admission_id: admission._id });
+  } catch (error) {
+    const status = Number(error?.status);
+    return res
+      .status(status >= 400 && status <= 599 ? status : 503)
+      .json({ error: error?.code || 'schedule_due_unavailable' });
+  }
+});
+/* === VIVENTIUM END === */
+
 router.post('/glasshive-capabilities/grant', schedulerAuth, async (req, res) => {
   try {
     return res.json(await buildScheduledGlassHiveCapabilityBundle(scheduledCapabilityInput(req)));
@@ -715,6 +756,91 @@ router.post(
         ? `scheduler-${crypto.createHash('sha256').update(dispatchDocumentId).digest('hex').slice(0, 32)}`
         : `scheduler-${crypto.randomUUID()}`);
     const messageId = schedulerMessageId(req.user?.id, streamId);
+    if (
+      existingDispatch?.kind === 'schedule_due' &&
+      !(
+        existingDispatch.conversationPolicy === 'new' &&
+        requestedConversationId === 'new' &&
+        existingDispatch.conversationId === 'new'
+      )
+    ) {
+      const boundConversation = await getConvo(req.user?.id, requestedConversationId);
+      if (
+        !boundConversation ||
+        boundConversation.endpoint !== 'agents' ||
+        existingDispatch.conversationId !== requestedConversationId
+      ) {
+        return _res.status(403).json({
+          error: 'The scheduled conversation is unavailable',
+          reason: 'schedule_due_binding_unavailable',
+        });
+      }
+    }
+    let inheritedSourceFiles = [];
+    if (existingDispatch?.kind === 'schedule_due') {
+      const binding = await mongoose.connection
+        .collection('viventium_glasshive_callback_bindings')
+        .findOne({
+          _id: existingDispatch.bindingRef,
+          kind: 'schedule_binding',
+          ownerId: String(req.user.id),
+        });
+      req.viventiumSchedulerDueAdmissionId = existingDispatch._id;
+      const sourceId = binding?.sourceConversationId || binding?.conversationId;
+      if (sourceId && sourceId !== requestedConversationId) {
+        const sourceConvo = await getConvo(req.user.id, sourceId);
+        if (sourceConvo?.endpoint !== 'agents')
+          return _res.status(403).json({ reason: 'schedule_due_source_unavailable' });
+        const sourceState = await resolveReusableConversationState({
+          conversationId: sourceId,
+          userId: req.user.id,
+          surface: 'scheduler',
+        });
+        const rows = await getMessages({ user: String(req.user.id), conversationId: sourceId });
+        if (!sourceState.parentMessageId || !rows?.length)
+          return _res.status(503).json({ reason: 'schedule_due_source_context_unavailable' });
+        const sourceMessages = require('~/app/clients/BaseClient').getMessagesForConversation({
+          messages: rows,
+          parentMessageId: sourceState.parentMessageId,
+          skipCondition: (message) =>
+            require('~/server/services/viventium/ViventiumMainContextService').isSchedulerTransportRow(
+              message,
+            ) ||
+            require('~/server/services/viventium/normalizeTextContentParts').isRuntimeOnlyAssistantMessage(
+              message,
+            ) ||
+            require('~/server/services/viventium/listenOnlyTranscript').isListenOnlyTranscriptMessage(
+              message,
+            ),
+        });
+        Object.defineProperty(req, '_viventiumInheritedConversationContext', {
+          value:
+            require('~/server/services/viventium/ViventiumMainContextService').buildInheritedConversationContext(
+              {
+                conversationId: sourceId,
+                messages: sourceMessages,
+              },
+            ),
+          enumerable: false,
+        });
+        const fileIds = [
+          ...new Set(
+            sourceMessages
+              .flatMap((message) =>
+                (Array.isArray(message.files) ? message.files : []).map((file) =>
+                  typeof file === 'string' ? file : file.file_id,
+                ),
+              )
+              .filter(Boolean),
+          ),
+        ];
+        if (fileIds.length)
+          inheritedSourceFiles = await getFiles({
+            user: String(req.user.id),
+            file_id: { $in: fileIds },
+          });
+      }
+    }
     const validatedConversationId = await normalizeSchedulerConversationId({
       conversationId: requestedConversationId,
       userId: req.user?.id,
@@ -822,6 +948,14 @@ router.post(
       streamId,
       messageId,
       scheduleId,
+      ...(inheritedSourceFiles.length
+        ? {
+            files: [
+              ...(Array.isArray(sanitizedIncoming.files) ? sanitizedIncoming.files : []),
+              ...inheritedSourceFiles,
+            ],
+          }
+        : {}),
     };
     if (resolvedSpec) {
       req.body.spec = resolvedSpec;
@@ -843,14 +977,15 @@ router.post(
   validateConvoAccess,
   buildEndpointOption,
   async (req, res, next) => {
-    const result = await AgentController(req, res, next, initializeClient, addSchedulerTitle);
     if (req.viventiumSchedulerDispatchDocumentId) {
+      req._viventiumBeforeGenerationReceipt = async ({ streamId, conversationId }) => {
       await schedulerDispatchCollection().updateOne(
         { _id: req.viventiumSchedulerDispatchDocumentId },
-        { $set: { status: 'accepted', updatedAt: new Date() } },
+        { $set: { status: 'accepted', streamId, conversationId, updatedAt: new Date() } },
       );
+    };
     }
-    return result;
+    return AgentController(req, res, next, initializeClient, addSchedulerTitle);
   },
 );
 

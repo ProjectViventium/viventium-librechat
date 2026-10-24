@@ -63,6 +63,7 @@ export interface GlassHiveMissionDestination {
   telegramChatId?: string;
   telegramUserId?: string;
   telegramMessageId?: string;
+  telegramMessageThreadId?: string;
   voiceCallSessionId?: string;
   voiceRequestId?: string;
   unresolvedReason?: string;
@@ -715,6 +716,9 @@ function safeDestinations(binding: GlassHiveMissionBinding = {}): GlassHiveMissi
       telegramChatId: safeText(destination.telegramChatId, 160),
       telegramUserId: safeText(destination.telegramUserId, 160),
       telegramMessageId: safeText(destination.telegramMessageId, 160),
+        ...(destination.telegramMessageThreadId
+          ? { telegramMessageThreadId: safeText(destination.telegramMessageThreadId, 160) }
+          : {}),
       voiceCallSessionId: safeText(destination.voiceCallSessionId, 160),
       voiceRequestId: safeText(destination.voiceRequestId, 160),
       unresolvedReason: safeText(destination.unresolvedReason, 120),

@@ -132,14 +132,13 @@ export function nativePredecessorSupersession(
   };
 }
 
-/** Delivery removal and native cancellation permit moving only the unanswered input obligation. */
+/** Exact native cancellation and delivery removal return unanswered input on every surface. */
 export function nativePredecessorSourceRecovery(
   current: SerializableJobData,
   previous: SerializableJobData | null | undefined,
 ): previous is SerializableJobData {
   return Boolean(
     current.status === 'running' &&
-    current.adapterCapabilities?.supersede_scope === 'response_only' &&
     previous?.nativeResponseCancelled === true &&
     previous.interactionContext?.source_event_id &&
     previous.interactionContext.logical_turn_id === current.interactionContext?.logical_turn_id &&
@@ -152,7 +151,7 @@ export function nativePredecessorSourceRecovery(
 export function unboundPredecessorSourceRecovery(current: SerializableJobData, previous: SerializableJobData | null | undefined, unboundCancelled = false): previous is SerializableJobData {
   const turn = current.interactionContext;
   const old = previous?.interactionContext;
-  return Boolean(current.status === 'running' && current.adapterCapabilities?.supersede_scope === 'response_only' &&
+  return Boolean(current.status === 'running' &&
     previous?.status === 'superseded' &&
     previous.nativeResponseCancelled === true && unboundCancelled && previous.userId === current.userId &&
     previous.conversationId === current.conversationId && old?.logical_turn_id === turn?.logical_turn_id &&
@@ -190,7 +189,6 @@ export async function prepareNativeSourceRecovery(
     const pendingRemoval =
       live?.status === 'running' &&
       live.createdAt === current.createdAt &&
-      live.adapterCapabilities?.supersede_scope === 'response_only' &&
       stopped?.status === 'superseded' &&
       stopped.nativeResponseCancelled === true &&
       !unboundCancelled &&

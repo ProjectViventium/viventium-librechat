@@ -13,6 +13,7 @@ const {
   voiceTaskCommittedPresentationKey,
   verifyVoiceWorkerCompletionPresentation,
   nativeWorkInputPresentation,
+  mainGenerationPresentation,
   nativeQuestionFormSchema,
   nativeQuestionContent,
   nativeInputRequestSchema,
@@ -531,7 +532,14 @@ function restoreTaskFromSuppression(tombstone) {
     type: 'state',
     state,
     phase: state,
-    label: state === 'cancelling' ? 'Cancelling' : state,
+    label:
+      safeText(tombstone.label, 80) ||
+      (state === 'cancelled_confirmed'
+        ? 'Cancelled'
+        : state === 'cancelled_unenforceable'
+          ? 'Cancellation could not be confirmed'
+          : 'Cancelling'),
+    ...(safeText(tombstone.detail, 500) ? { detail: safeText(tombstone.detail, 500) } : {}),
     cancellable: false,
     retryable: false,
     owner,
@@ -562,7 +570,9 @@ function restoreTaskFromSuppression(tombstone) {
     events: [event],
     observedEventKeys: new Set(),
     sources: [],
-    current: { phase: state, label: event.label },
+    current: { phase: state, label: event.label,
+      ...(event.detail ? { detail: event.detail } : {}),
+    },
     lastEvent: event,
     expiresAtMs: Number(tombstone.expiresAtMs) || Date.now() + ACTIVE_TASK_TTL_MS,
     suppressionEvent: {
@@ -629,6 +639,8 @@ async function persistVoiceTaskSuppression(task) {
     state: new Set(['cancelling', 'cancelled_confirmed', 'cancelled_unenforceable']).has(task.state)
       ? task.state
       : 'cancelling',
+    label: task.current?.phase === task.state ? safeText(task.current.label, 80) : '',
+    detail: task.current?.phase === task.state ? safeText(task.current.detail, 500) : '',
     conversationId: task.conversationId || '',
     turnId: task.turnId || '',
     parentTaskId: task.parentTaskId || '',
@@ -656,6 +668,8 @@ async function persistVoiceTaskSuppression(task) {
           sequence: tombstone.sequence,
           emittedAt: new Date(tombstone.emittedAt),
           state: tombstone.state,
+          label: tombstone.label || null,
+          detail: tombstone.detail || null,
           conversationId: tombstone.conversationId || null,
           turnId: tombstone.turnId || null,
           parentTaskId: tombstone.parentTaskId || null,
@@ -726,6 +740,8 @@ async function hydrateVoiceTaskSuppression(taskId, { callSessionId, userId, stre
     sequence: Number.isSafeInteger(row.sequence) ? row.sequence : 0,
     emittedAt: row.emittedAt ? new Date(row.emittedAt).toISOString() : '',
     state: safeText(row.state, 80) || 'cancelling',
+    label: safeText(row.label, 80),
+    detail: safeText(row.detail, 500),
     conversationId: row.conversationId || '',
     turnId: row.turnId || '',
     parentTaskId: row.parentTaskId || '',
@@ -1884,12 +1900,14 @@ function snapshotEventForSuppression(row) {
       type: 'snapshot',
       state,
       phase: state,
+      ...(safeText(row.detail, 500) ? { detail: safeText(row.detail, 500) } : {}),
       label:
-        state === 'cancelled_confirmed'
+        safeText(row.label, 80) ||
+        (state === 'cancelled_confirmed'
           ? 'Cancelled'
           : state === 'cancelled_unenforceable'
             ? 'Cancellation could not be confirmed'
-            : 'Cancelling',
+            : 'Cancelling'),
       cancellable: false,
       retryable: false,
       owner: {
@@ -2806,6 +2824,7 @@ function registerVoiceTaskDeliveryPresentation(delivery, { userId, callSessionId
     delivery?.status === 'pending' &&
     /^callback_sha256:[a-f0-9]{64}$/.test(callbackRef) &&
     (nativeWorkInputPresentation(delivery) ||
+      mainGenerationPresentation(delivery) ||
       verifyVoiceWorkerCompletionPresentation(delivery.workerCompletionPresentation, {
         ownerId: userId,
         conversationId,
@@ -3579,7 +3598,7 @@ async function flushVoiceTaskOwnerOperations() {
   );
 }
 
-async function settleVoiceTaskCancellation(taskId, { confirmed, detail } = {}) {
+async function settleVoiceTaskCancellation(taskId, { confirmed, detail, label } = {}) {
   const task = tasks.get(String(taskId || ''));
   const correctingLateOwnerProof = task?.state === 'cancelled_unenforceable' && confirmed === true;
   if (!task || (task.state !== 'cancelling' && !correctingLateOwnerProof)) {
@@ -3599,7 +3618,7 @@ async function settleVoiceTaskCancellation(taskId, { confirmed, detail } = {}) {
   const event = nextEvent(terminalTask, {
     type: 'state',
     phase: terminalTask.state,
-    label: confirmed ? 'Cancelled' : 'Cancellation could not be confirmed',
+    label: confirmed ? safeText(label, 80) || 'Cancelled' : 'Cancellation could not be confirmed',
     detail,
     deferDelivery: true,
   });
@@ -3625,7 +3644,7 @@ async function settleVoiceTaskCancellation(taskId, { confirmed, detail } = {}) {
   return event;
 }
 
-async function confirmVoiceTaskOwnerCancellation(taskId, detail) {
+async function confirmVoiceTaskOwnerCancellation(taskId, detail, { label } = {}) {
   const task = tasks.get(String(taskId || ''));
   if (!task) {
     return null;
@@ -3636,6 +3655,7 @@ async function confirmVoiceTaskOwnerCancellation(taskId, detail) {
   if (task.state === 'cancelled_unenforceable') {
     return await settleVoiceTaskCancellation(taskId, {
       confirmed: true,
+      label,
       detail: safeText(detail, 500) || 'The task owner later proved it stopped.',
     });
   }
@@ -3650,6 +3670,7 @@ async function confirmVoiceTaskOwnerCancellation(taskId, detail) {
   }
   return await settleVoiceTaskCancellation(taskId, {
     confirmed: true,
+    label,
     detail: safeText(detail, 500) || 'The task owner confirmed it stopped.',
   });
 }

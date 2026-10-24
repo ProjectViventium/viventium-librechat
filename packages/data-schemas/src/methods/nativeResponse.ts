@@ -365,7 +365,9 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
       !parent ||
       (!historical && nativeResponseParentSource(parent).digest !== expectedParent.digest)
     )
-      throw new Error('native_response_parent_changed');
+      throw Object.assign(new Error('native_response_parent_changed'), {
+        code: 'native_response_parent_changed',
+      });
     const parentTouched = await messages().updateOne(
       { _id: parent._id, deletedAt: null },
       { $inc: { __v: 1 } },
@@ -782,7 +784,10 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     transaction: Transaction,
     project: (message: NativeResponseMessageProjection) => NativeResponseMessageProjection,
     failureClass?: string,
+    hostFailure?: { error_class: string; error: string },
   ): Promise<NativeResponseRow | null> {
+    if (hostFailure && (status !== 'failed' || !hostFailure.error_class || !hostFailure.error))
+      throw new Error('native_response_failure_snapshot_invalid');
     const nativeStopMessages: Record<string, string> = {
       native_input_declined: 'You declined that action. It was stopped.',
       native_input_expired:
@@ -805,7 +810,9 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
         !admission ||
         admission.recoverUntil <= Date.now() ||
         admission.stopSnapshotStoredAt !== undefined ||
-        !['pending', 'prepared', 'failed', 'cancelled'].includes(admission.status)
+        !(
+          hostFailure ? ['pending', 'prepared'] : ['pending', 'prepared', 'failed', 'cancelled']
+        ).includes(admission.status)
       )
         return null;
       if (
@@ -814,7 +821,9 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
       )
         return row;
       if (admission.terminalSnapshotStoredAt !== undefined) return null;
-      await lockSource(identity);
+      // A rejected host attempt can fail after its authored context changed; it cannot accept
+      // that obsolete answer. The same source IDs, roles, links and mutation transaction remain.
+      await lockSource(identity, Boolean(hostFailure));
       if (!(await authorize(identity)))
         throw new Error('native_response_terminal_authority_unavailable');
       const projected = project({ text: row.text, content: row.content, metadata: row.metadata });
@@ -833,8 +842,11 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
                 ...(projected.content || []).filter((part) => String(part.type) !== 'error'),
                 {
                   type: 'error',
-                  error_class: nativeStopMessage ? failureClass : `native_response_${status}`,
+                  error_class:
+                    hostFailure?.error_class ||
+                    (nativeStopMessage ? failureClass : `native_response_${status}`),
                   error:
+                    hostFailure?.error ||
                     nativeStopMessage ||
                     (status === 'cancelled'
                       ? 'The response was cancelled before completion.'

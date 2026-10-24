@@ -67,7 +67,7 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
     instruction: {
       type: 'string',
       description:
-        'Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call.',
+        'Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call. With inheritContext=true, this optional value must be an exact verbatim clause from a selected original input for this one assignment. Omit it to use the whole selected input; do not summarize or paraphrase it. Full conversation context stays available.',
       minLength: 1,
       maxLength: MAIN_DELEGATION_STRING_LIMITS.instruction,
     },

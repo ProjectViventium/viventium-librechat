@@ -104,6 +104,7 @@ const {
 const { maybeInjectGlassHiveCapabilityBroker } = require('./GlassHiveCapabilityBootstrapService');
 const {
   selectTrustedLaunchRequestBody,
+  selectTrustedSourceInstruction,
   trustedUploadedFilesFromRequestBody,
 } = require('./GlassHiveSourceSelection');
 
@@ -690,7 +691,7 @@ async function buildCapabilityCatalog({
         continue;
       }
       const name = String(tool?.name || '').trim();
-      if (!name) {
+      if (!name || policy.toolPolicies?.[name]?.access === 'none') {
         continue;
       }
       const brokerName = collisionSafeBrokerToolName(serverName, name, claimedBrokerToolNames);
@@ -1390,7 +1391,8 @@ async function invokeConversationOrchestrationTool({
             ownerId: catalog.user.id,
             ...input,
             ...(inheritedConversation ? { inheritedConversation } : {}),
-            ...(input.nativeInput || input.action === 'resume' ? { requestBody } : {}),
+            ...(['queue', 'message', 'steer', 'retry', 'resume'].includes(input.action) || input.nativeInput
+              ? { requestBody } : {}),
             operationId: stableInvocationId,
             ...(isManagedSourceMutation(requestBody)
               ? {
@@ -1446,6 +1448,10 @@ function inheritedWorkSchema(schema, requestBody) {
       ...schema.properties,
       inheritContext: { type: 'boolean', enum: [true] },
       sourceOrdinals: selection.properties.sourceOrdinals,
+      instruction: {
+        ...schema.properties.instruction,
+        description: MAIN_DELEGATION_JSON_SCHEMA.properties.instruction.description,
+      },
     },
     required: (schema.required || []).filter(
       (name) => !['title', 'instruction', 'resourceClass'].includes(name),
@@ -1469,7 +1475,13 @@ function inheritedWorkArguments(resources, args, start = false) {
         .map((segment) => (typeof segment.text === 'string' ? segment.text : ''))
         .filter(Boolean)
     : [];
-  const instruction = texts.length
+  const suppliedInstruction = selectTrustedSourceInstruction(
+    texts.length ? texts : typeof selected.text === 'string' ? [selected.text] : [],
+    args.instruction,
+  );
+  const instruction =
+    suppliedInstruction ??
+    (texts.length
     ? texts.join('\n\n')
     : String(selected.text || '') ||
       (trustedUploadedFilesFromRequestBody(selected).length
@@ -1477,7 +1489,7 @@ function inheritedWorkArguments(resources, args, start = false) {
             source_segments: segments || [],
             files: trustedUploadedFilesFromRequestBody(selected),
           })
-        : '');
+        : ''));
   if (!instruction)
     throw Object.assign(new Error('current_task_source_unavailable'), {
       code: 'current_task_source_unavailable',
@@ -1495,6 +1507,7 @@ function inheritedSelectionFailure(error, tool) {
     ![
       'source_selection_required',
       'invalid_source_selection',
+      'invalid_source_instruction_selection',
       'inherited_context_unavailable',
       'current_task_source_unavailable',
     ].includes(code)
@@ -1504,7 +1517,9 @@ function inheritedSelectionFailure(error, tool) {
     status: 'blocked',
     reason: code,
     tool,
-    retryable: ['source_selection_required', 'invalid_source_selection'].includes(code),
+    retryable: ['source_selection_required', 'invalid_source_selection',
+      'invalid_source_instruction_selection',
+    ].includes(code),
     needsInput: false,
   };
 }
@@ -1518,24 +1533,6 @@ async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationI
     return memoryBinding.invoke(grant, args);
   }
   if (isConversationOrchestrationTool(hostTool.toolName)) {
-    if (
-      hostTool.toolName === 'active_work_action' &&
-      args.inheritContext === true &&
-      ['queue', 'message', 'steer', 'retry'].includes(args.action)
-    ) {
-      try {
-        args = inheritedWorkArguments(hostTool.resources, args);
-      } catch (error) {
-        return (
-          inheritedSelectionFailure(error, hostTool.toolName) || {
-            status: 'blocked',
-            reason: 'invalid_arguments',
-            tool: hostTool.toolName,
-            retryable: false,
-          }
-        );
-      }
-    }
     return invokeConversationOrchestrationTool({
       grant,
       catalog,

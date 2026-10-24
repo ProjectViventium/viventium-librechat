@@ -108,6 +108,10 @@ async function persistPresentationOutcome(result) {
   const modifiedCount = Number(persisted?.modifiedCount ?? persisted?.nModified ?? 0);
   if (matchedCount > 0 || modifiedCount > 0) return;
 
+  // The exact owner-store failure receipt does not require an unpublished assistant row.
+  // Database errors still throw; absence never authorizes successful presentation.
+  if (acknowledgement.state === 'failed') return;
+
   if (['committed', 'committed_effect'].includes(acknowledgement.state)) {
     const terminalQuery = {
       ...query,

@@ -8,6 +8,8 @@
  * === VIVENTIUM END === */
 
 const crypto = require('crypto');
+const mongoose = require('mongoose');
+const { getConvo, getUserById } = require('~/models');
 const isEqual = require('lodash/isEqual');
 const {
   canonicalizeGlassHiveCallbackRef,
@@ -18,6 +20,10 @@ const {
   createNativeWorkInputPresentationService,
   notifyTelegramDeliveryReady,
   projectAudioDeliveryControls,
+  buildMainGenerationPresentation,
+  mainGenerationPresentation,
+  createMainGenerationPresentationVerifier,
+  createGlassHiveCallbackDeliveryDispatchService,
 } = require('@librechat/api');
 const {
   acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease,
@@ -135,6 +141,86 @@ const exactNativeInputPresentation = createNativeWorkInputPresentationService({
       session,
     }).lean(),
   fence: (operation, row) => transactionallyFencePersistedDelivery(operation, row),
+});
+
+function mainGenerationDeliveryCandidate({
+  body,
+  deliveryContext,
+  message,
+  surface,
+  destination = {},
+}) {
+  return {
+    userId: normalizeText(deliveryContext.ownerId),
+    conversationId: normalizeText(deliveryContext.conversationId),
+    callbackMessageId: normalizeText(message?.messageId),
+    originRef: normalizeText(deliveryContext.originRef),
+    event: normalizeText(body.event),
+    surface,
+    text: String(message?.text || ''),
+    fullText: String(message?.text || ''),
+    voiceCallSessionId: normalizeText(destination.voiceCallSessionId),
+    voiceRequestId: normalizeText(destination.voiceRequestId),
+    mainGenerationPresentation: buildMainGenerationPresentation(
+      deliveryContext.mainGenerationPresentation,
+      normalizeText(message?.messageId),
+      String(message?.text || ''),
+    ),
+  };
+}
+
+const exactMainGenerationPresentation = createMainGenerationPresentationVerifier({
+  readAdmission: (id, session) =>
+    mongoose.connection
+      .collection('viventium_scheduler_dispatch_intents')
+      .findOne({ _id: id, kind: 'schedule_due' }, { session }),
+  readBinding: (id, session) =>
+    mongoose.connection
+      .collection('viventium_glasshive_callback_bindings')
+      .findOne({ _id: id, kind: 'schedule_binding' }, { session }),
+  readMessage: (user, conversationId, messageId, session) =>
+    queryLean(
+      Message.findOne({ user, conversationId, messageId, isCreatedByUser: false }),
+      session,
+    ),
+  readOwner: async (ownerId) => Boolean(await getUserById(ownerId)),
+  readConversation: (ownerId, conversationId) => getConvo(ownerId, conversationId),
+  readTelegram: async (ownerId) => {
+    const mapping = await resolveTelegramMappingByUserId({ libreChatUserId: ownerId });
+    return mapping
+      ? {
+          telegramChatId: String(mapping.telegramChatId || ''),
+          telegramUserId: String(mapping.telegramUserId || ''),
+        }
+      : null;
+  },
+  readCall: getCallSession,
+});
+const mainGenerationDispatch = createGlassHiveCallbackDeliveryDispatchService({
+  DeliveryModel: ViventiumGlassHiveCallbackDelivery,
+  mainPresentationCurrent: exactMainGenerationPresentation,
+  resultExists: (filter) => GlassHiveTerminalCallbackResult.exists(filter).then(Boolean),
+  acquireEffectLease: (input) =>
+    acquireGlassHiveTerminalCallbackAcceptedOperationEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      ...input,
+    }),
+  renewEffectLease: (input) =>
+    renewGlassHiveTerminalCallbackEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      ...input,
+    }),
+  fenceEffectTransaction: (input) =>
+    fenceGlassHiveTerminalCallbackEffectTransaction({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      ...input,
+    }),
+  releaseEffectLease: (input) =>
+    releaseGlassHiveTerminalCallbackEffectLease({
+      ResultModel: GlassHiveTerminalCallbackResult,
+      ...input,
+    }),
+  runTransaction: runGlassHiveTerminalCallbackTransaction,
 });
 
 function isWorkerAttentionBinding(binding) {
@@ -538,8 +624,9 @@ function dispatchPermitLease(row) {
 
 function toDispatchPermit(row) {
   const question = nativeWorkInputPresentation(row, { allowExpired: true });
+  const main = mainGenerationPresentation(row || {});
   const lease =
-    question &&
+    (question || main) &&
     /^[a-f0-9]{32}$/.test(normalizeText(row?.dispatchPermitId)) &&
     Number.isSafeInteger(row.dispatchPermitGeneration) &&
     row.dispatchPermitGeneration > 0
@@ -547,7 +634,7 @@ function toDispatchPermit(row) {
           leaseId: row.dispatchPermitId,
           generation: row.dispatchPermitGeneration,
           resultRevision: 1,
-          resultDigest: question.digest,
+          resultDigest: question ? question.digest : main.responseDigest,
         }
       : dispatchPermitLease(row);
   const expiresAt = row?.dispatchPermitExpiresAt
@@ -666,6 +753,7 @@ async function markSupersededDelivery(deliveryId) {
 }
 
 async function recordFencedDeliveryTrace(row, status, at, transactionOptions) {
+  if (!row) return null;
   const payload = toDispatchPayload(row);
   try {
     await transactionallyFencePersistedDelivery(
@@ -685,12 +773,15 @@ async function recordFencedDeliveryTrace(row, status, at, transactionOptions) {
             session,
           );
           if (message) {
-            const deliveredText = String(
+            const canonicalMain = Boolean(mainGenerationPresentation(row));
+            const deliverySource = String(
               row.surface === 'voice' && row.workerCompletionPresentation
                 ? row.text || ''
                 : row.fullText || row.text || '',
-            ).trim();
-            const sourceText = String(message.text || '').trim();
+            );
+            const deliveredText = canonicalMain ? deliverySource : deliverySource.trim();
+            const canonicalSource = String(message.text || '');
+            const sourceText = canonicalMain ? canonicalSource : canonicalSource.trim();
             const content = (Array.isArray(message.content) ? message.content : []).filter(
               (part) => part?.type === 'text',
             );
@@ -860,6 +951,7 @@ function toDispatchPayload(delivery) {
     telegramMessageId: delivery.telegramMessageId || '',
     telegramMessageThreadId: delivery.telegramMessageThreadId || '',
     nativeInputBinding: delivery.nativeInputBinding || null,
+    mainGenerationPresentation: delivery.mainGenerationPresentation || null,
     telegramSentMessageIds: normalizeTelegramMessageIds(delivery.telegramSentMessageIds),
     voiceCallSessionId: delivery.voiceCallSessionId || '',
     voiceRequestId: delivery.voiceRequestId || '',
@@ -991,6 +1083,18 @@ async function exactWorkerCompletionPresentation({
   const requested = deliveryContext?.workerCompletionPresentation;
   if (surface !== 'voice' || normalizeText(body?.event) !== 'main.followup') return null;
   if (!isResolvedDestination(destination)) return null;
+  if (!requested && deliveryContext?.mainGenerationPresentation) {
+    const main = mainGenerationDeliveryCandidate({
+      body,
+      deliveryContext,
+      message,
+      surface,
+      destination,
+    });
+    if (!(await exactMainGenerationPresentation(main)))
+      throw new Error('voice_main_generation_presentation_invalid');
+    return null;
+  }
   const authority = {
     ownerId: normalizeText(deliveryContext?.ownerId),
     conversationId: normalizeText(deliveryContext?.conversationId),
@@ -1031,7 +1135,8 @@ async function publishPendingWorkerCompletionDelivery(delivery) {
     delivery.status !== 'pending' ||
     !(
       plainWorkerCompletionPresentation(delivery) ||
-      nativeWorkInputPresentation(delivery, { allowExpired: true })
+      nativeWorkInputPresentation(delivery, { allowExpired: true }) ||
+      mainGenerationPresentation(delivery)
     )
   )
     return;
@@ -1068,7 +1173,9 @@ async function publishPendingWorkerCompletionDelivery(delivery) {
       }).lean();
       if (!current) return;
       const question = await exactNativeInputPresentation(current, null, true);
-      if (!((await exactCanonicalWorkerCompletionPresentation(current)) || question)) {
+      const main =
+        mainGenerationPresentation(current) && (await exactMainGenerationPresentation(current));
+      if (!((await exactCanonicalWorkerCompletionPresentation(current)) || question || main)) {
         if (
           nativeWorkInputPresentation(current, { allowExpired: true }) ||
           plainWorkerCompletionPresentation(current)?.bindings.some(isWorkerAttentionBinding)
@@ -1553,6 +1660,19 @@ async function recordGlassHiveLinkedWebDelivery({
     externalDestinations(deliveryContext).length > 0
   )
     return null;
+  if (deliveryContext.mainGenerationPresentation) {
+    const main = mainGenerationDeliveryCandidate({
+      body,
+      deliveryContext,
+      message,
+      surface: 'librechat',
+    });
+    if (!(await exactMainGenerationPresentation(main)))
+      throw new Error('glasshive_linked_main_presentation_invalid');
+    // Main already persisted its canonical reply. Recognize that same presentation;
+    // no worker terminal transaction, additional message or second inference exists.
+    return true;
+  }
   effectSession ||= currentGlassHiveTerminalCallbackTransaction()?.session || null;
   if (!effectSession) throw new Error('glasshive_linked_presentation_transaction_required');
   if (!effectFence) {
@@ -2029,6 +2149,15 @@ async function enqueueGlassHiveCallbackDelivery({
             telegramMessageId: normalizeText(destination.telegramMessageId),
             telegramMessageThreadId: normalizeText(destination.telegramMessageThreadId),
             ...(pendingInputBinding ? { nativeInputBinding: pendingInputBinding } : {}),
+            ...(deliveryContext.mainGenerationPresentation
+              ? {
+                  mainGenerationPresentation: buildMainGenerationPresentation(
+                    deliveryContext.mainGenerationPresentation,
+                    callbackMessageId,
+                    String(message.text || ''),
+                  ),
+                }
+              : {}),
             voiceCallSessionId: normalizeText(destination.voiceCallSessionId),
             voiceRequestId: normalizeText(destination.voiceRequestId),
             retryCount: 0,
@@ -2054,7 +2183,9 @@ async function enqueueGlassHiveCallbackDelivery({
               ? { workerCompletionBindings: deliveryContext.workerCompletionBindings }
               : {}),
             text: preview,
-            fullText: completeText && completeText !== preview ? completeText : '',
+            fullText: deliveryContext.mainGenerationPresentation
+              ? String(message.text || '')
+              : completeText && completeText !== preview ? completeText : '',
             attachments: Array.isArray(message.attachments) ? message.attachments : [],
             expiresAt,
           },
@@ -2235,6 +2366,7 @@ function claimFilter({
       filter.$and.push({
         $or: [
           { 'workerCompletionPresentation.version': 1 },
+          { event: 'main.followup', 'mainGenerationPresentation.version': 1 },
           { event: 'run.needs_input', 'nativeInputBinding.version': 1 },
         ],
       });
@@ -2393,7 +2525,8 @@ async function getSettledGlassHiveVoiceCallbackDelivery({
     if (
       !reference &&
       (nativeWorkInputPresentation(row, { allowExpired: true }) ||
-        plainWorkerCompletionPresentation(row)?.bindings.some(isWorkerAttentionBinding))
+        plainWorkerCompletionPresentation(row)?.bindings.some(isWorkerAttentionBinding) ||
+        mainGenerationPresentation(row))
     ) {
       return {
         deliveryId: row.deliveryId,
@@ -2635,6 +2768,19 @@ async function resolveGlassHiveVoicePresentation({
     !presentedDispatchPermitMatches(current, dispatchPermit)
   )
     return null;
+  if (mainGenerationPresentation(current)) {
+    if (
+      !(await exactMainGenerationPresentation(current)) ||
+      current.deliveryId !== normalizeText(presentationRef) ||
+      current.voiceRequestId !== normalizeText(turnId)
+    )
+      return null;
+    return {
+      ...toDispatchPayload(current),
+      presentationRef: current.deliveryId,
+      turnId: current.voiceRequestId,
+    };
+  }
   if (nativeWorkInputPresentation(current)) {
     const question = await exactNativeInputPresentation(current);
     if (
@@ -2805,6 +2951,14 @@ async function authorizeGlassHiveCallbackDeliveryDispatch({
   });
   const initial = await ViventiumGlassHiveCallbackDelivery.findOne(constraint).lean();
   if (!initial) return null;
+  if (mainGenerationPresentation(initial))
+    return mainGenerationDispatch.authorizeGlassHiveCallbackDeliveryDispatch({
+      deliveryId,
+      claimId,
+      userId,
+      voiceCallSessionId,
+      leaseMs,
+    });
   if (plainWorkerCompletionPresentation(initial) || hasWorkerAttention(initial)) {
     try {
       return await authorizeWorkerCompletionDispatch({ constraint, initial, now, durationMs });
@@ -2984,6 +3138,17 @@ async function renewGlassHiveCallbackDeliveryDispatch({
         if (!current || !presentedDispatchPermitMatches(current, dispatchPermit)) {
           throw new Error('glasshive_callback_delivery_dispatch_permit_invalid');
         }
+        if (mainGenerationPresentation(current)) {
+          renewedPermit = await mainGenerationDispatch.renewGlassHiveCallbackDeliveryDispatch({
+            deliveryId,
+            claimId,
+            dispatchPermit,
+            userId,
+            voiceCallSessionId,
+            leaseMs,
+          });
+          return;
+        }
         const question = nativeWorkInputPresentation(current);
         if (question) {
           if (!(await exactNativeInputPresentation(current, session)))
@@ -3078,6 +3243,16 @@ async function releaseGlassHiveCallbackDeliveryDispatch({
       .session(session)
       .lean();
     if (!current || !presentedDispatchPermitMatches(current, dispatchPermit)) return;
+    if (mainGenerationPresentation(current)) {
+      released = await mainGenerationDispatch.releaseGlassHiveCallbackDeliveryDispatch({
+        deliveryId,
+        claimId,
+        dispatchPermit,
+        userId,
+        voiceCallSessionId,
+      });
+      return;
+    }
     const presentation =
       plainWorkerCompletionPresentation(current) ||
       (hasWorkerAttention(current) ? workerBindingPresentation(current) : null);
@@ -3348,6 +3523,17 @@ async function markGlassHiveCallbackDeliverySent({
   );
   const current = currentQuery?.lean ? await currentQuery.lean() : await currentQuery;
   if (plainWorkerCompletionPresentation(current)) return null;
+  if (mainGenerationPresentation(current)) {
+    const result = await mainGenerationDispatch.settleGlassHiveCallbackDeliverySent({
+      deliveryId,
+      claimId,
+      dispatchPermit,
+      userId,
+      voiceCallSessionId,
+      telegramMessageIds: normalizedMessageIds,
+    });
+    return recordFencedDeliveryTrace(result.row, 'sent', now);
+  }
   if (hasWorkerAttention(current)) {
     const filter = deliveryConstraintFilter({ deliveryId, claimId, userId, voiceCallSessionId });
     await recordObservedTelegramMessageIds(current, filter, dispatchPermit, normalizedMessageIds);
@@ -3678,6 +3864,17 @@ async function markGlassHiveCallbackDeliveryUnknown({
   const filter = deliveryConstraintFilter({ deliveryId, claimId, userId, voiceCallSessionId });
   const candidateQuery = ViventiumGlassHiveCallbackDelivery.findOne(filter);
   const candidate = candidateQuery?.lean ? await candidateQuery.lean() : await candidateQuery;
+  if (mainGenerationPresentation(candidate || {})) {
+    const result = await mainGenerationDispatch.settleGlassHiveCallbackDeliveryUnknown({
+      deliveryId,
+      claimId,
+      dispatchPermit,
+      userId,
+      voiceCallSessionId,
+      lastError: reason,
+    });
+    return recordFencedDeliveryTrace(result.row, 'delivery_unknown', now);
+  }
   if (
     requireIssuedPermit &&
     (!toDispatchPermit(candidate) ||
@@ -4099,6 +4296,13 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
       {
         surface: 'voice',
         status: 'pending',
+        event: 'main.followup',
+        'mainGenerationPresentation.version': 1,
+        $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
+      },
+      {
+        surface: 'voice',
+        status: 'pending',
         event: 'run.needs_input',
         'nativeInputBinding.version': 1,
         $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
@@ -4158,7 +4362,7 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
       (row) =>
         row.surface === 'voice' &&
         row.status === 'pending' &&
-        plainWorkerCompletionPresentation(row),
+        (plainWorkerCompletionPresentation(row) || mainGenerationPresentation(row)),
     )
     .map((row) => row.deliveryId);
   if (discoveryIds.length) {

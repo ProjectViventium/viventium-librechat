@@ -2659,6 +2659,43 @@ describe('Worker delivery presentation ownership', () => {
       expect(snapshotEvent(question.taskId).source.id).toBe(d.callbackId);
     },
   );
+  test('scheduled Main admission uses the same durable delivery discovery without a worker run', () => {
+    const { buildMainGenerationPresentation } = require('@librechat/api');
+    const d = delivery({
+      status: 'pending',
+      claimId: '',
+      runId: '',
+      event: 'main.followup',
+      text: 'Scheduled Main result.',
+      callbackId: 'callback_sha256:' + 'a'.repeat(64),
+      voiceRequestId: 'schedule-stream',
+      mainGenerationPresentation: buildMainGenerationPresentation(
+        { streamId: 'schedule-stream', admissionId: 'schedule-admission' },
+        'worker-result',
+        'Scheduled Main result.',
+      ),
+    });
+    const task = registerVoiceTaskDeliveryPresentation(d, scope);
+    expect(task).toMatchObject({
+      state: 'completed',
+      owner: { kind: 'glasshive_delivery', id: d.deliveryId },
+    });
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      phase: 'follow_up',
+      resultMessageId: d.callbackMessageId,
+      source: { id: d.callbackId },
+    });
+    expect(registerVoiceTaskDeliveryPresentation(d, scope).taskId).toBe(task.taskId);
+    expect(
+      registerVoiceTaskDeliveryPresentation({ ...d, userId: 'foreign-owner' }, scope),
+    ).toBeNull();
+    expect(
+      registerVoiceTaskDeliveryPresentation(
+        { ...d, deliveryId: 'other-delivery', event: 'run.completed' },
+        scope,
+      ),
+    ).toBeNull();
+  });
   test('pending Main delivery publishes one durable typed discovery snapshot before claim', () => {
     const d = pendingDelivery();
     const events = [];

@@ -2376,6 +2376,8 @@ function classifyCompletionErrorForLog(err) {
    * Purpose: GlassHive streams terminal failure metadata over an already-open HTTP 200 response.
    * Preserve known structured classes directly so fallback policy never depends on error prose.
    * === VIVENTIUM END === */
+  if (codes.includes('native_response_parent_changed')) return 'source_context_unavailable';
+  if (codes.includes('provider_unavailable')) return 'provider_temporarily_unavailable';
   for (const structuredCode of [
     'native_input_declined',
     'native_input_expired',
@@ -2390,6 +2392,7 @@ function classifyCompletionErrorForLog(err) {
     'provider_rate_limited',
     'provider_response_deadline_exceeded',
     'provider_temporarily_unavailable',
+    'provider_request_rejected',
     'host_capacity',
     'context_length_exceeded',
     'conversation_capability_grant_required',
@@ -2625,13 +2628,26 @@ function createFallbackInitializationError(fallbackError, contentParts) {
 function completionErrorSourceFrames(errorChain) {
   let implementationFiles;
   try {
+    const apiEntry = require.resolve('@librechat/api');
+    const apiDirectory = path.dirname(apiEntry);
     implementationFiles = new Map([
       [__filename, 'api/server/controllers/agents/client.js'],
       [
         path.resolve(__dirname, '../../services/viventium/nativeResponseService.js'),
         'api/server/services/viventium/nativeResponseService.js',
       ],
-      [require.resolve('@librechat/api'), 'packages/api/dist/index.js'],
+      [
+        path.resolve(__dirname, '../../services/viventium/ViventiumMainContextService.js'),
+        'api/server/services/viventium/ViventiumMainContextService.js',
+      ],
+      ...[
+        apiEntry,
+        ...Object.keys(require.cache).filter((file) => path.dirname(file) === apiDirectory),
+      ].map((file) => [file, 'packages/api/dist/index.js']),
+      [
+        path.resolve(apiDirectory, '../src/continuity/mainContinuity.ts'),
+        'packages/api/src/continuity/mainContinuity.ts',
+      ],
       ...['run.cjs', 'graphs/Graph.cjs', 'llm/invoke.cjs'].map((file) => [
         path.join(path.dirname(require.resolve('@librechat/agents')), file),
         `node_modules/@librechat/agents/dist/cjs/${file}`,
@@ -2866,6 +2882,7 @@ function createCompletionErrorContentPart(err) {
     provider_connected_account_reconnect_required: getPublicConnectedAccountReconnectMessage(err),
     provider_unauthorized: 'The model provider credentials were rejected.',
     provider_access_denied: 'The model provider denied access to this request.',
+    provider_request_rejected: 'The model provider declined this request or its settings.',
     context_length_exceeded: 'The request was too large for the model context.',
     conversation_capability_grant_required:
       'This turn needs a fresh connected-tool authorization. Retry the turn to continue.',
@@ -2873,17 +2890,31 @@ function createCompletionErrorContentPart(err) {
       'This conversation was still finishing an earlier reply, so this request did not start.',
     source_context_unavailable:
       'The conversation context could not be preserved. Please retry this turn.',
-    completion_error: 'The model provider could not complete this request.',
+    completion_error: 'Viventium could not complete this request. Please try again.',
   };
   const hostCapacityMetadata = () => {
     if (errorClass !== 'host_capacity') return {};
     const chain = getCompletionErrorChain(err);
-    const detail = chain.find(
+    const capacityFailures = chain.filter(
       (candidate) =>
         String(candidate?.code || candidate?.failure_class || '')
           .trim()
           .toLowerCase() === 'host_capacity',
     );
+    const detail =
+      capacityFailures.find(
+        (candidate) => candidate?.available || candidate?.required || candidate?.shortage,
+      ) || capacityFailures[0];
+    const dimensions = ['childProcesses', 'threads', 'memoryBytes', 'diskBytes'];
+    const capacity = {};
+    for (const field of ['available', 'required', 'shortage']) {
+      const values = {};
+      for (const dimension of dimensions) {
+        const value = detail?.[field]?.[dimension];
+        if (Number.isSafeInteger(value) && value >= 0) values[dimension] = value;
+      }
+      if (Object.keys(values).length) capacity[`capacity_${field}`] = values;
+    }
     const headerValue = (headers, name) => {
       if (!headers) return '';
       if (typeof headers.get === 'function') return String(headers.get(name) || '').trim();
@@ -2900,6 +2931,7 @@ function createCompletionErrorContentPart(err) {
     const capacityClass = String(detail?.capacityClass || '').trim();
     return {
       retryable: true,
+      ...capacity,
       ...(Number.isFinite(retryAfter) && retryAfter > 0
         ? { retry_after_seconds: Math.ceil(retryAfter) }
         : {}),
@@ -2922,11 +2954,28 @@ function createCompletionErrorContentPart(err) {
     ? { version: 1, responseMessageId: attentionFailure.foregroundAttention.responseMessageId }
     : null;
   /* === VIVENTIUM END === */
+  const capacityMetadata = hostCapacityMetadata();
+  let publicMessage = publicMessageByClass[errorClass] || publicMessageByClass.completion_error;
+  if (errorClass === 'host_capacity' && capacityMetadata.capacity_class === 'resource_pressure') {
+    const lacks = (dimension) =>
+      capacityMetadata.capacity_shortage?.[dimension] > 0 ||
+      (Number.isSafeInteger(capacityMetadata.capacity_available?.[dimension]) &&
+        Number.isSafeInteger(capacityMetadata.capacity_required?.[dimension]) &&
+        capacityMetadata.capacity_available[dimension] <
+          capacityMetadata.capacity_required[dimension]);
+    if (lacks('diskBytes')) {
+      publicMessage =
+        'The computer running Viventium is low on disk space and could not start this reply. Free some space, then retry.';
+    } else if (lacks('memoryBytes')) {
+      publicMessage =
+        'The computer running Viventium is low on memory and could not start this reply. Close unused apps, then retry.';
+    }
+  }
   return {
     type: ContentTypes.ERROR,
-    [ContentTypes.ERROR]: publicMessageByClass[errorClass] || publicMessageByClass.completion_error,
+    [ContentTypes.ERROR]: publicMessage,
     error_class: errorClass,
-    ...hostCapacityMetadata(),
+    ...capacityMetadata,
     ...(foregroundAttention ? { foregroundAttention } : {}),
   };
 }
@@ -4208,6 +4257,8 @@ function buildViventiumMcpRequestBody({
   );
   const projectedFiles = sourceSegments.length ? sourceFiles : files;
   const schedulerOwned = interactionContext?.origin === 'scheduler';
+  const telegramOwned =
+    interactionContext?.origin === 'interactive' && interactionContext?.surface === 'telegram';
   const clientPresentation = trustedLoopbackWebPresentation(req, interactionContext);
   return {
     ...(String(agentId || '').trim() ? { agent_id: String(agentId).trim() } : {}),
@@ -4226,17 +4277,26 @@ function buildViventiumMcpRequestBody({
     viventiumVoiceWorkAuthority: req?.viventiumVoiceWorkAuthority,
     viventiumVoiceStartAtMs: req?.viventiumVoiceStartAt,
     viventiumVoiceStartPerfMs: req?.viventiumVoicePerfStartAt,
-    viventiumTelegramChatId: req?.body?.telegramChatId,
-    viventiumTelegramUserId: req?.body?.telegramUserId,
-    viventiumTelegramMessageId: req?.body?.telegramMessageId,
-    viventiumTelegramMessageThreadId: req?.body?.externalThreadId,
+    viventiumTelegramChatId: telegramOwned ? req?.body?.telegramChatId : undefined,
+    viventiumTelegramUserId: telegramOwned ? req?.body?.telegramUserId : undefined,
+    viventiumTelegramMessageId: telegramOwned ? req?.body?.telegramMessageId : undefined,
+    viventiumTelegramMessageThreadId: schedulerOwned
+      ? (req?.body?.viventiumTelegramMessageThreadId ?? req?.body?.externalThreadId)
+      : telegramOwned
+        ? req?.body?.externalThreadId
+        : undefined,
+    ...(Array.isArray(req?.body?.viventiumScheduleConversationIds)
+      ? { viventiumScheduleConversationIds: req.body.viventiumScheduleConversationIds }
+      : {}),
     telegramAudioRequested: req?.body?.telegramAudioRequested === true,
     ...(schedulerOwned
       ? {
           viventiumScheduleId: req?.body?.scheduleId,
           viventiumSchedulerDispatchDocumentId: req?.viventiumSchedulerDispatchDocumentId,
+          viventiumSchedulerDueAdmissionId: req?.viventiumSchedulerDueAdmissionId,
           viventiumSchedulerOccurrenceKey: req?.body?.idempotencyKey,
-          viventiumSchedulerDeliveryChannels: req?.body?.deliveryChannels,
+          viventiumSchedulerDeliveryChannels:
+            req?.body?.viventiumSchedulerDeliveryChannels ?? req?.body?.deliveryChannels,
           viventiumSchedulerExternalWorkRequired:
             req?.viventiumSchedulerExternalWorkRequired === true,
         }
@@ -8700,7 +8760,13 @@ class AgentClient extends BaseClient {
       /* === VIVENTIUM NOTE ===
        * Feature: Sanitize agent payload content parts before formatting.
        */
-      const sanitizedPayload = normalizeTextPartsInPayload(stripInternalContentParts(payload));
+      const inheritedPayload =
+        require('~/server/services/viventium/ViventiumMainContextService').prependInheritedConversationPayload(
+          payload,
+          req._viventiumInheritedConversationContext,
+        );
+      const sanitizedPayload = normalizeTextPartsInPayload(stripInternalContentParts(inheritedPayload),
+      );
       const hardenedPayload = Array.isArray(sanitizedPayload)
         ? sanitizedPayload.map((message) => {
             if (!message || !Array.isArray(message.content)) {
@@ -8830,11 +8896,15 @@ class AgentClient extends BaseClient {
       let activatedCorticesList = [];
       let cortexExecutionPromise = null;
       const pendingCortexParts = [];
+      const canonicalResponseMessageId = this.responseMessageId;
+      const canonicalUserMessageId = this.parentMessageId;
+      const canonicalConversationId = this.conversationId;
+      const backgroundMainAgent = this.options.agent;
       const cortexPersistenceCoordinator = createCortexPersistenceCoordinator({
         persistSnapshot: (cortexParts) =>
           persistCortexPartsToCanonicalMessage({
             req,
-            responseMessageId: this.responseMessageId,
+            responseMessageId: canonicalResponseMessageId,
             cortexParts,
           }),
         onError: (error) => {
@@ -8858,8 +8928,6 @@ class AgentClient extends BaseClient {
       let emitCortexEvent = null;
       /* === VIVENTIUM END === */
       const responseStream = this.options.res;
-      const canonicalResponseMessageId = this.responseMessageId;
-      const canonicalUserMessageId = this.parentMessageId;
 
       /* === VIVENTIUM NOTE ===
        * Feature: Background Cortices - Two-Phase Orchestration
@@ -10239,8 +10307,8 @@ class AgentClient extends BaseClient {
           const directActionScopeKeys = collectDirectActionScopeKeysFromCortices(cortices);
           const effectiveDirectActionScopeKeys = collectEffectiveDirectActionScopeKeys({
             directActionSurfaces: directActionPolicySurfaces,
-            agentTools: this.options.agent?.tools,
-            toolDefinitions: this.options.agent?.toolDefinitions,
+            agentTools: backgroundMainAgent?.tools,
+            toolDefinitions: backgroundMainAgent?.toolDefinitions,
           });
           const wouldHold = shouldDeferToolCortexMainResponse({
             activatedCortices: cortices,
@@ -10257,15 +10325,15 @@ class AgentClient extends BaseClient {
 
           let mergedInsightsData = null;
           await executeActivated({
-            req: this.options.req,
+            req,
             // The Main stream may finish before Phase B. Keep background work detached from the
             // response lifecycle and deliver through the existing persisted/resumable event path.
             res: null,
-            mainAgent: this.options.agent,
+            mainAgent: backgroundMainAgent,
             messages: initialMessages,
-            runId: this.responseMessageId,
-            conversationId: this.conversationId,
-            activeMessageId: this.parentMessageId,
+            runId: canonicalResponseMessageId,
+            conversationId: canonicalConversationId,
+            activeMessageId: canonicalUserMessageId,
             activatedCortices: cortices,
             onCortexBrewing: (cortexData) => {
               void emitCortexEvent({ ...cortexData, type: ContentTypes.CORTEX_BREWING });
@@ -10302,8 +10370,8 @@ class AgentClient extends BaseClient {
                 ? formatEarlyActivationNotice()
                 : formatBrewingAcknowledgment(phaseBActivations) +
                   formatActivationSummary(phaseBActivations);
-            this.options.agent.instructions = [
-              this.options.agent.instructions || '',
+            backgroundMainAgent.instructions = [
+              backgroundMainAgent.instructions || '',
               activationContext,
             ]
               .filter(Boolean)
@@ -10338,10 +10406,10 @@ class AgentClient extends BaseClient {
                 lateDetectTimeoutMs > 0
                   ? async () => {
                       const lateDetectionResult = await detectActivations({
-                        req: this.options.req,
-                        mainAgent: this.options.agent,
+                        req,
+                        mainAgent: backgroundMainAgent,
                         messages: initialMessages,
-                        runId: this.responseMessageId,
+                        runId: canonicalResponseMessageId,
                         timeBudgetMs: lateDetectTimeoutMs,
                       }).catch((lateDetectionError) => {
                         logger.error(
@@ -10388,10 +10456,10 @@ class AgentClient extends BaseClient {
         this.attachBackgroundCortexCompletionPipeline({
           cortexExecutionPromise,
           pendingCortexParts,
-          req: this.options.req,
-          conversationId: this.conversationId,
-          responseMessageId: this.responseMessageId,
-          agent: this.options.agent,
+          req,
+          conversationId: canonicalConversationId,
+          responseMessageId: canonicalResponseMessageId,
+          agent: backgroundMainAgent,
           getResponseContentParts: () => this.contentParts,
           responseController,
           turnUserInputTime,

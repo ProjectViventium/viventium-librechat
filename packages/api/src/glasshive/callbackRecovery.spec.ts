@@ -1,4 +1,5 @@
 import { createGlassHiveCallbackBindingService } from './callbackBinding';
+import { hasKnownExternalWork } from './knownExternalWork';
 
 const terminal = {
   _id: 'origin-test',
@@ -33,6 +34,7 @@ function harness(row = terminal) {
   const defer = jest.fn().mockResolvedValue(null);
   const trace = jest.fn().mockResolvedValue({ accepted: true });
   const projectionUpdate = jest.fn();
+  const invalidate = jest.fn();
   const collection = jest.fn((name) => ({
     find: jest.fn().mockReturnValue(cursor),
     findOne: name === 'viventium_glasshive_callback_results' ? accepted : evidence,
@@ -58,8 +60,11 @@ function harness(row = terminal) {
     recordGlassHiveWorkDetailTrace: trace,
     deferGlassHiveWorkStateReconciliation: defer,
     reconcileAuthoritativeGlassHiveWorkState: jest.fn(),
+    invalidateActiveWorkSnapshot: invalidate,
   });
-  return { service, accepted, evidence, request, update, defer, trace, projectionUpdate, collection };
+  return { service, accepted, evidence, request, update, defer, trace, projectionUpdate, collection,
+    invalidate,
+  };
 }
 
 test('existing reconciliation requests only the exact accepted terminal result', async () => {
@@ -168,6 +173,224 @@ const stopDelivery = {
   payloadSha256: 'sha256:' + 'e'.repeat(64), authoritySha256: 'sha256:' + 'f'.repeat(64),
 };
 const stopDetail = { workRef: terminal.workRef, state: 'cancelled', callbackDeliveries: [stopDelivery] };
+
+/* === VIVENTIUM START: Silent settlement must remove only the current owned pending delivery. === */
+function matchesRow(filter: Record<string, unknown>, row: Record<string, unknown>): boolean {
+  return Object.entries(filter).every(([key, expected]) => {
+    if (key === '$or')
+      return (expected as Record<string, unknown>[]).some((part) => matchesRow(part, row));
+    if (expected && typeof expected === 'object' && !(expected instanceof Date)) {
+      const condition = expected as Record<string, unknown>;
+      if ('$exists' in condition) return Object.hasOwn(row, key) === condition.$exists;
+      if ('$in' in condition) return (condition.$in as unknown[]).includes(row[key]);
+      if ('$nin' in condition) return !(condition.$nin as unknown[]).includes(row[key]);
+      if ('$ne' in condition) return row[key] !== condition.$ne;
+    }
+    return expected instanceof Date && row[key] instanceof Date
+      ? expected.getTime() === (row[key] as Date).getTime()
+      : row[key] === expected;
+  });
+}
+
+function silentHarness(typed = false) {
+  const row = {
+    ...retainedStop,
+    deliveryState: 'enqueued',
+    adjudicationState: 'silent',
+    attentionPending: false,
+    followUpMessageId: '',
+    updatedAt: new Date('2026-10-24T01:00:00Z'),
+    ...(typed
+      ? {
+          terminalCallbackRunId: receipt.runId,
+          terminalCallbackId: receipt.callbackId,
+          terminalCallbackResultDigest: receipt.resultDigest,
+          terminalCallbackResultRevision: 1,
+          terminalCallbackAcceptedOperationId: receipt.acceptedOperationId,
+          terminalCallbackEffectLeaseGeneration: 2,
+        }
+      : {}),
+  };
+  const stored: Record<string, unknown> = { ...row };
+  const evidence: Record<string, unknown> = {
+    ownerId: row.ownerId,
+    originRef: row.originRef,
+    workRef: row.workRef,
+    workerId: row.workerId,
+    runId: row.runId,
+    state: 'silent',
+    workState: 'cancelled',
+    workTerminal: true,
+    event: 'run.cancelled',
+    callbackRef: stopDelivery.callbackRef,
+    attemptNumber: 1,
+    followUpMessageId: '',
+    errorCode: '',
+    ...(typed
+      ? {
+          terminalCallbackId: receipt.callbackId,
+          terminalCallbackResultDigest: receipt.resultDigest,
+          terminalCallbackResultRevision: 1,
+          terminalCallbackAcceptedOperationId: receipt.acceptedOperationId,
+          terminalCallbackEffectGeneration: 2,
+        }
+      : {}),
+  };
+  const h = harness(row);
+  const findOne = jest.fn(async (filter) => (matchesRow(filter, stored) ? { ...stored } : null));
+  const findEvidence = jest.fn(async (filter) =>
+    matchesRow(filter, evidence) ? { ...evidence } : null,
+  );
+  const cursor = {
+    sort: () => cursor,
+    limit: () => cursor,
+    toArray: async () =>
+      matchesRow({ deliveryState: { $in: ['pending', 'enqueued'] } }, stored)
+        ? [{ ...stored }]
+        : [],
+  };
+  const write = jest.fn(async (filter, update) => {
+    if (!matchesRow(filter, stored)) return null;
+    Object.assign(stored, update.$set);
+    return { ...stored };
+  });
+  h.collection.mockImplementation((name) => ({
+    find: () => cursor,
+    findOne:
+      name === 'viventium_external_work'
+        ? findOne
+        : name === 'viventium_glasshive_callback_results'
+          ? h.accepted
+          : findEvidence,
+    findOneAndUpdate: write,
+    updateOne: h.update,
+  }));
+  h.accepted.mockResolvedValue(typed ? receipt : null);
+  h.request.mockResolvedValue({
+    ...stopDetail,
+    callbackDeliveries: [{ ...stopDelivery, status: 'http_accepted' }],
+  });
+  return {
+    ...h,
+    row,
+    stored,
+    evidence,
+    findEvidence,
+    findOne,
+    write,
+    known: () => hasKnownExternalWork({ ownerId: row.ownerId, collection: { findOne } }),
+  };
+}
+
+test.each(['', 'mission_origin_cleanup_tombstoned'])(
+  'ordinary adjudication settles silent delivery without queueing (%s)',
+  async (errorCode) => {
+    const h = silentHarness();
+    h.stored.deliveryState = 'pending';
+    await h.service.recordGlassHiveAdjudicationOutcome({
+      originRef: terminal.originRef,
+      state: 'silent',
+      errorCode,
+    });
+    expect(h.stored.deliveryState).toBe(errorCode ? 'suppressed' : 'silent');
+    expect(h.stored.attentionPending).toBe(false);
+    await expect(h.known()).resolves.toBe(false);
+    expect(h.request).not.toHaveBeenCalled();
+  },
+);
+
+test.each([false, true])(
+  'legacy silent delivery self-heals once without producer polling (typed=%s)',
+  async (typed) => {
+    const h = silentHarness(typed);
+    await expect(h.known()).resolves.toBe(true);
+    for (let pass = 0; pass < 3; pass++)
+      await h.service.reconcileKnownExternalWorkHints({ limit: 10 });
+    expect(h.stored.deliveryState).toBe('silent');
+    await expect(h.known()).resolves.toBe(false);
+    expect(h.write).toHaveBeenCalledTimes(1);
+    expect(h.invalidate).toHaveBeenCalledTimes(1);
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _id: terminal.originRef,
+        ownerId: terminal.ownerId,
+        workRef: terminal.workRef,
+        workerId: retainedStop.workerId,
+        runId: terminal.runId,
+        updatedAt: h.row.updatedAt,
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({ deliveryState: 'silent', attentionPending: false }),
+      }),
+      { returnDocument: 'after' },
+    );
+  },
+);
+
+test('settling an old silent delivery leaves another current mission known', async () => {
+  const h = silentHarness();
+  const newer = {
+    ...h.row,
+    _id: 'new-origin',
+    originRef: 'new-origin',
+    workRef: 'new-work',
+    runId: 'new-run',
+    externalState: 'running',
+    deliveryState: 'pending',
+    adjudicationState: '',
+  };
+  h.findOne.mockImplementation(
+    async (filter) => [h.stored, newer].find((row) => matchesRow(filter, row)) || null,
+  );
+  await h.service.reconcileKnownExternalWorkHints({ limit: 10 });
+  expect(h.stored.deliveryState).toBe('silent');
+  expect(newer.externalState).toBe('running');
+  await expect(h.known()).resolves.toBe(true);
+});
+
+test.each([
+  'ownerId',
+  'workRef',
+  'workerId',
+  'runId',
+  'terminalCallbackId',
+  'terminalCallbackResultRevision',
+  'terminalCallbackAcceptedOperationId',
+  'terminalCallbackEffectGeneration',
+])('legacy silent evidence for another identity cannot settle current work (%s)', async (field) => {
+  const h = silentHarness(true);
+  h.evidence[field] = typeof h.evidence[field] === 'number' ? 3 : 'other-identity';
+  await h.service.reconcileKnownExternalWorkHints({ limit: 10 });
+  expect(h.stored.deliveryState).toBe('enqueued');
+  expect(h.write).not.toHaveBeenCalled();
+  expect(h.invalidate).not.toHaveBeenCalled();
+  await expect(h.known()).resolves.toBe(true);
+});
+
+test.each(['nonterminal', 'untrusted-ref', 'newer-run', 'newer-generation'])(
+  'silent repair preserves current work after an invalid or stale observation (%s)',
+  async (scenario) => {
+    const h = silentHarness(true);
+    if (scenario === 'nonterminal') h.evidence.workTerminal = false;
+    if (scenario === 'untrusted-ref') h.evidence.callbackRef = 'unverified';
+    if (scenario.startsWith('newer-')) {
+      h.write.mockImplementation(async () => {
+        h.stored.runId = 'newer-run';
+        h.stored.externalState = 'running';
+        h.stored.updatedAt = new Date('2026-10-24T01:00:01Z');
+        if (scenario === 'newer-generation') h.stored.terminalCallbackEffectLeaseGeneration = 3;
+        return null;
+      });
+    }
+    await h.service.reconcileKnownExternalWorkHints({ limit: 10 });
+    expect(h.stored.deliveryState).toBe('enqueued');
+    expect(h.invalidate).not.toHaveBeenCalled();
+    await expect(h.known()).resolves.toBe(true);
+    if (scenario.startsWith('newer-')) expect(h.request).not.toHaveBeenCalled();
+  },
+);
+/* === VIVENTIUM END === */
 
 function stopHarness() {
   const h = harness(retainedStop);

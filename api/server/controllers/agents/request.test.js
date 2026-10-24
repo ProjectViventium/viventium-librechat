@@ -18,6 +18,8 @@ const mockEnsureMorningBriefing = jest.fn(async () => undefined);
 const mockIsVoiceTaskSuppressed = jest.fn(() => false);
 const mockMessageFindOneAndDelete = jest.fn();
 const mockMessageExists = jest.fn(async () => false);
+const mockSourceHistoryRows = jest.fn(async () => []);
+const mockMutateNativeResponseSources = jest.fn(async (_filter, operation) => operation());
 const mockOriginalMessage = jest.fn();
 const mockConversationUpdateOne = jest.fn();
 const mockCommitAcceptedMainTurn = jest.fn(async () => ({ status: 'committed' }));
@@ -41,6 +43,7 @@ const mockGenerationJobManager = {
   emitChunk: jest.fn(),
   emitError: jest.fn(),
   getJob: jest.fn(),
+  settleSupersededGeneration: jest.fn(),
   setContentParts: jest.fn(),
   setGraph: jest.fn(),
   updateMetadata: jest.fn(),
@@ -90,6 +93,11 @@ jest.mock('~/models', () => ({
   getFiles: (...args) => mockGetFiles(...args),
   getNativeResponse: (...args) => mockGetNativeResponse(...args),
   saveMessage: (...args) => mockSaveMessage(...args),
+  captureNativeResponseSource: jest.fn(async (_userId, _conversationId, messageId) => ({
+    id: 'saved-source',
+    messageId,
+    digest: 'a'.repeat(64),
+  })),
 }));
 
 jest.mock('~/db/models', () => ({
@@ -97,6 +105,7 @@ jest.mock('~/db/models', () => ({
   ViventiumCortexInsightDelivery: {},
   Message: {
     exists: (...args) => mockMessageExists(...args),
+    find: (...args) => ({ select: () => ({ lean: () => mockSourceHistoryRows(...args) }) }),
     findOne: (...args) => ({
       select: () => ({
         lean: async () => {
@@ -140,7 +149,7 @@ jest.mock('~/server/services/viventium/VoiceTaskService', () => ({
 }));
 
 jest.mock('~/server/services/viventium/nativeResponseService', () => ({
-  mutateNativeResponseSources: async (_filter, operation) => operation(),
+  mutateNativeResponseSources: (...args) => mockMutateNativeResponseSources(...args),
   recoverNativeResponse: (...args) => mockRecoverNativeResponse(...args),
   recoverSavedNativeResponse: (...args) => mockRecoverSavedNativeResponse(...args),
   markNativeResponseReplayStored: (...args) => mockMarkNativeReplayStored(...args),
@@ -474,6 +483,12 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       emitter: new EventEmitter(),
     });
     mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 1 });
+    mockGenerationJobManager.settleSupersededGeneration.mockImplementation(
+      async (streamId, createdAt) => {
+        const current = await mockGenerationJobManager.getJob(streamId);
+        return current?.createdAt === createdAt && current.status === 'superseded';
+      },
+    );
     mockGenerationJobManager.emitDone.mockResolvedValue(undefined);
     mockGenerationJobManager.completeJob.mockResolvedValue(undefined);
     mockGenerationJobManager.markMainResponseComplete.mockResolvedValue(true);
@@ -776,7 +791,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       'source_context_unavailable',
       'The conversation context could not be preserved. Please retry this turn.',
     ],
-    [undefined, 'The model provider could not complete this request.'],
+    [undefined, 'Viventium could not complete this request. Please try again.'],
   ])(
     'relays a public typed generation failure without internal diagnostic text (%s)',
     async (code, expected) => {
@@ -1151,7 +1166,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       if (expectedError) {
         expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
           expect.any(String),
-          hasError ? expectedError : 'The model provider could not complete this request.',
+          hasError ? expectedError : 'Viventium could not complete this request. Please try again.',
           hasError ? 'provider_temporarily_unavailable' : 'completion_error',
         );
         expect(mockGenerationJobManager.finishNativeResponse).not.toHaveBeenCalled();
@@ -1339,12 +1354,13 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     if (shouldFailRevoked) {
       expect(await store.getJob(streamId)).toMatchObject({
         status: 'error',
-        error: 'The model provider could not complete this request.',
+        error: 'Viventium could not complete this request. Please try again.',
       });
       expect(publicErrors).toHaveBeenCalledTimes(1);
       expect(publicErrors).toHaveBeenCalledWith(
         streamId,
-        'The model provider could not complete this request.',
+        'Viventium could not complete this request. Please try again.',
+        'completion_error',
       );
       expect(mockGenerationJobManager.emitError).not.toHaveBeenCalled();
       expect(manager.hasLocalNativeResponseProducer(identity)).toBe(false);
@@ -1357,7 +1373,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       streamId,
       mode === 'different_error'
         ? 'The conversation context could not be preserved. Please retry this turn.'
-        : 'The model provider could not complete this request.',
+        : 'Viventium could not complete this request. Please try again.',
     );
     expect(publicFinals).not.toHaveBeenCalled();
     if (mode === 'stopped') {
@@ -1368,7 +1384,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     } else if (shouldFailRevoked) {
       expect(mockGenerationJobManager.failRevokedNativeResponse).toHaveBeenCalledWith(
         supplied,
-        'The model provider could not complete this request.',
+        'Viventium could not complete this request. Please try again.',
+        'completion_error',
       );
     }
     if (mode === 'other_stream') {
@@ -1415,7 +1432,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       }
       expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
         expect.any(String),
-        'The model provider could not complete this request.',
+        'Viventium could not complete this request. Please try again.',
         'completion_error',
       );
       expect(mockGenerationJobManager.finishNativeResponse).not.toHaveBeenCalled();
@@ -1533,7 +1550,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
         expect(mockMarkNativeReplayStored).not.toHaveBeenCalled();
         expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
           'conv-1',
-          'The model provider could not complete this request.',
+          'Viventium could not complete this request. Please try again.',
           'completion_error',
         );
       }
@@ -1556,7 +1573,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     expect(mockMarkNativeReplayStored).toHaveBeenCalled();
     expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
       'conv-1',
-      'The model provider could not complete this request.',
+      'Viventium could not complete this request. Please try again.',
       'completion_error',
     );
   });
@@ -2022,6 +2039,34 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     );
   });
 
+  test('a newer recorded input suppresses a publication failure before supersede status and abort arrive', async () => {
+    const req = makeReq();
+    req.viventiumCallSession = { callSessionId: 'call-1' };
+    req.body.viventiumVoiceTaskId = 'task-1';
+    req.body.streamId = 'stream-1';
+    mockGenerationJobManager.getJob.mockResolvedValue({ createdAt: 1, status: 'running' });
+    mockGenerationJobManager.settleSupersededGeneration.mockResolvedValueOnce(true);
+    const client = makeClient(Promise.resolve());
+    client.sendMessage.mockRejectedValueOnce(new Error('native_response_publication_revoked'));
+
+    await AgentController(req, makeRes(), jest.fn(), async () => ({ client }), jest.fn());
+    await jest.advanceTimersByTimeAsync(120);
+
+    expect(mockGenerationJobManager.emitError).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.settleSupersededGeneration).toHaveBeenCalledWith('stream-1', 1);
+    expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith('stream-1');
+    expect(mockSaveMessage).not.toHaveBeenCalledWith(
+      req,
+      expect.objectContaining({ error: true }),
+      expect.anything(),
+    );
+    expect(mockSettleVoiceTaskGeneration).toHaveBeenCalledWith(
+      'task-1',
+      { userId: 'user-1', callSessionId: 'call-1', streamId: 'stream-1' },
+      {},
+    );
+  });
+
   /* === VIVENTIUM START === Exact supersession task settlement and retained effect receipts. */
   test.each(['superseded', 'user_cancelled'])(
     'settles initialization abort %s through its existing typed outcome',
@@ -2256,7 +2301,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     );
     expect(mockGenerationJobManager.emitError).toHaveBeenCalledWith(
       'stream-1',
-      'The model provider could not complete this request.',
+      'Viventium could not complete this request. Please try again.',
       'completion_error',
     );
   });
@@ -3497,5 +3542,259 @@ describe('Voice file delivery outcome', () => {
       resultMessageId: 'file-result',
       error: { code: 'provider_timeout', message: 'Provider timed out.' },
     });
+  });
+});
+
+describe('coalesced retained input ancestry', () => {
+  const link = AgentController.__testables.linkAcceptedInteractionSources;
+  const owner = { user: 'user-1', conversationId: 'conv-1' };
+  function fixture() {
+    const req = makeReq();
+    req.body.parentMessageId = 'base';
+    const context = {
+      conversation_id: 'conv-1',
+      logical_turn_id: 'fresh-turn',
+      revision: 1,
+      source_event_id: 'source-d',
+      ready_input_continuation: { source_message_id: 'd', presentation_source_sequence: 4 },
+      source_segments: ['b', 'c', 'd'].map((id) => ({
+        source_event_id: `source-${id}`,
+        source_message_id: id,
+        source_parent_message_id: id === 'b' ? 'unpublished' : 'base',
+        source_persisted: true,
+        authoring_revision: 1,
+      })),
+    };
+    const rows = [
+      { ...owner, messageId: 'base', parentMessageId: '', isCreatedByUser: true, sender: 'User' },
+      ...context.source_segments.map((source) => ({
+        ...owner,
+        messageId: source.source_message_id,
+        parentMessageId: source.source_parent_message_id,
+        isCreatedByUser: true,
+        sender: 'User',
+        metadata: {
+          viventium: {
+            interactionContext: { source_event_id: source.source_event_id },
+            telegramInput: { state: 'ready', sourceEventId: source.source_event_id },
+          },
+        },
+      })),
+    ];
+    mockSourceHistoryRows.mockResolvedValue(rows);
+    return { req, context, rows };
+  }
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockMutateNativeResponseSources.mockImplementation(async (_filter, operation) => operation());
+    require('~/db/models').Message.updateOne.mockResolvedValue({
+      matchedCount: 1,
+      modifiedCount: 1,
+    });
+  });
+  test('uses the proven adapter base for the missing first source, then links every retained source in order', async () => {
+    const { req, context } = fixture();
+    const before = JSON.stringify(context);
+    await link(req, context);
+    const { Message } = require('~/db/models');
+    expect(
+      Message.updateOne.mock.calls.map(([filter, update]) => [
+        filter.messageId,
+        filter.parentMessageId,
+        update.$set.parentMessageId,
+      ]),
+    ).toEqual([
+      ['b', 'unpublished', 'base'],
+      ['c', 'base', 'b'],
+      ['d', 'base', 'c'],
+    ]);
+    expect(mockMutateNativeResponseSources).toHaveBeenCalledTimes(3);
+    expect(
+      mockMutateNativeResponseSources.mock.calls.every(
+        ([filter]) =>
+          filter.user === owner.user &&
+          filter.conversationId === owner.conversationId &&
+          filter.isCreatedByUser === true,
+      ),
+    ).toBe(true);
+    expect(req.body.parentMessageId).toBe('c');
+    expect(JSON.stringify(context)).toBe(before);
+  });
+  test('an ordinary live claim includes newly authored pending B/C before its current D input', async () => {
+    const { req, context } = fixture();
+    delete context.ready_input_continuation;
+    await link(req, context);
+    expect(
+      require('~/db/models').Message.updateOne.mock.calls.map(([filter, update]) => [
+        filter.messageId,
+        update.$set.parentMessageId,
+      ]),
+    ).toEqual([
+      ['b', 'base'],
+      ['c', 'b'],
+      ['d', 'c'],
+    ]);
+    expect(req.body.parentMessageId).toBe('c');
+  });
+  test.each([false, true])(
+    'an already authored first source adds no history read to a successor claim (ready=%s)',
+    async (ready) => {
+      const { req, context, rows } = fixture();
+      if (!ready) delete context.ready_input_continuation;
+      context.revision = 2;
+      context.source_segments[0].source_parent_message_id = 'base';
+      context.source_segments[1].authoring_revision = 2;
+      context.source_segments[2].authoring_revision = 2;
+      rows[1].parentMessageId = 'base';
+      rows[1].metadata.viventium.telegramInput.state = 'admitted';
+      await link(req, context);
+      expect(mockSourceHistoryRows).not.toHaveBeenCalled();
+      expect(
+        require('~/db/models').Message.updateOne.mock.calls.map(([filter]) => filter.messageId),
+      ).toEqual(['c', 'd']);
+    },
+  );
+  test('keeps a healthy original first parent and still includes the other pending inputs', async () => {
+    const { req, context, rows } = fixture();
+    rows.push({
+      ...owner,
+      messageId: 'unpublished',
+      parentMessageId: 'base',
+      isCreatedByUser: false,
+    });
+    await link(req, context);
+    expect(
+      require('~/db/models').Message.updateOne.mock.calls.map(([filter]) => filter.messageId),
+    ).toEqual(['c', 'd']);
+    expect(req.body.parentMessageId).toBe('c');
+  });
+  test.each([
+    'missing base',
+    'foreign base',
+    'deleted base',
+    'deleted ancestor',
+    'current input base',
+    'descendant base',
+    'cycle',
+    'admitted first input',
+    'changed first source',
+    'unpersisted ledger',
+    'foreign first input',
+  ])('does not invent an anchor when %s', async (mode) => {
+    const { req, context, rows } = fixture();
+    if (mode === 'missing base') rows.splice(0, 1);
+    if (mode === 'foreign base') rows[0].user = 'other-owner';
+    if (mode === 'deleted base') rows[0].deletedAt = new Date();
+    if (mode === 'deleted ancestor') {
+      rows[0].parentMessageId = 'deleted';
+      rows.push({ ...owner, messageId: 'deleted', parentMessageId: '', deletedAt: new Date() });
+    }
+    if (mode === 'current input base') req.body.parentMessageId = 'c';
+    if (mode === 'descendant base') rows[0].parentMessageId = 'c';
+    if (mode === 'cycle') rows[0].parentMessageId = 'base';
+    if (mode === 'admitted first input')
+      rows[1].metadata.viventium.telegramInput.state = 'admitted';
+    if (mode === 'changed first source') rows[1].parentMessageId = 'elsewhere';
+    if (mode === 'unpersisted ledger') delete context.source_segments[0].source_persisted;
+    if (mode === 'foreign first input') rows[1].user = 'other-owner';
+    await expect(link(req, context)).rejects.toMatchObject({
+      code: 'source_context_unavailable',
+      status: 413,
+    });
+    expect(mockMutateNativeResponseSources).not.toHaveBeenCalled();
+    expect(require('~/db/models').Message.updateOne).not.toHaveBeenCalled();
+  });
+  test('keeps an already repaired first anchor idempotent and still links the remaining inputs', async () => {
+    const { req, context, rows } = fixture();
+    rows[1].parentMessageId = 'base';
+    await link(req, context);
+    expect(
+      require('~/db/models').Message.updateOne.mock.calls.map(([filter]) => filter.messageId),
+    ).toEqual(['c', 'd']);
+  });
+  test('the normal history loader and protected carrier receive every original current source after linking', async () => {
+    const { req, context, rows } = fixture();
+    for (const row of rows) row.text = `Exact ${row.messageId} source.`;
+    for (const source of context.source_segments) {
+      source.source_index = 0;
+      source.text = rows.find((row) => row.messageId === source.source_message_id).text;
+    }
+    const originalTexts = rows.map((row) => row.text);
+    require('~/db/models').Message.updateOne.mockImplementation(async (filter, update) => {
+      const row = rows.find(
+        (candidate) =>
+          candidate.messageId === filter.messageId &&
+          candidate.parentMessageId === filter.parentMessageId,
+      );
+      if (!row) return { matchedCount: 0, modifiedCount: 0 };
+      row.parentMessageId = update.$set.parentMessageId;
+      return { matchedCount: 1, modifiedCount: 1 };
+    });
+    await link(req, context);
+    const {
+      captureMainContextSnapshot,
+      traceMainHistoryAncestry,
+    } = require('~/server/services/viventium/ViventiumMainContextService');
+    const { formatMessage, formatAgentMessages } = require('@librechat/agents');
+    const proof = traceMainHistoryAncestry({
+      messages: rows,
+      headId: req.body.parentMessageId,
+      ownerId: 'user-1',
+      conversationId: 'conv-1',
+    });
+    const visible = [
+      ...proof.messageIds.map((id) => rows.find((row) => row.messageId === id)),
+      rows.find((row) => row.messageId === 'd'),
+    ];
+    setTrustedInteractionContext(req, {
+      ...context,
+      actor_kind: 'external_user',
+      origin: 'interactive',
+      surface: 'telegram',
+      logical_turn_id: 'fresh-turn',
+      revision: 1,
+      source_sequence: 4,
+      source_order_scope: 'a'.repeat(64),
+    });
+    const snapshot = captureMainContextSnapshot(req, {
+      agent: {
+        id: 'main',
+        model_parameters: { configuration: { defaultHeaders: { 'X-GlassHive-Agent-Id': 'main' } } },
+      },
+      visibleMessages: visible,
+      messages: formatAgentMessages(
+        visible.map((message) => ({ ...formatMessage({ message }), messageId: message.messageId })),
+      ).messages,
+      historyAncestry: proof,
+      protectUnreconciledHistory: true,
+      nativeBodyCarrier: true,
+    });
+    expect(
+      snapshot.visibleMessageChain.filter((row) => row.current_input).map((row) => row.id),
+    ).toEqual(['b', 'c', 'd']);
+    expect(
+      snapshot.visibleMessageChain.find((row) => row.id === 'base').current_input,
+    ).toBeUndefined();
+    expect(rows.map((row) => row.text)).toEqual(originalTexts);
+  });
+  test('a raced first-source update stays unavailable instead of claiming repaired ancestry', async () => {
+    const { req, context } = fixture();
+    require('~/db/models').Message.updateOne.mockResolvedValueOnce({
+      matchedCount: 0,
+      modifiedCount: 0,
+    });
+    await expect(link(req, context)).rejects.toMatchObject({
+      code: 'source_context_unavailable',
+      status: 413,
+    });
+    expect(require('~/db/models').Message.updateOne).toHaveBeenCalledTimes(1);
+  });
+  test('the existing native source fence can reject the repair before any history edit', async () => {
+    const { req, context } = fixture();
+    mockMutateNativeResponseSources.mockRejectedValueOnce(
+      Object.assign(new Error('Native source cannot change'), { code: 'native_source_conflict' }),
+    );
+    await expect(link(req, context)).rejects.toMatchObject({ code: 'native_source_conflict' });
+    expect(require('~/db/models').Message.updateOne).not.toHaveBeenCalled();
   });
 });

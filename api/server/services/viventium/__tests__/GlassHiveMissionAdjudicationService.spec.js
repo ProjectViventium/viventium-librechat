@@ -1284,7 +1284,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
           callbackRef: canonicalCallbackRef('cb-1'),
           attemptNumber: 1,
         },
-        destinations: [{ surface: 'telegram' }],
+        destinations: [{ surface: 'telegram', telegramMessageThreadId: '42' }],
       },
       body: {
         callback_id: 'cb-1',
@@ -1293,6 +1293,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         work_terminal: true,
         worker_id: 'worker-1',
         run_id: 'run-1',
+        telegramMessageThreadId: 'forged-topic',
         message: 'Verified synthetic result.',
       },
     });
@@ -1311,6 +1312,12 @@ describe('GlassHiveMissionAdjudicationService', () => {
           evidence: 'Verified synthetic result.',
           callbackRef: canonicalCallbackRef('cb-1'),
           attemptNumber: 1,
+          destinations: [
+            expect.objectContaining({
+              surface: 'telegram',
+              telegramMessageThreadId: '42',
+            }),
+          ],
           state: 'pending',
         }),
       },

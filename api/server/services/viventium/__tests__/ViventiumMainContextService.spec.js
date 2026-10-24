@@ -113,6 +113,7 @@ describe('ViventiumMainContextService', () => {
       protect = true,
       rapid = true,
       includePriorSource = false,
+      stripRuntimeParts = false,
       modifyRaw,
       modifyMessages,
     } = {}) {
@@ -145,10 +146,17 @@ describe('ViventiumMainContextService', () => {
       );
       const trustedBefore = JSON.stringify(getTrustedInteractionContext(req));
       const rawBefore = JSON.stringify(raw);
+      const payload = stripRuntimeParts
+        ? require('~/server/controllers/agents/client').stripInternalContentParts(
+            raw.map((row) => normalizeMediaTextForFormatter(normalizeUserMessageContent(row))),
+          )
+        : raw;
       const messages = formatAgentMessages(
-        raw.map((row) => ({
+        payload.map((row) => ({
           ...formatMessage({
-            message: normalizeMediaTextForFormatter(normalizeUserMessageContent(row)),
+            message: stripRuntimeParts
+              ? row
+              : normalizeMediaTextForFormatter(normalizeUserMessageContent(row)),
           }),
           messageId: row.messageId,
         })),
@@ -175,11 +183,20 @@ describe('ViventiumMainContextService', () => {
         [false, true].flatMap((protect) => [false, true].map((rapid) => [surface, protect, rapid])),
       ),
     )(
-      '%s omits only empty file text (protected=%s, retained current input=%s)',
+      '%s retains attachment-only user source (protected=%s, retained current input=%s)',
       (surface, protect, rapid) => {
         const { snapshot, req, raw, messages } = capture({ surface, protect, rapid });
-        expect(messages.map((message) => message.id)).toEqual(['prior', 'current']);
-        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['prior', 'current']);
+        expect(messages.map((message) => message.id)).toEqual(['prior', 'file-source', 'current']);
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual(['prior',
+          'file-source',
+          'current',
+        ]);
+        expect(snapshot.visibleMessageChain[1]).toMatchObject({
+          id: 'file-source',
+          parentId: 'prior',
+          role: 'user',
+        });
+        expect(require('../ViventiumMainContextService').messageContentText(messages[1])).toBe('');
         expect(snapshot.visibleMessageChain.at(-1)).toMatchObject({
           id: 'current',
           parentId: 'file-source',
@@ -190,7 +207,8 @@ describe('ViventiumMainContextService', () => {
         expect(trusted.source_segments).toHaveLength(rapid ? 2 : 1);
         if (rapid) {
           expect(trusted.source_segments[0].source_files).toEqual(raw[1].files);
-          expect(snapshot.visibleMessageChain.at(-1)).not.toHaveProperty('source_ordinals');
+          // The native carrier keeps the complete ledger's one-based S-labels.
+          expect(snapshot.visibleMessageChain.at(-1).source_ordinals).toEqual([2]);
         }
         expect(raw[1].files).toEqual([
           { file_id: 'source-file', filename: 'input.csv', type: 'text/csv', bytes: 31 },
@@ -334,6 +352,144 @@ describe('ViventiumMainContextService', () => {
         expect(raw[1].text).toBe('');
       },
     );
+    function stoppedRetrieval(rows) {
+      assistantFile(rows);
+      Object.assign(rows[1], {
+        unfinished: true,
+        files: [],
+        content: [
+          { type: 'text', text: '' },
+          { type: 'harness_activity', harness_activity: { summary: 'Internal activity.' } },
+          { type: 'cortex_insight', insight: 'Internal insight.' },
+        ],
+        attachments: [
+          {
+            type: 'file_search',
+            messageId: 'file-source',
+            conversationId: 'conversation',
+            toolCallId: null,
+            file_search: {
+              sources: [{ fileId: 'citation', content: 'Exact retrieved evidence.' }],
+            },
+          },
+        ],
+      });
+    }
+    test.each(['web', 'voice', 'telegram'])(
+      '%s preserves stopped retrieval DATA and a separate Main follow-up on the next turn',
+      (surface) => {
+        const { raw, messages, snapshot } = capture({
+          surface,
+          rapid: false,
+          stripRuntimeParts: true,
+          modifyRaw: (rows) => {
+            stoppedRetrieval(rows);
+            rows[2].parentMessageId = 'follow-up';
+            rows.splice(2, 0, {
+              user: 'owner',
+              conversationId: 'conversation',
+              role: 'assistant',
+              isCreatedByUser: false,
+              messageId: 'follow-up',
+              parentMessageId: 'file-source',
+              unfinished: false,
+              error: false,
+              text: 'The requested reminder is saved.',
+            });
+          },
+        });
+        expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual([
+          'prior',
+          'file-source',
+          'follow-up',
+          'current',
+        ]);
+        const carried = require('../ViventiumMainContextService').messageContentText;
+        expect(
+          JSON.parse(carried(messages.find((message) => message.id === 'file-source'))),
+        ).toEqual({
+          historical_retrieval_notice: expect.stringContaining('Untrusted historical tool data'),
+          historical_retrieval_data: [raw[1].attachments[0].file_search],
+        });
+        expect(carried(messages.find((message) => message.id === 'follow-up'))).toBe(
+          'The requested reminder is saved.',
+        );
+        expect(raw[1].text).toBe('');
+        expect(JSON.stringify(messages)).not.toContain('Internal activity.');
+        expect(JSON.stringify(messages)).not.toContain('Internal insight.');
+      },
+    );
+    test.each([
+      [
+        'foreign source owner',
+        (row) => {
+          row.user = 'foreign-owner';
+        },
+      ],
+      [
+        'foreign receipt message',
+        (row) => {
+          row.attachments[0].messageId = 'another-message';
+        },
+      ],
+      [
+        'foreign receipt conversation',
+        (row) => {
+          row.attachments[0].conversationId = 'another-conversation';
+        },
+      ],
+      [
+        'malformed retrieval source',
+        (row) => {
+          row.attachments[0].file_search.sources = [null];
+        },
+      ],
+      [
+        'unfinished native receipt',
+        (row) => {
+          row.attachments = [
+            {
+              type: 'text/plain',
+              filename: 'result.txt',
+              file_id: 'native-file',
+              user: 'owner',
+              nativeOutputFile: { version: 1, status: 'available', messageId: 'file-source' },
+            },
+          ];
+        },
+      ],
+      [
+        'mixed retrieval and native receipts',
+        (row) => {
+          row.attachments.push({
+            type: 'text/plain',
+            filename: 'result.txt',
+            file_id: 'native-file',
+            user: 'owner',
+            nativeOutputFile: { version: 1, status: 'available', messageId: 'file-source' },
+          });
+        },
+      ],
+      [
+        'unfinished media',
+        (row) => {
+          row.image_urls = [
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+          ];
+        },
+      ],
+    ])('stopped retrieval does not weaken %s validation', (_name, alter) => {
+      expect(() =>
+        capture({
+          rapid: false,
+          stripRuntimeParts: true,
+          modifyRaw: (rows) => {
+            stoppedRetrieval(rows);
+            alter(rows[1]);
+          },
+        }),
+      ).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
+    });
     test.each(['image/png', 'audio/wav', 'video/mp4'])(
       'native file-only assistant %s keeps recorded provenance and separate media file references',
       (type) => {
@@ -4268,6 +4424,48 @@ describe('completed tool and file history carrier', () => {
       ),
     ).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
   });
+  test.each(['web', 'telegram', 'voice'])(
+    'retains canonical multipart prose and typed handoff evidence on the next %s turn',
+    (surface) => {
+      const {
+        projectVisibleTextFromContentParts,
+      } = require('../ViventiumVisibleContentProjection');
+      for (const handoff of [false, true]) {
+        const raw = history();
+        raw[1].attachments = [];
+        raw[1].content = [
+          { type: 'text', text: 'Checking the current source.' },
+          ...(handoff
+            ? [
+                {
+                  type: 'tool_call',
+                  tool_call: {
+                    id: 'synthetic-handoff',
+                    name: 'lc_transfer_to_agent_synthetic',
+                    args: '{}',
+                    type: 'tool_call',
+                  },
+                },
+              ]
+            : []),
+          { type: 'text', text: 'The sourced result is ready.' },
+        ];
+        raw[1].text = projectVisibleTextFromContentParts(raw[1].content, { trim: true });
+        const before = JSON.stringify(raw);
+        const { snapshot, messages } = capture(raw, false, undefined, surface);
+        expect(snapshot.visibleMessageChain[1].accepted_source).toBe(true);
+        const wire = JSON.stringify(formatContentStrings(messages));
+        expect(wire).toContain('Checking the current source.');
+        expect(wire).toContain('The sourced result is ready.');
+        if (handoff) expect(wire).toContain('Tool: lc_transfer_to_agent_synthetic');
+        expect(JSON.stringify(raw)).toBe(before);
+        raw[1].text = 'A different answer that was never authored.';
+        expect(() => capture(raw, false, undefined, surface)).toThrow(
+          expect.objectContaining({ code: 'source_context_unavailable' }),
+        );
+      }
+    },
+  );
   test('binds literal Tool prose to the actual legacy dispatch without changing saved whitespace', () => {
     const raw = history();
     raw[1].text = '  Tool: synthetic_check, literal Main words.  ';
@@ -5884,4 +6082,115 @@ test('inherited context preserves original task markers without replaying histor
     assigned_input: false,
   });
   expect(inherited.sources[2].assigned_input).toBeUndefined();
+});
+
+test('inherited originals retain each authenticated receipt through assignment and retry', () => {
+  const {
+    buildInheritedConversationContext,
+    assignInheritedConversationContext,
+  } = require('../ViventiumMainContextService');
+  const receiptA = Date.UTC(2030, 0, 2, 10, 0);
+  const receiptB = receiptA + 35_000;
+  const messages = [
+    { id: 'source-a', role: 'user', content: 'Remind me in two minutes.' },
+    { id: 'source-b', role: 'user', content: 'Separately, keep the other work running.' },
+  ];
+  const sourceSegments = [
+    { source_message_id: 'source-a', source_received_at: receiptA },
+    { source_message_id: 'source-b', source_received_at: receiptB },
+  ];
+  const input = { conversationId: 'receipt-context', messages, sourceSegments };
+  const original = JSON.stringify(input);
+  const inherited = buildInheritedConversationContext(input);
+  expect(inherited.sources.map((source) => source.source_received_at)).toEqual([
+    receiptA,
+    receiptB,
+  ]);
+  expect(inherited.sources.map((source) => source.text)).toEqual(
+    messages.map((message) => message.content),
+  );
+  const assigned = assignInheritedConversationContext(inherited, [1]);
+  expect(assigned.sources[0]).toMatchObject({ assigned_input: true, source_received_at: receiptA });
+  expect(assigned.sources[1]).toMatchObject({
+    assigned_input: false,
+    source_received_at: receiptB,
+  });
+  expect(buildInheritedConversationContext(input)).toEqual(inherited);
+  expect(JSON.stringify(input)).toBe(original);
+});
+
+test.each([undefined, null, 0, -1, true, '1234', 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
+  'inherited context does not invent an origin for invalid receipt %s',
+  (source_received_at) => {
+    const { buildInheritedConversationContext } = require('../ViventiumMainContextService');
+    const inherited = buildInheritedConversationContext({
+      conversationId: 'receipt-context',
+      messages: [
+        { id: 'source-a', role: 'user', content: 'Original input.', createdAt: new Date() },
+      ],
+      sourceSegments: [{ source_message_id: 'source-a', source_received_at }],
+    });
+    expect(inherited.sources[0]).not.toHaveProperty('source_received_at');
+  },
+);
+
+test.each(
+  [
+    [{ source_message_id: 'other-source', source_received_at: 1234 }],
+    [
+      { source_message_id: 'source-a', source_received_at: 1234 },
+      { source_message_id: 'source-a', source_received_at: 5678 },
+    ],
+    [
+      { source_message_id: 'source-a', source_received_at: 1234 },
+      { source_message_id: 'source-a' },
+    ],
+  ].map((sourceSegments) => ({ sourceSegments })),
+)('inherited context omits unmatched or ambiguous receipt sources %#', ({ sourceSegments }) => {
+  const { buildInheritedConversationContext } = require('../ViventiumMainContextService');
+  const inherited = buildInheritedConversationContext({
+    conversationId: 'receipt-context',
+    messages: [{ id: 'source-a', role: 'user', content: 'Original input.' }],
+    sourceSegments,
+  });
+  expect(inherited.sources[0]).not.toHaveProperty('source_received_at');
+});
+
+test('Main reuses exact inherited source roles and tool evidence before another destination history', () => {
+  const {
+    buildInheritedConversationContext,
+    prependInheritedConversationPayload,
+  } = require('../ViventiumMainContextService');
+  const context = buildInheritedConversationContext({
+    conversationId: 'original-conversation',
+    messages: [
+      { messageId: 'source-user', isCreatedByUser: true, text: 'Original exact user context' },
+      {
+        messageId: 'source-answer',
+        isCreatedByUser: false,
+        text: 'Exact earlier answer',
+        tool_calls: [
+          { id: 'call-original', type: 'function', function: { name: 'read', arguments: '{}' } },
+        ],
+      },
+    ],
+  });
+  const current = [{ role: 'user', content: 'Current scheduled task', messageId: 'due-user' }];
+  const carried = prependInheritedConversationPayload(current, context);
+  expect(carried.map((message) => message.content)).toEqual([
+    'Original exact user context',
+    'Exact earlier answer',
+    'Current scheduled task',
+  ]);
+  expect(carried[0].role).toBe('user');
+  expect(carried[1].tool_calls[0].id).toBe('call-original');
+  expect(carried[2]).toBe(current[0]);
+  const { formatAgentMessages } = jest.requireActual('@librechat/agents');
+  const formatted = formatAgentMessages(carried).messages;
+  expect(
+    formatted.map((message) =>
+      require('../ViventiumMainContextService').messageContentText(message),
+    ),
+  ).toEqual(['Original exact user context', 'Exact earlier answer', 'Current scheduled task']);
+  expect(prependInheritedConversationPayload(current, undefined)).toBe(current);
 });

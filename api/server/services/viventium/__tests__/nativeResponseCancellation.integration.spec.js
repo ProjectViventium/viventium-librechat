@@ -126,6 +126,51 @@ async function admit(context = { surface: 'web' }, required = false) {
   await methods.admitNativeResponse(identity, transaction);
 }
 
+test('automatic parents preserve a stored native Stop, its direct interruption context, and replay', async () => {
+  await admit();
+  const originalGetMessages = mockModels.getMessages;
+  const originalGetConvo = mockModels.getConvo;
+  mockModels.getConvo = async () => ({ conversationId: 'conversation', endpoint: 'agents' });
+  mockModels.getMessages = (filter, select) =>
+    mongoose.models.Message.find(filter).select(select).sort({ createdAt: 1 }).lean();
+  try {
+    const { resolveReusableConversationState } = require('../conversationThreading');
+    const { buildDirectParentTurnContext } = require('@librechat/api');
+    const select = (surface) =>
+      resolveReusableConversationState({ userId: user, conversationId: 'conversation', surface });
+    expect((await select('voice')).parentMessageId).toBe('source');
+    expect((await mockManager.abortJob('stream', 'user_cancelled')).success).toBe(true);
+    const stopped = await methods.getNativeResponse(user, 'answer');
+    expect(stopped.nativeResponse).toMatchObject({
+      status: 'cancelled',
+      stopSnapshotStoredAt: expect.any(Number),
+    });
+    for (const surface of ['voice', 'telegram']) {
+      const state = await select(surface);
+      expect(state.parentMessageId).toBe('answer');
+      const selected = state.messages.find(
+        (message) => message.messageId === state.parentMessageId,
+      );
+      expect(selected.nativeResponse).toBeUndefined();
+      expect(JSON.parse(buildDirectParentTurnContext(selected))).toEqual({
+        direct_parent_response: {
+          messageId: 'answer',
+          parentMessageId: 'source',
+          unfinished: true,
+          finish_reason: 'incomplete',
+        },
+      });
+    }
+    expect((await mockManager.abortJob('stream', 'user_cancelled')).success).toBe(false);
+    expect((await select('telegram')).parentMessageId).toBe('answer');
+    expect((await methods.getNativeResponse(user, 'answer')).text).toBe(partial);
+  } finally {
+    mockModels.getMessages = originalGetMessages;
+    if (originalGetConvo === undefined) delete mockModels.getConvo;
+    else mockModels.getConvo = originalGetConvo;
+  }
+});
+
 test.each(['pending', 'prepared'])(
   'Stop persists the %s partial before provider abort and FINAL',
   async (status) => {

@@ -3836,6 +3836,12 @@ describe('/api/viventium/glasshive/callback', () => {
       const task = getVoiceTaskByStreamId('glasshive:run-terminal');
       expect(task).toMatchObject({ state, cancellable: false, parentTaskId: parent.taskId });
       expect(snapshotEvent(task.taskId)).toMatchObject({ state, cancellable: false });
+      if (event === 'run.cancelled' || event === 'run.interrupted') {
+        expect(snapshotEvent(task.taskId)).toMatchObject({
+          label: 'Work continues',
+          detail: 'This earlier run stopped. The same work is still active.',
+        });
+      }
       expect(mockRecordGlassHiveCallbackExternalState).toHaveBeenLastCalledWith(
         expect.objectContaining({
           body: expect.objectContaining({ work_state: 'queued', work_terminal: false }),

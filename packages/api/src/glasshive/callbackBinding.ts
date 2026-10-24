@@ -781,7 +781,11 @@ function configuredDestinationsFromRequest(requestBody: RuntimeRecord = {}): Run
     requestBody.viventiumSchedulerDeliveryChannels || requestBody.deliveryChannels,
   );
   if (scheduledChannels.length) {
-    return scheduledChannels.map((surface) => ({ surface }));
+    return scheduledChannels.map((surface) => ({ surface,
+        ...(surface === 'telegram' && requestBody.viventiumTelegramMessageThreadId
+          ? { telegramMessageThreadId: normalizeText(requestBody.viventiumTelegramMessageThreadId) }
+          : {}),
+      }));
   }
 
   const surface = normalizeText(requestBody.viventiumSurface, 32).toLowerCase();
@@ -1426,7 +1430,11 @@ async function resolveTelegramDestination(
   if (!telegramUserId || !telegramChatId) {
     return { surface: 'telegram', unresolvedReason: 'telegram_mapping_not_found' };
   }
-  return { surface: 'telegram', telegramChatId, telegramUserId };
+  return { surface: 'telegram', telegramChatId, telegramUserId,
+      ...(destination.telegramMessageThreadId
+        ? { telegramMessageThreadId: normalizeText(destination.telegramMessageThreadId) }
+        : {}),
+    };
 }
 
 function parseJsonObject(value: unknown): RuntimeRecord | null {
@@ -2272,9 +2280,90 @@ async function recoverRetainedStopCallback(row: RuntimeRecord): Promise<void> {
   });
 }
 
-/** Request the sender's retained result only after Core accepted that exact authenticated identity. */
+  /** Repair the old pending projection only from the current authenticated silent decision. */
+  async function reconcileSilentAdjudicationOutcome(row: RuntimeRecord): Promise<boolean> {
+    if (
+      row.deliveryState !== 'enqueued' ||
+      row.adjudicationState !== 'silent' ||
+      !TERMINAL_STATES.includes(row.externalState) ||
+      (row.terminalCallbackRunId && row.terminalCallbackRunId !== row.runId)
+    )
+      return false;
+    const scope = {
+      ownerId: normalizeText(row.ownerId, 160),
+      originRef: normalizeText(row.originRef || row._id, 160),
+      workRef: normalizeText(row.workRef, 160),
+      workerId: normalizeText(row.workerId, 160),
+      runId: normalizeText(row.runId, 160),
+    };
+    if (Object.values(scope).some((value) => !value)) return false;
+    const snapshotFilter: RuntimeRecord = { _id: row._id, ...scope };
+    const evidenceFilter: RuntimeRecord = {
+      ...scope,
+      state: 'silent',
+      workTerminal: true,
+      workState: row.externalState,
+      followUpMessageId: normalizeText(row.followUpMessageId, 160),
+      errorCode: normalizeText(row.adjudicationErrorCode, 120),
+    };
+    for (const [field, evidenceField] of [
+      ['terminalCallbackId', 'terminalCallbackId'],
+      ['terminalCallbackResultDigest', 'terminalCallbackResultDigest'],
+      ['terminalCallbackResultRevision', 'terminalCallbackResultRevision'],
+      ['terminalCallbackAcceptedOperationId', 'terminalCallbackAcceptedOperationId'],
+      ['terminalCallbackEffectLeaseGeneration', 'terminalCallbackEffectGeneration'],
+    ]) {
+      evidenceFilter[evidenceField] = Object.prototype.hasOwnProperty.call(row, field)
+        ? row[field]
+        : { $exists: false };
+    }
+    for (const field of [
+      'launchState',
+      'externalState',
+      'deliveryState',
+      'adjudicationState',
+      'adjudicationErrorCode',
+      'followUpMessageId',
+      'updatedAt',
+      'terminalCallbackRunId',
+      'terminalCallbackResultEndedAt',
+      'terminalCallbackId',
+      'terminalCallbackResultDigest',
+      'terminalCallbackResultRevision',
+      'terminalCallbackAcceptedOperationId',
+      'terminalCallbackEffectLeaseId',
+      'terminalCallbackEffectLeaseGeneration',
+    ])
+      snapshotFilter[field] = Object.prototype.hasOwnProperty.call(row, field)
+        ? row[field]
+        : { $exists: false };
+    const evidence = await mongoose.connection
+      .collection('viventium_glasshive_mission_evidence')
+      .findOne(evidenceFilter, { projection: { callbackRef: 1 } });
+    if (!/^callback_sha256:[a-f0-9]{64}$/.test(String(evidence?.callbackRef || ''))) return false;
+    const deliveryState =
+      row.adjudicationErrorCode === 'mission_origin_cleanup_tombstoned' ? 'suppressed' : 'silent';
+    const updated = await externalWorkCollection().findOneAndUpdate(
+      snapshotFilter,
+      {
+        $set: { deliveryState, attentionPending: false, updatedAt: new Date() },
+      },
+      { returnDocument: 'after' },
+    );
+    const document =
+      updated && Object.prototype.hasOwnProperty.call(updated, 'value') ? updated.value : updated;
+    if (!document)
+      throw Object.assign(new Error('glasshive_delivery_projection_snapshot_changed'), {
+        code: 'glasshive_delivery_projection_snapshot_changed',
+      });
+    invalidateActiveWorkSnapshot?.({ ownerId: scope.ownerId, fetchImpl });
+    return true;
+  }
+
+  /** Request the sender's retained result only after Core accepted that exact authenticated identity. */
 async function recoverAcceptedTerminalResult(row: RuntimeRecord): Promise<void> {
-  const scope = {
+    if (await reconcileSilentAdjudicationOutcome(row)) return;
+    const scope = {
     ownerId: normalizeText(row.ownerId, 160),
     originRef: normalizeText(row.originRef || row._id, 160),
     workRef: normalizeText(row.workRef, 160),
@@ -2376,11 +2465,24 @@ async function reconcileKnownExternalWorkHints(
           ownerId: 1,
           originRef: 1,
           workRef: 1,
-          runId: 1,
+            workerId: 1,
+            runId: 1,
           externalState: 1,
           launchState: 1,
           deliveryState: 1,
           attentionPending: 1,
+            adjudicationState: 1,
+            adjudicationErrorCode: 1,
+            followUpMessageId: 1,
+            updatedAt: 1,
+            terminalCallbackRunId: 1,
+            terminalCallbackResultEndedAt: 1,
+            terminalCallbackId: 1,
+            terminalCallbackResultDigest: 1,
+            terminalCallbackResultRevision: 1,
+            terminalCallbackAcceptedOperationId: 1,
+            terminalCallbackEffectLeaseId: 1,
+            terminalCallbackEffectLeaseGeneration: 1,
           stateReconciliationPendingAt: 1,
           stateReconciliationNextAt: 1,
           stateReconciliationAttempts: 1,
@@ -2750,9 +2852,11 @@ async function recordGlassHiveAdjudicationOutcome({
     adjudicatedAt: now,
     updatedAt: now,
   };
-  const deliveryState = normalizedState === 'silent' && normalizedErrorCode === 'mission_origin_cleanup_tombstoned'
+  const deliveryState = normalizedState === 'silent'
+        ? normalizedErrorCode === 'mission_origin_cleanup_tombstoned'
     ? 'suppressed'
-    : normalizedState === 'failed' ? (unresolvedDelivery ? 'unresolved' : 'failed') : 'enqueued';
+          : 'silent'
+        : normalizedState === 'failed' ? (unresolvedDelivery ? 'unresolved' : 'failed') : 'enqueued';
   effectSession ||= mongoose.transactionAsyncLocalStorage?.getStore()?.session || null;
   const collection = externalWorkCollection();
   const unsettledResult = await collection.findOneAndUpdate(
@@ -2936,7 +3040,17 @@ async function notifySchedulerExternalWorkSummary(
   if (!binding?.scheduleOccurrenceKey || !summary || summary.requiredTotal < 1) {
     return null;
   }
-  const url = schedulingExternalCallbackUrl();
+    if (binding.schedulerDispatchDocumentId) {
+      const dispatch = await mongoose.connection
+        .collection('viventium_scheduler_dispatch_intents')
+        .findOne({
+          _id: normalizeText(binding.schedulerDispatchDocumentId),
+          userId: normalizeText(binding.ownerId),
+        });
+      // This admission belongs to the application receiver, not the legacy clock.
+      if (dispatch?.kind === 'schedule_due') return null;
+    }
+    const url = schedulingExternalCallbackUrl();
   const secret = normalizeText(
     process.env.VIVENTIUM_SCHEDULER_SECRET || process.env.SCHEDULER_LIBRECHAT_SECRET,
     4096,

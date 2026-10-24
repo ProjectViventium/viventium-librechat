@@ -21,6 +21,7 @@ const { primeFiles } = require('~/app/clients/tools/util/fileSearch');
 const { getEndpointsConfig } = require('~/server/services/Config/getEndpointsConfig');
 const { isConversationOrchestrationTool } = require('./GlassHiveConversationOrchestration');
 const {
+  getTrustedInteractionContext,
   projectTrustedClientPresentation,
   projectTrustedNativeInteractionHeaders,
 } = require('./interactionContext');
@@ -2149,10 +2150,36 @@ async function attachConversationProviderCapabilityBundle({
     return false;
   }
   if (coordinationOnly) bundle.conversation_tool_mode = 'coordination';
+  /* === VIVENTIUM START === Fast Queen defers schedule setup to actual native handoff. === */
+  if (
+    !coordinationOnly &&
+    !req?._viventiumCortexToolEvidence &&
+    process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED === 'true'
+  ) {
+    await require('./ScheduleDueService').applyConversationScheduleAccess({
+      bundle,
+      user: req?.user,
+      requestBody: {
+        ...trustedRequestBody,
+        viventiumSchedulerDueAdmissionId:
+          getTrustedInteractionContext(req)?.origin === 'scheduler'
+            ? req?.viventiumSchedulerDueAdmissionId
+            : undefined,
+        viventiumStreamId:
+          req?._resumableStreamId || req?.body?.streamId || trustedRequestBody.viventiumStreamId,
+      },
+    });
+  }
+  /* === VIVENTIUM END === */
   // The signed ledger carries only current upload IDs and safe metadata. GlassHive resolves
   // original bytes under this authenticated owner's storage root, never a request-supplied path.
   if (uploadedFiles.length > 0) {
-    bundle = { ...bundle, viventium_upload_context: { selected_uploads: uploadedFiles } };
+    bundle = { ...bundle, viventium_upload_context: { selected_uploads: uploadedFiles,
+        current_upload_ids: trustedUploadedFilesFromRequestBody(trustedRequestBody)
+          .map((file) => file.file_id)
+          .filter(Boolean),
+      },
+    };
   }
   if (!bundle || Object.keys(bundle).length === 0) {
     const brokerUnavailableInstructions = applyCapabilityBrokerUnavailableInstructions(

@@ -723,6 +723,92 @@ describe('GenerationJobManager logical turns', () => {
     await store.destroy();
   });
 
+  test.each([false, true])(
+    'Memory rollback does not revive a deleted predecessor; previously admitted=%s',
+    async (previouslyAdmitted) => {
+      const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+      try {
+        const first = await store.claimLogicalTurn(
+          'memory-prior',
+          'owner',
+          telegramContext('memory-prior-chat', 'a'),
+        );
+        if (previouslyAdmitted) {
+          await store.createJob('memory-prior', 'owner', 'memory-prior-chat', {
+            interactionContext: first.interactionContext,
+          });
+          await store.deleteJob('memory-prior');
+        }
+        const candidate = await store.claimLogicalTurn(
+          'memory-candidate',
+          'owner',
+          telegramContext('memory-prior-chat', 'b'),
+        );
+        expect(
+          await store.rollbackLogicalTurnClaim('memory-candidate', candidate.interactionContext),
+        ).toBe(true);
+        const next = await store.claimLogicalTurn('memory-ready', 'owner', {
+          ...telegramContext('memory-prior-chat', 'c'),
+          ready_input_continuation: {
+            source_message_id: 'input-c',
+            presentation_source_sequence: 3,
+          },
+        });
+        expect(next.status).toBe(previouslyAdmitted ? 'claimed' : 'busy');
+      } finally {
+        await store.destroy();
+      }
+    },
+  );
+
+  test('Memory pending rollback survives completed TTL while an empty completed turn still expires', async () => {
+    let now = 1_725_000_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const store = new InMemoryJobStore({ ttlAfterComplete: 100 });
+    const context = (id: string): InteractionContext => ({
+      ...telegramContext('memory-retained-chat', id),
+      source_segments: [{ ordinal: 0, source_event_id: id, source_index: 0, text: id }],
+    });
+    try {
+      const first = await store.claimLogicalTurn('memory-a', 'owner', context('a'));
+      await store.createJob('memory-a', 'owner', 'memory-retained-chat', {
+        interactionContext: first.interactionContext,
+      });
+      const candidate = await store.claimLogicalTurn('memory-b', 'owner', context('b'));
+      await store.acknowledgeDelivery({
+        logical_turn_id: first.interactionContext.logical_turn_id!,
+        revision: first.interactionContext.revision,
+        state: 'failed',
+      });
+      await store.updateJob('memory-a', { status: 'superseded', completedAt: now });
+      expect(await store.rollbackLogicalTurnClaim('memory-b', candidate.interactionContext)).toBe(
+        true,
+      );
+      const empty = await store.claimLogicalTurn(
+        'memory-empty',
+        'owner',
+        telegramContext('memory-empty-chat', 'empty'),
+      );
+      await store.createJob('memory-empty', 'owner', 'memory-empty-chat', {
+        interactionContext: empty.interactionContext,
+      });
+      await store.updateJob('memory-empty', { status: 'complete', completedAt: now });
+      await store.completeLogicalTurn('memory-empty');
+      now += 101;
+      await store.cleanup();
+      expect(
+        await store.resolveDeliveryOwner(empty.interactionContext.logical_turn_id!, 1),
+      ).toBeNull();
+      const next = await store.claimLogicalTurn('memory-c', 'owner', context('c'));
+      expect(
+        next.interactionContext.source_segments?.map((source) => source.source_event_id),
+      ).toEqual(['b', 'c']);
+    } finally {
+      await store.destroy();
+      clock.mockRestore();
+    }
+  });
+
   test('InMemory expires inactive source watermarks but retains them while a turn is active', async () => {
     let now = 1_725_000_000_000;
     jest.spyOn(Date, 'now').mockImplementation(() => now);

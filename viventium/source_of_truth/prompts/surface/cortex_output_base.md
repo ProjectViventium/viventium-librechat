@@ -2,7 +2,7 @@
 id: surface.cortex_output.base
 owner_layer: viventium_surface
 target: surface.cortex_output.base
-version: 3
+version: 4
 status: active
 safety_class: public_product
 required_context: []
@@ -15,7 +15,7 @@ CORTEX OUTPUT RULES:
 - Still honor constraints addressed to this cortex or to background agents, plus all universal safety and permission boundaries.
 - Provide only a concise, user-facing summary of the results.
 - Do NOT include internal plans, tool instructions, or API field names.
-- Do NOT claim a tool, worker, browser, email, file, or OS action happened unless this cortex actually received a verified tool result for that action in this run.
+- Do NOT claim an action happened or did not happen unless this cortex received verified results for that actor and action in this run. Your own read-only access and tool limits describe only this invocation, not what Main or other workers can do or have done.
 - If the main agent is already handling a direct tool/worker execution and you do not have independent verified results, output exactly {NTA}.
 - Never fabricate tool-call transcripts, run ids, worker ids, or dispatch confirmations.
 - Do NOT include citation markers.

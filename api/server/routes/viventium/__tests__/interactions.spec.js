@@ -1487,6 +1487,38 @@ describe('POST /api/viventium/interactions/delivery-ack', () => {
     },
   );
 
+  test.each(['telegram', 'voice'])(
+    'acknowledges an exact %s failure even when no assistant reply was published',
+    async (surface) => {
+      const result = await mockAcknowledgeDelivery();
+      result.acknowledgement.state = 'failed';
+      mockAcknowledgeDelivery.mockResolvedValue(result);
+      mockMessageUpdateOne.mockResolvedValue({ matchedCount: 0, modifiedCount: 0 });
+      const app = createApp(require('../interactions'));
+      for (const idempotent of [false, true]) {
+        result.idempotent = idempotent;
+        const res = response();
+        await dispatch(
+          app,
+          request({
+            headers: {
+              'x-viventium-adapter-secret':
+                surface === 'voice' ? 'voice-adapter-secret' : 'adapter-secret',
+            },
+            body: { logical_turn_id: 'turn-1', revision: 2, state: 'failed' },
+          }),
+          res,
+        );
+        expect(res.statusCode).toBe(200);
+        expect(res.body).toEqual({ acknowledged: true, idempotent });
+      }
+      expect(mockMessageFindOneAndDelete).not.toHaveBeenCalled();
+      expect(mockCommitAcceptedMainTurnFromPresentation).not.toHaveBeenCalled();
+      expect(mockRecordTelegramTransportReceipt).not.toHaveBeenCalled();
+      expect(mockRefreshVoiceTaskCommittedPresentation).not.toHaveBeenCalled();
+    },
+  );
+
   test('End failure retains an already completed canonical answer and its background evidence', async () => {
     const result = await mockAcknowledgeDelivery();
     result.acknowledgement.state = 'failed';

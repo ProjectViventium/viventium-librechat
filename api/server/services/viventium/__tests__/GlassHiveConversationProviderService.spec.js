@@ -1,3 +1,7 @@
+const mockApplyConversationScheduleAccess = jest.fn(async () => undefined);
+jest.mock('../ScheduleDueService', () => ({
+  applyConversationScheduleAccess: (...args) => mockApplyConversationScheduleAccess(...args),
+}));
 const { Constants } = require('librechat-data-provider');
 const crypto = require('crypto');
 const { setTrustedInteractionContext } = require('../interactionContext');
@@ -619,6 +623,9 @@ describe('GlassHiveConversationProviderService', () => {
       const bundle = JSON.parse(Buffer.from(encoded, 'base64').toString());
       expect(bundle.viventium_upload_context.selected_uploads.map((file) => file.file_id)).toEqual(
         call.hostToolResources.transcribe_audio.files.map((file) => file.file_id),
+      );
+      expect(bundle.viventium_upload_context.current_upload_ids).toEqual(
+        currentFiles.map((file) => file.file_id),
       );
     },
   );
@@ -2015,6 +2022,108 @@ describe('GlassHiveConversationProviderService', () => {
     ).toBe(false);
     expect(ordinaryAgent.model_parameters.configuration.defaultHeaders).toEqual({});
   });
+
+  test.each([
+    ['direct-xai', 'coordination', false, false],
+    ['codex-cli', 'native', true, false],
+    ['codex-cli', 'native', false, true],
+  ])(
+    'schedule setup follows native execution, not fast reply (%s)',
+    async (harnessProfile, toolMode, expected, cortex) => {
+      process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED = 'true';
+      mockApplyConversationScheduleAccess.mockClear();
+      buildConversationProviderBootstrapBundle.mockResolvedValue({ agents_md: 'Existing context' });
+      const targetAgent = {
+        model: 'model-synthetic',
+        tools: ['active_work_list'],
+        glasshive_options: { orchestration: { parallel_available: true, tool_mode: toolMode } },
+        model_parameters: { configuration: { defaultHeaders: {} } },
+      };
+      const inheritedConversation = { version: 1, segments: [] };
+      try {
+        await expect(
+          attachConversationProviderCapabilityBundle({
+            targetAgent,
+            declaredAgent: targetAgent,
+            req: {
+              user: { id: 'owner-synthetic' },
+              ...(cortex ? { _viventiumCortexToolEvidence: { observeGrant: jest.fn() } } : {}),
+            },
+            requestBody: {
+              conversationId: 'conversation-synthetic',
+              messageId: 'source-synthetic',
+            },
+            inheritedConversation,
+            capability: {
+              workspace_binding: true,
+              host_tools_transport: 'broker_mcp',
+              conversation_orchestration_tools: ['active_work_list'],
+              models: [{ id: 'model-synthetic', harnessProfile }],
+            },
+          }),
+        ).resolves.toBe(true);
+        expect(mockApplyConversationScheduleAccess).toHaveBeenCalledTimes(expected ? 1 : 0);
+      } finally {
+        delete process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED;
+      }
+    },
+  );
+
+  test.each(['scheduler', 'interactive', 'forged-body'])(
+    'full native invocation projects only server-owned due provenance (%s)',
+    async (origin) => {
+      process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED = 'true';
+      buildConversationProviderBootstrapBundle.mockResolvedValue({ agents_md: 'Existing context' });
+      const targetAgent = {
+        model: 'model-synthetic',
+        tools: ['active_work_list'],
+        glasshive_options: { orchestration: { parallel_available: true, tool_mode: 'native' } },
+        model_parameters: { configuration: { defaultHeaders: {} } },
+      };
+      const req = {
+        user: { id: 'owner-synthetic' },
+        _resumableStreamId: 'actual-controller-stream',
+        viventiumSchedulerDueAdmissionId: origin === 'forged-body' ? undefined : 'actual-admission',
+        body: {
+          conversationId: 'conversation-synthetic',
+          messageId: 'response-synthetic',
+          text: 'Internal scheduled execution envelope',
+          viventiumSchedulerDueAdmissionId: 'forged-body-admission',
+          viventiumStreamId: 'forged-stream',
+        },
+      };
+      setTrustedInteractionContext(req, {
+        actor_kind: origin === 'scheduler' ? 'system' : 'external_user',
+        origin: origin === 'scheduler' ? 'scheduler' : 'interactive',
+        surface: 'workbench',
+      });
+      try {
+        await attachConversationProviderCapabilityBundle({
+          targetAgent,
+          declaredAgent: targetAgent,
+          req,
+          inheritedConversation: { version: 1, segments: [] },
+          capability: {
+            workspace_binding: true,
+            host_tools_transport: 'broker_mcp',
+            conversation_orchestration_tools: ['active_work_list'],
+            models: [{ id: 'model-synthetic', harnessProfile: 'codex-cli' }],
+          },
+        });
+        expect(mockApplyConversationScheduleAccess).toHaveBeenCalledWith(
+          expect.objectContaining({
+            requestBody: expect.objectContaining({
+              viventiumSchedulerDueAdmissionId:
+                origin === 'scheduler' ? 'actual-admission' : undefined,
+              viventiumStreamId: 'actual-controller-stream',
+            }),
+          }),
+        );
+      } finally {
+        delete process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED;
+      }
+    },
+  );
 
   test('attaches one signed bundle while preserving existing provider headers', async () => {
     buildConversationProviderBootstrapBundle.mockResolvedValue({

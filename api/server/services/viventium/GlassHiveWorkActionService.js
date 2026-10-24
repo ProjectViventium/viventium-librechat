@@ -44,6 +44,17 @@ module.exports = createGlassHiveWorkActionService({
   getActiveWorkSnapshot,
   invalidateActiveWorkSnapshot,
   requestAccountApi,
+  prepareActionRuntimeBundle: async ({ ownerId, requestBody }) => {
+    if (process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED !== 'true') return undefined;
+    // Failure to prepare the current source must not reuse a previous task's create grant.
+    const bundle = { schedule_access: { destinations: [], manage_destination_ids: [] } };
+    await require('./ScheduleDueService').applyConversationScheduleAccess({
+      bundle,
+      user: { id: ownerId },
+      requestBody,
+    });
+    return bundle;
+  },
   getActionFileSources: async ({ ownerId, fileIds, requestBody, serverReq }) => {
     const req = serverReq;
     if (!req || String(req.user?.id || req.user?._id || '') !== String(ownerId))

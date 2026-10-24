@@ -66,7 +66,7 @@ export interface InteractionSourceSegment {
   original_sha256?: string;
 }
 
-function normalizeInteractionSourceFiles(candidates: unknown): readonly InteractionSourceFile[] {
+export function normalizeInteractionSourceFiles(candidates: unknown): readonly InteractionSourceFile[] {
   const result: InteractionSourceFile[] = [];
   const seen = new Set<string>();
   for (const value of Array.isArray(candidates) ? candidates : []) {

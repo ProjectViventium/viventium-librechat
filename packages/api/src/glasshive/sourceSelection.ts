@@ -5,6 +5,8 @@
  * identifiers and attachment paths never enter the model-controlled schema.
  * === VIVENTIUM END === */
 
+import { MAIN_DELEGATION_STRING_LIMITS } from './conversationOrchestration';
+
 type UnknownRecord = Record<string, unknown>;
 
 export type SourceSelectionError = 'source_selection_required' | 'invalid_source_selection';
@@ -81,6 +83,26 @@ export function trustedUploadedFilesFromRequestBody(
       ),
     ];
   });
+}
+
+/** Select a task clause without rewriting or granting authority over unrelated source text. */
+export function selectTrustedSourceInstruction(
+  originals: readonly string[],
+  instruction?: unknown,
+): string | undefined {
+  if (instruction === undefined) return undefined;
+  if (
+    typeof instruction !== 'string' ||
+    !instruction.trim() ||
+    instruction.trim() !== instruction ||
+    instruction.length > MAIN_DELEGATION_STRING_LIMITS.instruction ||
+    !originals.some((text) => text.includes(instruction))
+  ) {
+    throw Object.assign(new Error('invalid_source_instruction_selection'), {
+      code: 'invalid_source_instruction_selection',
+    });
+  }
+  return instruction;
 }
 
 export function selectTrustedLaunchRequestBody(

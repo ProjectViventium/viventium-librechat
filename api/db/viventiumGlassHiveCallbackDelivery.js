@@ -163,6 +163,22 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
     { _id: false, strict: 'throw' },
   );
 
+  const mainGenerationPresentationSchema = new mongoose.Schema(
+    {
+      version: { type: Number, enum: [1], required: true, immutable: true },
+      streamId: { type: String, required: true, maxlength: 512, immutable: true },
+      admissionId: { type: String, required: true, maxlength: 512, immutable: true },
+      responseMessageId: { type: String, required: true, maxlength: 512, immutable: true },
+      responseDigest: {
+        type: String,
+        required: true,
+        match: /^sha256:[a-f0-9]{64}$/,
+        immutable: true,
+      },
+    },
+    { _id: false, strict: 'throw' },
+  );
+
   const attachmentSchema = new mongoose.Schema(
     {
       user: String,
@@ -289,6 +305,11 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
       terminalCallbackEffectGeneration: { type: Number, default: 0 },
       workerCompletionPresentation: {
         type: workerCompletionPresentationSchema,
+        default: null,
+        immutable: true,
+      },
+      mainGenerationPresentation: {
+        type: mainGenerationPresentationSchema,
         default: null,
         immutable: true,
       },

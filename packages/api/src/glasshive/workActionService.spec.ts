@@ -714,3 +714,55 @@ test('rejects inherited conversation on a non-continuation action', async () => 
   })).rejects.toThrow('inherited_context_action_invalid');
   expect(deps.requestAccountApi).not.toHaveBeenCalled();
 });
+
+test('later native continuation receives current app target references through the existing action bundle', async () => {
+  const base = dependencies();
+  const first = {
+    conversationId: 'conversation-1',
+    messageId: 'source-first',
+    text: 'First original request',
+  };
+  const second = {
+    conversationId: 'conversation-1',
+    messageId: 'source-second',
+    text: 'Later original request',
+  };
+  const prepareActionRuntimeBundle = jest.fn(
+    async ({ requestBody }: { requestBody: Record<string, unknown> }) => ({
+      schedule_access: {
+        destinations: [
+          { destination_id: 'whd-synthetic', request_data: { request_ref: requestBody.messageId } },
+        ],
+        manage_destination_ids: ['whd-synthetic'],
+      },
+    }),
+  );
+  const service = createGlassHiveWorkActionService({ ...base, prepareActionRuntimeBundle });
+  for (const [index, requestBody] of [first, second].entries()) {
+    await service.executeGlassHiveWorkAction({
+      ownerId: 'owner-1',
+      workRef: 'same-worker',
+      action: 'steer',
+      instruction: 'Use the current original conversation',
+      operationId: `operation-${index}`,
+      requestBody,
+    });
+  }
+  const sent = base.requestAccountApi.mock.calls.map(
+    ([input]) => input.body as Record<string, unknown>,
+  );
+  expect(
+    sent.map(
+      (body) =>
+        (
+          body.runtimeBundle as {
+            schedule_access: { destinations: Array<{ request_data: { request_ref: string } }> };
+          }
+        ).schedule_access.destinations[0].request_data.request_ref,
+    ),
+  ).toEqual(['source-first', 'source-second']);
+  expect(prepareActionRuntimeBundle).toHaveBeenLastCalledWith({
+    ownerId: 'owner-1',
+    requestBody: second,
+  });
+});

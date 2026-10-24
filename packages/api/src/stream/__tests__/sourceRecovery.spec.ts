@@ -8,6 +8,7 @@ import {
 } from '../../agents/sourceSelectionContext';
 import { prepareNativeSourceRecovery, nativePredecessorSupersession, nativePredecessorSourceRecovery } from '../../glasshive/nativeSupersession';
 import { normalizeAdapterCapabilities } from '../../agents/interactionContext';
+import { resolveManagedMutationSource } from '../../glasshive/sourceMutation';
 
 /* === VIVENTIUM START === Cancelled foreground ownership moves only after exact release and facts. === */
 const capabilities = { segment_stability: 'immediate', supersede_scope: 'response_only' } as const;
@@ -22,7 +23,9 @@ const context = (source: string, text: string): InteractionContext => ({
 });
 const facts = { effects: [], work: [] };
 
-async function managerLifecycleFixture(cancelledFinal: boolean, committedBeforeSecond = false, fromWeb = false) {
+async function managerLifecycleFixture(cancelledFinal: boolean, committedBeforeSecond = false, fromWeb = false,
+  currentFromWeb = false,
+) {
   const store = new InMemoryJobStore();
   const manager = new GenerationJobManagerClass({ jobStore: store });
   const voice = { segment_stability: 'provisional', supersede_scope: 'response_only' } as const;
@@ -54,9 +57,12 @@ async function managerLifecycleFixture(cancelledFinal: boolean, committedBeforeS
     });
   }
   await manager.createJob('lifecycle-second', 'owner', 'chat', {
-    interactionContext: context('L2', 'Tell me when it is ready.'),
-    adapterCapabilities: voice,
-    deliveryPolicy: { commit_authority: 'external_adapter' },
+    interactionContext: {
+      ...context('L2', 'Tell me when it is ready.'),
+      ...(currentFromWeb ? { surface: 'web' as const } : {}),
+    },
+    adapterCapabilities: currentFromWeb ? normalizeAdapterCapabilities() : voice,
+    deliveryPolicy: { commit_authority: currentFromWeb ? 'server' : 'external_adapter' },
   });
   if (committedBeforeSecond) return { store, manager, voice, native };
   if (!fromWeb) await manager.completeJob(previous.streamId);
@@ -95,6 +101,30 @@ test.each([false, true])('real manager supersession retains both inputs after ol
     await f.manager.destroy();
   }
 });
+
+test.each([false, true])(
+  'a current Web Main recovers unanswered input after exact native cancellation; predecessor Web=%s',
+  async (fromWeb) => {
+    const f = await managerLifecycleFixture(false, false, fromWeb, true);
+    try {
+      const committed = await f.manager.commitLogicalTurnAuthor('lifecycle-second', 'owner');
+      expect(
+        committed?.source_segments?.map(({ source_event_id, authoring_revision }) => ({
+          source_event_id,
+          authoring_revision,
+        })),
+      ).toEqual([
+        { source_event_id: 'L1', authoring_revision: 2 },
+        { source_event_id: 'L2', authoring_revision: 2 },
+      ]);
+      expect(committed?.source_recovery_facts).toEqual(facts);
+      expect(resolveManagedMutationSource(committed!, 'L1')).toBe('L1');
+      expect(await f.store.getNativeResponseCommit(f.native)).toEqual({ status: 'revoked' });
+    } finally {
+      await f.manager.destroy();
+    }
+  },
+);
 
 test('a real same-turn successor preserves a committed answer author without source recovery', async () => {
   const f = await managerLifecycleFixture(false, true);
@@ -194,8 +224,10 @@ test('a cancelled author returns both exact ordered inputs to the successor afte
   );
   await f.manager.destroy();
 });
-test('accepted work retains its durable owner while the unanswered source moves', async () => {
+test.each(['response_only', 'response_and_authoring'] as const)(
+  'accepted work retains its durable owner while unanswered source moves on %s', async (supersede_scope) => {
   const f = await fixture();
+    f.current.adapterCapabilities = { segment_stability: 'immediate', supersede_scope };
   const receipt = {
     effect_kind: 'durable_work_accepted',
     effect_ref: 'existing-work',
@@ -224,6 +256,101 @@ test('accepted work retains its durable owner while the unanswered source moves'
   expect((await f.store.getJob('first'))?.durableEffectReceipts).toEqual([receipt]);
   expect(committed?.source_recovery_facts?.work[0].workRef).toBe('existing-work');
   await f.manager.destroy();
+},
+);
+test('three Web inputs keep exact originals and accepted work when the second reply is removed', async () => {
+  const f = await managerLifecycleFixture(false, false, true, true);
+  try {
+    await f.manager.commitLogicalTurnAuthor('lifecycle-second', 'owner');
+    await f.manager.updateMetadata('lifecycle-second', {
+      responseMessageId: 'second-response',
+      userMessage: { messageId: 'second-source' },
+    });
+    const second = (await f.store.getJob('lifecycle-second'))!;
+    const native = {
+      ...f.native,
+      streamId: second.streamId,
+      jobCreatedAt: second.createdAt,
+      invocationId: 'second-invocation',
+      responseMessageId: 'second-response',
+      revision: 2,
+      source: { ...f.native.source, messageId: 'second-source' },
+    };
+    expect(await f.manager.bindNativeResponse(native)).toBe(true);
+    await f.manager.retainNativeAcceptedSources(native, [
+      { id: 'lifecycle-source', sha256: 'a'.repeat(64) },
+      { id: 'second-source', sha256: 'b'.repeat(64) },
+    ]);
+    const receipt = {
+      effect_kind: 'durable_work_accepted',
+      effect_ref: 'second-work',
+      source_event_id: 'L2',
+      response_message_id: 'second-response',
+      committed_at: 1,
+    } as const;
+    await f.store.updateJob(second.streamId, {
+      durableEffectReceipt: receipt,
+      durableEffectReceipts: [receipt],
+    });
+    const outcomes = {
+      effects: [],
+      work: [
+        {
+          sourceEventId: 'L2',
+          originRef: 'origin',
+          workRef: 'second-work',
+          launchState: 'accepted',
+        },
+      ],
+    };
+    await f.manager.createJob('lifecycle-third', 'owner', 'chat', {
+      interactionContext: { ...context('L3', 'What is eight times seven?'), surface: 'web' },
+      adapterCapabilities: normalizeAdapterCapabilities(),
+      deliveryPolicy: { commit_authority: 'server' },
+    });
+    expect(
+      await f.manager.acknowledgeStreamDelivery(
+        second.streamId,
+        {
+          logical_turn_id: native.logicalTurnId,
+          revision: 2,
+          state: 'partial_removed',
+          presentation_ref: native.responseMessageId,
+        },
+        native,
+      ),
+    ).toMatchObject({ status: 'recorded' });
+    f.manager.setNativeSourceRecovery((current, previous) =>
+      prepareNativeSourceRecovery(current, previous, {
+        beforeCapture: async () => Date.now() + 1000,
+        getJob: (id) => f.store.getJob(id),
+        isUnboundCancelled: (job) => f.store.isNativeResponseUnboundCancelled(job),
+        readFacts: async () => ({ facts: outcomes, pending: false }),
+        sleep: async () => {
+          throw new Error('Unexpected pending proof');
+        },
+      }),
+    );
+    const committed = await f.manager.commitLogicalTurnAuthor('lifecycle-third', 'owner');
+    expect(
+      committed?.source_segments?.map(({ source_event_id, text, authoring_revision }) => ({
+        source_event_id,
+        text,
+        authoring_revision,
+      })),
+    ).toEqual([
+      { source_event_id: 'L1', text: 'Create a synthetic CSV.', authoring_revision: 3 },
+      { source_event_id: 'L2', text: 'Tell me when it is ready.', authoring_revision: 3 },
+      { source_event_id: 'L3', text: 'What is eight times seven?', authoring_revision: 3 },
+    ]);
+    expect(resolveManagedMutationSource(committed!, 'L1')).toBe('L1');
+    expect(committed?.source_recovery_facts).toEqual(outcomes);
+    expect((await f.store.getJob(second.streamId))?.durableEffectReceipts).toEqual([receipt]);
+    expect(await f.store.isCurrentLogicalTurn(second.streamId)).toBe(false);
+    expect(await f.store.getNativeResponseCommit(native)).toEqual({ status: 'revoked' });
+  } finally {
+    await f.manager.destroy();
+  }
 });
 test('an accepted effect for an earlier owned source blocks replay without acquiring current presentation authority', async () => {
   const f = await fixture(); f.manager.setNativeSourceRecovery(async () => facts);
@@ -547,7 +674,7 @@ test.each([
   ['ACK state', { deliveryAcknowledgement: { logical_turn_id: 'turn-1', revision: 1, state: 'failed' } }],
   ['cancellation', { nativeResponseCancelled: false }],
   ['invocation', {}],
-  ['successor scope', {}],
+  ['successor status', {}],
 ] as const)('Web recovery rejects a conflicting %s without reading facts', async (_name, patch) => {
   const f = await fixture();
   f.previous.adapterCapabilities = normalizeAdapterCapabilities();
@@ -556,7 +683,7 @@ test.each([
     f.previous.deliveryAcknowledgement!.logical_turn_id = f.previous.nativeResponse!.logicalTurnId;
   }
   if (_name === 'invocation') f.current.nativePredecessor!.invocationId = 'other-invocation';
-  if (_name === 'successor scope') f.current.adapterCapabilities = normalizeAdapterCapabilities();
+  if (_name === 'successor status') f.current.status = 'complete';
   const readFacts = jest.fn();
   try {
     await expect(prepareNativeSourceRecovery(f.current, f.previous, {

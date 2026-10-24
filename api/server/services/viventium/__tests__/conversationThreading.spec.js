@@ -82,6 +82,109 @@ describe('conversationThreading', () => {
     expect(resolveLatestLeafMessageId(messages)).toBe('assistant-phase2');
   });
 
+  const activeReply = () => [
+    {
+      messageId: 'scheduled-input',
+      parentMessageId: 'prior-answer',
+      createdAt: '2026-03-26T20:00:00.000Z',
+      isCreatedByUser: true,
+      text: 'An immutable scheduled input',
+    },
+    {
+      messageId: 'streaming-answer',
+      parentMessageId: 'scheduled-input',
+      createdAt: '2026-03-26T20:00:01.000Z',
+      isCreatedByUser: false,
+      unfinished: true,
+      text: '',
+    },
+  ];
+
+  const stableParent = async (messages) => {
+    mockGetMessages.mockResolvedValueOnce(messages);
+    const state = await resolveReusableConversationState({
+      conversationId: 'conv-1',
+      userId: 'user-1',
+    });
+    return state.parentMessageId;
+  };
+
+  test('stable parent selection does not capture an unfinished assistant that will change', async () => {
+    const messages = activeReply();
+    const before = JSON.stringify(messages);
+    expect(await stableParent(messages)).toBe('scheduled-input');
+    expect(JSON.stringify(messages)).toBe(before);
+    messages[1].text = 'The final answer';
+    messages[1].unfinished = false;
+    expect(await stableParent(messages)).toBe('streaming-answer');
+  });
+
+  test('default leaf selection still exposes active Main to worker callback ownership', () => {
+    expect(resolveLatestLeafMessageId(activeReply())).toBe('streaming-answer');
+  });
+
+  test('stable parent selection preserves an authored interrupted answer and its replay', async () => {
+    const messages = activeReply();
+    messages[1].text = 'The retained partial answer';
+    messages[1].finish_reason = 'incomplete';
+    expect(await stableParent(messages)).toBe('streaming-answer');
+    expect(await stableParent(messages)).toBe('streaming-answer');
+  });
+
+  test.each([
+    ['unconfirmed cancellation', { nativeResponse: { status: 'cancelled' } }],
+    ['cancellation activity', { content: [{ type: 'harness_activity', status: 'cancelled' }] }],
+    ['length finish', { finish_reason: 'length' }],
+    ['ordinary finish', { finish_reason: 'stop' }],
+  ])('stable parent selection still excludes active %s drafts', async (_label, patch) => {
+    const messages = activeReply();
+    Object.assign(messages[1], patch);
+    expect(await stableParent(messages)).toBe('scheduled-input');
+  });
+
+  test.each([
+    ['unfinished user', { isCreatedByUser: true, unfinished: true }],
+    ['legacy role', { unfinished: true }],
+    ['legacy completion state', { isCreatedByUser: false }],
+  ])('stable parent selection preserves %s records', async (_label, fields) => {
+    const messages = activeReply();
+    messages[1] = {
+      messageId: 'eligible-record',
+      parentMessageId: 'scheduled-input',
+      createdAt: '2026-03-26T20:00:02.000Z',
+      ...fields,
+    };
+    expect(await stableParent(messages)).toBe('eligible-record');
+  });
+
+  test('stable parent fallback cannot return an unfinished assistant', async () => {
+    const messages = activeReply();
+    messages[0].parentMessageId = 'scheduled-input';
+    expect(await stableParent(messages)).toBe('scheduled-input');
+    expect(await stableParent([messages[1]])).toBeNull();
+  });
+
+  test.each(['telegram', 'voice', 'gateway', 'workbench'])(
+    '%s automatic parent selection uses stable evidence without removing active work',
+    async (surface) => {
+      const messages = activeReply();
+      mockGetMessages.mockResolvedValueOnce(messages);
+      const state = await resolveReusableConversationState({
+        conversationId: 'conv-1',
+        userId: 'user-1',
+        surface,
+      });
+      expect(state.parentMessageId).toBe('scheduled-input');
+      expect(state.messages).toBe(messages);
+      expect(state.messages).toContain(messages[1]);
+      expect(mockGetMessages).toHaveBeenCalledTimes(1);
+      expect(mockGetMessages).toHaveBeenCalledWith(
+        { conversationId: 'conv-1' },
+        expect.stringContaining('isCreatedByUser unfinished'),
+      );
+    },
+  );
+
   test('resolveLatestLeafMessageId ignores every passive voice transcript for live replies', () => {
     const messages = [
       {

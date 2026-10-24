@@ -426,6 +426,148 @@ export function rapidInputContract(createStore: () => IJobStore) {
       'b',
     ]);
   });
+  test.each([false, true])(
+    'a failed predecessor stays failed while exact pending goals start fresh; release earlier author=%s',
+    async (releaseEarlierAuthor) => {
+      const first = await store.claimLogicalTurn('a-stream', 'owner', context('a'));
+      await admitAndCommit('a-stream', first);
+      const failed = await store.claimLogicalTurn('b-stream', 'owner', context('b'));
+      await store.updateJob('a-stream', { status: 'superseded' });
+      expect(await store.cancelNativeResponse((await store.getJob('a-stream'))!)).toMatchObject({
+        status: 'revoked',
+      });
+      const acknowledgement = {
+        logical_turn_id: first.interactionContext.logical_turn_id!,
+        revision: first.interactionContext.revision,
+        state: 'failed' as const,
+      };
+      expect(await store.acknowledgeDelivery(acknowledgement)).toMatchObject({
+        status: 'recorded',
+      });
+      expect(
+        await store.bindDeliveryAcknowledgement('a-stream', acknowledgement, null),
+      ).toMatchObject({ status: 'recorded' });
+      expect(await store.rollbackLogicalTurnClaim('b-stream', failed.interactionContext)).toBe(
+        true,
+      );
+      // Rollback cannot turn failed delivery into proof that output was removed.
+      expect(
+        await store.acknowledgeDelivery({
+          ...acknowledgement,
+          state: 'partial_removed',
+        }),
+      ).toMatchObject({ status: 'conflict' });
+      const retry = await store.claimLogicalTurn('c-stream', 'owner', context('c'));
+      expect(retry.supersededStreamIds).toEqual([]);
+      expect(retry.interactionContext.logical_turn_id).not.toBe(
+        first.interactionContext.logical_turn_id,
+      );
+      expect(
+        retry.interactionContext.source_segments?.map((source) => [
+          source.source_event_id,
+          source.authoring_revision,
+        ]),
+      ).toEqual([
+        ['b', 1],
+        ['c', 1],
+      ]);
+      expect((await store.getJob('a-stream'))?.nativeResponseCancelled).toBe(true);
+      expect((await store.getJob('a-stream'))?.deliveryAcknowledgement?.state).toBe('failed');
+      expect((await store.getJob('a-stream'))?.interactionContext?.source_event_id).toBe('a');
+      if (releaseEarlierAuthor) {
+        await store.relinquishLogicalTurnAuthor!('a-stream', 'owner', first.interactionContext);
+      }
+      const committed = await admitAndCommit('c-stream', retry);
+      expect(owned(committed).map((source) => source[1])).toEqual(['b', 'c']);
+    },
+  );
+  test('a committed predecessor starts a fresh turn after a rolled-back admission without replaying its old goal', async () => {
+    const first = await store.claimLogicalTurn('a-stream', 'owner', context('a'));
+    await admitAndCommit('a-stream', first);
+    const candidate = await store.claimLogicalTurn('b-stream', 'owner', context('b'));
+    expect(await store.rollbackLogicalTurnClaim('b-stream', candidate.interactionContext)).toBe(
+      true,
+    );
+    expect(
+      await store.acknowledgeDelivery({
+        logical_turn_id: first.interactionContext.logical_turn_id!,
+        revision: first.interactionContext.revision,
+        state: 'committed',
+      }),
+    ).toMatchObject({ status: 'recorded' });
+    const retry = await store.claimLogicalTurn('c-stream', 'owner', context('c'));
+    expect(retry.supersededStreamIds).toEqual([]);
+    expect(retry.interactionContext.logical_turn_id).not.toBe(
+      first.interactionContext.logical_turn_id,
+    );
+    expect(
+      retry.interactionContext.source_segments?.map((source) => source.source_event_id),
+    ).toEqual(['b', 'c']);
+    expect(owned(await admitAndCommit('c-stream', retry)).map((source) => source[1])).toEqual([
+      'b',
+      'c',
+    ]);
+  });
+  test.each([undefined, 'partial_removed'] as const)(
+    'rollback retains the failed admission without changing a nonterminal predecessor; acknowledgement=%s',
+    async (state) => {
+      const first = await store.claimLogicalTurn('a-stream', 'owner', context('a'));
+      await admitAndCommit('a-stream', first);
+      const failed = await store.claimLogicalTurn('b-stream', 'owner', context('b'));
+      if (state) {
+        expect(
+          await store.acknowledgeDelivery({
+            logical_turn_id: first.interactionContext.logical_turn_id!,
+            revision: first.interactionContext.revision,
+            state,
+          }),
+        ).toMatchObject({ status: 'recorded' });
+      }
+      expect(await store.rollbackLogicalTurnClaim('b-stream', failed.interactionContext)).toBe(
+        true,
+      );
+      const retry = await store.claimLogicalTurn('c-stream', 'owner', context('c'));
+      expect(retry.supersededStreamIds).toEqual(['a-stream']);
+      expect(retry.interactionContext.logical_turn_id).toBe(
+        first.interactionContext.logical_turn_id,
+      );
+      expect(
+        retry.interactionContext.source_segments?.map((source) => source.source_event_id),
+      ).toEqual(['a', 'b', 'c']);
+      expect(owned(await admitAndCommit('c-stream', retry)).map((source) => source[1])).toEqual([
+        'b',
+        'c',
+      ]);
+    },
+  );
+  test.each([false, true])(
+    'rollback of a removed candidate is allowed only before its source-author commit; committed=%s',
+    async (committed) => {
+      const first = await store.claimLogicalTurn('a-stream', 'owner', context('a'));
+      await admitAndCommit('a-stream', first);
+      const candidate = await store.claimLogicalTurn('b-stream', 'owner', context('b'));
+      await store.createJob('b-stream', 'owner', 'conversation', {
+        interactionContext: candidate.interactionContext,
+      });
+      if (committed) {
+        await store.commitLogicalTurnAdmission!('b-stream', 'owner', candidate.interactionContext);
+      }
+      await store.deleteJob('b-stream');
+      expect(await store.rollbackLogicalTurnClaim('b-stream', candidate.interactionContext)).toBe(
+        !committed,
+      );
+      if (!committed) {
+        const retry = await store.claimLogicalTurn('c-stream', 'owner', context('c'));
+        expect(
+          retry.interactionContext.source_segments?.map((source) => source.source_event_id),
+        ).toEqual(['a', 'b', 'c']);
+        expect(owned(await admitAndCommit('c-stream', retry)).map((source) => source[1])).toEqual([
+          'b',
+          'c',
+        ]);
+      }
+    },
+  );
   /* === VIVENTIUM START ===
    * Feature: Exact cancelled Main source-author reconciliation.
    * Purpose: A revoked Main cannot keep unresolved input, while other owners and committed work
@@ -438,6 +580,17 @@ export function rapidInputContract(createStore: () => IJobStore) {
       cleanupOnComplete: false,
     });
     await manager.initialize();
+    manager.setNativeSourceRecovery((current, previous) =>
+        prepareNativeSourceRecovery(current, previous, {
+          beforeCapture: async () => Date.now() + 1000,
+        isUnboundCancelled: (job) => store.isNativeResponseUnboundCancelled!(job),
+        getJob: (id) => store.getJob(id),
+        readFacts: async () => ({ facts: { effects: [], work: [] }, pending: false }),
+          sleep: async () => {
+            throw new Error('Unexpected pending source proof');
+        },
+      }),
+    );
     try {
       const first = await manager.createJob('a-stream', 'owner', 'conversation', {
         interactionContext: quoted('a', 1),
@@ -492,6 +645,54 @@ export function rapidInputContract(createStore: () => IJobStore) {
         status: 'superseded',
         nativeResponseCancelled: true,
       });
+    } finally {
+      await manager.destroy();
+    }
+  });
+  test('manager source-recovery failure returns its created job input for a normal retry', async () => {
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    await manager.initialize();
+    let rejectNextCapture = true;
+    manager.setNativeSourceRecovery((current, previous) => {
+      if (rejectNextCapture) {
+        rejectNextCapture = false;
+        return Promise.reject(new Error('synthetic_source_capture_failure'));
+      }
+      return prepareNativeSourceRecovery(current, previous, {
+        beforeCapture: async () => Date.now() + 1000,
+        isUnboundCancelled: (job) => store.isNativeResponseUnboundCancelled!(job),
+        getJob: (id) => store.getJob(id),
+        readFacts: async () => ({ facts: { effects: [], work: [] }, pending: false }),
+        sleep: async () => {
+          throw new Error('Unexpected pending source proof');
+        },
+      });
+    });
+    try {
+      await manager.createJob('a-stream', 'owner', 'conversation', {
+        interactionContext: context('a'),
+        adapterCapabilities: telegramCapabilities,
+      });
+      const first = await manager.commitLogicalTurnAuthor('a-stream', 'owner');
+      await manager.createJob('b-stream', 'owner', 'conversation', {
+        interactionContext: context('b'),
+        adapterCapabilities: telegramCapabilities,
+      });
+      await expect(manager.commitLogicalTurnAuthor('b-stream', 'owner')).rejects.toThrow(
+        'synthetic_source_capture_failure',
+      );
+      expect(await store.getJob('b-stream')).toBeNull();
+      await manager.createJob('c-stream', 'owner', 'conversation', {
+        interactionContext: context('c'),
+        adapterCapabilities: telegramCapabilities,
+      });
+      const committed = await manager.commitLogicalTurnAuthor('c-stream', 'owner');
+      expect(committed?.logical_turn_id).toBe(first?.logical_turn_id);
+      expect(owned(committed!).map((source) => source[1])).toEqual(['a', 'b', 'c']);
     } finally {
       await manager.destroy();
     }

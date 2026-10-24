@@ -1233,6 +1233,57 @@ describe('native response binding and recovery', () => {
     expect(admit).toHaveBeenCalledTimes(1);
     expect(send).not.toHaveBeenCalled();
   });
+  it.each(['current', 'superseded', 'release_refused', 'foreign_producer'])(
+    'prepares an admitted prior invocation before the successor dispatch gate: %s',
+    async (mode) => {
+      const d = deps();
+      const order: string[] = [];
+      d.isCurrent.mockResolvedValue(mode !== 'superseded');
+      d.release.mockImplementation(async () => {
+        order.push('release-prior');
+        return mode !== 'release_refused';
+      });
+      const service = createNativeResponseRecoveryService(d);
+      const send = jest.fn(async () => {
+        order.push('send');
+        return new Response('{}');
+      });
+      const wrapped = createNativeResponseFetch(
+        send,
+        async () => context,
+        service.admit,
+        jest.fn(),
+        {
+          beforeDispatch: async () => {
+            order.push('dispatch-gate');
+            // This is the production lease rule: an admitted invocation cannot renew a pre-dispatch lease.
+            if (!d.release.mock.calls.length) throw new Error('admitted_binding_blocks_lease');
+          },
+          whileOccupied: async () => true,
+          isCurrent: async () => mode === 'current',
+        },
+        undefined,
+        (next) =>
+          service.prepareInvocation(
+            next,
+            mode === 'foreign_producer'
+              ? { ...identity, invocationId: 'foreign-producer' }
+              : identity,
+          ),
+      );
+      const request = wrapped('http://native.test/v1/chat/completions', { body: '{}' });
+      if (mode === 'current') {
+        await expect(request).resolves.toBeInstanceOf(Response);
+        expect(order).toEqual(['release-prior', 'dispatch-gate', 'send']);
+        expect(d.revoke).toHaveBeenCalledWith(expect.objectContaining(identity));
+        expect(send).toHaveBeenCalledTimes(1);
+      } else {
+        await expect(request).rejects.toThrow();
+        expect(send).not.toHaveBeenCalled();
+        expect(order).not.toContain('dispatch-gate');
+      }
+    },
+  );
   it('continues a later invocation of the current revision unbound after a rejected admission', async () => {
     const send = jest.fn<ReturnType<MainContinuityFetch>, Parameters<MainContinuityFetch>>(
       async () => new Response('{}'),
@@ -1594,6 +1645,14 @@ describe('native response binding and recovery', () => {
       'revoked',
     );
     expect(send).not.toHaveBeenCalled();
+  });
+  it('does not require an existing admitted identity for a first dispatch', async () => {
+    const d = deps();
+    d.db.getNativeResponse.mockResolvedValue(null);
+    d.isCurrent.mockResolvedValue(false);
+    expect(await createNativeResponseRecoveryService(d).admit(identity)).toBe(true);
+    expect(d.isCurrent).not.toHaveBeenCalled();
+    expect(d.bind).toHaveBeenCalledTimes(2);
   });
   it('persists Mongo admission between both original-job bind fences', async () => {
     const d = deps();

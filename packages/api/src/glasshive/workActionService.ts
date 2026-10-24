@@ -61,6 +61,10 @@ export interface GlassHiveWorkActionDependencies {
   invalidateActiveWorkSnapshot(input: UnknownRecord): unknown;
   requestAccountApi(input: UnknownRecord): Promise<unknown>;
   getActionFileSources?(input: GlassHiveWorkActionInput): Promise<ActionFileSource[]>;
+  prepareActionRuntimeBundle?(input: {
+    ownerId: string;
+    requestBody: UnknownRecord;
+  }): Promise<UnknownRecord | undefined>;
   fetchImpl?: typeof globalThis.fetch;
   reauthorizeCapabilityAuthorization(input: UnknownRecord): Promise<unknown>;
   readCapabilityReauthorizationReceiptCandidate?(input: UnknownRecord): Promise<unknown>;
@@ -429,8 +433,17 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     if (input.inheritedConversation && !RUN_PRODUCING_ACTIONS.has(action)) {
       throw new Error('inherited_context_action_invalid');
     }
+    const runtimeBundle =
+      input.requestBody && (RUN_PRODUCING_ACTIONS.has(action) || action === 'resume')
+        ? await deps.prepareActionRuntimeBundle?.({
+            ownerId: normalizedText(ownerId),
+            requestBody: input.requestBody,
+          })
+        : undefined;
+    await assertCurrentVoiceAuthority();
     const actionBody = {
         action,
+      ...(runtimeBundle ? { runtimeBundle } : {}),
         ...(instruction ? { instruction } : {}),
         idempotencyKey,
         ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),

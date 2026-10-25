@@ -440,7 +440,8 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
     },
     async defer(ownerId: string, claim: TelegramInputClaim) {
       const record = await exact(ownerId, claim);
-      if (record.state !== 'ready') throw inputConflict('source_input_not_ready');
+      if (!['preparing', 'ready'].includes(record.state))
+        throw inputConflict('source_input_not_ready');
       return replace(record, { leaseUntil: 0, retryAt: now() + RETRY_MS });
     },
     async status(
@@ -477,7 +478,12 @@ export function createTelegramInputService(deps: TelegramInputDependencies) {
       }
       const record = await exact(ownerId, claim);
       if (['completed', 'cancelled'].includes(record.state)) return record;
-      if (state === 'renew' && record.state === 'ready' && record.leaseUntil === 0) return record;
+      if (
+        state === 'renew' &&
+        ['preparing', 'ready'].includes(record.state) &&
+        record.leaseUntil === 0
+      )
+        return record;
       if (state === 'renew')
         return replace(record, { leaseUntil: now() + TELEGRAM_INPUT_LEASE_MS });
       if (record.state === 'admitted') throw inputConflict('source_input_already_admitted');

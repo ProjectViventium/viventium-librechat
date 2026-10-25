@@ -1,6 +1,6 @@
 import IoRedis from 'ioredis';
 import type { StandardGraph } from '@librechat/agents';
-import type { Redis } from 'ioredis';
+import type { Redis, Command } from 'ioredis';
 import type { SerializableJobData } from '../interfaces/IJobStore';
 import { RedisJobStore } from '../implementations/RedisJobStore';
 
@@ -20,8 +20,12 @@ describe('RedisJobStore job serialization', () => {
       viventiumVoiceTaskId: 'voice-task',
       viventiumVoiceEffectAuthority: { version: 1, mode: 'call', source: 'synthetic' },
       viventiumVoiceWorkAuthority: {
-        version: 1, callSessionId: 'voice-call', userId: 'voice-owner',
-        kind: 'participant_text', fingerprint: 'a'.repeat(64), turnIds: [],
+        version: 1,
+        callSessionId: 'voice-call',
+        userId: 'voice-owner',
+        kind: 'participant_text',
+        fingerprint: 'a'.repeat(64),
+        turnIds: [],
       },
     };
     const restored = codec.deserializeJob(
@@ -49,20 +53,26 @@ describe('RedisJobStore job serialization', () => {
       committed_at: 1_725_000_000_001,
     };
     const sibling = { ...receipt, effect_ref: 'worker-b' };
-    const restored = codec.deserializeJob(codec.serializeJob({
-      streamId: 'effect-stream',
-      userId: 'effect-owner',
-      createdAt: 1,
-      status: 'superseded',
-      durableEffectReceipt: receipt,
-      durableEffectReceipts: [receipt, sibling],
-    }));
+    const restored = codec.deserializeJob(
+      codec.serializeJob({
+        streamId: 'effect-stream',
+        userId: 'effect-owner',
+        createdAt: 1,
+        status: 'superseded',
+        durableEffectReceipt: receipt,
+        durableEffectReceipts: [receipt, sibling],
+      }),
+    );
     expect(restored.durableEffectReceipt).toEqual(receipt);
     expect(restored.durableEffectReceipts).toEqual([receipt, sibling]);
   });
   it('uses Redis TIME and co-slotted TTL fencing for durable source-order observation', async () => {
     const redis = {
-      eval: jest.fn().mockResolvedValue(['12347', '1725000000123', '1']),
+      options: {},
+      sendCommand: jest.fn((command: Command) => {
+        command.resolve(['12347', '1725000000123', '1']);
+        return command.promise;
+      }),
     };
     const store = new RedisJobStore(redis as unknown as Redis, {
       sourceOrderTtl: 11,
@@ -81,15 +91,82 @@ describe('RedisJobStore job serialization', () => {
     });
 
     const [script, keyCount, sourceKey, logicalKey, sequence, sourceTtl, runningTtl] =
-      redis.eval.mock.calls[0];
+      redis.sendCommand.mock.calls[0][0].args;
     expect(store.sourceOrderDurability).toBe('durable');
     expect(script).toContain("redis.call('TIME')");
     expect(script).toContain("redis.call('EXPIRE', KEYS[1], target_ttl)");
-    expect(keyCount).toBe(2);
+    expect(keyCount).toBe('2');
     expect(sourceKey).toMatch(/^stream:source-order:\{[a-f0-9]{64}\}$/);
     expect(logicalKey).toMatch(/^stream:logical:\{[a-f0-9]{64}\}$/);
     expect(sourceKey.match(/\{([^}]+)\}/)?.[1]).toBe(logicalKey.match(/\{([^}]+)\}/)?.[1]);
-    expect([sequence, sourceTtl, runningTtl]).toEqual([12346, 11, 22]);
+    expect([sequence, sourceTtl, runningTtl]).toEqual(['12346', '11', '22']);
+  });
+
+  it.each([false, true])(
+    'native source-order command preserves the configured key prefix and hash slot; cluster=%s',
+    async (isCluster) => {
+      const redis = {
+        isCluster,
+        options: { keyPrefix: 'instance-fixture::' },
+        sendCommand: jest.fn((command: Command) => {
+          command.resolve(['2', '1725000000123', '0']);
+          return command.promise;
+        }),
+      };
+      const store = new RedisJobStore(redis as unknown as Redis);
+      await store.observeSourceOrder({ source_order_scope: 'b'.repeat(64), source_sequence: 2 });
+      const command = redis.sendCommand.mock.calls[0][0];
+      expect(command.name).toBe('eval');
+      expect(command.getKeys()).toHaveLength(2);
+      expect(command.getKeys().every((key) => String(key).startsWith('instance-fixture::'))).toBe(
+        true,
+      );
+      const [source, logical] = command.getKeys().map(String);
+      expect(source.match(/\{([^}]+)\}/)?.[1]).toBe(logical.match(/\{([^}]+)\}/)?.[1]);
+    },
+  );
+
+  it('native source-order default expires at five seconds without changing the client timeout', async () => {
+    jest.useFakeTimers();
+    try {
+      const redis = { options: {}, sendCommand: (command: Command) => command.promise };
+      let failure: Error | undefined;
+      const pending = new RedisJobStore(redis as unknown as Redis)
+        .observeSourceOrder({
+          source_order_scope: 'c'.repeat(64),
+          source_sequence: 1,
+        })
+        .catch((error: Error) => {
+          failure = error;
+        });
+      await jest.advanceTimersByTimeAsync(4999);
+      expect(failure).toBeUndefined();
+      await jest.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(failure?.message).toBe('Command timed out');
+      expect(redis.options).toEqual({});
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('native source-order command keeps the original Redis error', async () => {
+    const failure = Object.assign(new Error('Synthetic Redis refusal'), {
+      code: 'SYNTHETIC_REFUSAL',
+    });
+    const redis = {
+      options: {},
+      sendCommand: (command: Command) => {
+        command.reject(failure);
+        return command.promise;
+      },
+    };
+    await expect(
+      new RedisJobStore(redis as unknown as Redis).observeSourceOrder({
+        source_order_scope: 'c'.repeat(64),
+        source_sequence: 1,
+      }),
+    ).rejects.toBe(failure);
   });
 
   it('round-trips the client presentation receipt', () => {

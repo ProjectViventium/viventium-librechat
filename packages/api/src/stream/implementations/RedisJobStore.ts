@@ -23,6 +23,7 @@ import { createContentAggregator } from '@librechat/agents';
 import { retainAggregatedDeliveryDisposition } from '../../channels/deliveryDisposition';
 import type { StandardGraph } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
+import { Command } from 'ioredis';
 import type { Redis, Cluster } from 'ioredis';
 import type {
   SerializableJobData,
@@ -298,12 +299,15 @@ export interface RedisJobStoreOptions {
   runStepsAfterCompleteTtl?: number;
   /** TTL for inactive source-order watermarks in seconds (default: 300). */
   sourceOrderTtl?: number;
+  /** Bound only the idempotent source watermark command (default: 5000 ms). */
+  sourceOrderTimeoutMs?: number;
 }
 
 export class RedisJobStore implements IJobStore {
   readonly sourceOrderDurability = 'durable' as const;
 
   private redis: Redis | Cluster;
+  private readonly sourceOrderTimeoutMs: number;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private ttl: typeof DEFAULT_TTL;
 
@@ -335,6 +339,7 @@ export class RedisJobStore implements IJobStore {
 
   constructor(redis: Redis | Cluster, options?: RedisJobStoreOptions) {
     this.redis = redis;
+    this.sourceOrderTimeoutMs = Math.max(1, options?.sourceOrderTimeoutMs ?? 5000);
     this.ttl = {
       completed: options?.completedTtl ?? DEFAULT_TTL.completed,
       running: options?.runningTtl ?? DEFAULT_TTL.running,
@@ -715,8 +720,12 @@ export class RedisJobStore implements IJobStore {
   async observeSourceOrder(
     observation: SourceOrderObservation,
   ): Promise<SourceOrderObservationResult> {
-    const result = (await this.redis.eval(
-      `local requested = tonumber(ARGV[1])
+    // Native command timeout rejects this caller without a generic write race. A delayed
+    // watermark EVAL is monotonic and idempotent; it cannot admit work or rewind a newer source.
+    const command = new Command(
+      'eval',
+      [
+        `local requested = tonumber(ARGV[1])
        local current = tonumber(redis.call('HGET', KEYS[1], 'latestSourceSequence') or '-1')
        local observed_at = redis.call('HGET', KEYS[1], 'sourceOrderObservedAt') or ''
        local stale = current > requested
@@ -740,13 +749,17 @@ export class RedisJobStore implements IJobStore {
          redis.call('EXPIRE', KEYS[1], target_ttl)
        end
        return {tostring(current), observed_at, stale and '1' or '0'}`,
-      2,
-      KEYS.sourceOrder(observation.source_order_scope),
-      KEYS.logicalTurnFromSourceOrderScope(observation.source_order_scope),
-      observation.source_sequence,
-      this.ttl.sourceOrder,
-      this.ttl.running,
-    )) as [string, string, string];
+        2,
+        KEYS.sourceOrder(observation.source_order_scope),
+        KEYS.logicalTurnFromSourceOrderScope(observation.source_order_scope),
+        observation.source_sequence,
+        this.ttl.sourceOrder,
+        this.ttl.running,
+      ],
+      { keyPrefix: this.redis.options?.keyPrefix, replyEncoding: 'utf8' },
+    );
+    command.setTimeout(this.sourceOrderTimeoutMs);
+    const result = (await this.redis.sendCommand(command)) as [string, string, string];
     return {
       latest_source_sequence: Number(result[0]),
       observed_at: Number(result[1]),
@@ -2013,11 +2026,13 @@ export class RedisJobStore implements IJobStore {
       if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
       if ARGV[3] ~= '' and redis.call('HGET', KEYS[1], 'nativeResponse') ~= ARGV[3] then return 0 end
       local native = redis.call('HEXISTS', KEYS[1], 'nativeResponse') == 1
+      local cancelled = redis.call('HGET', KEYS[1], 'nativeResponseCancelled') == '1'
       local finished = redis.call('HGET', KEYS[1], 'nativeResponseFinished') == '1'
-      local protected = {createdAt=true, userId=true, streamId=true, conversationId=true, responseMessageId=true, userMessage=true, interactionContext=true, finalEvent=true, generationCompleted=true}
+      -- A late onStart cannot invalidate an unbound cancellation's exact proof.
+      local identity = {createdAt=true, userId=true, streamId=true, conversationId=true, responseMessageId=true, userMessage=true, interactionContext=true}
       for index = 4, #ARGV, 2 do
         local field = ARGV[index]
-        if not (native and (protected[field] or (finished and (field == 'status' or field == 'error' or field == 'errorClass' or field == 'completedAt')))) then
+        if not (((native or cancelled) and identity[field]) or (native and (field == 'finalEvent' or field == 'generationCompleted' or (finished and (field == 'status' or field == 'error' or field == 'errorClass' or field == 'completedAt'))))) then
           redis.call('HSET', KEYS[1], field, ARGV[index+1])
         end
       end

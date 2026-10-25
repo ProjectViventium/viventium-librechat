@@ -47,6 +47,20 @@
 </p>
 
 
+<!-- VIVENTIUM START: describe this fork's retained Telegram intake contract. -->
+## Viventium channel recovery
+
+This fork retains authenticated Telegram input before waiting for its durable ordering service.
+If ordering is unavailable, the saved input stays in the existing recovery queue; it cannot enter
+Main until ordering is available. Recovery prepares earlier inputs before admitting a later one.
+The Telegram adapter can show a saved-message notice from the returned receipt without asking the
+user to repeat accepted work.
+
+The ordering command has a five-second deadline. Durable Redis streams keep reconnecting by
+default; cache-only connections keep their existing limit, and an explicit operator limit takes
+precedence. See the [fork changelog](viventium/CHANGELOG.md) for the scope and limits.
+<!-- VIVENTIUM END -->
+
 # ✨ Features
 
 - 🖥️ **UI & Experience** inspired by ChatGPT with enhanced design and features

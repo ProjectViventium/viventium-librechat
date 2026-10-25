@@ -1103,6 +1103,7 @@ router.post('/source-order', telegramAuth, async (req, res) => {
   ) {
     return res.status(400).json({ observed: false, error: 'invalid_source_order' });
   }
+  let inputReceipt;
   try {
     const capabilities = GenerationJobManager.getSourceOrderCapabilities();
     if (capabilities.replica_safe !== true) {
@@ -1119,18 +1120,22 @@ router.post('/source-order', telegramAuth, async (req, res) => {
         });
       }
     }
-    const result = await GenerationJobManager.observeSourceOrder({
-      source_order_scope: sourceOrderScope,
-      source_sequence: sourceSequence,
-    });
-    let inputReceipt;
-    if (req.body?.input) {
+    // Retain an authenticated input before the ordering dependency can stall. The existing
+    // preparation lease recovers it; /chat still requires source authority before admission.
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'input')) {
       const input = req.body.input;
       if (
+        !input ||
+        typeof input !== 'object' ||
+        Array.isArray(input) ||
         !/^[a-f0-9]{64}$/.test(String(input.conversationGeneration || '')) ||
         !/^[a-f0-9-]{36}$/.test(String(input.preparationId || '')) ||
         typeof input.text !== 'string' ||
         !input.preparation ||
+        typeof input.preparation !== 'object' ||
+        Array.isArray(input.preparation) ||
+        input.preparation.version !== 1 ||
+        Number(input.preparation.message?.message_id) !== sourceSequence ||
         Buffer.byteLength(JSON.stringify(input.preparation), 'utf8') > 64 * 1024
       ) {
         return res.status(400).json({ error: 'invalid_source_input' });
@@ -1239,6 +1244,10 @@ router.post('/source-order', telegramAuth, async (req, res) => {
         ...(claimed ? { claimToken: record.claimToken, leaseUntil: record.leaseUntil } : {}),
       };
     }
+    const result = await GenerationJobManager.observeSourceOrder({
+      source_order_scope: sourceOrderScope,
+      source_sequence: sourceSequence,
+    });
     return res.json({
       ...(inputReceipt ? { input: inputReceipt } : {}),
       observed: true,
@@ -1254,7 +1263,33 @@ router.post('/source-order', telegramAuth, async (req, res) => {
     logger.error('[VIVENTIUM][telegram/source-order] Observation failed', {
       error: error?.name || 'Error',
     });
-    return res.status(503).json({ observed: false, error: 'source_order_unavailable' });
+    if (inputReceipt?.claimed === true && inputReceipt.state === 'preparing') {
+      try {
+        const deferred = await TelegramInput.defer(req.user.id, {
+          sourceEventId: inputReceipt.sourceEventId,
+          claimToken: inputReceipt.claimToken,
+        });
+        if (deferred.state === 'preparing' && deferred.leaseUntil === 0) {
+          const { claimToken: _claimToken, ...retainedReceipt } = inputReceipt;
+          inputReceipt = {
+            ...retainedReceipt,
+            state: deferred.state,
+            claimed: false,
+            leaseUntil: 0,
+          };
+        }
+      } catch (deferError) {
+        // Preserve the original unavailable result; its owned lease remains recoverable.
+        logger.error('[VIVENTIUM][telegram/source-order] Preparation defer failed', {
+          error: deferError?.name || 'Error',
+        });
+      }
+    }
+    return res.status(503).json({
+      observed: false,
+      error: 'source_order_unavailable',
+      ...(inputReceipt ? { input: inputReceipt } : {}),
+    });
   }
 });
 
@@ -1284,20 +1319,6 @@ router.post('/inputs/status', telegramAuth, async (req, res, next) => {
     next(error);
   }
 });
-
-/* === VIVENTIUM START ===
- * Fix: source-ordered turn membership. Bounded like Main's input-persistence wait; an earlier input
- * that fails, is cancelled, or loses its lease stops holding the newer one.
- */
-async function waitForEarlierTelegramInputs(record, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (await TelegramInput.hasEarlierPreparingInput(record)) {
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return true;
-}
-/* === VIVENTIUM END === */
 
 /* === VIVENTIUM START ===
  * Feature: Telegram reply provenance at admission.
@@ -1708,18 +1729,25 @@ router.post(
         .lean();
       retainedSourceParent = source?.parentMessageId;
       const originalParent = source?.metadata?.viventium?.telegramInput?.originalParentMessageId;
-      if (typeof originalParent === 'string' && originalParent) {
-        parentMessageId = originalParent;
+      // Current persisted ancestry owns the source; the intake hint cannot rewind an authored chain.
+      const sourceParent =
+        typeof retainedSourceParent === 'string' &&
+        retainedSourceParent &&
+        retainedSourceParent !== retainedInput.sourceMessageId
+          ? retainedSourceParent
+          : originalParent;
+      if (typeof sourceParent === 'string' && sourceParent) {
+        parentMessageId = sourceParent;
         if (
           retainedInput.state === 'ready' &&
           !recoveredStreamId &&
-          originalParent !== Constants.NO_PARENT &&
-          !conversationState.messages.some((message) => message.messageId === originalParent)
+          sourceParent !== Constants.NO_PARENT &&
+          !conversationState.messages.some((message) => message.messageId === sourceParent)
         ) {
           const rows = await Message.find({ user: req.user.id, conversationId })
             .select('messageId parentMessageId user conversationId deletedAt')
             .lean();
-          const original = rows.find((message) => message.messageId === originalParent);
+          const original = rows.find((message) => message.messageId === sourceParent);
           if (!original || original.deletedAt != null) {
             const currentParent = rows.find(
               (message) => message.messageId === retainedSourceParent,
@@ -1923,12 +1951,10 @@ router.post(
       // A recovered admitted input keeps its admitted, already-prepared source unchanged.
       if (!recoveredStreamId) {
         /* === VIVENTIUM START ===
-         * Fix: source-ordered turn membership. A fresh input first lets an earlier input of this
-         * conversation finish preparing, then joins the logical turn before it stops preparing, so
-         * a newer input's claim always merges it in source order.
+         * Fix: retain each source before marking preparation ready. Recovering sources prepare
+         * independently; Main waits through the existing pending receipt, never a timed sleep.
          */
         if (retainedInput.state === 'preparing') {
-          await waitForEarlierTelegramInputs(retainedInput);
           await GenerationJobManager.retainLogicalTurnInput(
             req.user.id,
             bindInteractionSourceSegments(req, text, uploadedFiles, {
@@ -1982,6 +2008,9 @@ router.post(
             error: 'This attachment group was not accepted. Please resend the whole group.',
           });
         }
+      }
+      if (!recoveredStreamId && (await TelegramInput.hasEarlierPreparingInput(retainedInput))) {
+        req._viventiumTelegramInputSettlement = 'defer';
       }
       const observation = await GenerationJobManager.observeSourceOrder({
         source_order_scope: sourceOrderScope,

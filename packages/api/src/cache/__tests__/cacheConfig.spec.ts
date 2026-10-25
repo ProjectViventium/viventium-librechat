@@ -14,6 +14,7 @@ describe('cacheConfig', () => {
     delete process.env.USE_REDIS_STREAMS;
     delete process.env.USE_REDIS_CLUSTER;
     delete process.env.REDIS_PING_INTERVAL;
+    delete process.env.REDIS_RETRY_MAX_ATTEMPTS;
     delete process.env.FORCED_IN_MEMORY_CACHE_NAMESPACES;
 
     // Clear module cache
@@ -195,6 +196,33 @@ describe('cacheConfig', () => {
       expect(cacheConfig.USE_REDIS_STREAMS).toBe(true);
     });
   });
+
+  // VIVENTIUM START: durable stream connections recover after prolonged dependency outages.
+  describe('Redis connection recovery defaults', () => {
+    test('durable streams keep reconnecting when no limit is configured', async () => {
+      process.env.USE_REDIS = 'true';
+      process.env.REDIS_URI = 'redis://localhost:6379';
+      const { cacheConfig } = await import('../cacheConfig');
+      expect(cacheConfig.REDIS_RETRY_MAX_ATTEMPTS).toBe(0);
+    });
+
+    test('cache-only connections retain the upstream default', async () => {
+      process.env.USE_REDIS = 'true';
+      process.env.USE_REDIS_STREAMS = 'false';
+      process.env.REDIS_URI = 'redis://localhost:6379';
+      const { cacheConfig } = await import('../cacheConfig');
+      expect(cacheConfig.REDIS_RETRY_MAX_ATTEMPTS).toBe(10);
+    });
+
+    test.each(['2', '0'])('preserves an explicit reconnect limit of %s', async (limit) => {
+      process.env.USE_REDIS = 'true';
+      process.env.REDIS_URI = 'redis://localhost:6379';
+      process.env.REDIS_RETRY_MAX_ATTEMPTS = limit;
+      const { cacheConfig } = await import('../cacheConfig');
+      expect(cacheConfig.REDIS_RETRY_MAX_ATTEMPTS).toBe(Number(limit));
+    });
+  });
+  // VIVENTIUM END
 
   describe('REDIS_CA file reading', () => {
     test('should be null when REDIS_CA is not set', async () => {

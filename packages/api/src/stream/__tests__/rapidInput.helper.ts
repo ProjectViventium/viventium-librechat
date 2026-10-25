@@ -651,6 +651,76 @@ export function rapidInputContract(createStore: () => IJobStore) {
       await manager.destroy();
     }
   });
+  test('cancelled pre-native identity survives late onStart metadata while its successor recovers every source', async () => {
+    const manager = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: new InMemoryEventTransport(),
+      cleanupOnComplete: false,
+    });
+    await manager.initialize();
+    manager.setNativeSourceRecovery((current, previous) =>
+      prepareNativeSourceRecovery(current, previous, {
+        beforeCapture: async () => Date.now() + 1000,
+        isUnboundCancelled: (job) => store.isNativeResponseUnboundCancelled!(job),
+        getJob: (id) => store.getJob(id),
+        readFacts: async () => {
+          // onStart may finish after the previous request was superseded but before the
+          // successor commits. Terminal bookkeeping still belongs to that old job.
+          await store.updateJob(previous.streamId, {
+            responseMessageId: 'late-old-response',
+            userMessage: { messageId: 'late-old-input' },
+            generationCompleted: true,
+            finalEvent: JSON.stringify({ final: true, superseded: true }),
+          });
+          return { facts: { effects: [], work: [] }, pending: false };
+        },
+        sleep: async () => {
+          throw new Error('Unexpected pending source proof');
+        },
+      }),
+    );
+    try {
+      await manager.createJob('a-stream', 'owner', 'conversation', {
+        interactionContext: quoted('a', 1),
+        adapterCapabilities: telegramCapabilities,
+      });
+      await manager.commitLogicalTurnAuthor('a-stream', 'owner');
+      await manager.createJob('b-stream', 'owner', 'conversation', {
+        interactionContext: context('b', 2),
+        adapterCapabilities: telegramCapabilities,
+      });
+      const cancelled = structuredClone((await store.getJob('a-stream'))!);
+      expect(await store.isNativeResponseUnboundCancelled!(cancelled)).toBe(true);
+      const committed = await manager.commitLogicalTurnAuthor('b-stream', 'owner');
+      expect(owned(committed!)).toEqual([
+        [1, 'a', 'Willow 427 / Elm 441'],
+        [2, 'b', null],
+      ]);
+      const stopped = (await store.getJob('a-stream'))!;
+      expect(stopped.responseMessageId).toBe(cancelled.responseMessageId);
+      expect(stopped.userMessage).toEqual(cancelled.userMessage);
+      expect(stopped.interactionContext).toEqual(cancelled.interactionContext);
+      expect(stopped.generationCompleted).toBe(true);
+      expect(JSON.parse(stopped.finalEvent!)).toMatchObject({ final: true, superseded: true });
+      expect(await store.isNativeResponseUnboundCancelled!(stopped)).toBe(true);
+      expect(committed?.source_segments?.map((source) => source.authoring_revision)).toEqual([
+        2, 2,
+      ]);
+      await manager.createJob('c-stream', 'owner', 'conversation', {
+        interactionContext: context('c', 3),
+        adapterCapabilities: telegramCapabilities,
+      });
+      const final = await manager.commitLogicalTurnAuthor('c-stream', 'owner');
+      expect(owned(final!)).toEqual([
+        [1, 'a', 'Willow 427 / Elm 441'],
+        [2, 'b', null],
+        [3, 'c', null],
+      ]);
+      expect(final?.source_segments?.map((source) => source.authoring_revision)).toEqual([3, 3, 3]);
+    } finally {
+      await manager.destroy();
+    }
+  });
   test('manager source-recovery failure returns its created job input for a normal retry', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: store,

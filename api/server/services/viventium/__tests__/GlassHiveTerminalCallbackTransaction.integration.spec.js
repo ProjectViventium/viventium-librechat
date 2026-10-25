@@ -1146,7 +1146,7 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
     ).toMatchObject({ deliveryState: 'unresolved' });
   });
 
-  test('authored Message and evidence survive a later surface rollback and more than ten delivery failures', async () => {
+  test('authored Message survives bounded delivery failures and cold recovery without regeneration', async () => {
     const h = await authoredDeliveryProof('authored-commit');
     const flush = () => h.service.flushGlassHiveMissionAdjudications({ ownerId: h.result.ownerId });
     try {
@@ -1164,34 +1164,72 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
         authoredAt: expect.any(Date),
       });
       expect(await h.receipts.countDocuments({})).toBe(0);
-      for (let attempt = 2; attempt <= 11; attempt += 1) {
+      for (let attempt = 2; attempt <= 10; attempt += 1) {
         await h.due();
         await expect(flush()).resolves.toMatchObject({ failed: 1 });
       }
       evidence = await h.collection.findOne({ _id: h.evidence._id });
       expect(evidence).toMatchObject({
-        state: 'delivery_pending',
-        attempts: 11,
+        state: 'deadletter',
+        attempts: 10,
+        errorCode: 'mission_delivery_retry_exhausted',
         followUpMessageId: h.authoredId,
+        followUpText: h.preparedText,
+        authoredAt: expect.any(Date),
       });
       expect(h.prepare).toHaveBeenCalledTimes(1);
       expect(h.persist).toHaveBeenCalledTimes(1);
+      expect(h.delivery).toHaveBeenCalledTimes(10);
       expect(
         await Message.countDocuments({ user: h.result.ownerId, messageId: h.authoredId }),
       ).toBe(1);
+      // Exhaustion ends hot retries; it does not discard the saved Main answer.
+      await expect(h.service.reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({
+        rows: 0,
+        owners: 0,
+      });
+      await expect(flush()).resolves.toMatchObject({ visible: 0, failed: 0 });
+      expect(h.delivery).toHaveBeenCalledTimes(10);
+
+      let delivered;
+      const deliveryCommitted = new Promise((resolve) => {
+        delivered = resolve;
+      });
+      const originalDelivery = h.delivery.getMockImplementation();
+      h.delivery.mockImplementation(async (...args) => {
+        const result = await originalDelivery(...args);
+        expect(deferGlassHiveTerminalCallbackAfterCommit(delivered)).toBe(true);
+        return result;
+      });
       h.allowDelivery();
-      await h.due();
-      await expect(flush()).resolves.toMatchObject({ visible: 1, failed: 0 });
+      // Advance only cold-recovery eligibility; the real reconciler must own re-admission.
+      await h.collection.updateOne(
+        { _id: h.evidence._id, state: 'deadletter' },
+        { $set: { updatedAt: new Date(0) } },
+      );
+      await expect(h.service.reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({
+        rows: 1,
+        owners: 1,
+      });
+      await deliveryCommitted;
       expect(await h.collection.findOne({ _id: h.evidence._id })).toMatchObject({
         state: 'completed',
-        attempts: 12,
+        attempts: 11,
+        followUpMessageId: h.authoredId,
       });
       expect(await h.receipts.countDocuments({ deliveryRef: `main-web:${h.authoredId}` })).toBe(1);
-      await h.service.reconcilePendingGlassHiveMissionAdjudications();
+      await expect(h.service.reconcilePendingGlassHiveMissionAdjudications()).resolves.toEqual({
+        rows: 0,
+        owners: 0,
+      });
       h.service.clearAdjudicationTimersForTests();
       await flush();
       expect(h.prepare).toHaveBeenCalledTimes(1);
-      expect(h.delivery).toHaveBeenCalledTimes(12);
+      expect(h.persist).toHaveBeenCalledTimes(1);
+      expect(h.delivery).toHaveBeenCalledTimes(11);
+      expect(
+        await Message.countDocuments({ user: h.result.ownerId, messageId: h.authoredId }),
+      ).toBe(1);
     } finally {
       h.service.clearAdjudicationTimersForTests();
     }

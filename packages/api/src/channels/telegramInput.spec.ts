@@ -92,8 +92,8 @@ function fixture() {
     messages,
     streams,
     persistPrepared,
-    advance: () => {
-      clock += TELEGRAM_INPUT_LEASE_MS + 1;
+    advance: (milliseconds = TELEGRAM_INPUT_LEASE_MS + 1) => {
+      clock += milliseconds;
     },
     revoke: () => {
       authorized = false;
@@ -464,24 +464,60 @@ test('retryable preparation failures retain an album as one recoverable group', 
   ).toBe(true);
 });
 
-test('ready input yields its preparation lease promptly and a trailing heartbeat cannot delay recovery', async () => {
-  const f = fixture(),
-    row = await f.service.register(id(), registration);
-  await f.service.ready('owner', claim(row), input);
-  const waiting = await f.service.defer('owner', claim(row));
-  expect(waiting.leaseUntil).toBe(0);
-  expect(waiting.retryAt).toBeLessThan(1_000_000 + TELEGRAM_INPUT_LEASE_MS);
-  expect((await f.service.status('owner', claim(row), 'renew')).leaseUntil).toBe(0);
-  expect(await f.service.claimPending()).toEqual([]);
-  f.advance();
-  const [next] = await f.service.claimPending();
-  expect(next).toMatchObject({
-    state: 'ready',
-    sourceMessageId: row.sourceMessageId,
-    sourceSequence: 1,
-  });
-  expect(next.claimToken).not.toBe(row.claimToken);
-});
+test.each(['preparing', 'ready'] as const)(
+  '%s input yields its preparation lease promptly and a trailing heartbeat cannot delay recovery',
+  async (state) => {
+    const f = fixture(),
+      row = await f.service.register(id(), registration);
+    if (state === 'ready') await f.service.ready('owner', claim(row), input);
+    const waiting = await f.service.defer('owner', claim(row));
+    expect(waiting.leaseUntil).toBe(0);
+    expect(waiting.retryAt).toBeLessThan(1_000_000 + TELEGRAM_INPUT_LEASE_MS);
+    expect((await f.service.status('owner', claim(row), 'renew')).leaseUntil).toBe(0);
+    expect(await f.service.claimPending()).toEqual([]);
+    f.advance(5001);
+    const [next] = await f.service.claimPending();
+    expect(next).toMatchObject({
+      state,
+      sourceMessageId: row.sourceMessageId,
+      sourceSequence: 1,
+    });
+    expect(next.claimToken).not.toBe(row.claimToken);
+    expect(next.attempts).toBe(0);
+    expect(next.failures).toEqual([]);
+  },
+);
+
+test.each(['admitted', 'completed', 'cancelled', 'failed'] as const)(
+  'defer refuses %s input without changing its exact state',
+  async (state) => {
+    const f = fixture(),
+      row = await f.service.register(id(), registration);
+    const before = { ...row, state };
+    f.rows.set(row.sourceEventId, structuredClone(before));
+    await expect(f.service.defer('owner', claim(row))).rejects.toMatchObject({
+      code: 'source_input_not_ready',
+    });
+    expect(f.rows.get(row.sourceEventId)).toEqual(before);
+  },
+);
+test.each(['foreign owner', 'stale claim', 'changed mapping'] as const)(
+  'preparation defer refuses %s without releasing another owner',
+  async (kind) => {
+    const f = fixture(),
+      row = await f.service.register(id(), registration);
+    if (kind === 'changed mapping') f.revoke();
+    const owner = kind === 'foreign owner' ? 'other-owner' : 'owner';
+    const token =
+      kind === 'stale claim'
+        ? { ...claim(row), claimToken: '99999999-9999-4999-8999-999999999999' }
+        : claim(row);
+    await expect(f.service.defer(owner, token)).rejects.toMatchObject({
+      code: 'source_input_claim_conflict',
+    });
+    expect(f.rows.get(row.sourceEventId)).toEqual(row);
+  },
+);
 
 /* VIVENTIUM: permanent preparation failure belongs to the whole verified upload group. */
 async function registerAlbum(f: ReturnType<typeof fixture>, count = 8) {

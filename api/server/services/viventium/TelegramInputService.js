@@ -108,14 +108,28 @@ function conversationSiblingFilter(record) {
     conversationId: record.conversationId,
   };
 }
-/** An earlier input of this conversation is still being prepared under a live lease. */
+/** A retryable failure before preparation still owns its place in the conversation. */
+function recoverablePreparationFilter() {
+  return {
+    $or: [
+      { inputState: 'preparing' },
+      {
+        inputState: 'failed',
+        inputRetryAt: { $gt: 0 },
+        inputAttempts: { $lt: 3 },
+        streamId: { $in: ['', null] },
+        inputPreparedDigest: { $in: ['', null] },
+      },
+    ],
+  };
+}
+/** Earlier preparation fences Main admission even after its original lease expires. */
 async function hasEarlierPreparingInput(record) {
   return Boolean(
     await Ingress.exists({
       ...conversationSiblingFilter(record),
       sourceSequence: { $lt: record.sourceSequence },
-      inputState: 'preparing',
-      inputLeaseUntil: { $gt: Date.now() },
+      ...recoverablePreparationFilter(),
     }),
   );
 }
@@ -125,7 +139,7 @@ async function hasNewerUnresolvedInput(record) {
     await Ingress.exists({
       ...conversationSiblingFilter(record),
       sourceSequence: { $gt: record.sourceSequence },
-      inputState: { $in: ['preparing', 'ready', 'admitted'] },
+      $or: [{ inputState: { $in: ['ready', 'admitted'] } }, recoverablePreparationFilter()],
     }),
   );
 }

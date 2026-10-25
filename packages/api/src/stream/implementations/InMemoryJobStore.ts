@@ -1326,7 +1326,9 @@ export class InMemoryJobStore implements IJobStore {
     delete safe.nativeResponseCancelled;
     delete safe.nativeResponseFinished;
     delete safe.nativeResponseSettled;
-    if (job.nativeResponse) {
+    // An unbound cancellation tombstone also owns this exact identity. A late onStart
+    // must not change its proof before the successor recovers the unanswered sources.
+    if (job.nativeResponse || job.nativeResponseCancelled) {
       for (const key of [
         'createdAt',
         'userId',
@@ -1335,11 +1337,13 @@ export class InMemoryJobStore implements IJobStore {
         'responseMessageId',
         'userMessage',
         'interactionContext',
-        'finalEvent',
-        'generationCompleted',
       ] as const) {
         delete safe[key];
       }
+    }
+    if (job.nativeResponse) {
+      delete safe.finalEvent;
+      delete safe.generationCompleted;
       if (job.nativeResponseFinished) {
         delete safe.status;
         delete safe.error;

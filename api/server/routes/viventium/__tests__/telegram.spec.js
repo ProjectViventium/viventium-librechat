@@ -210,6 +210,7 @@ const mockForegroundAttention = jest.fn();
 const mockForegroundCancel = jest.fn();
 jest.mock('~/server/services/viventium/nativeResponseService', () => ({
   readRetainedHostFinal: (...args) => mockReadHostFinal(...args),
+  readRetainedMainFinal: (...args) => mockReadHostFinal(...args),
   mutateNativeResponseSources: (...args) => mockMutateNativeResponseSources(...args),
   getForegroundAttentionControl: () => ({
     attention: (...args) => mockForegroundAttention(...args),

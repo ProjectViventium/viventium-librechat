@@ -7,6 +7,7 @@ on:
       - dev-staging
       - release/*
     paths:
+      - '.github/workflows/backend-review.yml'
       - 'api/**'
       - 'packages/**'
 
@@ -338,7 +339,11 @@ jobs:
             '^/api/viventium/telegram POST /chat'
             '^/api/viventium/telegram POST (?:/source-order|glasshive|cortex|orchestration|/call-link)'
             '^/api/viventium/telegram POST (?!/chat|/source-order|glasshive|cortex|orchestration|/call-link)'
-            '^/api/viventium/telegram (?!POST )'
+            '^/api/viventium/telegram GET '
+            '^/api/viventium/telegram prepared '
+            '^/api/viventium/telegram durable '
+            '^/api/viventium/telegram (?:a|an|admitted|retained) '
+            '^/api/viventium/telegram (?!POST |GET |prepared |durable |a |an |admitted |retained )'
           )
           for index in "${!patterns[@]}"; do
             npm run test:ci -- --runInBand "$suite" --testNamePattern="${patterns[$index]}" --json --outputFile="$RUNNER_TEMP/telegram-$index.json"
@@ -348,7 +353,7 @@ jobs:
           const path = require('path');
           const expected = new Map();
           const passed = new Map();
-          for (let index = 0; index < 4; index += 1) {
+          for (let index = 0; index < 8; index += 1) {
             const file = path.join(process.env.RUNNER_TEMP, `telegram-${index}.json`);
             const results = JSON.parse(fs.readFileSync(file, 'utf8')).testResults[0].assertionResults;
             if (index === 0) {

@@ -3149,6 +3149,69 @@ class ScheduleStorage:
         return cursor.rowcount == 1
 
 
+    def advance_terminal_scheduled_prompt_cursor(
+        self, task: Dict[str, Any], *, run_id: str, due_at: str,
+        next_run_at: Optional[str], now: str,
+    ) -> bool:
+        """Repair only an unchanged due cursor with an exact terminal occurrence receipt.
+
+        Preserve the run's actual failure/delivery facts. A concurrent edit, Stop, new
+        occurrence, or another repair wins; this transition never dispatches work.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Reconciliation can update the parent task. Read the CAS snapshot after it.
+            active_run = self._active_scheduled_prompt_run_for_task(
+                conn, task_id=task["id"], now=self._parse_utc_instant(now),
+                exclude_run_id=run_id,
+            )
+            current = conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ? AND user_id = ?",
+                (task["id"], task["user_id"]),
+            ).fetchone()
+            run = conn.execute(
+                "SELECT * FROM scheduled_prompt_runs WHERE run_id = ? AND task_id = ? AND user_id = ?",
+                (run_id, task["id"], task["user_id"]),
+            ).fetchone()
+            if (current is None or run is None or not current["active"]
+                    or current["next_run_at"] != task.get("next_run_at")
+                    or current["updated_at"] != task.get("updated_at")
+                    or self._structural_fingerprint(self._row_to_task(current))
+                    != self._structural_fingerprint(task)
+                    or run["due_at"] != due_at
+                    or run["status"] not in TERMINAL_SCHEDULED_PROMPT_RUN_STATUSES
+                    or active_run is not None):
+                conn.execute("ROLLBACK")
+                return False
+            metadata = json.loads(current["metadata_json"] or "{}") or {}
+            parent_started_at = self._parse_utc_instant(current["last_run_at"])
+            run_started_at = self._parse_utc_instant(run["started_at"])
+            owns_pending_status = bool(
+                parent_started_at is not None and parent_started_at == run_started_at
+            )
+            for key in (SCHEDULER_DEFERRED_OCCURRENCE_KEY, SCHEDULER_RETRY_OCCURRENCE_KEY):
+                receipt = metadata.get(key)
+                if isinstance(receipt, dict) and receipt.get("due_at") == due_at:
+                    owns_pending_status = True
+                    metadata.pop(key, None)
+            updates = {
+                "next_run_at": next_run_at,
+                "active": 0 if task["schedule"].get("type") == "once" else 1,
+                "updated_at": now, "metadata": metadata,
+            }
+            if owns_pending_status and current["last_status"] in {"waiting", "running"}:
+                updates["last_status"] = {
+                    "failed": "error", "completed": "success",
+                    "cancelled": "cancelled", "missed": "missed",
+                }[run["status"]]
+                updates["last_error"] = run["error_class"] if run["status"] == "failed" else None
+            self._update_scheduled_task_transition(
+                conn, task_id=task["id"], user_id=task["user_id"], updates=updates,
+            )
+            conn.execute("COMMIT")
+        self._sync_to_mirror()
+        return True
+
     def finalize_scheduled_prompt_run_attempt(
         self,
         run_id: str,

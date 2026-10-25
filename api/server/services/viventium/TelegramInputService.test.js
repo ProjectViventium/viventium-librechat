@@ -14,6 +14,7 @@ const mockIngress = {
   find: jest.fn(),
 };
 const mockGetFiles = jest.fn();
+const mockNativeSourceMatches = jest.fn(async () => true);
 const mockResolveMapping = jest.fn();
 const mockTransaction = jest.fn((operation) => operation());
 const mockSourceMutation = jest.fn((_filter, operation) => operation());
@@ -25,6 +26,8 @@ jest.mock('@librechat/api', () => ({
     return {};
   },
   telegramIngressDedupeTtlSeconds: () => 86400,
+  telegramTerminalPresentationScope: (...args) =>
+    jest.requireActual('@librechat/api').telegramTerminalPresentationScope(...args),
   telegramInputConversationGeneration: (...args) => mockConversationGeneration(...args),
   GenerationJobManager: { getJob: (...args) => mockGetJob(...args) },
 }));
@@ -32,7 +35,10 @@ jest.mock('~/db/models', () => ({
   Message: mockMessage,
   ViventiumTelegramIngressEvent: mockIngress,
 }));
-jest.mock('~/models', () => ({ getFiles: (...args) => mockGetFiles(...args) }));
+jest.mock('~/models', () => ({
+  getFiles: (...args) => mockGetFiles(...args),
+  nativeResponseSourceMatches: (...args) => mockNativeSourceMatches(...args),
+}));
 jest.mock('../TelegramLinkService', () => ({
   resolveTelegramMapping: (...args) => mockResolveMapping(...args),
 }));
@@ -42,6 +48,7 @@ jest.mock('./GlassHiveTerminalCallbackTransaction', () => ({
 const mockReadHostFinal = jest.fn(async () => null);
 jest.mock('./nativeResponseService', () => ({
   readRetainedHostFinal: (...args) => mockReadHostFinal(...args),
+  readRetainedMainFinal: (...args) => mockReadHostFinal(...args),
   mutateNativeResponseSources: (...args) => mockSourceMutation(...args),
 }));
 const inputService = require('./TelegramInputService');
@@ -114,6 +121,9 @@ test('coverage by an answer that did not author the input settles only an admitt
 });
 beforeEach(() => {
   jest.clearAllMocks();
+  mockReadHostFinal.mockResolvedValue(null);
+  mockGetJob.mockResolvedValue(undefined);
+  mockNativeSourceMatches.mockResolvedValue(true);
   mockConversationGeneration.mockImplementation(() => 'bound-generation');
   mockResolveMapping.mockResolvedValue({ libreChatUserId: 'owner' });
   mockMessage.exists.mockResolvedValue(true);
@@ -452,6 +462,118 @@ test('effect-committed input settles once instead of reopening the saved receipt
   expect(await service.claimPending(1)).toEqual([]);
   expect(writes).toEqual(['completed']);
 });
+test.each(['cached job', 'retained host final'])(
+  'uncertain file delivery after completed Main settles without replay through %s',
+  async (retention) => {
+    const { createTelegramInputService } = jest.requireActual('@librechat/api');
+    let clock = 1_000_000;
+    const acknowledgement = {
+      logical_turn_id: 'turn',
+      revision: 2,
+      state: 'failed',
+      presentation_refs: ['telegram:chat:confirmed-file'],
+    };
+    let retained = {
+      ...row,
+      telegramChatId: 'chat',
+      telegramMessageThreadId: '',
+      requestedConversationId: 'conversation',
+      conversationGeneration: 'c'.repeat(64),
+      state: 'admitted',
+      claimToken: '00000000-0000-4000-8000-000000000001',
+      registrationId: '00000000-0000-4000-8000-000000000002',
+      leaseUntil: 0,
+      retryAt: 0,
+      attempts: 0,
+      streamId: 'stream',
+      failureCode: '',
+      preparedDigest: 'd'.repeat(64),
+      failures: [],
+      primarySourceEventId: row.sourceEventId,
+      relatedSourceEventIds: [],
+      mediaGroupId: '',
+      responseBinding: {
+        streamId: 'stream',
+        responseMessageId: 'reply',
+        logicalTurnId: 'turn',
+        revision: 2,
+      },
+    };
+    const hostFinal = {
+      responseMessageId: 'reply',
+      conversationId: 'conversation',
+      interactionContext: {
+        source_event_id: row.sourceEventId,
+        logical_turn_id: 'turn',
+        revision: 2,
+      },
+      finalEvent: {
+        requestMessage: { messageId: row.sourceMessageId },
+        responseMessage: { text: '{NTA}', files: [{ file_id: 'accepted-file' }] },
+      },
+      acknowledgement,
+    };
+    mockIngress.findOne.mockImplementation(() => ({ lean: async () => retained }));
+    mockIngress.exists.mockResolvedValue(true);
+    mockReadHostFinal.mockResolvedValue(hostFinal);
+    mockGetJob.mockResolvedValue(
+      retention === 'cached job'
+        ? {
+            status: 'complete',
+            metadata: {
+              userId: 'owner',
+              generationCompleted: true,
+              deliveryAcknowledgement: acknowledgement,
+            },
+          }
+        : undefined,
+    );
+    const writes = [];
+    const prepare = jest.fn();
+    const service = createTelegramInputService({
+      ...mockDependencies,
+      now: () => clock,
+      verifyOwner: async () => true,
+      hasCommittedDelivery: async () => false,
+      persistPrepared: prepare,
+      transaction: async (operation) => operation(),
+      repository: {
+        read: async () => structuredClone(retained),
+        due: async () =>
+          retained.state === 'admitted' && retained.leaseUntil <= clock
+            ? [structuredClone(retained)]
+            : [],
+        replace: async (previous, next) => {
+          if (JSON.stringify(previous) !== JSON.stringify(retained)) return false;
+          writes.push(structuredClone(next));
+          retained = structuredClone(next);
+          return true;
+        },
+      },
+    });
+    // Use the real host readStream and terminal-settlement consumers, not a synthetic 'failed'.
+    expect(await service.claimPending(1)).toEqual([]);
+    expect(retained).toMatchObject({
+      state: 'failed',
+      failureCode: 'accepted_response_unavailable',
+      leaseUntil: 0,
+      retryAt: 0,
+      attempts: 0,
+      claimToken: '00000000-0000-4000-8000-000000000001',
+    });
+    clock += 120_001;
+    expect(await service.claimPending(1)).toEqual([]);
+    expect(writes).toHaveLength(1);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(mockMessage.updateOne).not.toHaveBeenCalled();
+    expect(mockIngress.updateOne).not.toHaveBeenCalled();
+    expect(hostFinal.acknowledgement).toEqual(acknowledgement);
+    expect(hostFinal.finalEvent.responseMessage).toEqual({
+      text: '{NTA}',
+      files: [{ file_id: 'accepted-file' }],
+    });
+  },
+);
 /* VIVENTIUM END */
 
 /* VIVENTIUM START: exact durable terminal recovery, with no provider or Redis resurrection. */
@@ -487,7 +609,14 @@ function terminalFixture() {
     exists: jest.fn(async () => true),
     updateOne: jest.fn(async () => ({ matchedCount: 1 })),
   };
-  const MessageModel = { findOne: jest.fn(() => ({ lean: async () => message })) };
+  const MessageModel = {
+    findOne: jest.fn(() => ({
+      select() {
+        return this;
+      },
+      lean: async () => message,
+    })),
+  };
   const identity = {
     record,
     streamId: 'stream',
@@ -557,6 +686,7 @@ test('recovers only the exact bound terminal and preserves its typed class', asy
     isCreatedByUser: false,
     unfinished: false,
     error: true,
+    deletedAt: null,
     'metadata.viventium.interactionContext.source_event_id': row.sourceEventId,
     'metadata.viventium.interactionContext.logical_turn_id': 'turn',
     'metadata.viventium.interactionContext.revision': 2,
@@ -764,4 +894,493 @@ test('the same exact ingress reader accepts host final and rejects replaced or m
   f.IngressModel.exists.mockResolvedValue(false);
   expect(await f.read()).toBeNull();
   mockReadHostFinal.mockResolvedValue(null);
+});
+
+describe('obsolete accepted terminal recovery', () => {
+  const record = {
+    ...row,
+    telegramChatId: 'chat',
+    telegramMessageThreadId: '',
+    conversationGeneration: 'generation',
+    state: 'admitted',
+    claimToken: 'claim',
+    leaseUntil: 100,
+    streamId: 'old-stream',
+  };
+  const context = { source_event_id: row.sourceEventId, logical_turn_id: 'old-turn', revision: 2 };
+  const binding = {
+    streamId: 'old-stream',
+    responseMessageId: 'old-answer',
+    logicalTurnId: 'old-turn',
+    revision: 2,
+  };
+  beforeEach(() => {
+    mockReadHostFinal.mockResolvedValue(null);
+    mockIngress.findOne.mockReturnValue({
+      lean: async () => ({ ...record, responseBinding: binding }),
+    });
+    mockIngress.exists.mockResolvedValue(true);
+    mockIngress.updateOne.mockResolvedValue({ matchedCount: 1 });
+    mockResolveMapping.mockResolvedValue({ libreChatUserId: row.libreChatUserId });
+    mockMessage.exists.mockResolvedValue(true);
+    mockMessage.findOne.mockReturnValue({
+      select() {
+        return this;
+      },
+      lean: async () => ({
+        messageId: 'old-answer',
+        error: true,
+        unfinished: false,
+        content: [{ type: 'error', error_class: 'native_response_failed', error: 'Known failure' }],
+        metadata: { viventium: { interactionContext: context } },
+      }),
+    });
+  });
+  test('known failed obsolete presentation settles failed, preserves source and invalidates old lease', async () => {
+    expect(await mockDependencies.settleObsoleteTerminal(record)).toBe(true);
+    expect(mockIngress.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        responseBinding: binding,
+        inputState: 'admitted',
+        inputClaimToken: 'claim',
+      }),
+      {
+        $set: {
+          inputState: 'failed',
+          inputFailureCode: 'source_terminal_superseded',
+          inputLeaseUntil: 0,
+          inputRetryAt: 0,
+          inputClaimToken: '',
+        },
+      },
+    );
+    expect(mockMessage.updateOne).not.toHaveBeenCalled();
+  });
+  test('later completion alone cannot settle an unknown accepted action', async () => {
+    mockReadHostFinal.mockResolvedValue(null);
+    mockMessage.findOne.mockReturnValue({
+      select() {
+        return this;
+      },
+      lean: async () => null,
+    });
+    expect(await mockDependencies.settleObsoleteTerminal(record)).toBe(false);
+    expect(mockIngress.updateOne).not.toHaveBeenCalled();
+  });
+  test('a current terminal remains recoverable when no newer completed source exists', async () => {
+    mockIngress.exists.mockResolvedValue(false);
+    mockMessage.exists.mockImplementation(async (filter) => !filter.$or);
+    expect(await mockDependencies.settleObsoleteTerminal(record)).toBe(false);
+    expect(mockIngress.updateOne).not.toHaveBeenCalled();
+  });
+  test('a changed current response binding cannot settle old claimed presentation', async () => {
+    mockIngress.findOne.mockReturnValue({
+      lean: async () => ({ ...record, responseBinding: { ...binding, revision: 3 } }),
+    });
+    expect(await mockDependencies.settleObsoleteTerminal(record)).toBe(false);
+    expect(mockIngress.updateOne).not.toHaveBeenCalled();
+  });
+  test.each(['newer-failed', 'new-conversation', 'expired-ingress'])(
+    'durable chat source %s retires only old failed presentation',
+    async (kind) => {
+      const newer = {
+        libreChatUserId: record.libreChatUserId,
+        telegramUserId: record.telegramUserId,
+        telegramChatId: record.telegramChatId,
+        telegramMessageThreadId: record.telegramMessageThreadId,
+        sourceOrderScope: record.sourceOrderScope,
+        sourceEventId: 'f'.repeat(64),
+        sourceSequence: 13,
+        inputState: 'failed',
+        conversationId:
+          kind === 'new-conversation' ? 'different-conversation' : record.conversationId,
+      };
+      const matches = require('sift').default;
+      mockIngress.exists.mockImplementation(async (filter) =>
+        filter.sourceSequence ? kind !== 'expired-ingress' && matches(filter)(newer) : true,
+      );
+      const saved = {
+        user: record.libreChatUserId,
+        deletedAt: null,
+        isCreatedByUser: true,
+        metadata: {
+          viventium: {
+            interactionContext: {
+              source_order_scope: record.sourceOrderScope,
+              source_sequence: 13,
+              source_event_id: newer.sourceEventId,
+            },
+            originalInputReceipt: { sourceEventId: newer.sourceEventId },
+          },
+        },
+      };
+      mockMessage.exists.mockImplementation(async (filter) => {
+        if (!filter.$or) return true;
+        expect(filter.$or[0].$expr).toEqual({
+          $eq: [
+            '$metadata.viventium.originalInputReceipt.sourceEventId',
+            '$metadata.viventium.interactionContext.source_event_id',
+          ],
+        });
+        const query = structuredClone(filter);
+        delete query.$or[0].$expr;
+        return (
+          saved.metadata.viventium.originalInputReceipt.sourceEventId ===
+            saved.metadata.viventium.interactionContext.source_event_id && matches(query)(saved)
+        );
+      });
+      expect(await mockDependencies.settleObsoleteTerminal(record)).toBe(true);
+      expect(mockIngress.updateOne).toHaveBeenCalledWith(
+        expect.objectContaining({ inputState: 'admitted' }),
+        {
+          $set: {
+            inputState: 'failed',
+            inputFailureCode: 'source_terminal_superseded',
+            inputLeaseUntil: 0,
+            inputRetryAt: 0,
+            inputClaimToken: '',
+          },
+        },
+      );
+    },
+  );
+  test('own merged A+B sources are compared at their actual later presentation sequence', async () => {
+    const mergedContext = {
+      ...context,
+      source_sequence: 13,
+      ready_input_continuation: { presentation_source_sequence: 14 },
+      source_segments: [{ source_event_id: 'd'.repeat(64), source_sequence: 13 }],
+    };
+    mockMessage.findOne.mockReturnValue({
+      select() {
+        return this;
+      },
+      lean: async () => ({
+        messageId: 'old-answer',
+        error: true,
+        unfinished: false,
+        content: [{ type: 'error', error_class: 'native_response_failed', error: 'Known failure' }],
+        metadata: { viventium: { interactionContext: mergedContext } },
+      }),
+    });
+    mockIngress.exists.mockImplementation(async (filter) => (filter.sourceSequence ? false : true));
+    mockMessage.exists.mockImplementation(async (filter) => !filter.$or);
+    expect(await mockDependencies.settleObsoleteTerminal(record)).toBe(false);
+    expect(mockIngress.exists).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceSequence: { $gt: 14 },
+        sourceEventId: { $nin: [record.sourceEventId, 'd'.repeat(64)] },
+      }),
+    );
+    expect(mockIngress.updateOne).not.toHaveBeenCalled();
+  });
+});
+
+test('a complete cached stream before adapter ACK remains presentable even if retained proof is unavailable', async () => {
+  mockGetJob.mockResolvedValue({ status: 'complete', metadata: { userId: 'owner' } });
+  mockReadHostFinal.mockResolvedValue(null);
+  mockIngress.findOne.mockReturnValue({ lean: async () => null });
+  expect(await mockDependencies.readStream('complete-before-ack', 'owner')).toBe('terminal');
+});
+
+test('current failed presentation ACK settles the exact source through the real retained ACK owner', async () => {
+  const record = {
+    ...row,
+    inputState: 'admitted',
+    state: 'admitted',
+    streamId: 'stream',
+    inputClaimToken: 'claim',
+    claimToken: 'claim',
+    inputLeaseUntil: 100,
+    leaseUntil: 100,
+    authorityBoundAt: new Date(1),
+    responseBinding: {
+      streamId: 'stream',
+      responseMessageId: 'reply',
+      logicalTurnId: 'turn',
+      revision: 2,
+    },
+  };
+  const ack = {
+    logical_turn_id: 'turn',
+    revision: 2,
+    state: 'failed',
+    presentation_ref: 'telegram:chat',
+  };
+  const message = {
+    messageId: 'reply',
+    parentMessageId: row.sourceMessageId,
+    error: true,
+    unfinished: false,
+    content: [
+      { type: 'error', error_class: 'native_response_failed', error: 'Known terminal failure' },
+    ],
+    metadata: {
+      viventium: {
+        interactionContext: {
+          source_event_id: row.sourceEventId,
+          logical_turn_id: 'turn',
+          revision: 2,
+        },
+        deliveryAcknowledgement: ack,
+      },
+    },
+  };
+  mockGetJob.mockResolvedValue(undefined);
+  mockReadHostFinal.mockResolvedValue(null);
+  mockIngress.findOne.mockReturnValue({ lean: async () => record });
+  mockIngress.exists.mockImplementation(async (filter) => !filter.sourceSequence);
+  mockMessage.exists.mockImplementation(async (filter) => !filter.$or);
+  mockMessage.findOne.mockReturnValue({
+    select() {
+      return this;
+    },
+    lean: async () => message,
+  });
+  mockMessage.updateOne.mockResolvedValue({ matchedCount: 1 });
+  mockIngress.updateOne.mockImplementation(async (_filter, patch) => {
+    Object.assign(record, patch.$set);
+    return { matchedCount: 1 };
+  });
+  expect(await mockDependencies.settleObsoleteTerminal({ ...record })).toBe(true);
+  expect(record).toMatchObject({
+    inputState: 'failed',
+    inputFailureCode: 'source_terminal_presented',
+    inputClaimToken: '',
+    inputLeaseUntil: 0,
+    inputRetryAt: 0,
+  });
+  expect(mockTransaction).toHaveBeenCalled();
+  expect(mockMessage.updateOne).toHaveBeenCalledWith(
+    expect.objectContaining({
+      messageId: 'reply',
+      parentMessageId: row.sourceMessageId,
+      error: true,
+      unfinished: false,
+      'metadata.viventium.interactionContext.logical_turn_id': 'turn',
+    }),
+    { $set: { 'metadata.viventium.deliveryAcknowledgement': ack } },
+  );
+});
+
+describe('retained native failure ACK fences', () => {
+  const ack = {
+    logical_turn_id: 'turn',
+    revision: 2,
+    state: 'failed',
+    presentation_ref: 'telegram:chat',
+  };
+  function nativeFixture() {
+    const f = terminalFixture();
+    f.record.inputClaimToken = 'claim';
+    f.message.nativeResponse = {
+      status: 'failed',
+      finalReplayStoredAt: 10,
+      userId: 'owner',
+      conversationId: row.conversationId,
+      streamId: 'stream',
+      responseMessageId: 'reply',
+      source: { messageId: row.sourceMessageId, digest: 'd'.repeat(64) },
+      logicalTurnId: 'turn',
+      revision: 2,
+      invocationId: 'invocation',
+      bodySha256: 'e'.repeat(64),
+    };
+    f.MessageModel.updateOne = jest.fn(async () => ({ matchedCount: 1 }));
+    return f;
+  }
+  test('cacheless exact native final failure preserves its complete proof in ACK CAS', async () => {
+    const f = nativeFixture();
+    await expect(
+      acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+        IngressModel: f.IngressModel,
+        MessageModel: f.MessageModel,
+      }),
+    ).resolves.toMatchObject({ status: 'recorded' });
+    expect(mockNativeSourceMatches).toHaveBeenCalledWith(f.message.nativeResponse);
+    expect(f.MessageModel.updateOne.mock.calls[0][0]).toMatchObject({
+      nativeResponse: f.message.nativeResponse,
+    });
+    expect(f.IngressModel.updateOne.mock.calls[0][1].$set).toMatchObject({
+      inputState: 'failed',
+      inputClaimToken: '',
+    });
+  });
+  test.each([
+    'running',
+    'prepared',
+    'pending',
+    'missing-replay',
+    'foreign-owner',
+    'changed-source',
+    'different-source-message',
+  ])('does not settle %s native or fallback work', async (kind) => {
+    const f = nativeFixture();
+    if (kind === 'running')
+      mockGetJob.mockResolvedValue({
+        status: 'running',
+        metadata: {
+          userId: 'owner',
+          conversationId: row.conversationId,
+          responseMessageId: 'reply',
+          interactionContext: { logical_turn_id: 'turn', revision: 2 },
+        },
+      });
+    if (kind === 'prepared' || kind === 'pending') f.message.nativeResponse.status = kind;
+    if (kind === 'missing-replay') f.message.nativeResponse.finalReplayStoredAt = 0;
+    if (kind === 'foreign-owner') f.message.nativeResponse.userId = 'foreign';
+    if (kind === 'changed-source') mockNativeSourceMatches.mockResolvedValue(false);
+    if (kind === 'different-source-message')
+      f.message.nativeResponse.source.messageId = 'different';
+    await expect(
+      acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+        IngressModel: f.IngressModel,
+        MessageModel: f.MessageModel,
+      }),
+    ).resolves.toEqual({ status: 'not_found' });
+    expect(f.MessageModel.updateOne).not.toHaveBeenCalled();
+    expect(f.IngressModel.updateOne).not.toHaveBeenCalled();
+  });
+  test.each(['owner', 'conversation', 'response', 'revision'])(
+    'a replacement cached %s binding cannot settle the former failure',
+    async (kind) => {
+      const f = nativeFixture();
+      const metadata = {
+        userId: 'owner',
+        conversationId: row.conversationId,
+        responseMessageId: 'reply',
+        interactionContext: { logical_turn_id: 'turn', revision: 2 },
+      };
+      if (kind === 'owner') metadata.userId = 'foreign';
+      if (kind === 'conversation') metadata.conversationId = 'foreign';
+      if (kind === 'response') metadata.responseMessageId = 'replacement';
+      if (kind === 'revision') metadata.interactionContext.revision = 3;
+      mockGetJob.mockResolvedValue({ status: 'complete', metadata });
+      await expect(
+        acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+          IngressModel: f.IngressModel,
+          MessageModel: f.MessageModel,
+        }),
+      ).resolves.toEqual({ status: 'not_found' });
+      expect(f.IngressModel.updateOne).not.toHaveBeenCalled();
+    },
+  );
+  test('a changed exact native snapshot cannot be acknowledged through a stale CAS', async () => {
+    const f = nativeFixture();
+    f.MessageModel.updateOne.mockResolvedValue({ matchedCount: 0 });
+    await expect(
+      acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+        IngressModel: f.IngressModel,
+        MessageModel: f.MessageModel,
+      }),
+    ).resolves.toEqual({ status: 'conflict' });
+    expect(f.IngressModel.updateOne).not.toHaveBeenCalled();
+  });
+});
+
+describe('failed ACK merged-source settlement', () => {
+  const ack = {
+    logical_turn_id: 'turn',
+    revision: 2,
+    state: 'failed',
+    presentation_ref: 'telegram:chat',
+  };
+  function grouped() {
+    const f = terminalFixture();
+    const primary = {
+      ...f.record,
+      inputClaimToken: 'primary-claim',
+      authorityBoundAt: new Date(1),
+      inputRelatedSourceEventIds: ['b'.repeat(64)],
+      inputPrimarySourceEventId: row.sourceEventId,
+    };
+    const child = {
+      ...primary,
+      sourceEventId: 'b'.repeat(64),
+      sourceMessageId: 'child-original',
+      inputClaimToken: 'child-claim',
+      responseBinding: undefined,
+      inputRelatedSourceEventIds: [],
+    };
+    const unlisted = { ...child, sourceEventId: 'c'.repeat(64), inputClaimToken: 'unlisted-claim' };
+    const rows = [primary, child, unlisted];
+    const matches = require('sift').default;
+    f.IngressModel.findOne.mockImplementation((filter) => ({
+      lean: async () => rows.find(matches(filter)) || null,
+    }));
+    f.IngressModel.exists.mockImplementation(async (filter) => rows.some(matches(filter)));
+    f.IngressModel.updateOne.mockImplementation(async (filter, patch) => {
+      const found = rows.find(matches(filter));
+      if (!found) return { matchedCount: 0 };
+      Object.assign(found, patch.$set);
+      return { matchedCount: 1 };
+    });
+    f.MessageModel.updateOne = jest.fn(async () => ({ matchedCount: 1 }));
+    return { ...f, primary, child, unlisted, rows };
+  }
+  test('one existing ACK transaction settles primary and listed admitted aliases, retaining original identities', async () => {
+    const f = grouped();
+    await expect(
+      acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+        IngressModel: f.IngressModel,
+        MessageModel: f.MessageModel,
+      }),
+    ).resolves.toMatchObject({ status: 'recorded' });
+    for (const record of [f.primary, f.child])
+      expect(record).toMatchObject({
+        inputState: 'failed',
+        inputFailureCode: 'source_terminal_presented',
+        inputClaimToken: '',
+        inputLeaseUntil: 0,
+        inputRetryAt: 0,
+      });
+    expect(f.child.sourceMessageId).toBe('child-original');
+    expect(f.child.sourceEventId).toBe('b'.repeat(64));
+    expect(f.unlisted).toMatchObject({ inputState: 'admitted', inputClaimToken: 'unlisted-claim' });
+    expect(f.IngressModel.updateOne.mock.calls[1][0]).toMatchObject({
+      inputPrimarySourceEventId: row.sourceEventId,
+      inputClaimToken: 'child-claim',
+      streamId: 'stream',
+      inputState: 'admitted',
+      sourceEventId: 'b'.repeat(64),
+    });
+  });
+  test.each([
+    'foreign-owner',
+    'other-stream',
+    'other-primary',
+    'other-conversation',
+    'already-completed',
+  ])('does not settle a listed alias with %s authority', async (kind) => {
+    const f = grouped();
+    if (kind === 'foreign-owner') f.child.libreChatUserId = 'foreign';
+    if (kind === 'other-stream') f.child.streamId = 'different';
+    if (kind === 'other-primary') f.child.inputPrimarySourceEventId = 'different';
+    if (kind === 'other-conversation') f.child.conversationId = 'different';
+    if (kind === 'already-completed') f.child.inputState = 'completed';
+    const before = structuredClone(f.child);
+    await expect(
+      acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+        IngressModel: f.IngressModel,
+        MessageModel: f.MessageModel,
+      }),
+    ).resolves.toMatchObject({ status: 'recorded' });
+    expect(f.child).toEqual(before);
+    expect(f.IngressModel.updateOne).toHaveBeenCalledTimes(1);
+  });
+  test('a raced alias claim rejects the transaction instead of reporting complete settlement', async () => {
+    const f = grouped();
+    const update = f.IngressModel.updateOne.getMockImplementation();
+    f.IngressModel.updateOne.mockImplementation(async (filter, patch) =>
+      filter.sourceEventId === f.child.sourceEventId ? { matchedCount: 0 } : update(filter, patch),
+    );
+    await expect(
+      acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+        IngressModel: f.IngressModel,
+        MessageModel: f.MessageModel,
+      }),
+    ).rejects.toMatchObject({ code: 'telegram_terminal_ack_conflict' });
+    expect(f.child.inputState).toBe('admitted');
+    expect(f.child.inputClaimToken).toBe('child-claim');
+  });
 });

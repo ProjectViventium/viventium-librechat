@@ -2195,3 +2195,167 @@ def test_persistently_conflicting_once_task_terminates_at_the_contract_cap(tmp_p
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_terminal_occurrence_reconciles_stale_cursor_without_redispatch(tmp_path):
+    for kind in ('once', 'daily'):
+        storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / f'{kind}.db')))
+        schedule = ({'type': 'once', 'timezone': 'UTC', 'run_at': '2026-02-13T19:00:00Z'}
+                    if kind == 'once' else {'type': 'daily', 'time': '19:00', 'timezone': 'UTC'})
+        task = _seed_task(storage, schedule=schedule)
+        due = '2026-02-13T19:00:00Z'
+        claim = storage.claim_scheduled_prompt_occurrence(task_id=task['id'], user_id=task['user_id'],
+            executor='viventium_agent', due_at=due, lease_owner='crashed-owner', now=due, lease_seconds=60)
+        storage.update_scheduled_prompt_run(claim['run']['run_id'], {'status': 'failed',
+            'error_class': 'worker_lost', 'completed_at': '2026-02-13T19:01:00Z'})
+        storage.update_task(task['user_id'], task['id'], {'last_status': 'error', 'last_error': 'worker_lost'})
+        stale = storage.get_task(task['user_id'], task['id'])
+        engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+        try:
+            with patch('scheduling_cortex.scheduler.dispatch_task') as dispatch:
+                engine._process_task(stale, datetime(2026, 2, 13, 19, 2, tzinfo=timezone.utc))
+                engine._process_task(stale, datetime(2026, 2, 13, 19, 2, tzinfo=timezone.utc))
+                dispatch.assert_not_called()
+            current = storage.get_task(task['user_id'], task['id'])
+            assert current['last_status'] == 'error'
+            assert current['last_error'] == 'worker_lost'
+            assert current['next_run_at'] == (None if kind == 'once' else '2026-02-14T19:00:00Z')
+            assert current['active'] == (0 if kind == 'once' else 1)
+            assert len(storage.list_scheduled_prompt_runs(task_id=task['id'])) == 1
+        finally:
+            engine.stop()
+
+
+def test_terminal_cursor_repair_cannot_overwrite_user_edit_or_stop(tmp_path):
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / 'schedules.db')))
+    task = _seed_task(storage)
+    due = task['next_run_at']
+    claim = storage.claim_scheduled_prompt_occurrence(task_id=task['id'], user_id=task['user_id'],
+        executor='viventium_agent', due_at=due, lease_owner='owner', now=due, lease_seconds=60)
+    storage.update_scheduled_prompt_run(claim['run']['run_id'], {'status': 'completed'})
+    for edit in ({'prompt': 'New user request'}, {'active': 0}):
+        snapshot = storage.get_task(task['user_id'], task['id'])
+        storage.update_task(task['user_id'], task['id'], edit)
+        assert storage.advance_terminal_scheduled_prompt_cursor(snapshot, run_id=claim['run']['run_id'],
+            due_at=due, next_run_at='2026-02-14T19:00:00Z', now='2026-02-13T19:02:00Z') is False
+        current = storage.get_task(task['user_id'], task['id'])
+        assert current['next_run_at'] == due
+        for field, value in edit.items():
+            assert current[field] == value
+
+
+def _seed_stale_terminal_retry(storage):
+    due = '2026-06-16T22:00:00Z'
+    task = _seed_task(storage, schedule={
+        'type': 'interval', 'timezone': 'America/Toronto',
+        'interval': {'every': 45, 'unit': 'minute'},
+        'active_window': {'start_local': '09:00', 'end_local': '21:00', 'cadence': 'restart_daily'},
+    }, next_run_at='2026-06-16T22:10:01Z', metadata={
+        'scheduler_deferred_occurrence_v1': {
+            'version': 1, 'due_at': due, 'retry_at': '2026-06-16T22:10:01Z',
+            'error_class': 'scheduler_gateway_unavailable',
+        },
+    })
+    claim = storage.claim_scheduled_prompt_occurrence(
+        task_id=task['id'], user_id=task['user_id'], executor='viventium_agent',
+        due_at=due, lease_owner='lost-owner', now=due, lease_seconds=60,
+    )
+    storage.update_scheduled_prompt_run(claim['run']['run_id'], {
+        'status': 'failed', 'error_class': 'stale_run_reconciled',
+        'completed_at': '2026-06-17T00:52:00Z',
+    })
+    storage.update_task(task['user_id'], task['id'], {
+        'last_run_at': '2026-06-16T22:05:01Z', 'last_status': 'waiting',
+        'last_error': 'scheduler_gateway_unavailable',
+    })
+    return storage.get_task(task['user_id'], task['id']), claim['run']['run_id']
+
+
+def test_terminal_cursor_projects_truth_and_keeps_next_occurrence_eligible(tmp_path):
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / 'schedules.db')))
+    stale, old_run_id = _seed_stale_terminal_retry(storage)
+    now = datetime(2026, 6, 20, 17, 0, tzinfo=timezone.utc)
+    engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+    try:
+        with patch('scheduling_cortex.scheduler.dispatch_task') as invoke:
+            engine._process_task(stale, now)
+            invoke.assert_not_called()
+        repaired = storage.get_task(stale['user_id'], stale['id'])
+        assert repaired['last_status'] == 'error'
+        assert repaired['last_error'] == 'stale_run_reconciled'
+        assert repaired['last_run_at'] == stale['last_run_at']
+        assert repaired['next_run_at'] == '2026-06-16T22:45:00Z'
+        assert 'scheduler_deferred_occurrence_v1' not in repaired['metadata']
+        with patch('scheduling_cortex.scheduler.dispatch_task', return_value={
+            'conversation_id': 'same-conversation',
+            'delivery': {'outcome': 'sent', 'channels': {'telegram': {'outcome': 'sent'}}},
+        }) as invoke:
+            engine._process_task(repaired, now)
+            invoke.assert_called_once()
+            assert invoke.call_args.args[0]['_scheduled_prompt_due_at'] == '2026-06-20T16:45:00Z'
+        runs = storage.list_scheduled_prompt_runs(task_id=stale['id'])
+        assert len(runs) == 2
+        original = next(run for run in runs if run['run_id'] == old_run_id)
+        assert original['status'] == 'failed'
+        assert original['error_class'] == 'stale_run_reconciled'
+        assert original['due_at'] == '2026-06-16T22:00:00Z'
+    finally:
+        engine.stop()
+
+
+def test_terminal_cursor_uses_current_definition_not_legacy_fingerprint_column(tmp_path):
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / 'schedules.db')))
+    stale, _ = _seed_stale_terminal_retry(storage)
+    with storage._connect() as conn:
+        conn.execute('UPDATE scheduled_tasks SET structural_fingerprint = ? WHERE id = ?',
+                     ('legacy-fingerprint', stale['id']))
+    engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+    try:
+        with patch('scheduling_cortex.scheduler.dispatch_task') as invoke:
+            engine._process_task(stale, datetime(2026, 6, 20, 17, 0, tzinfo=timezone.utc))
+            invoke.assert_not_called()
+        current = storage.get_task(stale['user_id'], stale['id'])
+        assert current['next_run_at'] == '2026-06-16T22:45:00Z'
+        assert current['last_status'] == 'error'
+        assert current['last_error'] == 'stale_run_reconciled'
+    finally:
+        engine.stop()
+
+
+def test_terminal_cursor_recovery_keeps_native_misfire_policy_and_receipt(tmp_path):
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / 'schedules.db')))
+    stale, old_run_id = _seed_stale_terminal_retry(storage)
+    now = datetime(2026, 6, 20, 17, 10, tzinfo=timezone.utc)
+    engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+    try:
+        with patch('scheduling_cortex.scheduler.dispatch_task') as invoke:
+            engine._process_task(stale, now)
+            repaired = storage.get_task(stale['user_id'], stale['id'])
+            engine._process_task(repaired, now)
+            invoke.assert_not_called()
+        current = storage.get_task(stale['user_id'], stale['id'])
+        assert current['last_status'] == 'missed'
+        assert current['last_delivery']['due_at'] == '2026-06-20T16:45:00Z'
+        assert current['last_delivery']['reason'] == 'misfire_grace_exceeded'
+        assert current['next_run_at'] == '2026-06-20T17:30:00Z'
+        runs = storage.list_scheduled_prompt_runs(task_id=stale['id'])
+        assert {(run['due_at'], run['status']) for run in runs} == {
+            ('2026-06-16T22:00:00Z', 'failed'), ('2026-06-20T16:45:00Z', 'missed'),
+        }
+        assert next(run for run in runs if run['run_id'] == old_run_id)['error_class'] == 'stale_run_reconciled'
+    finally:
+        engine.stop()
+
+
+def test_terminal_cursor_does_not_project_onto_unrelated_pending_status(tmp_path):
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / 'schedules.db')))
+    stale, run_id = _seed_stale_terminal_retry(storage)
+    storage.update_task(stale['user_id'], stale['id'], {'metadata': {}, 'last_run_at': '2026-06-17T14:00:00Z'})
+    current = storage.get_task(stale['user_id'], stale['id'])
+    assert storage.advance_terminal_scheduled_prompt_cursor(
+        current, run_id=run_id, due_at='2026-06-16T22:00:00Z',
+        next_run_at='2026-06-16T22:45:00Z', now='2026-06-20T17:00:00Z',
+    )
+    repaired = storage.get_task(stale['user_id'], stale['id'])
+    assert repaired['last_status'] == 'waiting'
+    assert repaired['last_error'] == 'scheduler_gateway_unavailable'

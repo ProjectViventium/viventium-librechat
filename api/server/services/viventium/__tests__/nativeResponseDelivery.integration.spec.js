@@ -104,6 +104,7 @@ beforeEach(async () => {
       metadata: { kept: true, viventium: { keepSibling: true } },
     },
   ]);
+  const admittedAt = Date.now();
   identity = {
     userId: user,
     conversationId: 'conversation',
@@ -121,8 +122,8 @@ beforeEach(async () => {
     agentId: 'main',
     originSha256: nativeResponseOrigin('http://native.test/v1'),
     source: await methods.captureNativeResponseSource(user, 'conversation', 'question'),
-    admittedAt: Date.now(),
-    recoverUntil: Date.now() + 86400000,
+    admittedAt,
+    recoverUntil: admittedAt + 86400000,
     deliveryDispositionRequired: true,
     deliveryContext: { surface: 'telegram', authenticated: true, audioRequested: true },
   };

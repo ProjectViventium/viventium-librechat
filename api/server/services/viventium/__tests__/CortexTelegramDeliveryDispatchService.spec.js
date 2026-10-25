@@ -2,11 +2,24 @@
 
 jest.mock(
   '@librechat/data-schemas',
-  () => ({ logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() } }),
+  () => ({
+    ...jest.requireActual('@librechat/data-schemas'),
+    logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+  }),
   { virtual: true },
 );
 
-jest.mock('@librechat/api', () => ({ GenerationJobManager: {} }));
+jest.mock('@librechat/api', () => ({
+  GenerationJobManager: {},
+  retainedCortexTelegramAcknowledgement: (...args) =>
+    jest.requireActual('@librechat/api').retainedCortexTelegramAcknowledgement(...args),
+  exactCortexTelegramAuthority: (...args) =>
+    jest.requireActual('@librechat/api').exactCortexTelegramAuthority(...args),
+  cortexTelegramPresentationProof: (...args) =>
+    jest.requireActual('@librechat/api').cortexTelegramPresentationProof(...args),
+  exactCortexTelegramPresentation: (...args) =>
+    jest.requireActual('@librechat/api').exactCortexTelegramPresentation(...args),
+}));
 jest.mock('~/db/models', () => ({
   Message: {},
   ViventiumCortexInsightDelivery: {},
@@ -63,6 +76,8 @@ function exactFixture() {
     user: ownerId,
     conversationId,
     messageId: parentMessageId,
+    parentMessageId: 'source-1',
+    isCreatedByUser: false,
     unfinished: false,
     metadata: {
       viventium: {
@@ -81,10 +96,14 @@ function exactFixture() {
     messageId: persistedMessageId,
     parentMessageId,
     text: 'A useful late result.',
+    isCreatedByUser: false,
+    unfinished: false,
     metadata: {
       viventium: {
         type: 'cortex_followup',
         messageRevision: 2,
+        cortexPresentationGeneration: 2,
+        cortexPresentationClaimToken: 'claim-2',
         cortexPresentationParentMessageId: parentMessageId,
       },
     },
@@ -100,6 +119,8 @@ function exactFixture() {
     sourceEventId,
     streamId,
     conversationId,
+    sourceMessageId: 'source-1',
+    responseBinding: { streamId, responseMessageId: parentMessageId, logicalTurnId, revision: 1 },
     authorityBoundAt: new Date('2026-08-26T18:00:00.000Z'),
   };
   const job = {
@@ -170,8 +191,21 @@ function exactFixture() {
 function buildService(fixture = exactFixture()) {
   const DeliveryModel = {
     find: jest.fn(() => query([fixture.candidate])),
+    updateMany: jest.fn(async () => ({ matchedCount: 1 })),
   };
+  fixture.followup.metadata.viventium.cortexTelegramPresentation = jest
+    .requireActual('@librechat/api')
+    .cortexTelegramPresentationProof(fixture.followup, {
+      ...fixture.fence,
+      presentationLeaseToken: undefined,
+    });
   const MessageModel = {
+    updateOne: jest.fn(async (_filter, update) => {
+      Object.assign(fixture.followup.metadata.viventium, {
+        cortexTelegramPresentation: update.$set['metadata.viventium.cortexTelegramPresentation'],
+      });
+      return { matchedCount: 1 };
+    }),
     findOne: jest.fn((filter) =>
       query(filter.messageId === fixture.parentMessageId ? fixture.parent : fixture.followup),
     ),
@@ -191,6 +225,11 @@ function buildService(fixture = exactFixture()) {
     markDropped: jest.fn(async () => fixture.claimed.claimed),
   };
   const bindMessageGeneration = jest.fn(async (input) => ({ ...input.message, revision: 2 }));
+  const readRetainedMainFinal = jest.fn(async () => null);
+  const readRetainedMainFinalState = jest.fn(async (scope) => {
+    const final = await readRetainedMainFinal(scope);
+    return final ? { state: 'complete', final } : { state: 'unavailable' };
+  });
   const service = createCortexTelegramDeliveryDispatchService({
     DeliveryModel,
     MessageModel,
@@ -199,9 +238,12 @@ function buildService(fixture = exactFixture()) {
     jobManager,
     deliveryService,
     bindMessageGeneration,
+    readRetainedMainFinalState,
   });
   return {
     service,
+    readRetainedMainFinal,
+    readRetainedMainFinalState,
     DeliveryModel,
     MessageModel,
     IngressModel,
@@ -407,5 +449,219 @@ describe('CortexTelegramDeliveryDispatchService', () => {
       dropReason: 'delivery_outcome_unknown',
       allowExpiredLease: true,
     });
+  });
+});
+
+describe('durable Cortex delivery recovery', () => {
+  test.each(['deletedAt', 'unfinished', 'error'])(
+    'refuses canonical followup %s',
+    async (field) => {
+      const f = exactFixture();
+      f.followup[field] = field === 'deletedAt' ? new Date() : true;
+      const d = buildService(f);
+      expect(await d.service.claimPending({ limit: 1 })).toEqual([]);
+      expect(d.deliveryService.claimPendingByParent).not.toHaveBeenCalled();
+    },
+  );
+  test('claims and authorizes a retained canonical result after the job cache disappears', async () => {
+    const f = exactFixture();
+    const d = buildService(f);
+    d.jobManager.getJob.mockResolvedValue(null);
+    d.readRetainedMainFinal.mockResolvedValue({
+      responseMessageId: f.parentMessageId,
+      conversationId: f.conversationId,
+      interactionContext: f.parent.metadata.viventium.interactionContext,
+    });
+    const [delivery] = await d.service.claimPending({ limit: 1 });
+    expect(delivery.text).toBe(f.followup.text);
+    d.DeliveryModel.find.mockReturnValue(query(f.claimed.claimed));
+    expect(await d.service.authorizeClaim({ cortexClaim: delivery.cortexClaim })).toMatchObject({
+      presentationLeaseToken: f.fence.presentationLeaseToken,
+    });
+    expect(d.jobManager.bindCortexPresentation).not.toHaveBeenCalled();
+  });
+  test('cannot use a retained result to bypass a conflicting live job', async () => {
+    const f = exactFixture();
+    const d = buildService(f);
+    d.jobManager.getJob.mockResolvedValue({ ...f.job, status: 'superseded' });
+    d.readRetainedMainFinal.mockResolvedValue({
+      responseMessageId: f.parentMessageId,
+      conversationId: f.conversationId,
+      interactionContext: f.parent.metadata.viventium.interactionContext,
+    });
+    expect(await d.service.claimPending({ limit: 1 })).toEqual([]);
+    expect(d.readRetainedMainFinal).not.toHaveBeenCalled();
+  });
+  test.each(['sourceEventId', 'responseBinding'])(
+    'refuses changed durable ingress %s',
+    async (field) => {
+      const f = exactFixture();
+      const d = buildService(f);
+      f.ingress[field] =
+        field === 'sourceEventId' ? 'f'.repeat(64) : { ...f.ingress.responseBinding, revision: 9 };
+      expect(await d.service.claimPending({ limit: 1 })).toEqual([]);
+    },
+  );
+  test('a body edit between claim and authorize invalidates the saved presentation proof', async () => {
+    const f = exactFixture();
+    const d = buildService(f);
+    const [delivery] = await d.service.claimPending({ limit: 1 });
+    f.followup.text = 'Changed canonical text';
+    d.DeliveryModel.find.mockReturnValue(query(f.claimed.claimed));
+    await expect(
+      d.service.authorizeClaim({ cortexClaim: delivery.cortexClaim }),
+    ).rejects.toMatchObject({ code: 'cortex_telegram_dispatch_claim_conflict' });
+    expect(d.deliveryService.fencePresentation).not.toHaveBeenCalled();
+  });
+  test('an invalid bounded prefix yields to a later valid candidate on the next tick', async () => {
+    const f = exactFixture();
+    const d = buildService(f);
+    const deferred = new Set();
+    const rows = Array.from({ length: 4 }, (_, i) => ({
+      ...f.candidate,
+      deliveryId: `old-${i}`,
+      parentMessageId: `gone-${i}`,
+    })).concat(f.candidate);
+    d.DeliveryModel.updateMany.mockImplementation(async (filter) => {
+      deferred.add(filter.parentMessageId);
+      return { matchedCount: 1 };
+    });
+    d.DeliveryModel.find.mockImplementation((filter) => {
+      if (filter.status === 'claimed') return query([]);
+      let limit = Infinity;
+      const q = query([]);
+      q.limit.mockImplementation((n) => {
+        limit = n;
+        return q;
+      });
+      q.lean.mockImplementation(async () =>
+        rows.filter((row) => !deferred.has(row.parentMessageId)).slice(0, limit),
+      );
+      return q;
+    });
+    expect(await d.service.claimPending({ limit: 1 })).toEqual([]);
+    expect(await d.service.claimPending({ limit: 1 })).toHaveLength(1);
+  });
+  test('retained ACK validates durable lease, cohort and channel without a job', async () => {
+    const f = exactFixture();
+    const d = buildService(f);
+    d.jobManager.getJob.mockResolvedValue(null);
+    d.readRetainedMainFinal.mockResolvedValue({
+      responseMessageId: f.parentMessageId,
+      conversationId: f.conversationId,
+      interactionContext: f.parent.metadata.viventium.interactionContext,
+    });
+    const authorizedRows = f.claimed.claimed.map((row) => ({
+      ...row,
+      presentationLeaseToken: f.fence.presentationLeaseToken,
+      presentationLeaseOwnerId: f.ownerId,
+      presentationLeaseClaimToken: f.fence.claimToken,
+      presentationLeaseGeneration: f.fence.generation,
+      presentationLeaseExpiresAt: new Date('2099-01-01'),
+    }));
+    d.DeliveryModel.find.mockReturnValue(query(authorizedRows));
+    f.followup.metadata.viventium.cortexTelegramPresentation = jest
+      .requireActual('@librechat/api')
+      .cortexTelegramPresentationProof(f.followup, f.fence);
+    const ack = {
+      state: 'committed',
+      logical_turn_id: f.logicalTurnId,
+      revision: 1,
+      presentation_ref: 'telegram:-100123:99',
+      presentation_refs: ['telegram:-100123:99'],
+    };
+    expect(await d.service.acknowledgeRetained(ack, f.fence)).toMatchObject({
+      status: 'recorded',
+      presentation: { userId: f.ownerId },
+    });
+    expect(
+      await d.service.acknowledgeRetained(
+        { ...ack, presentation_ref: 'telegram:777:99', presentation_refs: ['telegram:777:99'] },
+        f.fence,
+      ),
+    ).toEqual({ status: 'conflict' });
+    expect(await d.service.acknowledgeRetained(ack, { ...f.fence, generation: 3 })).toEqual({
+      status: 'conflict',
+    });
+    f.followup.metadata.viventium.deliveryAcknowledgement = {
+      ...ack,
+      revision: 2,
+      logical_turn_revision: 1,
+      cortex_presentation_generation: 2,
+      cortex_presentation_claim_token: 'claim-2',
+    };
+    const settledRows = authorizedRows.map((row) => ({
+      ...row,
+      status: 'sent',
+      claimToken: '',
+      presentationLeaseToken: '',
+      presentedSurfaces: ['web', 'telegram'],
+    }));
+    d.DeliveryModel.find.mockReturnValue(query(settledRows));
+    expect(await d.service.acknowledgeRetained(ack, f.fence)).toMatchObject({
+      status: 'recorded',
+      idempotent: true,
+    });
+    expect(
+      await d.service.acknowledgeRetained(
+        {
+          ...ack,
+          presentation_ref: 'telegram:-100123:100',
+          presentation_refs: ['telegram:-100123:100'],
+        },
+        f.fence,
+      ),
+    ).toEqual({ status: 'conflict' });
+    const unknownRows = authorizedRows.map((row) => ({
+      ...row,
+      status: 'dropped',
+      dropReason: 'delivery_outcome_unknown',
+    }));
+    d.DeliveryModel.find.mockReturnValue(query(unknownRows));
+    expect(await d.service.acknowledgeRetained(ack, f.fence)).toEqual({ status: 'conflict' });
+  });
+});
+
+describe('typed retained supersession settlement', () => {
+  test.each(['superseded', 'unavailable'])(
+    'retained %s settles only definite supersession',
+    async (state) => {
+      const f = exactFixture();
+      const d = buildService(f);
+      d.jobManager.getJob.mockResolvedValue(null);
+      d.readRetainedMainFinalState.mockResolvedValue({
+        state,
+        parent: {
+          responseMessageId: f.parentMessageId,
+          conversationId: f.conversationId,
+          interactionContext: f.parent.metadata.viventium.interactionContext,
+        },
+      });
+      expect(await d.service.claimPending({ limit: 1 })).toEqual([]);
+      expect(d.deliveryService.markDropped).toHaveBeenCalledTimes(state === 'superseded' ? 1 : 0);
+      expect(d.DeliveryModel.updateMany).toHaveBeenCalledTimes(state === 'superseded' ? 0 : 1);
+      if (state === 'superseded')
+        expect(d.deliveryService.markDropped).toHaveBeenCalledWith({
+          ownerId: f.ownerId,
+          claims: f.claimed.claimed,
+          dropReason: 'conversation_moved_on',
+        });
+    },
+  );
+  test('typed supersession cannot bypass foreign or replaced ingress', async () => {
+    const f = exactFixture();
+    const d = buildService(f);
+    d.jobManager.getJob.mockResolvedValue(null);
+    f.ingress.responseBinding.revision = 9;
+    d.readRetainedMainFinalState.mockResolvedValue({
+      state: 'superseded',
+      parent: {
+        responseMessageId: f.parentMessageId,
+        conversationId: f.conversationId,
+        interactionContext: f.parent.metadata.viventium.interactionContext,
+      },
+    });
+    expect(await d.service.claimPending({ limit: 1 })).toEqual([]);
+    expect(d.deliveryService.markDropped).not.toHaveBeenCalled();
   });
 });

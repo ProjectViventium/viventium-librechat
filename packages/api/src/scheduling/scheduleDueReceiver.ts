@@ -1,6 +1,7 @@
 /* === VIVENTIUM START === Application-owned scheduled Main admission. === */
 import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import type { ScheduledTaskSource } from './scheduledTaskSource';
+import { scheduleDueUnknownRecovery } from './scheduleDueRecovery';
 
 export interface ScheduledDestination {
   surface: 'librechat' | 'telegram' | 'voice';
@@ -67,6 +68,10 @@ export interface ScheduleDueAdmission {
   claimToken?: string;
   failureCode?: string;
   resultMessageId?: string;
+  nextAttemptAt?: Date;
+  resultRecoveryAttempts?: number;
+  resultRecoveryExhaustedAt?: Date;
+  resultRecoveryDiagnostic?: string;
 }
 
 export interface ScheduleDueStore {
@@ -394,6 +399,7 @@ export function createScheduleDueDispatcher({
         await update(admission, {
           dueState: result.state === 'unknown' ? 'unknown' : 'failed',
           failureCode: result.failureCode || 'scheduled_execution_failed',
+          ...(result.state === 'unknown' ? scheduleDueUnknownRecovery(admission) : {}),
         });
         return true;
       }

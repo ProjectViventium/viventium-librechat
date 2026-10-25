@@ -468,7 +468,12 @@ const startServer = async () => {
       upgradeFinalization.markReady();
     } catch (startupError) {
       if (!upgradeFinalization.isArmed()) {
-        throw startupError;
+        logger.error(
+          'Required Viventium API startup failed before recovery was ready:',
+          startupError,
+        );
+        process.exit(1);
+        return;
       }
       try {
         upgradeFinalization.markFailed(startupError);

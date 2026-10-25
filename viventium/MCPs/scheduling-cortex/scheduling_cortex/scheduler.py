@@ -873,6 +873,22 @@ class SchedulerEngine:
             version_id=str(workbench.get("version_id") or "") or None,
         )
         if not claim.get("claimed"):
+            if claim.get("reason") == "occurrence_already_terminal":
+                terminal = claim.get("run") or {}
+                # Resume after this exact occurrence. The next tick applies the existing
+                # latest-occurrence and misfire policy, including a due catch-up.
+                next_run = compute_next_run(schedule, occurrence_due_dt, occurrence_due_dt)
+                repaired = self._storage.advance_terminal_scheduled_prompt_cursor(
+                    task, run_id=str(terminal.get("run_id") or ""),
+                    due_at=to_utc_iso(occurrence_due_dt),
+                    next_run_at=to_utc_iso(next_run) if next_run else None,
+                    now=to_utc_iso(now),
+                )
+                (logger.info if repaired else logger.debug)(
+                    "Terminal occurrence cursor reconciled task=%s advanced=%s",
+                    task_id, repaired,
+                )
+                return
             if claim.get("reason") == "task_has_active_occurrence":
                 blocker = claim.get("run") if isinstance(claim.get("run"), dict) else {}
                 deferred_metadata = dict(metadata)

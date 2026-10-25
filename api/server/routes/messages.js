@@ -114,6 +114,10 @@ const sanitizeMessageForPublicResponse = (message) => {
     hostFinal: _hostFinal,
     ...publicMessage
   } = message;
+  if (publicMessage.metadata?.viventium && typeof publicMessage.metadata.viventium === 'object') {
+    const { cortexTelegramPresentation: _receipt, ...viventium } = publicMessage.metadata.viventium;
+    publicMessage.metadata = { ...publicMessage.metadata, viventium };
+  }
   return {
     ...publicMessage,
     ...(Object.hasOwn(publicMessage, 'content')

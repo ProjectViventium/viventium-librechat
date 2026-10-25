@@ -70,6 +70,7 @@ beforeEach(async () => {
       content: [{ type: 'text', text: 'Working.' }],
     },
   ]);
+  const admittedAt = Date.now();
   identity = {
     userId: user,
     conversationId,
@@ -84,8 +85,8 @@ beforeEach(async () => {
     agentId: 'agent',
     originSha256: 'c'.repeat(64),
     source: await db.captureNativeResponseSource(user, conversationId, 'question'),
-    admittedAt: Date.now(),
-    recoverUntil: Date.now() + 86_400_000,
+    admittedAt,
+    recoverUntil: admittedAt + 86_400_000,
   };
   await db.admitNativeResponse(identity, transaction);
   await db.settleNativeResponse(identity, 'unsupported');

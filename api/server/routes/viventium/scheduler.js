@@ -1191,6 +1191,23 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
     return;
   }
   if (!job) {
+    const retained =
+      await require('~/server/services/viventium/nativeResponseService').readRetainedMainFinal({
+        userId,
+        streamId,
+        includeSettled: true,
+      });
+    if (requestAbort.signal.aborted) return;
+    if (retained?.interactionContext?.origin === 'scheduler') {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      writeSseEvent(
+        res,
+        'message',
+        attachLogicalTurnMetadata(retained.finalEvent, retained.interactionContext),
+      );
+      return res.end();
+    }
     return res.status(404).json({
       error: 'Stream not found',
       message: 'The generation job does not exist or has expired.',
@@ -1336,6 +1353,28 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
     return;
   }
   if (!job) {
+    const retained =
+      await require('~/server/services/viventium/nativeResponseService').readRetainedMainFinal({
+        userId,
+        streamId,
+        includeSettled: true,
+      });
+    if (requestAbort.signal.aborted) return;
+    if (retained?.interactionContext?.origin === 'scheduler') {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      for (const attachment of extractAttachments(retained.finalEvent))
+        writeSseEvent(res, 'attachment', attachment);
+      const text = extractFinalResponseText(retained.finalEvent);
+      if (text)
+        writeSseEvent(res, 'message', {
+          type: 'final',
+          text,
+          messageId: retained.responseMessageId,
+        });
+      writeSseEvent(res, 'done', { final: true, messageId: retained.responseMessageId });
+      return res.end();
+    }
     return res.status(404).json({
       error: 'Stream not found',
       message: 'The generation job does not exist or has expired.',

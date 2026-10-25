@@ -17,6 +17,8 @@ const {
   supportsMessagingDeliveryDisposition,
   prepareNativeSourceRecovery,
   deliverCortexBatchToRunningMain,
+  readRetainedNativeMainFinal,
+  inspectRetainedMainFinalState,
 } = require('@librechat/api');
 const {
   extractEnvVariable,
@@ -728,6 +730,153 @@ async function readRetainedHostFinal(query) {
     },
   };
 }
+async function readRetainedMainFinal(query) {
+  const host = await readRetainedHostFinal(query);
+  if (host)
+    return (!query.conversationId || host.conversationId === query.conversationId) &&
+      (!query.responseMessageId || host.responseMessageId === query.responseMessageId)
+      ? host
+      : null;
+  const db = require('~/models');
+  const { Message } = require('~/db/models');
+  return readRetainedNativeMainFinal(query, {
+    readCandidates: (scope) =>
+      Message.find({
+        user: scope.userId,
+        deletedAt: null,
+        isCreatedByUser: false,
+        'nativeResponse.streamId': scope.streamId,
+        ...(scope.conversationId ? { conversationId: scope.conversationId } : {}),
+        ...(scope.responseMessageId ? { messageId: scope.responseMessageId } : {}),
+      })
+        .select('+nativeResponse')
+        .limit(2)
+        .lean(),
+    sourceMatches: (identity) => db.nativeResponseSourceMatches(identity),
+    isCurrent: async (identity) => {
+      if (!(await hostResponseAuthorIsCurrent(identity))) return false;
+      return !(await Message.exists({
+        user: identity.userId,
+        deletedAt: null,
+        $or: [
+          {
+            'metadata.viventium.interactionContext.logical_turn_id': identity.logicalTurnId,
+            'metadata.viventium.interactionContext.revision': { $gt: identity.revision },
+          },
+          {
+            'nativeResponse.logicalTurnId': identity.logicalTurnId,
+            'nativeResponse.revision': { $gt: identity.revision },
+          },
+          ...(identity.sourceOrderScope && identity.sourceSequence != null
+            ? [
+                {
+                  'metadata.viventium.interactionContext.source_order_scope':
+                    identity.sourceOrderScope,
+                  'metadata.viventium.interactionContext.source_sequence': {
+                    $gt: identity.sourceSequence,
+                  },
+                },
+                {
+                  'nativeResponse.sourceOrderScope': identity.sourceOrderScope,
+                  'nativeResponse.sourceSequence': { $gt: identity.sourceSequence },
+                },
+              ]
+            : []),
+        ],
+      }));
+    },
+    readCompleted: async (identity) => {
+      const [message] = await db.getMessages({
+        user: identity.userId,
+        conversationId: identity.conversationId,
+        messageId: identity.responseMessageId,
+      });
+      return message ? getService().projectForTransmit(identity, message) : null;
+    },
+    readSource: (identity) =>
+      db.getMessage({
+        user: identity.userId,
+        conversationId: identity.conversationId,
+        messageId: identity.source.messageId,
+      }),
+  });
+}
+async function readRetainedMainFinalState(query) {
+  const db = require('~/models');
+  const { Message, ViventiumTelegramIngressEvent } = require('~/db/models');
+  return inspectRetainedMainFinalState(query, {
+    readFinal: readRetainedMainFinal,
+    readCandidates: () =>
+      Message.find({
+        user: query.userId,
+        deletedAt: null,
+        isCreatedByUser: false,
+        ...(query.conversationId ? { conversationId: query.conversationId } : {}),
+        ...(query.responseMessageId ? { messageId: query.responseMessageId } : {}),
+        $or: [
+          { 'nativeResponse.streamId': query.streamId },
+          { 'hostFinal.streamId': query.streamId },
+        ],
+      })
+        .select('+nativeResponse +hostFinal')
+        .limit(2)
+        .lean(),
+    sourceMatches: (identity) => db.nativeResponseSourceMatches(identity),
+    hasNewerSource: async (identity, context) =>
+      Boolean(
+        (await Message.exists({
+          user: identity.userId,
+          deletedAt: null,
+          $or: [
+            {
+              'metadata.viventium.interactionContext.logical_turn_id': identity.logicalTurnId,
+              'metadata.viventium.interactionContext.revision': { $gt: identity.revision },
+            },
+            {
+              'nativeResponse.logicalTurnId': identity.logicalTurnId,
+              'nativeResponse.revision': { $gt: identity.revision },
+            },
+            ...(identity.sourceOrderScope && identity.sourceSequence != null
+              ? [
+                  {
+                    'nativeResponse.sourceOrderScope': identity.sourceOrderScope,
+                    'nativeResponse.sourceSequence': { $gt: identity.sourceSequence },
+                  },
+                  {
+                    'hostFinal.sourceOrderScope': identity.sourceOrderScope,
+                    'hostFinal.sourceSequence': { $gt: identity.sourceSequence },
+                  },
+                  {
+                    isCreatedByUser: true,
+                    'metadata.viventium.interactionContext.source_order_scope':
+                      identity.sourceOrderScope,
+                    'metadata.viventium.interactionContext.source_sequence': {
+                      $gt: identity.sourceSequence,
+                    },
+                    'metadata.viventium.originalInputReceipt.sourceEventId': { $exists: true },
+                    $expr: {
+                      $eq: [
+                        '$metadata.viventium.originalInputReceipt.sourceEventId',
+                        '$metadata.viventium.interactionContext.source_event_id',
+                      ],
+                    },
+                  },
+                ]
+              : []),
+          ],
+        })) ||
+        (context.surface === 'telegram' &&
+          identity.sourceOrderScope &&
+          identity.sourceSequence != null &&
+          (await ViventiumTelegramIngressEvent.exists({
+            libreChatUserId: identity.userId,
+            sourceOrderScope: identity.sourceOrderScope,
+            sourceSequence: { $gt: identity.sourceSequence },
+          }))),
+      ),
+  });
+}
+
 async function acknowledgeRetainedHostFinal(acknowledgement, surface) {
   return require('~/models').acknowledgeHostResponseFinal(
     acknowledgement,
@@ -740,7 +889,29 @@ async function acknowledgeRetainedHostFinal(acknowledgement, surface) {
 async function markNativeResponseReplayStored(identity, mode) {
   const marked = await require('~/models').markNativeResponseReplayStored(identity);
   if (!marked) return false;
+  let scheduled = false;
+  if (mode !== 'cancelled') {
+    try {
+      const job = await GenerationJobManager.getJob(identity.streamId);
+      scheduled = job?.metadata?.interactionContext?.origin === 'scheduler';
+    } catch {
+      logger.warn('[scheduleDue] Canonical result wake remains recoverable');
+    }
+  }
   const settled = await GenerationJobManager.settleNativeResponse(identity, mode);
+  if (scheduled) {
+    setImmediate(() =>
+      Promise.resolve()
+        .then(async () => {
+          await require('./ScheduleDueService').wakeScheduleDueResult({
+            userId: identity.userId,
+            streamId: identity.streamId,
+            responseMessageId: identity.responseMessageId,
+          });
+        })
+        .catch(() => logger.warn('[scheduleDue] Canonical result wake remains recoverable')),
+    );
+  }
   if (settled) {
     // Canonical replay is committed. Wake the existing durable mission lane, including recovery.
     try {
@@ -1212,6 +1383,8 @@ module.exports = {
   wrapNativeResponseFetch,
   recoverSavedNativeResponse,
   readRetainedHostFinal,
+  readRetainedMainFinal,
+  readRetainedMainFinalState,
   acknowledgeRetainedHostFinal,
   markNativeResponseReplayStored,
   recoverNativeResponse,

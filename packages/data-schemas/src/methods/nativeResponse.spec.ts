@@ -64,6 +64,7 @@ describe('native response source and final persistence', () => {
         attachments: [{ type: 'file', file_id: 'kept' }],
       },
     ]);
+    const admittedAt = Date.now();
     identity = {
       userId: user,
       conversationId: 'conversation',
@@ -78,8 +79,8 @@ describe('native response source and final persistence', () => {
       agentId: 'agent',
       originSha256: 'c'.repeat(64),
       source: await methods.captureNativeResponseSource(user, 'conversation', 'question'),
-      admittedAt: Date.now(),
-      recoverUntil: Date.now() + 86_400_000,
+      admittedAt,
+      recoverUntil: admittedAt + 86_400_000,
     };
     commit.mockClear();
   });

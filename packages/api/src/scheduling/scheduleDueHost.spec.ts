@@ -34,7 +34,15 @@ function setup(readBindingOwners?: () => Promise<string[]>) {
     conversationId: body.conversationId,
   }));
   const enqueue = jest.fn(async () => ({ configured: 1, enqueued: 1, unresolved: 0 }));
-  const readJob = jest.fn(async () => ({ status: 'complete' }));
+  const readJob = jest.fn<Promise<{ status: string } | null>, [string]>(async () => ({
+    status: 'complete',
+  }));
+  const readRetainedResult = jest.fn<
+    Promise<
+      { state: 'complete'; messageId: string } | { state: 'failed'; failureCode: string } | null
+    >,
+    [ScheduleDueAdmission]
+  >(async () => null);
   const readTelegram = jest.fn<
     Promise<{ telegramChatId?: string; telegramUserId?: string } | null>,
     [string]
@@ -135,6 +143,7 @@ function setup(readBindingOwners?: () => Promise<string[]>) {
     readActiveCall,
     dispatch,
     readJob,
+    readRetainedResult,
     readResume: async () => ({ responseMessageId: 'response-1' }),
     subscribe: async (_streamId, onDone) => {
       wake = onDone;
@@ -205,6 +214,7 @@ function setup(readBindingOwners?: () => Promise<string[]>) {
     enqueue,
     readMessage,
     readJob,
+    readRetainedResult,
     readTelegram,
     admit,
     claimAgain: (admission: ScheduleDueAdmission) => {
@@ -803,4 +813,40 @@ describe('Viventium application receiver uses existing owners', () => {
     expect(data.dispatch).toHaveBeenCalledTimes(1);
     expect(data.enqueue).toHaveBeenCalledTimes(1);
   });
+});
+
+test.each([true, false])(
+  'lost job before result ID pin recovers exact retained result=%s without executing again',
+  async (found) => {
+    const data = setup();
+    const { admission } = await data.admit();
+    admission.status = 'accepted';
+    admission.dueState = 'unknown';
+    admission.failureCode = 'schedule_due_stream_unavailable';
+    data.readJob.mockResolvedValue(null);
+    data.readRetainedResult.mockResolvedValue(
+      found ? { state: 'complete', messageId: 'response-1' } : null,
+    );
+    await data.host.reconcile();
+    expect(data.dispatch).not.toHaveBeenCalled();
+    expect(data.enqueue).toHaveBeenCalledTimes(found ? 1 : 0);
+    expect(admission.dueState).toBe(found ? 'delivery_queued' : 'unknown');
+    if (found) expect(admission.resultMessageId).toBe('response-1');
+  },
+);
+
+test('known retained native failure settles accepted scheduled admission without rerun', async () => {
+  const data = setup();
+  const { admission } = await data.admit();
+  admission.status = 'accepted';
+  admission.dueState = 'unknown';
+  data.readJob.mockResolvedValue(null);
+  data.readRetainedResult.mockResolvedValue({
+    state: 'failed',
+    failureCode: 'scheduled_execution_failed',
+  });
+  await data.host.reconcile();
+  expect(data.dispatch).not.toHaveBeenCalled();
+  expect(data.enqueue).not.toHaveBeenCalled();
+  expect(admission.dueState).toBe('failed');
 });

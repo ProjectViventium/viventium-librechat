@@ -92,10 +92,13 @@ function sanitizePrivateMessageContent(value, ancestors = new WeakSet()) {
  * the reserved leaf without an extra read; only the first authenticated source insert stamps it.
  */
 const ORIGINAL_INPUT_RECEIPT_PATH = 'metadata.viventium.originalInputReceipt';
+const CORTEX_PRESENTATION_RECEIPT_PATH = 'metadata.viventium.cortexTelegramPresentation';
 function protectsOriginalInputReceipt(path) {
   return (
     path === 'metadata' ||
     path === 'metadata.viventium' ||
+    path === CORTEX_PRESENTATION_RECEIPT_PATH ||
+    path.startsWith(`${CORTEX_PRESENTATION_RECEIPT_PATH}.`) ||
     path === ORIGINAL_INPUT_RECEIPT_PATH ||
     path.startsWith(`${ORIGINAL_INPUT_RECEIPT_PATH}.`)
   );
@@ -248,6 +251,7 @@ function sanitizeMessageForPersistence(message, { purpose = 'update' } = {}) {
     ) {
       metadata.viventium = { ...metadata.viventium };
       delete metadata.viventium.originalInputReceipt;
+      delete metadata.viventium.cortexTelegramPresentation;
     }
     document.metadata = metadata;
   }
@@ -645,6 +649,18 @@ async function saveMessage(req, params, metadata) {
       }).lean();
       if (!winner) throw new Error('native_response_message_deleted');
       return winner;
+    }
+    if (
+      metadata?.hostGenerationComplete === true &&
+      req._viventiumHostResponseIdentity &&
+      message.metadata?.viventium?.interactionContext?.origin === 'scheduler'
+    ) {
+      const { userId, streamId, responseMessageId } = req._viventiumHostResponseIdentity;
+      setImmediate(() =>
+        require('~/server/services/viventium/ScheduleDueService')
+          .wakeScheduleDueResult({ userId, streamId, responseMessageId })
+          .catch(() => logger.warn('[scheduleDue] Canonical result wake remains recoverable')),
+      );
     }
     /* === VIVENTIUM END === */
 
@@ -1046,7 +1062,9 @@ async function getMessages(filter, select) {
     // Exclude private writer input in Mongo itself, then expose only its existing state.
     // Explicit projections above remain internal callers' responsibility.
     const rows = await Message.find(filter)
-      .select('+savedMemoryWrite -savedMemoryWrite.source')
+      .select(
+        '+savedMemoryWrite -savedMemoryWrite.source -metadata.viventium.cortexTelegramPresentation',
+      )
       .sort({ createdAt: 1 })
       .lean();
     return rows.map(({ savedMemoryWrite, memoryWriteStatus: _ignored, ...message }) => {

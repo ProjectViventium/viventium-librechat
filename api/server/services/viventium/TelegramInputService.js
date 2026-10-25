@@ -2,6 +2,7 @@
 const {
   createTelegramInputService,
   telegramIngressDedupeTtlSeconds,
+  telegramTerminalPresentationScope,
   GenerationJobManager,
 } = require('@librechat/api');
 const { ViventiumTelegramIngressEvent: Ingress, Message } = require('~/db/models');
@@ -12,7 +13,10 @@ const {
 } = require('./GlassHiveTerminalCallbackTransaction');
 const { mutateNativeResponseSources } = require('./nativeResponseService');
 const { committedDeliveryFilter } = require('./telegramCommittedDelivery');
-const { readRetainedTelegramTerminal } = require('./TelegramIngressAuthorityService');
+const {
+  readRetainedTelegramTerminal,
+  acknowledgeRetainedTelegramFailure,
+} = require('./TelegramIngressAuthorityService');
 
 const fields = {
   state: 'inputState',
@@ -148,6 +152,56 @@ async function hasNewerFailedAdmittedInput(record) {
       sourceSequence: { $gt: record.sourceSequence },
       inputState: 'failed',
       streamId: { $nin: ['', null] },
+    }),
+  );
+}
+async function hasNewerTerminalPresentationSource(record, context) {
+  const scope = telegramTerminalPresentationScope(record, context);
+  const ingress = await Ingress.exists({
+    libreChatUserId: record.libreChatUserId,
+    telegramUserId: record.telegramUserId,
+    telegramChatId: record.telegramChatId,
+    telegramMessageThreadId: record.telegramMessageThreadId,
+    sourceOrderScope: record.sourceOrderScope,
+    sourceSequence: { $gt: scope.sourceSequence },
+    sourceEventId: { $nin: scope.excludedSourceEventIds },
+  });
+  if (ingress) return true;
+  return Boolean(
+    await Message.exists({
+      user: record.libreChatUserId,
+      deletedAt: null,
+      $or: [
+        {
+          isCreatedByUser: true,
+          'metadata.viventium.interactionContext.source_order_scope': record.sourceOrderScope,
+          'metadata.viventium.interactionContext.source_sequence': { $gt: scope.sourceSequence },
+          'metadata.viventium.interactionContext.source_event_id': {
+            $nin: scope.excludedSourceEventIds,
+          },
+          'metadata.viventium.originalInputReceipt.sourceEventId': { $exists: true },
+          $expr: {
+            $eq: [
+              '$metadata.viventium.originalInputReceipt.sourceEventId',
+              '$metadata.viventium.interactionContext.source_event_id',
+            ],
+          },
+        },
+        {
+          'nativeResponse.userId': record.libreChatUserId,
+          'nativeResponse.streamId': { $ne: record.streamId },
+          'nativeResponse.sourceOrderScope': record.sourceOrderScope,
+          'nativeResponse.sourceSequence': { $gt: scope.sourceSequence },
+          'nativeResponse.source.messageId': { $ne: record.sourceMessageId },
+        },
+        {
+          'hostFinal.userId': record.libreChatUserId,
+          'hostFinal.streamId': { $ne: record.streamId },
+          'hostFinal.sourceOrderScope': record.sourceOrderScope,
+          'hostFinal.sourceSequence': { $gt: scope.sourceSequence },
+          'hostFinal.source.messageId': { $ne: record.sourceMessageId },
+        },
+      ],
     }),
   );
 }
@@ -388,6 +442,72 @@ const service = createTelegramInputService({
       context?.source_order_scope === record.sourceOrderScope
     );
   },
+  settleObsoleteTerminal: async (record) => {
+    const terminal = await readRetainedTelegramTerminal({
+      ownerId: record.libreChatUserId,
+      streamId: record.streamId,
+      includeSettled: true,
+    });
+    if (
+      !terminal?.error_class ||
+      terminal.conversationId !== record.conversationId ||
+      terminal.interactionContext?.source_event_id !== record.sourceEventId
+    )
+      return false;
+    const ack = terminal.acknowledgement;
+    if (
+      ack?.state === 'failed' &&
+      ack.logical_turn_id === terminal.interactionContext?.logical_turn_id &&
+      ack.revision === terminal.interactionContext?.revision &&
+      (await verifyOwner(record))
+    ) {
+      const settled = await acknowledgeRetainedTelegramFailure(ack, 'telegram');
+      return settled.status === 'recorded';
+    }
+    if (!(await hasNewerTerminalPresentationSource(record, terminal.interactionContext)))
+      return false;
+    return runGlassHiveTerminalCallbackTransaction(async () => {
+      const current = await Ingress.findOne(exactFilter(record)).lean();
+      if (
+        !current?.responseBinding ||
+        current.responseBinding.streamId !== record.streamId ||
+        current.responseBinding.responseMessageId !== terminal.responseMessageId ||
+        current.responseBinding.logicalTurnId !== terminal.interactionContext?.logical_turn_id ||
+        current.responseBinding.revision !== terminal.interactionContext?.revision ||
+        !(await verifyOwner(record)) ||
+        !(await hasNewerTerminalPresentationSource(record, terminal.interactionContext))
+      )
+        return false;
+      const failure = await Message.findOne({
+        user: record.libreChatUserId,
+        conversationId: record.conversationId,
+        messageId: terminal.responseMessageId,
+        parentMessageId: record.sourceMessageId,
+        isCreatedByUser: false,
+        unfinished: false,
+        error: true,
+        deletedAt: null,
+        'metadata.viventium.interactionContext.source_event_id': record.sourceEventId,
+        'metadata.viventium.interactionContext.logical_turn_id':
+          current.responseBinding.logicalTurnId,
+        'metadata.viventium.interactionContext.revision': current.responseBinding.revision,
+      }).lean();
+      if (!failure) return false;
+      const updated = await Ingress.updateOne(
+        { ...exactFilter(record), responseBinding: current.responseBinding },
+        {
+          $set: {
+            inputState: 'failed',
+            inputFailureCode: 'source_terminal_superseded',
+            inputLeaseUntil: 0,
+            inputRetryAt: 0,
+            inputClaimToken: '',
+          },
+        },
+      );
+      return Number(updated?.matchedCount ?? updated?.n ?? 0) === 1;
+    });
+  },
   readStream: async (streamId, ownerId) => {
     const job = await GenerationJobManager.getJob(streamId);
     if (!job) {
@@ -408,7 +528,19 @@ const service = createTelegramInputService({
     if (['committed', 'committed_effect'].includes(ack?.state)) return 'completed';
     // VIVENTIUM: the adapter's failed acknowledgement is terminal for this stream's answer.
     if (ack?.state === 'failed') return 'failed';
-    return ['error', 'aborted', 'superseded'].includes(job.status) ? 'failed' : 'pending';
+    if (
+      ['complete', 'error', 'aborted', 'superseded'].includes(job.status) ||
+      job.metadata?.generationCompleted === true
+    ) {
+      const terminal = await readRetainedTelegramTerminal({
+        ownerId,
+        streamId,
+        includeSettled: true,
+      });
+      // A cached completed final can still be replayed by its existing stream owner before ACK.
+      return terminal || job.status === 'complete' ? 'terminal' : 'missing';
+    }
+    return 'pending';
   },
 });
 async function inputEnvelope(record) {

@@ -1223,6 +1223,7 @@ describe('ResumableAgentController Phase B stream completion window', () => {
     });
     const job = await store.getJob(streamId);
     const claim = { interactionContext: job.interactionContext };
+    const admittedAt = Date.now();
     const identity = {
       userId: 'user-1',
       conversationId: 'conv-1',
@@ -1237,8 +1238,8 @@ describe('ResumableAgentController Phase B stream completion window', () => {
       agentId: 'synthetic-agent',
       originSha256: 'b'.repeat(64),
       source: { id: 'synthetic-source-id', messageId: 'user-msg-1', digest: 'c'.repeat(64) },
-      admittedAt: Date.now(),
-      recoverUntil: Date.now() + 86_400_000,
+      admittedAt,
+      recoverUntil: admittedAt + 86_400_000,
     };
     expect(await manager.bindNativeResponse(identity)).toBe(true);
     if (mode === 'committed' || mode === 'committed_pending') {

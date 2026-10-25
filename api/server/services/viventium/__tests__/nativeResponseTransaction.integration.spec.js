@@ -104,6 +104,7 @@ describe('native host transaction retry with actual Mongo and generation owner',
       interactionContext: claim.interactionContext,
       userMessage: { messageId: 'question' },
     });
+    const admittedAt = Date.now();
     identity = {
       userId: user,
       conversationId,
@@ -118,8 +119,8 @@ describe('native host transaction retry with actual Mongo and generation owner',
       agentId: 'main',
       originSha256: 'c'.repeat(64),
       source: await db.captureNativeResponseSource(user, conversationId, 'question'),
-      admittedAt: Date.now(),
-      recoverUntil: Date.now() + 86400000,
+      admittedAt,
+      recoverUntil: admittedAt + 86400000,
     };
     if (!(await mockManager.bindNativeResponse(identity)))
       throw new Error('native test admission failed');

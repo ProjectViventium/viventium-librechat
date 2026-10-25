@@ -238,6 +238,7 @@ describe('Mongo personal-account cleanup repository', () => {
       ]);
       const transaction = <T>(operation: () => Promise<T>) =>
         mongoose.connection.transaction(operation);
+      const admittedAt = Date.now();
       const identity = {
         userId: OWNER,
         conversationId: 'conversation-cleanup-1',
@@ -256,8 +257,8 @@ describe('Mongo personal-account cleanup repository', () => {
           'conversation-cleanup-1',
           'native-parent',
         ),
-        admittedAt: Date.now(),
-        recoverUntil: Date.now() + 86_400_000,
+        admittedAt,
+        recoverUntil: admittedAt + 86_400_000,
       };
       await methods.admitNativeResponse(identity, transaction);
       await models.Message.collection.updateOne(

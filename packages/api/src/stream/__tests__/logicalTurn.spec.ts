@@ -2665,23 +2665,26 @@ describe('GenerationJobManager logical turns', () => {
     });
     const aJob = (await store.getJob('telegram-restart-a'))!;
     const digest = 'a'.repeat(64);
-    const nativeIdentity = (job: typeof aJob, responseMessageId: string, invocationId: string) => ({
-      userId: 'user-1',
-      conversationId: 'conversation-restart',
-      responseMessageId,
-      streamId: job.streamId,
-      jobCreatedAt: job.createdAt,
-      logicalTurnId: job.interactionContext!.logical_turn_id!,
-      revision: job.interactionContext!.revision,
-      invocationId,
-      bodySha256: digest,
-      providerId: 'provider',
-      agentId: 'agent',
-      originSha256: digest,
-      source: { id: 'source-db-id', messageId: 'source-a', digest },
-      admittedAt: Date.now(),
-      recoverUntil: Date.now() + 86_400_000,
-    });
+    const nativeIdentity = (job: typeof aJob, responseMessageId: string, invocationId: string) => {
+      const admittedAt = Date.now();
+      return {
+        userId: 'user-1',
+        conversationId: 'conversation-restart',
+        responseMessageId,
+        streamId: job.streamId,
+        jobCreatedAt: job.createdAt,
+        logicalTurnId: job.interactionContext!.logical_turn_id!,
+        revision: job.interactionContext!.revision,
+        invocationId,
+        bodySha256: digest,
+        providerId: 'provider',
+        agentId: 'agent',
+        originSha256: digest,
+        source: { id: 'source-db-id', messageId: 'source-a', digest },
+        admittedAt,
+        recoverUntil: admittedAt + 86_400_000,
+      };
+    };
     expect(await store.bindNativeResponse(nativeIdentity(aJob, 'response-a', 'invocation-a'))).toBe(
       true,
     );

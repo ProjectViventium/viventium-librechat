@@ -64,6 +64,7 @@ describe('native response source and final persistence', () => {
         attachments: [{ type: 'file', file_id: 'kept' }],
       },
     ]);
+    const admittedAt = Date.now();
     identity = {
       userId: user,
       conversationId: 'conversation',
@@ -78,8 +79,8 @@ describe('native response source and final persistence', () => {
       agentId: 'agent',
       originSha256: 'c'.repeat(64),
       source: await methods.captureNativeResponseSource(user, 'conversation', 'question'),
-      admittedAt: Date.now(),
-      recoverUntil: Date.now() + 86_400_000,
+      admittedAt,
+      recoverUntil: admittedAt + 86_400_000,
     };
     commit.mockClear();
   });
@@ -1890,75 +1891,160 @@ describe('native response source and final persistence', () => {
     },
   );
   describe.each(['direct', 'native-host'])('durable host final %s', (path) => {
-    const context = () => ({ conversation_id: identity.conversationId,
-      logical_turn_id: identity.logicalTurnId, revision: identity.revision, surface: 'telegram' });
-    async function saveHostFinal(mode = 'final', isCurrent = async () => true, storedSurface = 'telegram', beforeFinal = async () => {}) {
+    const context = () => ({
+      conversation_id: identity.conversationId,
+      logical_turn_id: identity.logicalTurnId,
+      revision: identity.revision,
+      surface: 'telegram',
+    });
+    async function saveHostFinal(
+      mode = 'final',
+      isCurrent = async () => true,
+      storedSurface = 'telegram',
+      beforeFinal = async () => {},
+    ) {
       if (path === 'native-host') {
         await methods.admitNativeResponse(identity, transaction);
         await methods.settleNativeResponse(identity, 'unsupported');
       }
       await beforeFinal();
       const update = {
-        messageId: 'answer', conversationId: 'conversation', parentMessageId: 'question',
-        isCreatedByUser: false, unfinished: true, error: false,
-        text: 'The graph finished.', content: [{ type: 'text', text: 'The graph finished.' }],
+        messageId: 'answer',
+        conversationId: 'conversation',
+        parentMessageId: 'question',
+        isCreatedByUser: false,
+        unfinished: true,
+        error: false,
+        text: 'The graph finished.',
+        content: [{ type: 'text', text: 'The graph finished.' }],
         attachments: [{ type: 'file', file_id: 'kept' }],
-        metadata: { viventium: { interactionContext: { ...context(), surface: storedSurface }, deliveryDisposition: {
-          version: 1, audio: 'skip', valid: true, required: true, source: 'model',
-        } } },
+        metadata: {
+          viventium: {
+            interactionContext: { ...context(), surface: storedSurface },
+            deliveryDisposition: {
+              version: 1,
+              audio: 'skip',
+              valid: true,
+              required: true,
+              source: 'model',
+            },
+          },
+        },
       };
-      const persist = () => path === 'native-host'
-        ? methods.saveNativeResponseSnapshot(user, update, identity)
-        : mongoose.models.Message.findOneAndUpdate({ user, messageId: 'answer' }, update, { new: true });
-      return mode === 'final' ? methods.saveHostResponseFinal({ ...identity, surface: 'telegram' }, persist, isCurrent, transaction) : persist();
+      const persist = () =>
+        path === 'native-host'
+          ? methods.saveNativeResponseSnapshot(user, update, identity)
+          : mongoose.models.Message.findOneAndUpdate({ user, messageId: 'answer' }, update, {
+              new: true,
+            });
+      return mode === 'final'
+        ? methods.saveHostResponseFinal(
+            { ...identity, surface: 'telegram' },
+            persist,
+            isCurrent,
+            transaction,
+          )
+        : persist();
     }
     const query = () => ({ userId: user, streamId: identity.streamId, surface: 'telegram' });
     it('atomically stamps the final payload before presentation and reads it without a job', async () => {
       const saved = await saveHostFinal();
-      expect((await mongoose.models.Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean())?.hostFinal).toMatchObject({ version: 1,
-        storedAt: expect.any(Number), payloadSha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+      expect(
+        (
+          await mongoose.models.Message.findOne({ user, messageId: 'answer' })
+            .select('+hostFinal')
+            .lean()
+        )?.hostFinal,
+      ).toMatchObject({
+        version: 1,
+        storedAt: expect.any(Number),
+        payloadSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
       expect(saved?.unfinished).toBe(true);
       const recovered = await methods.readHostResponseFinal(query());
-      expect(recovered).toMatchObject({ text: 'The graph finished.', unfinished: true,
-        attachments: [{ file_id: 'kept' }] });
+      expect(recovered).toMatchObject({
+        text: 'The graph finished.',
+        unfinished: true,
+        attachments: [{ file_id: 'kept' }],
+      });
     });
     it('never replays an unfinished checkpoint as a completed host graph', async () => {
       await saveHostFinal('snapshot');
       expect(await methods.readHostResponseFinal(query())).toBeNull();
     });
-    it.each(['text', 'attachments', 'files', 'source_files', 'error', 'source', 'revision', 'owner', 'deleted', 'context'])(
-      'rejects a changed %s after the final receipt', async (change) => {
-        await saveHostFinal();
-        if (change === 'source_files') await mongoose.models.Message.updateOne({ messageId: 'question' }, { files: ['changed'] });
-        else if (change === 'source') await mongoose.models.Message.updateOne({ messageId: 'question' }, { text: 'Changed.' });
-        else await mongoose.models.Message.updateOne({ messageId: 'answer' }, { $set: {
-          ...(change === 'text' ? { text: 'Partial replacement.' } : {}),
-          ...(change === 'attachments' ? { attachments: [] } : {}),
-          ...(change === 'files' ? { files: ['changed'] } : {}),
-          ...(change === 'context' ? { 'metadata.viventium.interactionContext.source_event_id': 'different' } : {}),
-          ...(change === 'error' ? { error: true } : {}),
-          ...(change === 'revision' ? { 'metadata.viventium.interactionContext.revision': 2 } : {}),
-          ...(change === 'owner' ? { user: 'other' } : {}),
-          ...(change === 'deleted' ? { deletedAt: new Date() } : {}),
-        } });
-        expect(await methods.readHostResponseFinal(query())).toBeNull();
-      },
-    );
+    it.each([
+      'text',
+      'attachments',
+      'files',
+      'source_files',
+      'error',
+      'source',
+      'revision',
+      'owner',
+      'deleted',
+      'context',
+    ])('rejects a changed %s after the final receipt', async (change) => {
+      await saveHostFinal();
+      if (change === 'source_files')
+        await mongoose.models.Message.updateOne({ messageId: 'question' }, { files: ['changed'] });
+      else if (change === 'source')
+        await mongoose.models.Message.updateOne({ messageId: 'question' }, { text: 'Changed.' });
+      else
+        await mongoose.models.Message.updateOne(
+          { messageId: 'answer' },
+          {
+            $set: {
+              ...(change === 'text' ? { text: 'Partial replacement.' } : {}),
+              ...(change === 'attachments' ? { attachments: [] } : {}),
+              ...(change === 'files' ? { files: ['changed'] } : {}),
+              ...(change === 'context'
+                ? { 'metadata.viventium.interactionContext.source_event_id': 'different' }
+                : {}),
+              ...(change === 'error' ? { error: true } : {}),
+              ...(change === 'revision'
+                ? { 'metadata.viventium.interactionContext.revision': 2 }
+                : {}),
+              ...(change === 'owner' ? { user: 'other' } : {}),
+              ...(change === 'deleted' ? { deletedAt: new Date() } : {}),
+            },
+          },
+        );
+      expect(await methods.readHostResponseFinal(query())).toBeNull();
+    });
     it('rejects a newer durable author for the same logical turn', async () => {
       await saveHostFinal();
-      await mongoose.models.Message.create({ messageId: 'new-answer', user, conversationId: 'conversation',
-        isCreatedByUser: false, metadata: { viventium: { interactionContext: { ...context(), revision: 2 } } } });
+      await mongoose.models.Message.create({
+        messageId: 'new-answer',
+        user,
+        conversationId: 'conversation',
+        isCreatedByUser: false,
+        metadata: { viventium: { interactionContext: { ...context(), revision: 2 } } },
+      });
       expect(await methods.readHostResponseFinal(query())).toBeNull();
     });
     it('settles the same final once and retains the exact acknowledgement after restart', async () => {
       await saveHostFinal();
-      const ack = { logical_turn_id: identity.logicalTurnId, revision: 1,
-        state: 'committed' as const, presentation_ref: 'telegram:message' };
-      expect(await methods.acknowledgeHostResponseFinal(ack, 'telegram', transaction)).toMatchObject({ status: 'recorded', idempotent: false });
+      const ack = {
+        logical_turn_id: identity.logicalTurnId,
+        revision: 1,
+        state: 'committed' as const,
+        presentation_ref: 'telegram:message',
+      };
+      expect(
+        await methods.acknowledgeHostResponseFinal(ack, 'telegram', transaction),
+      ).toMatchObject({ status: 'recorded', idempotent: false });
       const restarted = createNativeResponseMethods(mongoose);
       expect(await restarted.readHostResponseFinal(query())).toBeNull();
-      expect(await restarted.acknowledgeHostResponseFinal(ack, 'telegram', transaction)).toMatchObject({ status: 'recorded', idempotent: true });
-      expect(await restarted.acknowledgeHostResponseFinal({ ...ack, presentation_ref: 'different' }, 'telegram', transaction)).toMatchObject({ status: 'conflict' });
+      expect(
+        await restarted.acknowledgeHostResponseFinal(ack, 'telegram', transaction),
+      ).toMatchObject({ status: 'recorded', idempotent: true });
+      expect(
+        await restarted.acknowledgeHostResponseFinal(
+          { ...ack, presentation_ref: 'different' },
+          'telegram',
+          transaction,
+        ),
+      ).toMatchObject({ status: 'conflict' });
     });
     it('requires exact surface and refuses Stop or terminal error as successful final', async () => {
       await saveHostFinal();
@@ -1968,59 +2054,120 @@ describe('native response source and final persistence', () => {
     });
     it('keeps ordinary final without proof when Stop wins during persistence', async () => {
       let checks = 0;
-      await expect(saveHostFinal('final', async () => ++checks === 1)).resolves.toMatchObject({ text: 'The graph finished.' });
-      const row = await mongoose.models.Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean();
+      await expect(saveHostFinal('final', async () => ++checks === 1)).resolves.toMatchObject({
+        text: 'The graph finished.',
+      });
+      const row = await mongoose.models.Message.findOne({ user, messageId: 'answer' })
+        .select('+hostFinal')
+        .lean();
       expect(row?.hostFinal).toBeUndefined();
       expect(row?.text).toBe('The graph finished.');
       expect(await methods.readHostResponseFinal(query())).toBeNull();
     });
-    it.each([1, 2])('keeps ordinary final without proof when author lookup %s throws', async (failingCheck) => {
-      let checks = 0;
-      await expect(saveHostFinal('final', async () => {
-        if (++checks === failingCheck) throw new Error('job_store_unavailable');
-        return true;
-      })).resolves.toMatchObject({ text: 'The graph finished.' });
-      const row = await mongoose.models.Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean();
-      expect(row?.hostFinal).toBeUndefined();
-      expect(await methods.readHostResponseFinal(query())).toBeNull();
-    });
+    it.each([1, 2])(
+      'keeps ordinary final without proof when author lookup %s throws',
+      async (failingCheck) => {
+        let checks = 0;
+        await expect(
+          saveHostFinal('final', async () => {
+            if (++checks === failingCheck) throw new Error('job_store_unavailable');
+            return true;
+          }),
+        ).resolves.toMatchObject({ text: 'The graph finished.' });
+        const row = await mongoose.models.Message.findOne({ user, messageId: 'answer' })
+          .select('+hostFinal')
+          .lean();
+        expect(row?.hostFinal).toBeUndefined();
+        expect(await methods.readHostResponseFinal(query())).toBeNull();
+      },
+    );
     it('keeps ordinary final without proof when the persisted context differs', async () => {
-      await expect(saveHostFinal('final', async () => true, 'web')).resolves.toMatchObject({ text: 'The graph finished.' });
-      expect((await mongoose.models.Message.findOne({ user, messageId: 'answer' }).select('+hostFinal').lean())?.hostFinal).toBeUndefined();
+      await expect(saveHostFinal('final', async () => true, 'web')).resolves.toMatchObject({
+        text: 'The graph finished.',
+      });
+      expect(
+        (
+          await mongoose.models.Message.findOne({ user, messageId: 'answer' })
+            .select('+hostFinal')
+            .lean()
+        )?.hostFinal,
+      ).toBeUndefined();
       expect(await methods.readHostResponseFinal(query())).toBeNull();
     });
     it('does not convert transaction infrastructure failures into a second save', async () => {
       const rejected = new Error('transaction_unavailable');
       const persist = jest.fn();
-      await expect(methods.saveHostResponseFinal({ ...identity, surface: 'telegram' }, persist,
-        async () => true, async () => { throw rejected; })).rejects.toBe(rejected);
+      await expect(
+        methods.saveHostResponseFinal(
+          { ...identity, surface: 'telegram' },
+          persist,
+          async () => true,
+          async () => {
+            throw rejected;
+          },
+        ),
+      ).rejects.toBe(rejected);
       expect(persist).not.toHaveBeenCalled();
     });
     it('does not retry or swallow an ordinary persistence rejection', async () => {
       const rejected = new Error('ordinary_persistence_rejected');
       const persist = jest.fn().mockRejectedValue(rejected);
-      await expect(methods.saveHostResponseFinal({ ...identity, surface: 'telegram' }, persist,
-        async () => true, transaction)).rejects.toBe(rejected);
+      await expect(
+        methods.saveHostResponseFinal(
+          { ...identity, surface: 'telegram' },
+          persist,
+          async () => true,
+          transaction,
+        ),
+      ).rejects.toBe(rejected);
       expect(persist).toHaveBeenCalledTimes(1);
       expect(await methods.readHostResponseFinal(query())).toBeNull();
     });
     it('permits preview removal to settle with the exact completed presentation', async () => {
       await saveHostFinal();
-      await mongoose.models.Message.updateOne({ user, messageId: 'answer' }, { $set: {
-        'metadata.viventium.deliveryAcknowledgement': { logical_turn_id: identity.logicalTurnId, revision: 1, state: 'partial_removed' },
-      } });
+      await mongoose.models.Message.updateOne(
+        { user, messageId: 'answer' },
+        {
+          $set: {
+            'metadata.viventium.deliveryAcknowledgement': {
+              logical_turn_id: identity.logicalTurnId,
+              revision: 1,
+              state: 'partial_removed',
+            },
+          },
+        },
+      );
       expect(await methods.readHostResponseFinal(query())).not.toBeNull();
-      expect(await methods.acknowledgeHostResponseFinal({ logical_turn_id: identity.logicalTurnId, revision: 1,
-        state: 'committed', presentation_ref: 'telegram:final' }, 'telegram', transaction)).toMatchObject({ status: 'recorded' });
+      expect(
+        await methods.acknowledgeHostResponseFinal(
+          {
+            logical_turn_id: identity.logicalTurnId,
+            revision: 1,
+            state: 'committed',
+            presentation_ref: 'telegram:final',
+          },
+          'telegram',
+          transaction,
+        ),
+      ).toMatchObject({ status: 'recorded' });
     });
     it('keeps ordinary final without proof when the source changed at the final write', async () => {
-      await expect(saveHostFinal('final', async () => true, 'telegram', async () => {
-        // Change the source after native admission, before the final-proof transaction.
-        await mongoose.models.Message.updateOne({ messageId: 'question' }, { text: 'Changed before save' });
-      })).resolves.toMatchObject({ text: 'The graph finished.' });
+      await expect(
+        saveHostFinal(
+          'final',
+          async () => true,
+          'telegram',
+          async () => {
+            // Change the source after native admission, before the final-proof transaction.
+            await mongoose.models.Message.updateOne(
+              { messageId: 'question' },
+              { text: 'Changed before save' },
+            );
+          },
+        ),
+      ).resolves.toMatchObject({ text: 'The graph finished.' });
       expect(await methods.readHostResponseFinal(query())).toBeNull();
     });
   });
-
 });
 /* === VIVENTIUM END === */

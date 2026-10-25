@@ -28,6 +28,7 @@ async function completedNative(origin = 'scheduler') {
     userMessage: { messageId: 'question' },
   });
   const digest = 'a'.repeat(64);
+  const admittedAt = Date.now();
   const identity = {
     userId: 'owner',
     conversationId: 'conversation',
@@ -42,8 +43,8 @@ async function completedNative(origin = 'scheduler') {
     agentId: 'agent',
     originSha256: digest,
     source: { id: 'source-db', messageId: 'question', digest },
-    admittedAt: Date.now(),
-    recoverUntil: Date.now() + 86_400_000,
+    admittedAt,
+    recoverUntil: admittedAt + 86_400_000,
   };
   await manager.bindNativeResponse(identity);
   await manager.commitNativeResponse(identity, digest);

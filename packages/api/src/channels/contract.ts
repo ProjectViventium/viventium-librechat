@@ -99,17 +99,19 @@ function readAttachments(value: unknown): ChannelAttachment[] {
   );
 }
 
+/** Preserve the declared transport mode; absent or unsupported legacy values are text input. */
+export function normalizeChannelInputMode(value: unknown): ChannelEnvelope['inputMode'] {
+  return CHANNEL_INPUT_MODES.includes(value as ChannelEnvelope['inputMode'])
+    ? (value as ChannelEnvelope['inputMode'])
+    : 'text';
+}
+
 export function normalizeChannelEnvelope(input: Record<string, unknown>): ChannelEnvelope {
   const text = typeof input.text === 'string' ? input.text : '';
   if (text.length > MAX_TEXT_LENGTH) {
     throw new Error('text is too long');
   }
-  const requestedInputMode = typeof input.inputMode === 'string' ? input.inputMode : 'text';
-  const inputMode = CHANNEL_INPUT_MODES.includes(
-    requestedInputMode as (typeof CHANNEL_INPUT_MODES)[number],
-  )
-    ? (requestedInputMode as (typeof CHANNEL_INPUT_MODES)[number])
-    : 'text';
+  const inputMode = normalizeChannelInputMode(input.inputMode);
 
   return {
     channel: readChannel(input.channel),

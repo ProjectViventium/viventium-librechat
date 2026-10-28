@@ -187,7 +187,7 @@ router.post('/', requireJwtAuth, async (req, res) => {
 
     const preferPublicPlayground = shouldPreferPublicPlaygroundForRequest(req);
     const readinessStartedAt = Date.now();
-    const readiness = await verifyPlaygroundReadiness({ preferPublicPlayground });
+    const readiness = await verifyPlaygroundReadiness();
     if (!readiness.ready) {
       logger.warn(
         `[VIVENTIUM][calls] call_rejected ${JSON.stringify({

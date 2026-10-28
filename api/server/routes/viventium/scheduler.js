@@ -1137,7 +1137,8 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       telegram_chat_id: telegramUserId,
       linked: true,
       voice_preferences: {
-        always_voice_response: Boolean(mapping?.alwaysVoiceResponse ?? false),
+        always_voice_response: Boolean(mapping?.alwaysVoiceResponse ?? true),
+        reply_voice_with_voice: Boolean(mapping?.replyVoiceWithVoice ?? true),
         voice_responses_enabled: Boolean(mapping?.voiceResponsesEnabled ?? true),
       },
     });

@@ -84,6 +84,13 @@ describe('Retained Telegram input authority', () => {
     expect(bound).toMatchObject({ sourceEventId: SOURCE_EVENT, telegramChatId: '-100123' });
   });
 
+  test('the original voice input survives a later admission and a fresh database read', async () => {
+    await bind({ inputMode: 'voice_note' });
+    expect((await dispatcherAuthority()).inputMode).toBe('voice_note');
+    await bind({ inputMode: 'text' });
+    expect((await dispatcherAuthority()).inputMode).toBe('voice_note');
+  });
+
   test('a continued admission of the same stream keeps the first binding time', async () => {
     await bind();
     const first = (await dispatcherAuthority()).authorityBoundAt.getTime();

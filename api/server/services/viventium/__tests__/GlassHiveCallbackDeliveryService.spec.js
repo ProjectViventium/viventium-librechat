@@ -1154,6 +1154,31 @@ describe('GlassHiveCallbackDeliveryService', () => {
     },
   );
 
+  test.each(['voice_note', 'text', undefined])(
+    'durable callback projects original inputMode %s',
+    async (inputMode) => {
+      mockFindOneAndUpdate.mockImplementation((_filter, update) =>
+        leanResult({ ...update.$setOnInsert }),
+      );
+      const result = await enqueueGlassHiveCallbackDelivery({
+        body: { callback_id: 'callback-mode', event: 'main.followup', inputMode: 'voice_call' },
+        message: { messageId: 'main-message', text: 'The result.' },
+        text: 'The result.',
+        deliveryContext: {
+          ownerId: 'owner',
+          conversationId: 'conversation',
+          originRef: 'origin',
+          inputMode,
+          destinations: [
+            { surface: 'telegram', telegramChatId: 'chat', telegramUserId: 'telegram-user' },
+          ],
+        },
+      });
+      expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.inputMode).toBe(inputMode);
+      expect(result.deliveries[0].inputMode).toBe(inputMode);
+    },
+  );
+
   test('scheduled Main carries byte-exact canonical text for its proof and gateway digest', async () => {
     mockFindOneAndUpdate.mockImplementation((_filter, update) =>
       leanResult({ ...update.$setOnInsert }),

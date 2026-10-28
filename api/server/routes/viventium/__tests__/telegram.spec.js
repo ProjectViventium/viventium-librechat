@@ -1970,7 +1970,14 @@ describe('/api/viventium/telegram', () => {
 
   const retainedAuthorityBinding = (row) => [
     { sourceEventId: row.sourceEventId, libreChatUserId: 'user_1', streamId: 'stream_1' },
-    [{ $set: { authorityBoundAt: { $ifNull: ['$authorityBoundAt', '$$NOW'] } } }],
+    [
+      {
+        $set: {
+          authorityBoundAt: { $ifNull: ['$authorityBoundAt', '$$NOW'] },
+          inputMode: { $ifNull: ['$inputMode', 'text'] },
+        },
+      },
+    ],
   ];
 
   test('a retained input binds its ingress authority to exactly its admitted stream', async () => {
@@ -4979,6 +4986,41 @@ describe('/api/viventium/telegram', () => {
     expect(lastVoiceProvider).toBe('xai');
   });
 
+  test.each(['voice_note', 'text'])(
+    'POST /chat binds original %s source and syncs reply voice independently',
+    async (inputMode) => {
+      const req = createMockReq({
+        url: '/api/viventium/telegram/chat',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          text: 'hi',
+          conversationId: 'new',
+          telegramUserId: 'tg-1',
+          telegramChatId: 'tg-1',
+          voiceMode: false,
+          viventiumInputMode: inputMode,
+          reply_voice_with_voice: false,
+        },
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../telegram')), req, res);
+      expect(res.statusCode).toBe(200);
+      expect(mockLastPreparedBody.viventiumInputMode).toBe(inputMode);
+      expect(
+        mockTelegramMappingUpdateOne.mock.calls.some(
+          ([filter, update]) =>
+            filter.telegramUserId === 'tg-1' && update.$set.replyVoiceWithVoice === false,
+        ),
+      ).toBe(true);
+      expect(
+        mockTelegramIngressUpdateOne.mock.calls.some(
+          ([, update]) => update.$set?.inputMode === inputMode,
+        ),
+      ).toBe(true);
+      expect(lastVoiceMode).toBe(false);
+    },
+  );
+
   test('POST /chat injects saved voice provider for Telegram text turns that request audio', async () => {
     mockResolveUserVoiceRoute.mockResolvedValueOnce({
       stt: { provider: 'pywhispercpp', variant: 'base.en' },
@@ -5296,6 +5338,238 @@ describe('/api/viventium/telegram', () => {
     expect(writes).toContain('"logical_turn_id":"logical-telegram-2"');
     expect(writes).toContain('"revision":2');
     expect(writes).toContain('"surface":"telegram"');
+  });
+
+  test.each([
+    [true, true, true],
+    [true, true, false],
+    [true, false, true],
+    [true, false, false],
+    [false, true, true],
+    [false, true, false],
+    [false, false, true],
+    [false, false, false],
+  ])(
+    'POST preferences retains independent master=%s replyVoice=%s always=%s',
+    async (master, replyVoice, always) => {
+      const req = createMockReq({
+        url: '/api/viventium/telegram/preferences',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          telegramUserId: 'tg-1',
+          voiceResponsesEnabled: master,
+          replyVoiceWithVoice: replyVoice,
+          alwaysVoiceResponse: always,
+        },
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../telegram')), req, res);
+      expect(res.statusCode).toBe(200);
+      expect(res.body.voice_preferences).toEqual({
+        voice_responses_enabled: master,
+        reply_voice_with_voice: replyVoice,
+        always_voice_response: always,
+      });
+      expect(mockTelegramMappingUpdateOne).toHaveBeenLastCalledWith(
+        { telegramUserId: 'tg-1' },
+        {
+          $set: expect.objectContaining({
+            voiceResponsesEnabled: master,
+            replyVoiceWithVoice: replyVoice,
+            alwaysVoiceResponse: always,
+            voicePrefsUpdatedAt: expect.any(Date),
+          }),
+        },
+      );
+    },
+  );
+
+  test('POST preferences accepts only the new snake alias without resetting legacy values', async () => {
+    const req = createMockReq({
+      url: '/api/viventium/telegram/preferences',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: { telegramUserId: 'tg-1', reply_voice_with_voice: false },
+    });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../telegram')), req, res);
+    expect(res.statusCode).toBe(200);
+    const write = mockTelegramMappingUpdateOne.mock.calls.at(-1);
+    expect(write[0]).toEqual({ telegramUserId: 'tg-1' });
+    expect(write[1].$set.replyVoiceWithVoice).toBe(false);
+    expect(write[1].$set).not.toHaveProperty('alwaysVoiceResponse');
+    expect(write[1].$set).not.toHaveProperty('voiceResponsesEnabled');
+  });
+
+  test('POST preferences rejects a bridge secret mismatch before a mapping write', async () => {
+    const req = createMockReq({
+      url: '/api/viventium/telegram/preferences',
+      headers: { 'x-viventium-telegram-secret': 'invalid_secret' },
+      body: { telegramUserId: 'tg-1', replyVoiceWithVoice: false },
+    });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../telegram')), req, res);
+    expect(res.statusCode).toBe(401);
+    expect(mockTelegramMappingUpdateOne).not.toHaveBeenCalled();
+  });
+
+  test.each(['/chat', '/voice-route'])(
+    'group %s context cannot replace private voice preferences',
+    async (path) => {
+      const identity = {
+        telegramUserId: 'tg-1',
+        telegramChatId: '-100123',
+        alwaysVoiceResponse: false,
+        replyVoiceWithVoice: false,
+        voiceResponsesEnabled: false,
+      };
+      const req = createMockReq({
+        url: `/api/viventium/telegram${path}`,
+        method: path === '/chat' ? 'POST' : 'GET',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: path === '/chat' ? { ...identity, text: 'hi', conversationId: 'new' } : {},
+        query: path === '/voice-route' ? identity : {},
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../telegram')), req, res);
+      expect(res.statusCode).toBe(200);
+      expect(mockTelegramMappingUpdateOne).toHaveBeenCalled();
+      for (const [filter, update] of mockTelegramMappingUpdateOne.mock.calls) {
+        expect(filter).toEqual({ telegramUserId: 'tg-1' });
+        for (const field of [
+          'alwaysVoiceResponse',
+          'replyVoiceWithVoice',
+          'voiceResponsesEnabled',
+          'voicePrefsUpdatedAt',
+        ])
+          expect(update.$set).not.toHaveProperty(field);
+      }
+    },
+  );
+
+  test.each([
+    ['/voice-route', 0, 200],
+    ['/voice-route', '0', 200],
+    ['/voice-route', '7', 200],
+    ['/chat', 0, 400],
+    ['/chat', '7', 200],
+    ['/source-order', 0, 400],
+    ['/source-order', '7', 200],
+  ])(
+    'topic %s/%s context cannot replace private voice preferences',
+    async (path, telegramMessageThreadId, status) => {
+      const identity = {
+        telegramUserId: 'tg-1',
+        telegramChatId: 'tg-1',
+        telegramMessageThreadId,
+        sourceSequence: 42,
+        alwaysVoiceResponse: false,
+        replyVoiceWithVoice: false,
+        voiceResponsesEnabled: false,
+      };
+      const req = createMockReq({
+        url: `/api/viventium/telegram${path}`,
+        method: path === '/voice-route' ? 'GET' : 'POST',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: path === '/voice-route' ? {} : { ...identity, text: 'hi', conversationId: 'new' },
+        query: path === '/voice-route' ? identity : {},
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../telegram')), req, res);
+      expect(res.statusCode).toBe(status);
+      expect(mockTelegramMappingUpdateOne).toHaveBeenCalled();
+      for (const [filter, update] of mockTelegramMappingUpdateOne.mock.calls) {
+        expect(filter).toEqual({ telegramUserId: 'tg-1' });
+        for (const field of [
+          'alwaysVoiceResponse',
+          'replyVoiceWithVoice',
+          'voiceResponsesEnabled',
+          'voicePrefsUpdatedAt',
+        ])
+          expect(update.$set).not.toHaveProperty(field);
+      }
+    },
+  );
+
+  test('snake-case topic identity also protects private context preferences', async () => {
+    const req = createMockReq({
+      url: '/api/viventium/telegram/voice-route',
+      method: 'GET',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      query: {
+        telegramUserId: 'tg-1',
+        telegramChatId: 'tg-1',
+        telegram_message_thread_id: '7',
+        always_voice_response: false,
+        reply_voice_with_voice: false,
+        voice_responses_enabled: false,
+      },
+    });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../telegram')), req, res);
+    expect(res.statusCode).toBe(200);
+    const update = mockTelegramMappingUpdateOne.mock.calls.at(-1)[1].$set;
+    expect(update).not.toHaveProperty('voicePrefsUpdatedAt');
+    expect(update).not.toHaveProperty('alwaysVoiceResponse');
+  });
+
+  test.each(['tg-1', undefined])(
+    'private voice context %s updates the owner and preserves absent-chat compatibility',
+    async (telegramChatId) => {
+      const req = createMockReq({
+        url: '/api/viventium/telegram/voice-route',
+        method: 'GET',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        query: {
+          telegramUserId: 'tg-1',
+          telegramChatId,
+          always_voice_response: false,
+          reply_voice_with_voice: true,
+          voice_responses_enabled: true,
+        },
+      });
+      const res = createMockRes();
+      await dispatch(createTestApp(require('../telegram')), req, res);
+      expect(res.statusCode).toBe(200);
+      expect(mockTelegramMappingUpdateOne).toHaveBeenLastCalledWith(
+        { telegramUserId: 'tg-1' },
+        {
+          $set: expect.objectContaining({
+            alwaysVoiceResponse: false,
+            replyVoiceWithVoice: true,
+            voiceResponsesEnabled: true,
+            voicePrefsUpdatedAt: expect.any(Date),
+          }),
+        },
+      );
+    },
+  );
+
+  test('explicit preferences writes the actual owner even from a group control context', async () => {
+    const req = createMockReq({
+      url: '/api/viventium/telegram/preferences',
+      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+      body: {
+        telegramUserId: 'tg-1',
+        telegramChatId: '-100123',
+        telegramMessageThreadId: '7',
+        alwaysVoiceResponse: false,
+        replyVoiceWithVoice: true,
+        voiceResponsesEnabled: true,
+      },
+    });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../telegram')), req, res);
+    expect(res.statusCode).toBe(200);
+    expect(mockTelegramMappingUpdateOne).toHaveBeenLastCalledWith(
+      { telegramUserId: 'tg-1' },
+      {
+        $set: expect.objectContaining({
+          alwaysVoiceResponse: false,
+          replyVoiceWithVoice: true,
+          voiceResponsesEnabled: true,
+        }),
+      },
+    );
   });
 
   test('POST preferences persists voice preference sync payload', async () => {

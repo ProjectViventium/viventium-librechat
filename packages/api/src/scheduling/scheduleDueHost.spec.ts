@@ -452,6 +452,11 @@ describe('Viventium application receiver uses existing owners', () => {
     expect(data.readJob).not.toHaveBeenCalled();
     expect(data.dispatch).not.toHaveBeenCalled();
     expect(data.enqueue).toHaveBeenCalledTimes(1);
+    expect(data.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryContext: expect.objectContaining({ inputMode: 'text' }),
+      }),
+    );
     expect(admission.dueState).toBe('delivery_queued');
     expect(admission.failureCode).toBe('');
   });

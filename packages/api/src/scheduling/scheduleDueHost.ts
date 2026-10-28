@@ -136,6 +136,7 @@ interface DueHostDependencies {
       originRef: string;
       destinations: ScheduledDestination[];
       mainGenerationPresentation: { streamId: string; admissionId: string };
+      inputMode: 'text';
     };
   }): Promise<{ unresolved: number; enqueued: number; configured: number }>;
   onRecoveryError(code: string): void;
@@ -625,6 +626,7 @@ export function createScheduleDueHost(deps: DueHostDependencies) {
         text,
         deliveryContext: {
           ownerId: admission.userId,
+          inputMode: 'text',
           conversationId: admission.conversationId,
           originRef: binding._id,
           destinations: selectedDestinations,

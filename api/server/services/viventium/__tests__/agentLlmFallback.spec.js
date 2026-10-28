@@ -793,8 +793,8 @@ test('a final model request-rejection phase preserves outer HTTP400 no-retry sem
 });
 /* === VIVENTIUM END === */
 
-/* === VIVENTIUM START === Direct refusal keeps the existing typed no-fallback policy. === */
-test('typed Direct HTTP403 request refusal does not retry through another provider', () => {
+/* === VIVENTIUM START === Declared content refusal keeps the existing typed no-fallback policy. === */
+test('typed content-policy refusal does not retry through another provider', () => {
   const refused = { status: 403, code: 'provider_request_rejected' };
   expect(isRecoverableProviderFallbackError(refused)).toBe(false);
   expect(
@@ -807,7 +807,7 @@ test('typed Direct HTTP403 request refusal does not retry through another provid
     shouldRetryWithFallback([
       {
         type: ContentTypes.ERROR,
-        error: 'The selected API declined this request or its model access.',
+        error: 'The selected API rejected the request content.',
         error_class: refused.code,
       },
     ]),
@@ -824,5 +824,20 @@ test('typed Direct HTTP403 request refusal does not retry through another provid
   expect(isRecoverableProviderFallbackError({ status: 401, code: 'provider_auth_missing' })).toBe(
     true,
   );
+});
+/* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === Access failure remains eligible for the configured fallback. === */
+test.each([402, 403])('typed Direct HTTP%s access denial keeps configured fallback', (status) => {
+  expect(isRecoverableProviderFallbackError({ status, code: 'provider_access_denied' })).toBe(true);
+  expect(
+    shouldRetryWithFallback([
+      {
+        type: ContentTypes.ERROR,
+        error: 'Model access unavailable.',
+        error_class: 'provider_access_denied',
+      },
+    ]),
+  ).toBe(true);
 });
 /* === VIVENTIUM END === */

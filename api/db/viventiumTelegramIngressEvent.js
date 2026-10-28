@@ -32,6 +32,7 @@ module.exports = function createViventiumTelegramIngressEvent(db) {
       sourceSequence: { type: Number, min: 1, default: null },
       sourceOrderScope: { type: String, default: '' },
       sourceEventId: { type: String, default: '', index: true },
+      inputMode: { type: String, enum: ['text', 'voice', 'voice_note', 'voice_call'] },
       authorityBoundAt: { type: Date, default: null, index: true },
       responseBinding: {
         type: new mongoose.Schema(

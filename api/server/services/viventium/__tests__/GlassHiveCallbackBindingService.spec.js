@@ -496,6 +496,32 @@ describe('GlassHiveCallbackBindingService', () => {
     },
   );
 
+  test.each(['voice_note', 'text', undefined])(
+    'launch binding retains the admitted input mode %s',
+    async (inputMode) => {
+      await registerGlassHiveLaunchContext({
+        user: { id: 'user-1' },
+        toolName: 'workspace_launch',
+        toolArguments: { goal: 'Prepare the synthetic report', require_callback: true },
+        requestBody: {
+          messageId: 'assistant-anchor',
+          parentMessageId: 'user-message',
+          conversationId: 'conversation-1',
+          viventiumSourceEventId: 'source-1',
+          viventiumSurface: 'telegram',
+          viventiumInputMode: inputMode,
+          viventiumTelegramChatId: 'chat-1',
+          viventiumTelegramUserId: 'telegram-user-1',
+          viventiumTriggeringSourceSegments: [{ ordinal: 0, text: 'Prepare the report.' }],
+        },
+        toolCall: { id: 'call-launch-1', stepId: 'step-launch-1', turn: 0 },
+      });
+      expect(mockBindingUpdateOne.mock.calls[0][1].$setOnInsert.inputMode).toBe(
+        inputMode || 'text',
+      );
+    },
+  );
+
   test('persists a Core-owned target binding and required schedule relation before launch', async () => {
     const launch = await registerGlassHiveLaunchContext({
       user: { id: 'user-1' },
@@ -510,6 +536,7 @@ describe('GlassHiveCallbackBindingService', () => {
         parentMessageId: 'user-message',
         conversationId: 'conversation-1',
         viventiumSourceEventId: 'scheduler:occurrence-1',
+        viventiumInputMode: 'voice_note',
         viventiumTriggeringSourceSegments: [
           { ordinal: 0, text: 'Prepare the synthetic report exactly.' },
         ],
@@ -551,6 +578,7 @@ describe('GlassHiveCallbackBindingService', () => {
         requestedParentMessageId: 'user-message',
         configuredDestinations: [{ surface: 'telegram' }, { surface: 'librechat' }],
         scheduleOccurrenceKey: 'schedule:occurrence-1',
+        inputMode: 'text',
         launchState: 'prepared',
         preparationExpiresAt: expect.any(Date),
         workRef: '',
@@ -1467,6 +1495,7 @@ describe('GlassHiveCallbackBindingService', () => {
       conversationId: 'conversation-1',
       anchorMessageId: 'assistant-anchor',
       requestedParentMessageId: 'user-message',
+      inputMode: 'voice_note',
       configuredDestinations: [{ surface: 'telegram' }, { surface: 'librechat' }],
       scheduleOccurrenceKey: 'schedule:occurrence-1',
     });
@@ -1482,11 +1511,13 @@ describe('GlassHiveCallbackBindingService', () => {
       conversation_id: 'conversation-1',
       message_id: 'assistant-anchor',
       parent_message_id: 'forged-parent',
+      inputMode: 'text',
       surface: 'telegram',
       telegram_chat_id: 'attacker-chat',
       telegram_user_id: 'attacker-user',
     });
 
+    expect(resolved.inputMode).toBe('voice_note');
     expect(mockBindingFindOne).toHaveBeenCalledWith({ _id: 'ghi-origin-1' });
     expect(mockRequestAccountApi).toHaveBeenCalledWith(
       expect.objectContaining({

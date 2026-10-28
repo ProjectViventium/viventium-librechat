@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Phone, PhoneOff, Loader2, SlidersHorizontal } from 'lucide-react';
 import { useRecoilValue } from 'recoil';
+import { useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { TooltipAnchor } from '@librechat/client';
 import { QueryKeys, request } from 'librechat-data-provider';
@@ -473,6 +474,7 @@ export function shouldContinueCallTaskPolling(state: CallTaskContinuationState) 
 
 export default function CallButton({ className }: { className?: string }) {
   const localize = useLocalize();
+  const [searchParams, setSearchParams] = useSearchParams();
   const conversation = useRecoilValue(store.conversationByIndex(0));
   const agentId = conversation?.agent_id;
   const conversationId = conversation?.conversationId;
@@ -486,6 +488,8 @@ export default function CallButton({ className }: { className?: string }) {
   const [defaultsStatus, setDefaultsStatus] = useState('');
   const [savingDefaults, setSavingDefaults] = useState(false);
   const callWindowRef = useRef<Window | null>(null);
+  const localCallIntentConsumed = useRef(false);
+  const callActionRef = useRef<HTMLButtonElement | null>(null);
   const callSessionIdRef = useRef<string>('');
   const playgroundOriginRef = useRef<string>('');
   const continuationTimerRef = useRef<number | null>(null);
@@ -775,6 +779,28 @@ export default function CallButton({ className }: { className?: string }) {
     [agentId, conversationId, enabled, state, token],
   );
 
+  /* === VIVENTIUM START ===
+   * The helper's navigation hint focuses the existing Call action after login.
+   * A URL is not trusted call authority: only the user's normal click or Enter starts a call.
+   */
+  useEffect(() => {
+    if (
+      !enabled ||
+      !token ||
+      localCallIntentConsumed.current ||
+      searchParams.get('viventiumCall') !== '1' ||
+      !['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname)
+    ) {
+      return;
+    }
+    localCallIntentConsumed.current = true;
+    const remainingParams = new URLSearchParams(searchParams);
+    remainingParams.delete('viventiumCall');
+    setSearchParams(remainingParams, { replace: true });
+    callActionRef.current?.focus();
+  }, [enabled, token, searchParams, setSearchParams]);
+  /* === VIVENTIUM END === */
+
   const endCall = useCallback(() => {
     const callSessionId = callSessionIdRef.current;
     const w = callWindowRef.current;
@@ -823,6 +849,7 @@ export default function CallButton({ className }: { className?: string }) {
         description={title}
         render={
           <button
+            ref={callActionRef}
             type="button"
             onClick={isActive || isSettings ? endCall : () => void startCall()}
             disabled={isConnecting}

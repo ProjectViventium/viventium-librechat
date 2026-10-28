@@ -563,9 +563,32 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
       telegram_chat_id: 'tg-1',
       linked: true,
       voice_preferences: {
-        always_voice_response: false,
+        always_voice_response: true,
+        reply_voice_with_voice: true,
         voice_responses_enabled: true,
       },
+    });
+  });
+
+  test('preserves explicit false in all three saved voice preferences', async () => {
+    mockResolveTelegramMappingByUserId.mockResolvedValue({
+      telegramUserId: 'tg-1',
+      alwaysVoiceResponse: false,
+      replyVoiceWithVoice: false,
+      voiceResponsesEnabled: false,
+    });
+    const req = createMockReq({
+      url: '/api/viventium/scheduler/telegram/resolve',
+      headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+      body: { userId: 'user_1', resolveVoice: false },
+    });
+    const res = createMockRes();
+    await dispatch(createTestApp(require('../scheduler')), req, res);
+    expect(mockResolveTelegramMappingByUserId).toHaveBeenCalledWith({ libreChatUserId: 'user_1' });
+    expect(res.body.voice_preferences).toEqual({
+      always_voice_response: false,
+      reply_voice_with_voice: false,
+      voice_responses_enabled: false,
     });
   });
 
@@ -588,7 +611,8 @@ describe('/api/viventium/scheduler/telegram/resolve', () => {
     expect(res.body.telegram_chat_id).toBe('tg-1');
     expect(res.body.linked).toBe(true);
     expect(res.body.voice_preferences).toEqual({
-      always_voice_response: false,
+      always_voice_response: true,
+      reply_voice_with_voice: true,
       voice_responses_enabled: true,
     });
   });

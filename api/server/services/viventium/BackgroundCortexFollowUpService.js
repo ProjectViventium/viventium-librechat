@@ -3786,7 +3786,9 @@ async function prepareCortexFollowUpMessage({
     ...(nativeAuthor
       ? {
           plannedMessageId: nativeAuthor.messageId,
-          nativeSourceMessageId: nativeAuthor.identity ? nativeAuthor.messageId : undefined,
+          nativeSourceMessageId: nativeAuthor.identity
+            ? nativeAuthor.messageId
+            : nativeAuthor.recoveredSourceMessageId,
         }
       : {}),
     voiceTaskId,
@@ -3901,7 +3903,7 @@ async function persistPreparedCortexFollowUpMessage(
           req,
           rows: [],
           message,
-          sourceMessageId: parentMessageId,
+          sourceMessageId: prepared.nativeSourceMessageId || parentMessageId,
           nativeOutputFiles: prepared.nativeOutputFiles,
         }),
     };

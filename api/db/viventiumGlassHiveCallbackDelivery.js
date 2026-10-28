@@ -245,6 +245,11 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
       conversationId: { type: String, required: true, index: true },
       requestedParentMessageId: { type: String, default: '', index: true },
       anchorMessageId: { type: String, default: '', index: true },
+      inputMode: {
+        type: String,
+        enum: ['text', 'voice', 'voice_note', 'voice_call'],
+        immutable: true,
+      },
       surface: { type: String, required: true, index: true },
       event: { type: String, required: true, index: true },
       workerId: { type: String, default: '', index: true },

@@ -13,6 +13,7 @@ const { getConvo, getUserById } = require('~/models');
 const isEqual = require('lodash/isEqual');
 const {
   canonicalizeGlassHiveCallbackRef,
+  normalizeChannelInputMode,
   fenceGlassHiveTerminalCallbackAcceptedOperation,
   verifyVoiceWorkerCompletionPresentation,
   nativeWorkInputBinding,
@@ -943,6 +944,9 @@ function toDispatchPayload(delivery) {
     workerId: delivery.workerId || null,
     runId: delivery.runId || null,
     surface: delivery.surface,
+    ...(delivery.inputMode != null
+      ? { inputMode: normalizeChannelInputMode(delivery.inputMode) }
+      : {}),
     text: delivery.text || '',
     fullText: delivery.fullText || '',
     attachments: delivery.attachments || [],
@@ -2137,6 +2141,9 @@ async function enqueueGlassHiveCallbackDelivery({
             requestedParentMessageId: normalizeText(deliveryContext?.requestedParentMessageId),
             anchorMessageId: normalizeText(deliveryContext?.anchorMessageId),
             surface,
+            ...(deliveryContext?.inputMode != null
+              ? { inputMode: normalizeChannelInputMode(deliveryContext.inputMode) }
+              : {}),
             event: traceEvent || event,
             workerId: normalizeText(body.worker_id),
             runId: normalizeText(body.run_id),

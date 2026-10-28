@@ -114,8 +114,11 @@ async function resolveTelegramMappingByUserId({ libreChatUserId }) {
 
 async function touchTelegramMapping({
   telegramUserId,
+  telegramChatId,
+  telegramMessageThreadId,
   telegramUsername,
   alwaysVoiceResponse,
+  replyVoiceWithVoice,
   voiceResponsesEnabled,
 }) {
   if (!telegramUserId) {
@@ -127,15 +130,24 @@ async function touchTelegramMapping({
   if (telegramUsername) {
     update.telegramUsername = telegramUsername;
   }
-  const hasAlwaysVoice = alwaysVoiceResponse != null;
-  const hasVoiceEnabled = voiceResponsesEnabled != null;
+  const chatId = normalizeTelegramId(telegramChatId);
+  const hasThread =
+    telegramMessageThreadId != null && String(telegramMessageThreadId).trim() !== '';
+  const privatePreferences =
+    !hasThread && (!chatId || chatId === normalizeTelegramId(telegramUserId));
+  const hasAlwaysVoice = privatePreferences && alwaysVoiceResponse != null;
+  const hasVoiceEnabled = privatePreferences && voiceResponsesEnabled != null;
+  const hasReplyVoice = privatePreferences && replyVoiceWithVoice != null;
   if (hasAlwaysVoice) {
-    update.alwaysVoiceResponse = coerceBoolean(alwaysVoiceResponse, false);
+    update.alwaysVoiceResponse = coerceBoolean(alwaysVoiceResponse, true);
+  }
+  if (hasReplyVoice) {
+    update.replyVoiceWithVoice = coerceBoolean(replyVoiceWithVoice, true);
   }
   if (hasVoiceEnabled) {
     update.voiceResponsesEnabled = coerceBoolean(voiceResponsesEnabled, true);
   }
-  if (hasAlwaysVoice || hasVoiceEnabled) {
+  if (hasAlwaysVoice || hasVoiceEnabled || hasReplyVoice) {
     update.voicePrefsUpdatedAt = new Date();
   }
   await TelegramUserMapping.updateOne({ telegramUserId }, { $set: update }).catch((err) => {

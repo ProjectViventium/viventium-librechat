@@ -236,6 +236,238 @@ afterAll(() => {
 });
 
 describe('GlassHiveMissionAdjudicationService', () => {
+  test('does not reclaim a slow active native synthesis after five minutes', async () => {
+    jest.useFakeTimers();
+    const service = require('../GlassHiveMissionAdjudicationService');
+    const claimed = row({
+      state: 'processing',
+      attempts: 1,
+      processingAt: new Date(Date.now() - 360000),
+    });
+    let release;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    mockFind.mockReturnValueOnce(cursor([row()])).mockReturnValue(cursor([]));
+    mockFindOneAndUpdate.mockResolvedValueOnce(claimed);
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(() => held);
+    service.wakeGlassHiveMissionAdjudications({
+      ownerId: 'user-1',
+      conversationId: 'conversation-1',
+    });
+    await jest.advanceTimersByTimeAsync(0);
+    const before = mockUpdateOne.mock.calls.length;
+    mockFind.mockReturnValue(cursor([claimed]));
+    await service.reconcilePendingGlassHiveMissionAdjudications();
+    expect(
+      mockUpdateOne.mock.calls
+        .slice(before)
+        .filter(
+          ([filter, change]) => filter._id === claimed._id && change.$set?.state === 'pending',
+        ),
+    ).toHaveLength(0);
+    mockFind.mockReturnValue(cursor([]));
+    release({ prepared: true });
+    await jest.advanceTimersByTimeAsync(0);
+  });
+
+  test.each([
+    'complete',
+    'consumer',
+    'pending',
+    'foreign',
+    'first',
+    'missing',
+    'unavailable',
+    'cancelled',
+    'queue',
+    'message',
+  ])('retains exact native synthesis across retry: %s', async (mode) => {
+    const first = row({
+      state: 'processing',
+      attempts: mode === 'first' ? 1 : 2,
+      processingAt: new Date(),
+    });
+    mockFind.mockReturnValueOnce(cursor([row({ attempts: mode === 'first' ? 0 : 1 })]));
+    if (['queue', 'message'].includes(mode))
+      mockExternalWorkFindOne.mockResolvedValue({
+        _id: first.originRef,
+        runId: 'later-run',
+        acceptedAction: mode,
+      });
+    mockFindOneAndUpdate.mockResolvedValueOnce(first);
+    mockFindOne.mockImplementation(async (filter) =>
+      Object.entries(filter).every(([key, value]) => first[key] === value) ? first : null,
+    );
+    mockUpdateOne.mockImplementation(async (filter, change) => {
+      if (change.$set) Object.assign(first, change.$set);
+      return { acknowledged: true, matchedCount: 1 };
+    });
+    const sends = [];
+    let lookups = 0;
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async ({ nativeAuthor: author }) => {
+      const send = async (url, init) => {
+        sends.push(init.method || 'POST');
+        if (init.method !== 'GET') {
+          expect(first.nativeSynthesisIdentity?.invocationId).toMatch(/^[a-f0-9]{64}$/);
+          return new Response('{}');
+        }
+        lookups += 1;
+        if (mode === 'missing') return new Response('', { status: 404 });
+        if (mode === 'unavailable') return new Response('', { status: 503 });
+        const scope = new URL(String(url));
+        expect(scope.searchParams.get('agent_id')).toBe('main-agent:phase_b:followup');
+        const result = {
+          object: 'glasshive.request.result',
+          version: 1,
+          state:
+            mode === 'cancelled'
+              ? 'cancelled'
+              : mode === 'pending' && lookups === 1
+                ? 'running'
+                : 'completed',
+          invocation_id: 'a'.repeat(64),
+          body_sha256: 'b'.repeat(64),
+          authority_sha256: 'c'.repeat(64),
+          stream_id: 'phase-b-stream',
+          message_id: author.messageId,
+          agent_id: 'main-agent:phase_b:followup',
+          conversation_id: mode === 'foreign' ? 'foreign' : 'conversation-1',
+          request_id: 'saved-response',
+          run_id: 'saved-run',
+          response: {
+            id: 'saved-response',
+            object: 'chat.completion',
+            created: 1,
+            model: 'configured-model',
+            choices: [
+              {
+                index: 0,
+                finish_reason: 'stop',
+                message: {
+                  role: 'assistant',
+                  content: 'Original Main answer',
+                  reasoning_content: 'Private reasoning must not replay',
+                  provider_specific_fields: {
+                    viventium: {
+                      delivery_disposition: { version: 1, audio: 'skip' },
+                      deliveryDispositionRanges: [
+                        { text_start: 0, text_end: 20, disposition: { audio: 'skip' } },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+            usage: { prompt_tokens: 4, completion_tokens: 6, total_tokens: 10 },
+            glasshive: { output_files: { version: 1, files: [{ file_id: 'original-file' }] } },
+          },
+        };
+        return new Response(JSON.stringify(result));
+      };
+      const bound = author.wrapFetch(send, 'native');
+      const reply = await bound('http://native.test/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'configured-model',
+          stream: true,
+          messages: [
+            {
+              role: 'system',
+              content: 'New Feelings and clock do not replace the accepted answer',
+            },
+          ],
+        }),
+        headers: {
+          Authorization: 'Bearer synthetic',
+          'X-Viventium-User-Id': 'user-1',
+          'X-Viventium-Conversation-Id': 'conversation-1',
+          'X-Viventium-Message-Id': author.messageId,
+          'X-GlassHive-Agent-Id': 'main-agent:phase_b:followup',
+          'X-Viventium-Stream-Id': 'phase-b-stream',
+          'X-GlassHive-Idempotency-Key': 'phase-b-stream',
+        },
+      });
+      if (['complete', 'consumer', 'pending', 'queue', 'message'].includes(mode)) {
+        expect(author.identity).toBeUndefined();
+        expect(author.recoveredSourceMessageId).toBe(author.messageId);
+      }
+      if (mode === 'consumer') {
+        const { getChatModelClass, Providers } = require('@librechat/agents');
+        const ChatModel = getChatModelClass(Providers.OPENAI);
+        const replay = reply.clone();
+        const model = new ChatModel({
+          model: 'configured-model',
+          apiKey: 'synthetic',
+          streaming: true,
+          streamUsage: true,
+          configuration: {
+            baseURL: 'http://native.test/v1',
+            fetch: async () => replay.clone(),
+          },
+        });
+        let combined;
+        for await (const chunk of await model.stream('Synthetic consumer check'))
+          combined = combined ? combined.concat(chunk) : chunk;
+        expect(combined.content).toBe('Original Main answer');
+        const metadata = combined.additional_kwargs.provider_specific_fields.viventium;
+        expect(metadata.output_files.files).toEqual([{ file_id: 'original-file' }]);
+        expect(metadata.deliveryDispositionRanges).toHaveLength(1);
+        expect(metadata.delivery_disposition.audio).toBe('skip');
+        expect(metadata.delivery_range_text).toBe('Original Main answer');
+        expect(combined.additional_kwargs.reasoning_content).toBeUndefined();
+        expect(combined.usage_metadata.total_tokens).toBe(10);
+      }
+      if (!['first', 'missing'].includes(mode)) {
+        const text = await reply.text();
+        expect(text).toContain('Original Main answer');
+        expect(text).toContain('original-file');
+        expect(text).toContain('deliveryDispositionRanges');
+        expect(text).toContain('[DONE]');
+      }
+      return { prepared: true };
+    });
+    const outcome = await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect(outcome.failed).toBe(['foreign', 'unavailable', 'cancelled'].includes(mode) ? 1 : 0);
+    expect(sends.filter((method) => method === 'POST')).toHaveLength(
+      ['first', 'missing'].includes(mode) ? 1 : 0,
+    );
+    if (mode === 'pending') expect(lookups).toBe(2);
+    if (['foreign', 'unavailable', 'cancelled'].includes(mode))
+      expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+  });
+
+  test('does not revive exhausted image results or implicitly publish old deadletters', async () => {
+    const exhausted = ['completed', 'failed', 'cancelled'].map((state, index) =>
+      row({
+        _id: `ghe_${String(index + 1).repeat(32)}`,
+        state: 'deadletter',
+        attempts: 10,
+        errorCode: 'mission_adjudication_retry_exhausted',
+        followUpMessageId: '',
+        adjudicationGroupId: `ghag_${String(index + 1).repeat(32)}`,
+        adjudicationGroupMemberIds: [`ghe_${String(index + 1).repeat(32)}`],
+        deliveryLedgerParentMessageId: 'assistant-anchor',
+        evidence: `Retained ${state} image task result`,
+      }),
+    );
+    mockFind.mockImplementation((filter) => cursor(filter.state === 'deadletter' ? exhausted : []));
+    const service = require('../GlassHiveMissionAdjudicationService');
+    await service.reconcilePendingGlassHiveMissionAdjudications();
+    expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+    expect(
+      mockUpdateOne.mock.calls.some(([filter]) => exhausted.some((row) => row._id === filter._id)),
+    ).toBe(false);
+    expect(exhausted.every((row) => row.state === 'deadletter' && row.attempts === 10)).toBe(true);
+    const recoveryScan = mockFind.mock.calls.find(([filter]) =>
+      filter.$or?.some((entry) => entry.state === 'pending'),
+    )[0];
+    expect(recoveryScan.$or.filter((entry) => entry.state === 'deadletter')).toEqual([
+      expect.objectContaining({ followUpMessageId: { $type: 'string', $ne: '' } }),
+    ]);
+  });
+
   test('terminal mission pending27 releases only its claim and keeps evidence until Main final', async () => {
     const processingAt = new Date('2026-10-11T14:28:04Z');
     const pending = row({ attempts: 0 });
@@ -1271,6 +1503,23 @@ describe('GlassHiveMissionAdjudicationService', () => {
     },
   );
 
+  test.each(['voice_note', 'text'])(
+    'Main follow-up keeps its original %s input from durable evidence',
+    async (inputMode) => {
+      const evidence = row({ inputMode });
+      mockFind.mockReturnValueOnce(cursor([evidence]));
+      mockFindOneAndUpdate.mockResolvedValueOnce({ ...evidence, state: 'processing' });
+      await expect(
+        flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
+      ).resolves.toMatchObject({ visible: 1, failed: 0 });
+      expect(mockEnqueueDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({
+          deliveryContext: expect.objectContaining({ inputMode }),
+        }),
+      );
+    },
+  );
+
   test('persists exact terminal evidence idempotently before scheduling synthesis', async () => {
     await enqueueGlassHiveMissionAdjudication({
       binding: {
@@ -1280,6 +1529,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         conversationId: 'conversation-1',
         anchorMessageId: 'assistant-anchor',
         mainAgentId: 'main-agent',
+        inputMode: 'voice_note',
         traceIdentity: {
           callbackRef: canonicalCallbackRef('cb-1'),
           attemptNumber: 1,
@@ -1294,6 +1544,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         worker_id: 'worker-1',
         run_id: 'run-1',
         telegramMessageThreadId: 'forged-topic',
+        inputMode: 'text',
         message: 'Verified synthetic result.',
       },
     });
@@ -1310,6 +1561,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
           _id: expect.stringMatching(/^ghe_[a-f0-9]{32}$/),
           originRef: 'ghi-origin-1',
           evidence: 'Verified synthetic result.',
+          inputMode: 'voice_note',
           callbackRef: canonicalCallbackRef('cb-1'),
           attemptNumber: 1,
           destinations: [

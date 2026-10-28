@@ -8,6 +8,7 @@
 
 const {
   GenerationJobManager,
+  normalizeChannelInputMode,
   exactCortexTelegramAuthority,
   cortexTelegramPresentationProof,
   exactCortexTelegramPresentation,
@@ -364,6 +365,9 @@ function createCortexTelegramDeliveryDispatchService({
       return {
         deliveryId: normalizeText(cortexClaim.deliveryIds[0] || candidate.deliveryId),
         streamId: normalizeText(candidate.streamId),
+        ...(authority.ingress.inputMode != null
+          ? { inputMode: normalizeChannelInputMode(authority.ingress.inputMode) }
+          : {}),
         telegramChatId: normalizeText(authority.ingress.telegramChatId),
         telegramUserId: normalizeText(authority.ingress.telegramUserId),
         telegramMessageId: normalizeText(authority.ingress.telegramMessageId),

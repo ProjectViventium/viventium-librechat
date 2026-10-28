@@ -221,13 +221,15 @@ async function readBoundedPlaygroundHealthBody(response) {
   }
 }
 
-async function verifyPlaygroundReadiness({ preferPublicPlayground = false } = {}) {
+async function verifyPlaygroundReadiness() {
   const expected = resolveExpectedPlaygroundIdentity();
   if (!expected) {
     return { ready: false, reason: 'playground_source_unavailable' };
   }
 
-  const baseUrl = resolvePlaygroundBaseUrl({ preferPublicPlayground });
+  // Runtime identity is checked on its configured service address. Public launch URLs are a
+  // separate client route and may not support loopback from the serving host.
+  const baseUrl = resolvePlaygroundBaseUrl();
   let healthUrl;
   try {
     healthUrl = new URL('/api/health', `${baseUrl}/`).toString();

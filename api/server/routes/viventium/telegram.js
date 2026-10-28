@@ -23,6 +23,7 @@ const { Readable } = require('stream');
 const {
   GenerationJobManager,
   normalizeChannelEnvelope,
+  normalizeChannelInputMode,
   buildChannelAgentRequest,
   bindReadyInputContinuation,
   telegramIngressDedupeTtlSeconds,
@@ -341,6 +342,7 @@ async function bindTelegramIngressAuthority({
   sourceSequence,
   sourceOrderScope,
   sourceEventId,
+  inputMode,
 }) {
   if (!recordId) {
     const error = new Error('Telegram ingress authority record is unavailable');
@@ -365,6 +367,7 @@ async function bindTelegramIngressAuthority({
         sourceSequence,
         sourceOrderScope,
         sourceEventId,
+        inputMode,
         authorityBoundAt: new Date(),
       },
     },
@@ -447,6 +450,11 @@ function extractTelegramIdentity(req) {
   const query = req.query ?? {};
   const telegramUserId = normalizeTelegramId(body.telegramUserId || query.telegramUserId || '');
   const telegramChatId = normalizeTelegramId(body.telegramChatId || query.telegramChatId || '');
+  const telegramMessageThreadId =
+    body.telegramMessageThreadId ??
+    body.telegram_message_thread_id ??
+    query.telegramMessageThreadId ??
+    query.telegram_message_thread_id;
   const telegramUsername =
     typeof body.telegramUsername === 'string'
       ? body.telegramUsername.trim()
@@ -460,6 +468,13 @@ function extractTelegramIdentity(req) {
       query.always_voice_response,
     null,
   );
+  const replyVoiceWithVoice = parseOptionalBoolean(
+    body.replyVoiceWithVoice ??
+      body.reply_voice_with_voice ??
+      query.replyVoiceWithVoice ??
+      query.reply_voice_with_voice,
+    null,
+  );
   const voiceResponsesEnabled = parseOptionalBoolean(
     body.voiceResponsesEnabled ??
       body.voice_responses_enabled ??
@@ -470,8 +485,10 @@ function extractTelegramIdentity(req) {
   return {
     telegramUserId,
     telegramChatId,
+    telegramMessageThreadId,
     telegramUsername,
     alwaysVoiceResponse,
+    replyVoiceWithVoice,
     voiceResponsesEnabled,
   };
 }
@@ -594,8 +611,11 @@ async function telegramAuth(req, res, next) {
     }
     await touchTelegramMapping({
       telegramUserId: identity.telegramUserId,
+      telegramChatId: identity.telegramChatId,
+      telegramMessageThreadId: identity.telegramMessageThreadId,
       telegramUsername: identity.telegramUsername,
       alwaysVoiceResponse: identity.alwaysVoiceResponse,
+      replyVoiceWithVoice: identity.replyVoiceWithVoice,
       voiceResponsesEnabled: identity.voiceResponsesEnabled,
     });
 
@@ -1490,6 +1510,11 @@ router.post(
       incoming.alwaysVoiceResponse ?? incoming.always_voice_response,
       null,
     );
+    const replyVoiceWithVoice = parseOptionalBoolean(
+      incoming.replyVoiceWithVoice ?? incoming.reply_voice_with_voice,
+      null,
+    );
+    const inputMode = normalizeChannelInputMode(incoming.viventiumInputMode);
     const voiceResponsesEnabled = parseOptionalBoolean(
       incoming.voiceResponsesEnabled ?? incoming.voice_responses_enabled,
       null,
@@ -1695,9 +1720,12 @@ router.post(
 
     await touchTelegramMapping({
       telegramUserId: telegramUserId || req.query?.telegramUserId || '',
+      telegramChatId: telegramChatId || req.query?.telegramChatId || '',
+      telegramMessageThreadId,
       telegramUsername:
         typeof incoming.telegramUsername === 'string' ? incoming.telegramUsername : '',
       alwaysVoiceResponse,
+      replyVoiceWithVoice,
       voiceResponsesEnabled,
     });
     /* === VIVENTIUM NOTE ===
@@ -1821,6 +1849,7 @@ router.post(
           sourceSequence,
           sourceOrderScope,
           sourceEventId,
+          inputMode,
         });
       } catch (error) {
         logger.error('[VIVENTIUM][telegram/chat] Durable ingress authority binding failed', {
@@ -2061,8 +2090,7 @@ router.post(
       externalThreadId: normalizeIngressId(incoming.telegramMessageThreadId),
       externalMessageId: telegramMessageId,
       externalUpdateId: telegramUpdateId,
-      inputMode:
-        typeof incoming.viventiumInputMode === 'string' ? incoming.viventiumInputMode : 'text',
+      inputMode,
       audioRequested: telegramAudioRequested === true,
       text,
     });
@@ -2222,6 +2250,7 @@ router.post(
         ownerId: req.user.id,
         sourceEventId: claim.sourceEventId,
         streamId: payload.streamId,
+        inputMode: req.body.viventiumInputMode,
       });
       await Message.updateOne(TelegramInput.messageFilter(req._viventiumTelegramInput), {
         $set: { 'metadata.viventium.telegramInput.state': 'admitted' },
@@ -2316,7 +2345,7 @@ router.post(
  * Feature: Telegram voice preference sync endpoint for scheduler parity.
  * Contract:
  * - POST /api/viventium/telegram/preferences
- *   body: { telegramUserId, alwaysVoiceResponse, voiceResponsesEnabled }
+ *   body: { telegramUserId, alwaysVoiceResponse, replyVoiceWithVoice, voiceResponsesEnabled }
  * === VIVENTIUM NOTE === */
 router.post('/preferences', telegramAuth, async (req, res) => {
   const body = req.body ?? {};
@@ -2330,15 +2359,19 @@ router.post('/preferences', telegramAuth, async (req, res) => {
     body.alwaysVoiceResponse ?? body.always_voice_response,
     null,
   );
+  const replyVoiceWithVoice = parseOptionalBoolean(
+    body.replyVoiceWithVoice ?? body.reply_voice_with_voice,
+    null,
+  );
   const voiceResponsesEnabled = parseOptionalBoolean(
     body.voiceResponsesEnabled ?? body.voice_responses_enabled,
     null,
   );
 
-  if (alwaysVoiceResponse == null && voiceResponsesEnabled == null) {
-    return res
-      .status(400)
-      .json({ error: 'alwaysVoiceResponse or voiceResponsesEnabled is required' });
+  if (alwaysVoiceResponse == null && replyVoiceWithVoice == null && voiceResponsesEnabled == null) {
+    return res.status(400).json({
+      error: 'alwaysVoiceResponse, replyVoiceWithVoice or voiceResponsesEnabled is required',
+    });
   }
 
   try {
@@ -2346,6 +2379,7 @@ router.post('/preferences', telegramAuth, async (req, res) => {
       telegramUserId,
       telegramUsername: identity.telegramUsername,
       alwaysVoiceResponse,
+      replyVoiceWithVoice,
       voiceResponsesEnabled,
     });
   } catch (err) {
@@ -2357,6 +2391,7 @@ router.post('/preferences', telegramAuth, async (req, res) => {
     updated: true,
     voice_preferences: {
       always_voice_response: alwaysVoiceResponse,
+      reply_voice_with_voice: replyVoiceWithVoice,
       voice_responses_enabled: voiceResponsesEnabled,
     },
   });

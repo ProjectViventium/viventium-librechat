@@ -25,7 +25,8 @@ module.exports = function createTelegramUserMapping(db) {
       /* === VIVENTIUM START ===
        * Feature: Persist Telegram voice preferences for scheduler dispatch parity.
        * === VIVENTIUM END === */
-      alwaysVoiceResponse: { type: Boolean, default: false },
+      alwaysVoiceResponse: { type: Boolean, default: true },
+      replyVoiceWithVoice: { type: Boolean, default: true },
       voiceResponsesEnabled: { type: Boolean, default: true },
       voicePrefsUpdatedAt: { type: Date, default: null },
     },

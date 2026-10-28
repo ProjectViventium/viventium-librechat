@@ -1446,7 +1446,7 @@ def _resolve_telegram_identity(
     telegram_user_id = _coerce_id(metadata.get("telegram_user_id") or metadata.get("telegramUserId"))
     telegram_chat_id = _coerce_id(metadata.get("telegram_chat_id") or metadata.get("telegramChatId"))
     voice_preferences: Dict[str, Any] = {
-        "always_voice_response": _coerce_bool(metadata.get("always_voice_response"), False),
+        "always_voice_response": _coerce_bool(metadata.get("always_voice_response"), True),
         "voice_responses_enabled": _coerce_bool(metadata.get("voice_responses_enabled"), True),
     }
     # Stable delivery identity is not authority for the owner's current Speaking choice.
@@ -1476,7 +1476,7 @@ def _resolve_telegram_identity(
             telegram_chat_id = telegram_chat_id or _coerce_id(response.get("telegram_chat_id") or response.get("telegramChatId"))
             current = response.get("voice_preferences") or {}
             voice_preferences.update(
-                always_voice_response=_coerce_bool(current.get("always_voice_response"), False),
+                always_voice_response=_coerce_bool(current.get("always_voice_response"), True),
                 voice_responses_enabled=_coerce_bool(current.get("voice_responses_enabled"), True),
             )
             if resolve_voice and response.get("speech_unavailable") == "voice_route_unavailable":
@@ -1505,7 +1505,7 @@ def _should_send_scheduler_voice(text: str, voice_preferences: Dict[str, bool]) 
         return False
     always_voice = _coerce_bool(
         (voice_preferences or {}).get("always_voice_response"),
-        False,
+        True,
     )
     return always_voice
 

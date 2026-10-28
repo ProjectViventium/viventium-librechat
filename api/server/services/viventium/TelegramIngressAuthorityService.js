@@ -8,6 +8,7 @@
  * Telegram. A continued admission of the same stream keeps its first binding time; a row that is
  * not this owner's source on this stream fails closed.
  * === VIVENTIUM END === */
+const { normalizeChannelInputMode } = require('@librechat/api');
 const { ViventiumTelegramIngressEvent, Message } = require('~/db/models');
 const {
   runGlassHiveTerminalCallbackTransaction,
@@ -17,6 +18,7 @@ async function bindRetainedTelegramIngressAuthority({
   ownerId,
   sourceEventId,
   streamId,
+  inputMode,
   IngressModel = ViventiumTelegramIngressEvent,
 }) {
   const owner = String(ownerId || '').trim();
@@ -26,7 +28,14 @@ async function bindRetainedTelegramIngressAuthority({
     owner && source && stream
       ? await IngressModel.updateOne(
           { sourceEventId: source, libreChatUserId: owner, streamId: stream },
-          [{ $set: { authorityBoundAt: { $ifNull: ['$authorityBoundAt', '$$NOW'] } } }],
+          [
+            {
+              $set: {
+                authorityBoundAt: { $ifNull: ['$authorityBoundAt', '$$NOW'] },
+                inputMode: { $ifNull: ['$inputMode', normalizeChannelInputMode(inputMode)] },
+              },
+            },
+          ],
         )
       : null;
   if (result?.acknowledged === false || Number(result?.matchedCount ?? result?.n ?? 0) < 1) {

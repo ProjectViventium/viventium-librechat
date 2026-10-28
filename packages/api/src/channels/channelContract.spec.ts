@@ -13,11 +13,24 @@ import {
   buildChannelDedupeKey,
   normalizeChannelConnectInput,
   normalizeChannelEnvelope,
+  normalizeChannelInputMode,
   resolveLoopbackGatewayUrl,
   verifyWhatsAppSignature,
 } from './index';
 
 describe('channel-neutral messaging contract', () => {
+  it.each(['text', 'voice', 'voice_note', 'voice_call'] as const)(
+    'preserves declared input mode %s',
+    (mode) => {
+      expect(normalizeChannelInputMode(mode)).toBe(mode);
+    },
+  );
+  it.each([undefined, null, '', 'unsupported', true])(
+    'legacy or invalid input mode %s is text',
+    (mode) => {
+      expect(normalizeChannelInputMode(mode)).toBe('text');
+    },
+  );
   it.each(['telegram', 'slack', 'whatsapp'] as const)(
     'normalizes scoped %s ingress without trusting model or agent overrides',
     (channel) => {
@@ -205,7 +218,7 @@ describe('channel-neutral messaging contract', () => {
       'https://[fec0::1]',
       'https://[feff::1]',
       'https://api.example.test/private-path',
-      'https://user:password@api.example.test',
+      'https://user:password@api.example.test/',
     ]) {
       expect(() =>
         normalizeChannelConnectInput('whatsapp', {

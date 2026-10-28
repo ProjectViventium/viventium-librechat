@@ -6,6 +6,7 @@
  */
 
 import React from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import CallButton from './CallButton';
@@ -62,7 +63,9 @@ function renderCallButton() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <CallButton />
+      <MemoryRouter>
+        <CallButton />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }

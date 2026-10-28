@@ -9,6 +9,7 @@
  * === VIVENTIUM END === */
 
 import * as crypto from 'crypto';
+import { normalizeChannelInputMode } from '../channels/contract';
 import { isFeelingsReadIsolated } from '../feelings/service';
 
 import type { VoiceWorkerPresentationBindingV1 } from '../trace/voiceWorkerCompletionTrace';
@@ -153,6 +154,7 @@ export interface GlassHiveLaunchRequestBody {
   deliveryChannels?: string | string[];
   viventiumSchedulerDeliveryChannels?: string | string[];
   viventiumSurface?: string;
+  viventiumInputMode?: string;
   viventiumTelegramChatId?: string;
   viventiumTelegramUserId?: string;
   viventiumTelegramMessageId?: string;
@@ -235,6 +237,7 @@ export interface GlassHiveCallbackEffectFence {
 
 export interface GlassHiveCallbackContext {
   feelingsIsolated?: boolean;
+  inputMode?: ReturnType<typeof normalizeChannelInputMode>;
   bindingId: string;
   originRef: string;
   workRef: string;
@@ -1326,6 +1329,11 @@ export function createGlassHiveCallbackBindingService(
           anchorMessageId,
           requestedParentMessageId,
           configuredDestinations: destinations,
+          inputMode: normalizeChannelInputMode(
+            schedulerDispatchDocumentId || scheduleOccurrenceKey
+              ? 'text'
+              : requestBody.viventiumInputMode,
+          ),
           schedulerDispatchDocumentId,
           scheduleOccurrenceKey,
           scheduleId,
@@ -2119,6 +2127,9 @@ export function createGlassHiveCallbackBindingService(
       conversationId,
       anchorMessageId,
       requestedParentMessageId: normalizeText(binding.requestedParentMessageId),
+      ...(binding.inputMode != null
+        ? { inputMode: normalizeChannelInputMode(binding.inputMode) }
+        : {}),
       schedulerDispatchDocumentId: normalizeText(binding.schedulerDispatchDocumentId),
       scheduleOccurrenceKey: normalizeText(binding.scheduleOccurrenceKey),
       scheduleId: normalizeText(binding.scheduleId),

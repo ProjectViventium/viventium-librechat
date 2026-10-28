@@ -10,7 +10,9 @@
  * === VIVENTIUM END === */
 
 import * as crypto from 'crypto';
+import { normalizeChannelInputMode } from '../channels/contract';
 import { createNativeResponseFetch } from './nativeResponse';
+import type { NativeResult } from './nativeResponse';
 import { nativeIdentityJson } from '../stream/implementations/nativeResponse';
 import { deliverCortexBatchToRunningMain } from '../cortex/liveMainContext';
 import type { MainContinuityFetch } from '../continuity/mainContinuity';
@@ -86,6 +88,7 @@ export interface GlassHiveMissionTraceIdentity {
 }
 
 export interface GlassHiveMissionBinding {
+  inputMode?: ReturnType<typeof normalizeChannelInputMode>;
   feelingsIsolated?: boolean;
   originRef?: string;
   ownerId?: string;
@@ -143,6 +146,7 @@ export interface GlassHiveMissionAdjudicationInput {
 }
 
 export interface GlassHiveMissionEvidence {
+  inputMode?: ReturnType<typeof normalizeChannelInputMode>;
   feelingsIsolated?: boolean;
   _id: string;
   evidenceId: string;
@@ -420,6 +424,7 @@ export function createGlassHiveMissionAdjudicationService(
     final: boolean;
     signal?: AbortSignal | null;
     identity?: NativeResponseIdentity;
+    recoveredSourceMessageId?: string;
     streamId?: string;
     route?: { baseURL: string; headers: Record<string, string> };
     fetch?: MainContinuityFetch;
@@ -530,6 +535,86 @@ export function createGlassHiveMissionAdjudicationService(
     );
   }
 
+  function nativeAuthorSuperseded(): RuntimeError {
+    return Object.assign(new Error('mission_native_author_superseded'), {
+      code: 'glasshive_mission_evidence_superseded',
+    });
+  }
+
+  function savedNativeCompletionResponse(
+    result: NativeResult,
+    body: BodyInit | null | undefined,
+  ): Response {
+    const completion = result.response as RuntimeRecord | undefined;
+    const choice = completion?.choices?.[0];
+    if (
+      completion?.id !== result.request_id ||
+      completion?.object !== 'chat.completion' ||
+      completion.choices.length !== 1 ||
+      !['stop', 'tool_calls'].includes(choice?.finish_reason) ||
+      choice.message?.role !== 'assistant'
+    )
+      throw new Error('mission_native_recovery_invalid_result');
+    if (typeof body !== 'string' || JSON.parse(body).stream !== true)
+      return new Response(JSON.stringify(completion), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    const message = choice.message;
+    const viventium = message.provider_specific_fields?.viventium || {};
+    const terminal = {
+      ...(viventium.delivery_disposition
+        ? { delivery_disposition: viventium.delivery_disposition }
+        : {}),
+      ...(viventium.deliveryDispositionRanges
+        ? {
+            deliveryDispositionRanges: viventium.deliveryDispositionRanges,
+            delivery_range_text: message.content || '',
+          }
+        : {}),
+      ...(completion.glasshive?.output_files
+        ? { output_files: completion.glasshive.output_files }
+        : {}),
+    };
+    const chunk = (delta: RuntimeRecord, finish: string | null) => ({
+      id: completion.id,
+      object: 'chat.completion.chunk',
+      created: completion.created,
+      model: completion.model,
+      choices: [{ index: 0, delta, finish_reason: finish }],
+    });
+    const data: RuntimeRecord[] = [chunk({ role: 'assistant', content: '' }, null)];
+    if (message.content) data.push(chunk({ content: message.content }, null));
+    if (message.tool_calls?.length)
+      data.push(
+        chunk(
+          {
+            tool_calls: message.tool_calls.map((tool: RuntimeRecord, index: number) => ({
+              ...tool,
+              index,
+            })),
+          },
+          null,
+        ),
+      );
+    data.push(
+      chunk(
+        Object.keys(terminal).length ? { provider_specific_fields: { viventium: terminal } } : {},
+        choice.finish_reason,
+      ),
+    );
+    if (completion.usage)
+      data.push({
+        ...chunk({}, null),
+        choices: [],
+        usage: completion.usage,
+        glasshive: { usage_source: completion.glasshive?.usage_source },
+      });
+    return new Response(
+      data.map((item) => `data: ${JSON.stringify(item)}\n\n`).join('') + 'data: [DONE]\n\n',
+      { headers: { 'Content-Type': 'text/event-stream' } },
+    );
+  }
+
   function laneNativeAuthor(rows: RuntimeRecord[], context: RuntimeRecord): LaneNativeAuthor {
     const row = rows[rows.length - 1];
     const scope = authorScope(row);
@@ -537,6 +622,7 @@ export function createGlassHiveMissionAdjudicationService(
     const hash = crypto.createHash('sha256').update(groupId).digest('hex');
     const messageId = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
     const createdAt = Date.now();
+    const retrying = rows.some((item) => Number(item.attempts) > 1 || item.nativeSynthesisIdentity);
     const author: LaneNativeAuthor = {
       messageId,
       scope,
@@ -588,7 +674,7 @@ export function createGlassHiveMissionAdjudicationService(
         const bound = createNativeResponseFetch(
           baseFetch,
           async () => {
-            if (!(await author.current())) throw new Error('mission_native_author_superseded');
+            if (!(await author.current())) throw nativeAuthorSuperseded();
             return {
               userId: row.ownerId,
               conversationId: context.target.conversationId,
@@ -614,7 +700,22 @@ export function createGlassHiveMissionAdjudicationService(
             };
           },
           async (identity) => {
-            if (!(await author.current())) throw new Error('mission_native_author_superseded');
+            if (!(await author.current())) throw nativeAuthorSuperseded();
+            await runFencedMissionTransaction(rows, async () => {
+              for (const claimed of rows) {
+                const saved = await collection().updateOne(
+                  {
+                    _id: claimed._id,
+                    state: 'processing',
+                    attempts: claimed.attempts,
+                    processingAt: claimed.processingAt,
+                  },
+                  { $set: { nativeSynthesisIdentity: identity, updatedAt: new Date() } },
+                );
+                if (saved.matchedCount === 0) throw nativeAuthorSuperseded();
+                claimed.nativeSynthesisIdentity = identity;
+              }
+            });
             author.identity = identity;
             return true;
           },
@@ -654,6 +755,56 @@ export function createGlassHiveMissionAdjudicationService(
           author.fetch = baseFetch;
           // The actual stream header belongs to this dispatch, before an identity exists.
           author.streamId = streamId;
+          if (retrying) {
+            const lookup = new URL(
+              `${origin.href.replace(/\/$/, '')}/requests/by-idempotency/${encodeURIComponent(streamId)}/result`,
+            );
+            lookup.searchParams.set('stream_id', streamId);
+            lookup.searchParams.set('message_id', messageId);
+            lookup.searchParams.set('conversation_id', context.target.conversationId);
+            lookup.searchParams.set('agent_id', `${row.mainAgentId}:phase_b:followup`);
+            while (await author.current()) {
+              const retained = await baseFetch(lookup, {
+                method: 'GET',
+                headers: author.route.headers,
+                signal: init?.signal,
+              });
+              if (retained.status === 404) break;
+              if (!retained.ok) throw new Error(`mission_native_recovery_${retained.status}`);
+              const result = (await retained.json()) as NativeResult;
+              if (
+                result.version !== 1 ||
+                result.object !== 'glasshive.request.result' ||
+                result.stream_id !== streamId ||
+                result.message_id !== messageId ||
+                result.conversation_id !== context.target.conversationId ||
+                result.agent_id !== `${row.mainAgentId}:phase_b:followup` ||
+                !/^[a-f0-9]{64}$/.test(result.invocation_id) ||
+                !/^[a-f0-9]{64}$/.test(result.body_sha256) ||
+                !/^[a-f0-9]{64}$/.test(result.authority_sha256)
+              ) {
+                throw new Error('mission_native_recovery_identity_mismatch');
+              }
+              if (result.state === 'completed') {
+                if (!(await author.current())) throw nativeAuthorSuperseded();
+                const identity = rows.find(
+                  (item) => item.nativeSynthesisIdentity,
+                )?.nativeSynthesisIdentity;
+                author.identity =
+                  identity?.invocationId === result.invocation_id &&
+                  identity?.bodySha256 === result.body_sha256
+                    ? identity
+                    : undefined;
+                const response = savedNativeCompletionResponse(result, init?.body);
+                author.recoveredSourceMessageId = messageId;
+                return response;
+              }
+              if (!['queued', 'running', 'pending', 'admitted'].includes(result.state))
+                throw new Error(`mission_native_recovery_${result.state}`);
+              await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+            }
+            if (!(await author.current())) throw nativeAuthorSuperseded();
+          }
           return bound(input, init);
         };
       },
@@ -997,6 +1148,9 @@ export function createGlassHiveMissionAdjudicationService(
       mainAgentId: safeText(binding?.mainAgentId, 160),
       ...(binding?.feelingsIsolated === true ? { feelingsIsolated: true } : {}),
       surface: normalizedSurface(binding),
+      ...(binding?.inputMode != null
+        ? { inputMode: normalizeChannelInputMode(binding.inputMode) }
+        : {}),
       destinations: safeDestinations(binding),
       evidence,
       ...(shouldAdjudicateGlassHiveNeedsInput(body)
@@ -2264,6 +2418,7 @@ export function createGlassHiveMissionAdjudicationService(
       fullText: '',
       deliveryContext: {
         ownerId: row.ownerId,
+        ...(row.inputMode != null ? { inputMode: normalizeChannelInputMode(row.inputMode) } : {}),
         originRef: row.originRef,
         workRef: row.workRef,
         conversationId: target?.conversationId || row.conversationId,
@@ -2895,6 +3050,13 @@ export function createGlassHiveMissionAdjudicationService(
     for (const row of rows) {
       const ownerId = safeText(row.ownerId, 160);
       if (!ownerId) continue;
+      const liveAuthor = conversationAuthors.get(authorScope(row));
+      if (
+        row.state === 'processing' &&
+        (conversationFlushes.has(JSON.stringify([ownerId, row.conversationId])) ||
+          (liveAuthor && !liveAuthor.closed))
+      )
+        continue;
       owners.add(ownerId);
       if (row.state !== 'pending') {
         await collection().updateOne(

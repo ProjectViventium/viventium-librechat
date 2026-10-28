@@ -706,25 +706,85 @@ describe('/api/viventium/calls', () => {
     }
   });
 
-  test('POST prefers the configured public playground for matching public browser origins', async () => {
-    process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://voice-node.example.test';
-    process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://voice-node.example.test:8443';
-    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice-node.example.test:3443';
+  test.each(['http://localhost:3300', 'http://playground:3000'])(
+    'POST checks the runtime address %s without public loopback and keeps the public launch URL',
+    async (runtimeUrl) => {
+      process.env.VIVENTIUM_PLAYGROUND_URL = runtimeUrl;
+      process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://voice-node.example.test';
+      process.env.VIVENTIUM_PUBLIC_SERVER_URL = 'https://voice-node.example.test:8443';
+      process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice-node.example.test:3443';
+      global.fetch.mockImplementation(async (url) => {
+        if (url !== `${runtimeUrl}/api/health`) {
+          throw new Error('public loopback unavailable');
+        }
+        return playgroundHealthResponse(modernIdentity());
+      });
 
-    const callsRouter = require('../calls');
+      const app = express();
+      app.use(express.json());
+      app.use('/api/viventium/calls', require('../calls'));
 
-    const app = express();
-    app.use(express.json());
-    app.use('/api/viventium/calls', callsRouter);
+      const res = await request(app)
+        .post('/api/viventium/calls')
+        .set('origin', 'https://voice-node.example.test')
+        .send({ conversationId: 'new', agentId: 'agent_123' })
+        .expect(200);
 
-    const res = await request(app)
-      .post('/api/viventium/calls')
-      .set('origin', 'https://voice-node.example.test')
-      .send({ conversationId: 'new', agentId: 'agent_123' })
-      .expect(200);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(global.fetch).toHaveBeenCalledWith(
+        `${runtimeUrl}/api/health`,
+        expect.objectContaining({ redirect: 'error', cache: 'no-store' }),
+      );
+      const launch = new URL(res.body.playgroundUrl);
+      expect(launch.origin).toBe('https://voice-node.example.test:3443');
+      expect(launch.pathname).toBe('/call-bootstrap');
+      expect(launch.searchParams.get('autoConnect')).toBe('1');
+    },
+  );
 
-    expect(new URL(res.body.playgroundUrl).origin).toBe('https://voice-node.example.test:3443');
-  });
+  test.each([
+    ['unreachable', 'playground_unreachable'],
+    ['stale source', 'playground_identity_mismatch'],
+    ['unhealthy', 'playground_unhealthy'],
+  ])(
+    'POST from a public origin rejects an %s runtime even if the public endpoint looks healthy',
+    async (failure, reason) => {
+      process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://voice-node.example.test';
+      process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice-node.example.test:3443';
+      global.fetch.mockImplementation(async (url) => {
+        if (url !== 'http://localhost:3000/api/health') {
+          return playgroundHealthResponse(modernIdentity());
+        }
+        if (failure === 'unreachable') {
+          throw new Error('configured runtime unavailable');
+        }
+        if (failure === 'unhealthy') {
+          return { ok: false, status: 503 };
+        }
+        return playgroundHealthResponse(modernIdentity('b'.repeat(40)));
+      });
+
+      const app = express();
+      app.use(express.json());
+      app.use('/api/viventium/calls', require('../calls'));
+
+      const res = await request(app)
+        .post('/api/viventium/calls')
+        .set('origin', 'https://voice-node.example.test')
+        .send({ conversationId: 'new', agentId: 'agent_123' })
+        .expect(503);
+
+      expect(res.body).toMatchObject({ error: 'voice_runtime_not_ready', reason });
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(global.fetch).toHaveBeenCalledWith(
+        'http://localhost:3000/api/health',
+        expect.any(Object),
+      );
+      expect(
+        require('~/server/services/viventium/CallSessionService').createCallSession,
+      ).not.toHaveBeenCalled();
+    },
+  );
 
   test('POST keeps localhost playground links for localhost callers even when public origins exist', async () => {
     process.env.VIVENTIUM_PUBLIC_CLIENT_URL = 'https://voice-node.example.test';

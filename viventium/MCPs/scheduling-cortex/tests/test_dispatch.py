@@ -1310,8 +1310,36 @@ class DispatchTelegramTests(unittest.TestCase):
             mock_post.assert_not_called()
             self.assertEqual(user_id, 'tg-1')
             self.assertEqual(chat_id, 'chat-1')
-            self.assertFalse(voice_preferences['always_voice_response'])
+            self.assertTrue(voice_preferences['always_voice_response'])
             self.assertTrue(voice_preferences['voice_responses_enabled'])
+
+    def test_scheduler_voice_defaults_on_and_retains_explicit_false(self):
+        for preferences, expected in (({}, True), ({'always_voice_response': False}, False),
+                                      ({'voice_responses_enabled': False}, False),
+                                      ({'always_voice_response': True, 'reply_voice_with_voice': False}, True)):
+            with self.subTest(preferences=preferences):
+                self.assertEqual(dispatch._should_send_scheduler_voice('A useful reply.', preferences), expected)
+        self.assertFalse(dispatch._should_send_scheduler_voice('', {}))
+
+    def test_scheduler_voice_metadata_preserves_explicit_false(self):
+        task = {'user_id': 'synthetic-owner', 'metadata': {'telegram_user_id': 'synthetic-user',
+                'always_voice_response': False, 'reply_voice_with_voice': False,
+                'voice_responses_enabled': False}}
+        with patch.object(dispatch, '_post_json') as resolver:
+            _, _, preferences = dispatch._resolve_telegram_identity(task, 'http://localhost', 5, resolve_voice=False)
+        resolver.assert_not_called()
+        self.assertFalse(preferences['always_voice_response'])
+        self.assertFalse(preferences['voice_responses_enabled'])
+
+    def test_scheduler_voice_current_mapping_defaults_on_and_retains_explicit_false(self):
+        for current in ({}, {'always_voice_response': False, 'reply_voice_with_voice': False,
+                             'voice_responses_enabled': False}):
+            with self.subTest(current=current), patch.object(dispatch, '_get_scheduler_secret', return_value='synthetic'), patch.object(
+                dispatch, '_post_json', return_value={'telegram_user_id': 'synthetic-user',
+                    'voice_preferences': current}):
+                _, _, preferences = dispatch._resolve_telegram_identity({'user_id': 'synthetic-owner'}, 'http://localhost', 5)
+            for flag in ('always_voice_response', 'voice_responses_enabled'):
+                self.assertEqual(preferences[flag], current.get(flag, True))
 
     def test_resolve_telegram_identity_calls_scheduler(self):
         task = {'user_id': 'user_1', 'metadata': None}

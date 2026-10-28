@@ -11,6 +11,8 @@ jest.mock(
 
 jest.mock('@librechat/api', () => ({
   GenerationJobManager: {},
+  normalizeChannelInputMode: (...args) =>
+    jest.requireActual('@librechat/api').normalizeChannelInputMode(...args),
   retainedCortexTelegramAcknowledgement: (...args) =>
     jest.requireActual('@librechat/api').retainedCortexTelegramAcknowledgement(...args),
   exactCortexTelegramAuthority: (...args) =>
@@ -269,6 +271,24 @@ describe('CortexTelegramDeliveryDispatchService', () => {
     expect(deliveries[0].text).toBe(fixture.followup.text);
     expect(deliveries[0].cortexClaim.messageId).toBe(fixture.persistedMessageId);
   });
+
+  test.each(['voice_note', 'text', undefined])(
+    'late dispatch retains ingress input mode %s after job loss',
+    async (inputMode) => {
+      const fixture = exactFixture();
+      fixture.ingress.inputMode = inputMode;
+      const dependencies = buildService(fixture);
+      dependencies.jobManager.getJob.mockResolvedValue(null);
+      dependencies.readRetainedMainFinal.mockResolvedValue({
+        responseMessageId: fixture.parentMessageId,
+        conversationId: fixture.conversationId,
+        interactionContext: fixture.parent.metadata.viventium.interactionContext,
+      });
+      const deliveries = await dependencies.service.claimPending({ limit: 1, leaseMs: 120_000 });
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0].inputMode).toBe(inputMode);
+    },
+  );
 
   test('claims one persisted Telegram-missing presentation with exact durable authority', async () => {
     const fixture = exactFixture();

@@ -1570,6 +1570,158 @@ describe('installed Phase B model caller result status', () => {
 
 /* === VIVENTIUM START === Phase B selected files survive pre-merge streams without requiring audio. === */
 describe('Phase B native file carrier transport', () => {
+  test('recovered emitter source survives actual preparation and strict file persistence without a synthetic native identity', async () => {
+    const db = require('~/models');
+    const {
+      prepareCortexFollowUpMessage,
+      persistPreparedCortexFollowUpMessage,
+    } = require('../BackgroundCortexFollowUpService');
+    const { nativeFollowUpOutputFilesForMessage } = jest.requireActual('@librechat/api');
+    const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+    const parent = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
+    const author = {
+      messageId: 'recovered-emitter',
+      recoveredSourceMessageId: 'recovered-emitter',
+      wrapFetch: (fetch) => fetch,
+      finish: jest.fn(),
+    };
+    const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+      processStream: async () => {
+        const headers = options.graphConfig.llmConfig.configuration.defaultHeaders;
+        const envelope = {
+          version: 1,
+          owner_id: headers['X-Viventium-User-Id'],
+          conversation_id: headers['X-Viventium-Conversation-Id'],
+          message_id: headers['X-Viventium-Message-Id'],
+          stream_id: headers['X-Viventium-Stream-Id'],
+          agent_id: headers['X-GlassHive-Agent-Id'],
+          logical_turn_id: '',
+          logical_turn_revision: 1,
+          request_id: 'saved-request',
+          run_id: 'saved-run',
+          attempt_id: 'saved-attempt',
+          invocation_id: '',
+          files: [
+            {
+              filename: 'shape.svg',
+              mime_type: 'image/svg+xml',
+              bytes: 138,
+              sha256: 'a'.repeat(64),
+              download_url:
+                'https://artifacts.example.test/v1/link-refs/ghr_' + 'saved1234567890abcdef',
+            },
+          ],
+        };
+        options.customHandlers.on_chat_model_start.handle('on_chat_model_start', {});
+        options.customHandlers.on_chat_model_end.handle('on_chat_model_end', {
+          output: {
+            additional_kwargs: {
+              __raw_response: {
+                id: 'saved-request',
+                object: 'chat.completion',
+                glasshive: { output_files: envelope },
+              },
+            },
+          },
+        });
+        return 'Here is your file.';
+      },
+    }));
+    const input = {
+      req: {
+        id: 'synthetic-recovered-files',
+        user: { id: 'owner' },
+        body: {
+          conversationId: 'conversation',
+          messageId: 'accepted-parent',
+          viventiumSurface: 'web',
+        },
+        config: {
+          endpoints: {
+            agents: {
+              providerCapabilities: {
+                'glasshive-harness': {
+                  workspace_binding: true,
+                  conversation_session: true,
+                  responses_api: false,
+                },
+              },
+            },
+          },
+        },
+      },
+      agent: {
+        id: 'main',
+        provider: 'glasshive-harness',
+        model: 'codex-cli:gpt-6.1-sol',
+        model_parameters: { model: 'codex-cli:gpt-6.1-sol' },
+      },
+      insightsData: {
+        insights: [{ cortexName: 'Worker', insight: 'The verified shape is ready.' }],
+      },
+      recentResponse: 'Preparing your file.',
+      runId: 'stable-synthesis',
+      conversationId: 'conversation',
+      parentMessageId: 'accepted-parent',
+      nativeAuthor: author,
+      forceVisibleFollowUp: true,
+    };
+    const save = jest.fn(async (_req, message) => message);
+    try {
+      const prepared = await prepareCortexFollowUpMessage(input);
+      expect(author.identity).toBeUndefined();
+      expect(prepared.nativeOutputFiles.identity.responseMessageId).toBe(author.messageId);
+      const persisted = await persistPreparedCortexFollowUpMessage(
+        {
+          ...input,
+          dependencies: {
+            saveMessage: save,
+            prepareAttachments: (message) => {
+              const rebound = nativeFollowUpOutputFilesForMessage(prepared.nativeOutputFiles, {
+                userId: 'owner',
+                conversationId: 'conversation',
+                sourceMessageId: prepared.nativeSourceMessageId || input.parentMessageId,
+                responseMessageId: message.messageId,
+                agentId: 'main',
+              });
+              return [
+                {
+                  file_id: 'owned-saved-file',
+                  filename: rebound.envelope.files[0].filename,
+                  nativeOutputFile: {
+                    status: 'available',
+                    messageId: rebound.identity.responseMessageId,
+                  },
+                },
+              ];
+            },
+          },
+        },
+        prepared,
+      );
+      expect(persisted.attachments).toEqual([
+        expect.objectContaining({
+          filename: 'shape.svg',
+          nativeOutputFile: { status: 'available', messageId: author.messageId },
+        }),
+      ]);
+      expect(save).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          messageId: author.messageId,
+          attachments: expect.arrayContaining([
+            expect.objectContaining({ file_id: 'owned-saved-file' }),
+          ]),
+        }),
+        expect.anything(),
+      );
+    } finally {
+      messages.mockRestore();
+      parent.mockRestore();
+      createRun.mockRestore();
+    }
+  });
+
   test.each(['stream', 'terminal', 'replaced', 'foreign'])(
     '%s keeps only the actual emitting source before SDK concatenation',
     async (mode) => {
@@ -1601,7 +1753,7 @@ describe('Phase B native file carrier transport', () => {
                 bytes: 138,
                 sha256: 'a'.repeat(64),
                 download_url:
-                  'https://artifacts.example.test/v1/link-refs/ghr_main1234567890abcdef',
+                  'https://artifacts.example.test/v1/link-refs/ghr_' + 'main1234567890abcdef',
               },
             ],
           };

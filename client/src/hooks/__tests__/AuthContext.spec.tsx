@@ -323,6 +323,24 @@ describe('AuthContextProvider — silentRefresh post-login redirect', () => {
     jest.useRealTimers();
   });
 
+  it.each(['/c/new?viventiumCall=1', '/c/existing-conversation?viventiumCall=1'])(
+    'preserves the local call intent through normal login refresh: %s',
+    (destination) => {
+      jest.useFakeTimers();
+      sessionStorage.setItem(SESSION_KEY, destination);
+      renderProviderLive();
+      const [, refreshOptions] = mockRefreshMutate.mock.calls[0] as [
+        unknown,
+        { onSuccess: (data: unknown) => void },
+      ];
+      act(() => refreshOptions.onSuccess({ user: { id: '1', role: 'USER' }, token: 'new-token' }));
+      act(() => jest.advanceTimersByTime(100));
+      expect(mockNavigate).toHaveBeenCalledWith(destination, { replace: true });
+      expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+      jest.useRealTimers();
+    },
+  );
+
   it('navigates to current URL when no stored redirect exists', () => {
     jest.useFakeTimers();
     window.history.replaceState({}, '', '/c/new');

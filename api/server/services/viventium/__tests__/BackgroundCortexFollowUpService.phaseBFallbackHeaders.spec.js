@@ -1607,7 +1607,8 @@ describe('Phase B native file carrier transport', () => {
               mime_type: 'image/svg+xml',
               bytes: 138,
               sha256: 'a'.repeat(64),
-              download_url: 'https://artifacts.example.test/v1/link-refs/ghr_' + 'saved1234567890abcdef',
+              download_url:
+                'https://artifacts.example.test/v1/link-refs/ghr_' + 'saved1234567890abcdef',
             },
           ],
         };

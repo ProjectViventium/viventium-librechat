@@ -2369,11 +2369,9 @@ router.post('/preferences', telegramAuth, async (req, res) => {
   );
 
   if (alwaysVoiceResponse == null && replyVoiceWithVoice == null && voiceResponsesEnabled == null) {
-    return res
-      .status(400)
-      .json({
-        error: 'alwaysVoiceResponse, replyVoiceWithVoice or voiceResponsesEnabled is required',
-      });
+    return res.status(400).json({
+      error: 'alwaysVoiceResponse, replyVoiceWithVoice or voiceResponsesEnabled is required',
+    });
   }
 
   try {

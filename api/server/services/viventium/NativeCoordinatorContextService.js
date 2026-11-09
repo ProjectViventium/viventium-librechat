@@ -36,6 +36,7 @@ const {
   attachConversationProviderBootstrapBundle,
 } = require('./GlassHiveConversationProviderService');
 const {
+  applyLocalMediaWorkerBootstrap,
   buildConversationProviderBootstrapBundle,
   mergeWorkerContextBundle,
   projectWorkerFeelingBundle,
@@ -224,6 +225,8 @@ async function prepareContext({ binding, source, eventId, purpose, workerWorkRef
     workerFeelingsScope: workerContext.glasshive_worker_feelings_scope,
     capabilityDependency: workerContext.glasshive_capability_dependency,
   });
+  if (purpose === 'worker')
+    applyLocalMediaWorkerBootstrap(bundle, binding.configuration?.scope?.execution_mode);
   if ((allowedServerNames.length || hostTools.length) && !bundle.glasshive_capability_broker)
     throw failure('coordinator_capabilities_unavailable');
   if (workerContext.glasshive_uploaded_files.length)

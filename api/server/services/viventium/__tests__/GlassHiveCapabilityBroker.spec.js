@@ -7139,6 +7139,69 @@ describe('result-author mutation guard', () => {
   });
 });
 
+describe('local media Worker bootstrap', () => {
+  const originalMediaBootstrap = process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP;
+
+  afterEach(() => {
+    if (originalMediaBootstrap === undefined)
+      delete process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP;
+    else process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP = originalMediaBootstrap;
+  });
+
+  test.each([undefined, 'not-json', '{}'])(
+    'local media stays optional with absent or invalid operator configuration: %s',
+    (configuration) => {
+      const { applyLocalMediaWorkerBootstrap } = require('../GlassHiveCapabilityBootstrapService');
+      if (configuration === undefined) delete process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP;
+      else process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP = configuration;
+      const bundle = { agents_md: 'Original context.', env: { EXISTING_VALUE: 'retained' } };
+      expect(applyLocalMediaWorkerBootstrap(bundle, 'host')).toBe(bundle);
+      expect(bundle).toEqual({ agents_md: 'Original context.', env: { EXISTING_VALUE: 'retained' } });
+    },
+  );
+
+  test('local media merges both native host configurations without changing context or environment', () => {
+    const { applyLocalMediaWorkerBootstrap } = require('../GlassHiveCapabilityBootstrapService');
+    const mediaServer = { command: 'media-service', args: ['serve'] };
+    const mediaConfig = '[mcp_servers.viventium_media]\ncommand = "media-service"';
+    process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP = JSON.stringify({
+      claude_project_mcp: { mcpServers: { viventium_media: mediaServer } },
+      codex_config_append: mediaConfig,
+      env: { UNRELATED_VALUE: 'must not be projected' },
+    });
+    const bundle = {
+      agents_md: 'Original context.',
+      claude_project_mcp: { existing: { command: 'existing-service' } },
+      codex_config_append: '[mcp_servers.existing]\ncommand = "existing-service"',
+      env: { EXISTING_VALUE: 'retained' },
+    };
+    expect(applyLocalMediaWorkerBootstrap(bundle, 'host')).toBe(bundle);
+    expect(bundle).toEqual({
+      agents_md: 'Original context.',
+      claude_project_mcp: { existing: { command: 'existing-service' }, viventium_media: mediaServer },
+      codex_config_append: '[mcp_servers.existing]\ncommand = "existing-service"\n\n' + mediaConfig,
+      env: { EXISTING_VALUE: 'retained' },
+    });
+    const projected = JSON.stringify(bundle);
+    applyLocalMediaWorkerBootstrap(bundle, 'host');
+    expect(JSON.stringify(bundle)).toBe(projected);
+  });
+
+  test.each(['docker', undefined])(
+    'local media host configuration is not projected into other execution scopes: %s',
+    (executionMode) => {
+      const { applyLocalMediaWorkerBootstrap } = require('../GlassHiveCapabilityBootstrapService');
+      process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP = JSON.stringify({
+        claude_project_mcp: { mcpServers: { viventium_media: { command: 'media-service' } } },
+        codex_config_append: '[mcp_servers.viventium_media]\ncommand = "media-service"',
+      });
+      const bundle = { agents_md: 'Original context.' };
+      expect(applyLocalMediaWorkerBootstrap(bundle, executionMode)).toBe(bundle);
+      expect(bundle).toEqual({ agents_md: 'Original context.' });
+    },
+  );
+});
+
 describe('opaque Worker context composition', () => {
   const {
     mergeWorkerContextBundle,

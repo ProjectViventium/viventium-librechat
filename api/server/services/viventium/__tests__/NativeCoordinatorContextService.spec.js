@@ -36,6 +36,7 @@ jest.mock('../GlassHiveCapabilityAuthorizationService', () => ({
   readCapabilityAuthorizationServerScope: jest.fn(),
 }));
 jest.mock('../GlassHiveCapabilityBootstrapService', () => ({
+  applyLocalMediaWorkerBootstrap: jest.fn((bundle) => bundle),
   buildConversationProviderBootstrapBundle: jest.fn(),
   maybeInjectGlassHiveCapabilityBroker: jest.fn(),
   mergeWorkerContextBundle: jest.fn(({ existingBundle }) => ({ ...existingBundle })),
@@ -82,6 +83,7 @@ const {
   resolveConversationProviderUploadedFiles,
 } = require('../GlassHiveConversationProviderService');
 const {
+  applyLocalMediaWorkerBootstrap,
   buildConversationProviderBootstrapBundle,
 } = require('../GlassHiveCapabilityBootstrapService');
 const { bindOwnedVoiceCortexRecovery } = require('../BackgroundCortexFollowUpService');
@@ -296,6 +298,29 @@ test('uses the declared Native endpoint capability after initializeClient remaps
       targetAgent: expect.objectContaining({ provider: 'openAI', endpoint: 'glasshive-harness' }),
     }),
   );
+});
+
+test.each(['host', 'docker', undefined])(
+  'local media Worker projection uses the saved execution scope: %s',
+  async (executionMode) => {
+    const context = await service.prepareContext({
+      binding: { ...binding, configuration: { scope: { execution_mode: executionMode } } },
+      source: { requestBody: original },
+      eventId: 'native-media-worker',
+      purpose: 'worker',
+    });
+    expect(applyLocalMediaWorkerBootstrap).toHaveBeenCalledWith(context.bundle, executionMode);
+  },
+);
+
+test('local media Worker projection does not expand callback Main capabilities', async () => {
+  await service.prepareContext({
+    binding: { ...binding, configuration: { scope: { execution_mode: 'host' } } },
+    source: { requestBody: original },
+    eventId: 'native-media-callback',
+    purpose: 'callback',
+  });
+  expect(applyLocalMediaWorkerBootstrap).not.toHaveBeenCalled();
 });
 
 test('fails before preparing a broker when the declared Native endpoint has no workspace capability', async () => {

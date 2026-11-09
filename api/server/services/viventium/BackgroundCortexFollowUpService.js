@@ -1808,7 +1808,8 @@ async function resolveDurableMissionUserSources({ req, insightsData, conversatio
   return {
     ...insightsData,
     insights: insights.map((insight) => {
-      if (!isDurableMissionInsight(insight)) return insight;
+      if (!isDurableMissionInsight(insight) || isNativeCoordinatorResultInsight(insight))
+        return insight;
       const source = insight.authority.userSource;
       const message =
         source?.messageId && source?.conversationId ? sources.get(sourceKey(source)) : null;
@@ -2473,8 +2474,17 @@ function deduplicateInsights(insights) {
 }
 /* === VIVENTIUM END === */
 
+function isNativeCoordinatorResultInsight(insight) {
+  return ['native_coordinator_result', 'native_coordinator_turn_result'].includes(
+    insight?.authority?.kind,
+  );
+}
+
 function isDurableMissionInsight(insight) {
-  return ['durable_terminal_callback', 'durable_work_callback'].includes(insight?.authority?.kind);
+  return (
+    ['durable_terminal_callback', 'durable_work_callback'].includes(insight?.authority?.kind) ||
+    isNativeCoordinatorResultInsight(insight)
+  );
 }
 
 function boundMissionInput(insight) {
@@ -2509,9 +2519,7 @@ function formatFollowUpPrompt({
     .map((i) => {
       const name = i.cortexName || i.cortex_name || 'Background Agent';
       const mission = isDurableMissionInsight(i);
-      const nativeResult = ['native_coordinator_result', 'native_coordinator_turn_result'].includes(
-        i?.authority?.kind,
-      );
+      const nativeResult = isNativeCoordinatorResultInsight(i);
       const text =
         typeof i.insight === 'string'
           ? mission || nativeResult
@@ -2521,7 +2529,7 @@ function formatFollowUpPrompt({
       if (!text) {
         return null;
       }
-      if (mission) {
+      if (mission && !nativeResult) {
         // The courier must not discard the already-admitted input, authority or
         // result. The configured model owns synthesis; normal context admission
         // owns size limits rather than an arbitrary character prefix here.

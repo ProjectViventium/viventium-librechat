@@ -202,6 +202,46 @@ describe('GlassHiveConversationProviderService', () => {
       expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
       expect(getMessages).not.toHaveBeenCalled();
     });
+    test.each(['available', 'unavailable'])(
+      'current result file access survives zero-tool presentation and retained inventory %s',
+      async (inventory) => {
+        const input = args();
+        const retained = {
+          run_id: 'retained-run',
+          attempt_id: 'retained-attempt',
+          sha256: 'a'.repeat(64),
+        };
+        const current = {
+          run_id: 'current-run',
+          attempt_id: 'current-attempt',
+          sha256: 'b'.repeat(64),
+        };
+        if (inventory === 'available') mockRetainedFileAccess.mockResolvedValueOnce([retained]);
+        else
+          mockRetainedFileAccess.mockRejectedValueOnce(
+            new Error('Synthetic retained inventory failure'),
+          );
+        input.req.body.conversationId = 'conversation';
+        input.req.body.authorized_result_files = [{ ...current, run_id: 'forged-run' }];
+        await attachConversationProviderCapabilityBundle({
+          ...input,
+          authorizedResultFiles: [current],
+        });
+        const headers = input.targetAgent.model_parameters.configuration.defaultHeaders;
+        const encoded = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+        expect(JSON.parse(Buffer.from(encoded, 'base64'))).toEqual({
+          provider_capabilities: { native_tools: false },
+          authorized_result_files: inventory === 'available' ? [retained, current] : [current],
+        });
+        expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(
+          'sha256=' +
+            crypto
+              .createHmac('sha256', 'synthetic-bundle-secret')
+              .update(`v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${encoded}`)
+              .digest('hex'),
+        );
+      },
+    );
     test('re-signs at the existing invocation refresh boundary', async () => {
       const input = args();
       const now = jest.spyOn(Date, 'now').mockReturnValue(1700000000000);

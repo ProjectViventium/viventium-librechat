@@ -332,6 +332,29 @@ const presentationDependencies = {
     publisher,
     data,
   }) => {
+    const currentOutputFiles = outputFiles
+      ? nativeCoordinatorOutputFilesForMessage(
+          outputFiles,
+          {
+            ownerId: binding.ownerId,
+            conversationId: binding.nativeConversationId,
+            runId: data.run_id,
+            publisher,
+          },
+          {
+            userId: binding.ownerId,
+            conversationId: binding.conversationId,
+            responseMessageId: parentMessageId,
+            agentId: binding.agentId,
+          },
+        ).sourceEnvelope
+      : null;
+    const authorizedResultFiles =
+      currentOutputFiles?.files.map((file) => ({
+        run_id: currentOutputFiles.run_id,
+        attempt_id: currentOutputFiles.attempt_id,
+        sha256: file.sha256,
+      })) || [];
     const candidates = buildCortexInsightDeliveryCandidates({
       ownerId: binding.ownerId,
       conversationId: binding.conversationId,
@@ -371,10 +394,11 @@ const presentationDependencies = {
       recentResponse: '',
       forceVisibleFollowUp: true,
       allowMovedOnUsefulFollowUp: true,
+      authorizedResultFiles,
       dependencies: {
         saveMessage: (req, message, options) =>
           db.saveMessage(req, bindNativeResultAuthority(message, binding, source, data), options),
-        ...(outputFiles
+        ...(currentOutputFiles
           ? {
               prepareAttachments: async (message) => {
                 const {
@@ -382,7 +406,7 @@ const presentationDependencies = {
                   prepareMissionOutputFiles,
                 } = require('./nativeOutputFiles');
                 const selected = nativeCoordinatorOutputFilesForMessage(
-                  outputFiles,
+                  currentOutputFiles,
                   {
                     ownerId: binding.ownerId,
                     conversationId: binding.nativeConversationId,

@@ -103,6 +103,24 @@ test('the actual tool-less presentation contract signs a zero-tool clone while r
   expect(original.model_parameters.configuration.defaultHeaders).toEqual({});
 });
 
+test('current result file access reaches the signed zero-tool Phase B provider bundle', async () => {
+  const input = fixture([]);
+  input.authorizedResultFiles = [
+    { run_id: 'source-run', attempt_id: 'source-attempt', sha256: 'a'.repeat(64) },
+  ];
+  input.req.body.authorized_result_files = [
+    { run_id: 'forged-run', attempt_id: 'source-attempt', sha256: 'a'.repeat(64) },
+  ];
+  const result = await resolveFollowUpLLMConfig(input);
+  expect(mockAttach.mock.calls[0][0].authorizedResultFiles).toEqual(input.authorizedResultFiles);
+  const headers = result.configuration.defaultHeaders;
+  const bundle = JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64'));
+  expect(bundle).toEqual({
+    provider_capabilities: { native_tools: false },
+    authorized_result_files: input.authorizedResultFiles,
+  });
+});
+
 test.each([undefined, ['active_work_action']])(
   'does not narrow a participant without the actual empty tool execution contract: %p',
   async (tools) => {

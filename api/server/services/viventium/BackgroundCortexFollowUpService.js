@@ -1877,6 +1877,7 @@ async function resolveFollowUpLLMConfig({
   conversationId = '',
   parentMessageId = '',
   responseMessageId = '',
+  authorizedResultFiles,
   inheritedContext,
   tools,
 }) {
@@ -2113,6 +2114,7 @@ async function resolveFollowUpLLMConfig({
       req,
       inheritedConversation,
       capability: followUpCapability,
+      authorizedResultFiles,
       ...(toolLessParticipant ? { nativeTools: false } : {}),
       requestBody: {
         ...(req.body || {}),
@@ -3056,6 +3058,7 @@ async function generateFollowUpText({
   onNativeDeliveryOutput,
   onNativeSilentDecision,
   nativeAuthor,
+  authorizedResultFiles,
 }) {
   if (!agent) {
     return '';
@@ -3302,6 +3305,7 @@ async function generateFollowUpText({
     conversationId,
     parentMessageId,
     responseMessageId: nativeAuthor?.messageId,
+    authorizedResultFiles,
     inheritedContext: {
       prompt,
       evidence: insights,
@@ -3658,6 +3662,7 @@ async function prepareCortexFollowUpMessage({
   forceVisibleFollowUp = false,
   nativeAuthor,
   expectedSourceOrderScope,
+  authorizedResultFiles,
 }) {
   const recoverySuppression = req?.[ownedVoiceCortexRecovery]
     ? await refreshOwnedVoiceCortexRecovery(req)
@@ -3759,6 +3764,7 @@ async function prepareCortexFollowUpMessage({
         req,
         agent,
         nativeAuthor,
+        authorizedResultFiles,
         insightsData,
         recentResponse: followUpRecentResponse,
         userRequest,

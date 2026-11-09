@@ -18,6 +18,9 @@ jest.mock('../interactionContext', () => ({
  * === VIVENTIUM END === */
 
 const mockRequestAccountApi = jest.fn();
+jest.mock('../NativeCoordinatorWorkService', () => ({
+  requestNativeCoordinatorWork: (...args) => mockRequestAccountApi(...args),
+}));
 const mockBuildTrustedActionIdempotencyKey = jest.fn();
 const mockReauthorizeCapabilityAuthorization = jest.fn();
 const mockGetActiveWorkSnapshot = jest.fn();
@@ -130,6 +133,7 @@ describe('GlassHiveWorkActionService', () => {
       ownerId: 'owner-1',
       path: '/v1/work/work_00000001/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: {
         action,
         idempotencyKey: 'trusted-action-key',
@@ -167,11 +171,16 @@ describe('GlassHiveWorkActionService', () => {
     ).rejects.toMatchObject({ status: 400 });
 
     expect(mockReauthorizeCapabilityAuthorization).not.toHaveBeenCalled();
-    expect(mockRequestAccountApi).toHaveBeenCalledTimes(1);
+    expect(mockRequestAccountApi).toHaveBeenCalledTimes(2);
+    expect(mockRequestAccountApi).toHaveBeenNthCalledWith(1, {
+      ownerId: 'owner-1',
+      path: '/v1/work/work_00000001',
+    });
     expect(mockRequestAccountApi).toHaveBeenLastCalledWith({
       ownerId: 'owner-1',
       path: '/v1/work/work_00000001/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: {
         action: 'retry',
         idempotencyKey: 'trusted-action-key',
@@ -246,6 +255,7 @@ describe('GlassHiveWorkActionService', () => {
         ownerId: 'owner-1',
         path: '/v1/work/work_00000001/actions',
         method: 'POST',
+        fetchImpl: expect.any(Function),
         body: { action: 'resume', idempotencyKey: 'trusted-action-key' },
       });
     },
@@ -264,6 +274,7 @@ describe('GlassHiveWorkActionService', () => {
       ownerId: 'owner-1',
       path: '/v1/work/work_00000001/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: { action: 'stop', idempotencyKey: 'trusted-action-key' },
     });
     expect(mockReauthorizeCapabilityAuthorization).not.toHaveBeenCalled();
@@ -283,6 +294,7 @@ describe('GlassHiveWorkActionService', () => {
       ownerId: 'owner-1',
       path: '/v1/work/work_00000001/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: {
         action: 'steer',
         instruction: 'Add the requested footer.',
@@ -319,6 +331,7 @@ describe('GlassHiveWorkActionService', () => {
       ownerId: 'owner-1',
       path: '/v1/work/work_00000001/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: {
         action: 'message',
         instruction: 'Add the new evidence section.',
@@ -517,6 +530,7 @@ describe('GlassHiveWorkActionService', () => {
       ownerId: 'owner-1',
       path: '/v1/work/older-terminal-work/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: { action: 'dismiss', idempotencyKey: 'trusted-action-key' },
     });
   });

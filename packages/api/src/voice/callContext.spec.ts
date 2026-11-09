@@ -1,4 +1,4 @@
-import { bindCurrentCallContext, getCurrentCallContext } from './callContext';
+import { bindCurrentCallContext, getCurrentCallContext, inheritCurrentCallContext } from './callContext';
 
 describe('current Call data context', () => {
   const request = () => ({
@@ -77,4 +77,19 @@ describe('current Call data context', () => {
       currentCallContext: getCurrentCallContext(req), _viventiumCurrentCallContextV1: 'forged' } };
     expect(getCurrentCallContext(forged)).toBe('');
   });
+
+  test('a Main result keeps only the same admitted Call facts and gateway evidence', () => {
+    const source = request();
+    const target = request();
+    bindCurrentCallContext(source, gateway());
+    expect(inheritCurrentCallContext(source, target)).toBe(true);
+    expect(getCurrentCallContext(target)).toBe(getCurrentCallContext(source));
+    expect(facts(target).gatewayReadyRoute).toEqual(gateway().readyRoute);
+    const foreign = request(); foreign.user.id = 'foreign';
+    expect(inheritCurrentCallContext(source, foreign)).toBe(false);
+    expect(getCurrentCallContext(foreign)).toBe('');
+    const unbound = request();
+    expect(inheritCurrentCallContext(unbound, request())).toBe(false);
+  });
+
 });

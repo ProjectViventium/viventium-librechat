@@ -1189,6 +1189,54 @@ describe('retained native failure ACK fences', () => {
     f.MessageModel.updateOne = jest.fn(async () => ({ matchedCount: 1 }));
     return f;
   }
+  test.each(['exact', 'changed-source', 'wrong-error', 'running', 'foreign-owner'])(
+    'unsupported interruption settles only its exact owned terminal: %s',
+    async (kind) => {
+      const f = nativeFixture();
+      f.message.nativeResponse.status = 'unsupported';
+      delete f.message.nativeResponse.finalReplayStoredAt;
+      f.message.content = [
+        {
+          type: 'error',
+          error_class: 'native_response_unsupported',
+          error: 'The original graph runtime ended.',
+        },
+      ];
+      if (kind === 'changed-source') mockNativeSourceMatches.mockResolvedValue(false);
+      if (kind === 'wrong-error') f.message.content[0].error_class = 'native_response_failed';
+      if (kind === 'foreign-owner') f.message.nativeResponse.userId = 'foreign';
+      if (kind === 'running')
+        mockGetJob.mockResolvedValue({
+          status: 'running',
+          metadata: {
+            userId: 'owner',
+            conversationId: row.conversationId,
+            responseMessageId: 'reply',
+            interactionContext: { logical_turn_id: 'turn', revision: 2 },
+          },
+        });
+      await expect(
+        acknowledgeRetainedTelegramFailure(ack, 'telegram', {
+          IngressModel: f.IngressModel,
+          MessageModel: f.MessageModel,
+        }),
+      ).resolves.toMatchObject({ status: kind === 'exact' ? 'recorded' : 'not_found' });
+      if (kind === 'exact') {
+        expect(f.MessageModel.updateOne.mock.calls[0][0].nativeResponse).toEqual(
+          f.message.nativeResponse,
+        );
+        expect(f.IngressModel.updateOne.mock.calls[0][1].$set).toMatchObject({
+          inputState: 'failed',
+          inputRetryAt: 0,
+          inputLeaseUntil: 0,
+          inputClaimToken: '',
+        });
+      } else {
+        expect(f.MessageModel.updateOne).not.toHaveBeenCalled();
+        expect(f.IngressModel.updateOne).not.toHaveBeenCalled();
+      }
+    },
+  );
   test('cacheless exact native final failure preserves its complete proof in ACK CAS', async () => {
     const f = nativeFixture();
     await expect(

@@ -67,6 +67,8 @@ const createProviderDeadlineApiError = (status) => {
     : APIError.generate(status, { error: payload }, undefined, new Headers());
 };
 
+afterEach(() => jest.requireActual('@librechat/api').resetMainCompactionSchedulingForTests());
+
 describe('source context failure presentation', () => {
   test.each([false, true])('keeps a local source failure distinct (wrapped=%s)', (wrapped) => {
     const sourceError = Object.assign(new Error('Synthetic source unavailable'), {
@@ -88,6 +90,22 @@ describe('source context failure presentation', () => {
     ).toBe(false);
   });
 });
+
+test.each([false, true])(
+  'file courier failure stays typed without model retry (wrapped=%s)',
+  (wrapped) => {
+    const original = Object.assign(new Error('Synthetic private file detail'), {
+      code: 'native_output_files_identity_unavailable',
+      status: 409,
+    });
+    const error = wrapped ? new Error('Outer provider failure', { cause: original }) : original;
+    expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: 'The selected file could not be attached.',
+      error_class: 'native_output_files_identity_unavailable',
+    });
+  },
+);
 
 describe('scheduled authority conflict metadata', () => {
   test.each(['body', 'header', 'wrapped'])('preserves the declared conflict from %s', (shape) => {
@@ -229,8 +247,14 @@ jest.mock('~/server/services/BackgroundCortexService', () => ({
       ? mockBackgroundExecution(...args)
       : jest.requireActual('~/server/services/BackgroundCortexService').executeActivated(...args),
 }));
+
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  prepareMainAuthorContext: (...args) =>
+    require('~/test/helpers/mainAuthorContext').mockMainAuthorContext(
+      jest.requireActual('@librechat/api').prepareMainAuthorContext,
+      ...args,
+    ),
   isNativeCapacityRefusal: (...args) => mockIsNativeCapacityRefusal(...args),
   createRun: (...args) => mockCreateRun(...args),
   getRequiredPromptText: jest.fn((key, ...args) =>
@@ -855,6 +879,8 @@ describe('buildViventiumMcpRequestBody', () => {
         req: {
           body: {
             viventiumVoiceCallSessionId: 'call-spoofed',
+            viventiumCallSessionId: 'call-spoofed',
+            viventiumVoiceTaskId: 'task-spoofed',
             viventiumVoiceWorkAuthority: { callSessionId: 'call-spoofed' },
           },
           ...serverFields,
@@ -862,12 +888,17 @@ describe('buildViventiumMcpRequestBody', () => {
       });
     const nonVoice = build();
     expect(nonVoice.viventiumVoiceCallSessionId).toBeUndefined();
+    expect(nonVoice.viventiumCallSessionId).toBeUndefined();
+    expect(nonVoice.viventiumVoiceTaskId).toBeUndefined();
     expect(nonVoice.viventiumVoiceWorkAuthority).toBeUndefined();
     const voice = build({
       viventiumCallSession: { callSessionId: 'call-trusted' },
       viventiumVoiceWorkAuthority: trustedBinding,
+      body: { viventiumVoiceTaskId: 'task-trusted' },
     });
     expect(voice.viventiumVoiceCallSessionId).toBe('call-trusted');
+    expect(voice.viventiumCallSessionId).toBe('call-trusted');
+    expect(voice.viventiumVoiceTaskId).toBe('task-trusted');
     expect(voice.viventiumVoiceWorkAuthority).toBe(trustedBinding);
     const missingBinding = build({ viventiumCallSession: { callSessionId: 'call-trusted' } });
     expect(missingBinding.viventiumVoiceCallSessionId).toBe('call-trusted');
@@ -1810,6 +1841,7 @@ describe('late completion error content parts', () => {
 
   test('suppresses terminated stream errors after visible assistant text', () => {
     const contentParts = [{ type: ContentTypes.TEXT, text: 'Partial but visible answer.' }];
+
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(contentParts, new Error('terminated')),
     ).toBe(true);
@@ -1829,23 +1861,13 @@ describe('late completion error content parts', () => {
     );
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
-        [
-          {
-            type: ContentTypes.TEXT,
-            text: 'Final answer.',
-          },
-        ],
+        [{ type: ContentTypes.TEXT, text: 'Final answer.' }],
         new Error('provider stream ended after final text'),
       ),
     ).toBe(false);
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
-        [
-          {
-            type: ContentTypes.TEXT,
-            text: 'Partial answer.',
-          },
-        ],
+        [{ type: ContentTypes.TEXT, text: 'Partial answer.' }],
         new Error('status 429 rate_limit_error'),
       ),
     ).toBe(false);
@@ -7452,7 +7474,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       mockLoadAcceptedMainContext.mockResolvedValueOnce({
         status: 'available',
         capsule: full,
-        turns: [],
+        turns: recent,
+        semanticCompaction: summary,
       });
       if (carrierKiB === 128) {
         req.config.endpoints = {
@@ -7605,7 +7628,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       textSha256: crypto.createHash('sha256').update(backgroundText).digest('hex'),
       sources: [{ cortexId: 'synthetic-cortex', insightSha256: 'e'.repeat(64) }],
     };
-    const capsule = api.buildAcceptedMainContextCapsule({
+    const acceptedState = {
       turns: [
         {
           logicalTurnId: 'earlier-turn',
@@ -7621,8 +7644,13 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
           committedAt: new Date(),
         },
       ],
+    };
+    const capsule = api.buildAcceptedMainContextCapsule(acceptedState);
+    mockLoadAcceptedMainContext.mockResolvedValueOnce({
+      status: 'available',
+      capsule,
+      ...acceptedState,
     });
-    mockLoadAcceptedMainContext.mockResolvedValueOnce({ status: 'available', capsule, turns: [] });
     let runOptions;
     mockCreateRun = jest.fn(async (options) => {
       runOptions = options;
@@ -8268,7 +8296,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         expect(createRun).toHaveBeenCalledTimes(1);
         const input = mockCreateCortexFollowUpMessage.mock.calls[0][0];
         const configuration = createRun.mock.calls[0][0].graphConfig;
-        const user = processStream.mock.calls[0][0].messages[0].content;
+        const user = processStream.mock.calls[0][0].messages.at(-1).content;
         const trace = {
           caseId,
           parentText,
@@ -8288,7 +8316,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
         }
         expect(input.forceVisibleFollowUp).toBe(deferredMain);
         expect(prepared.shouldForceVisibleFollowUp).toBe(expectedForced);
-        expect(configuration.instructions.includes('completing a deferred response')).toBe(
+        expect(configuration.instructions.includes('to complete the deferred answer')).toBe(
           expectedForced,
         );
         expect(user).toContain(userRequest);
@@ -11598,6 +11626,221 @@ describe('typed native MCP startup error presentation', () => {
       expect(
         AgentClient.createCompletionErrorContentPart({ code: 'provider_auth_missing' }).error_class,
       ).toBe('provider_auth_missing');
+    },
+  );
+});
+
+describe('ordinary Main result context preparation', () => {
+  let promptDirectory;
+  let previousPromptGetter;
+  const previousBundle = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  beforeAll(() => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const os = require('node:os');
+    promptDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'main-result-context-'));
+    const {
+      buildPromptBundleFixture,
+    } = require('../../../../scripts/test-support/promptBundle.cjs');
+    const bundle = path.join(promptDirectory, 'bundle.json');
+    fs.writeFileSync(
+      bundle,
+      JSON.stringify(
+        buildPromptBundleFixture(
+          path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts'),
+        ),
+      ),
+    );
+    process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundle;
+    const api = require('@librechat/api');
+    previousPromptGetter = api.getRequiredPromptText.getMockImplementation();
+    api.getRequiredPromptText.mockImplementation((...args) =>
+      jest.requireActual('@librechat/api').getRequiredPromptText(...args),
+    );
+  });
+  afterAll(() => {
+    require('@librechat/api').getRequiredPromptText.mockImplementation(previousPromptGetter);
+    if (previousBundle === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+    else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousBundle;
+    require('node:fs').rmSync(promptDirectory, { recursive: true, force: true });
+  });
+
+  test.each([
+    ['telegram', false, false, 'interactive'],
+    ['telegram', true, false, 'interactive'],
+    ['voice', true, false, 'interactive'],
+    ['playground', false, false, 'interactive'],
+    ['telegram', true, true, 'interactive'],
+    ['web', false, false, 'interactive'],
+    ['web', true, false, 'interactive'],
+    ['', false, false, 'interactive'],
+    ['workbench', false, false, 'interactive'],
+    ['workbench', false, false, 'scheduler'],
+    ['telegram', false, false, 'scheduler'],
+    ['unknown', false, false, 'interactive'],
+  ])(
+    'uses ordinary memory, Feelings and channel rules without starting work (%s, native=%s, isolated=%s, origin=%s)',
+    async (surface, native, feelingsIsolated, origin) => {
+      const req = {
+        user: { id: 'owner', role: 'USER' },
+        body: {
+          viventiumSurface: surface,
+          ...(feelingsIsolated
+            ? { viventiumQaRun: true, viventiumEvalIsolation: { feelings: true } }
+            : {}),
+          voiceMode: surface === 'voice',
+          ...(surface === 'voice'
+            ? { viventiumActorTrust: 'owner_participant', viventiumCanAuthorizeSideEffects: true }
+            : {}),
+          text: 'Verified evidence.',
+        },
+        config: native
+          ? {
+              endpoints: {
+                agents: {
+                  providerCapabilities: {
+                    openAI: {
+                      workspace_binding: true,
+                      time_context_delivery: 'per_turn_header',
+                    },
+                  },
+                },
+              },
+            }
+          : {},
+        _viventiumContinuityActiveWorkContext: '',
+        _viventiumActiveWorkTurnContextPromise: Promise.resolve(''),
+        _viventiumFeelingSnapshotPromise: Promise.resolve({
+          enabled: true,
+          agentScope: 'all_agents',
+          capsule: '<viventium_feeling_state>Current synthetic state.</viventium_feeling_state>',
+          snapshotHash: 'synthetic-state',
+          version: 1,
+        }),
+      };
+      if (origin === 'scheduler') {
+        setTrustedInteractionContext(
+          req,
+          createSchedulerInteractionContext({
+            conversation_id: 'conversation',
+            source_event_id: 'scheduled-occurrence',
+            schedule_id: 'synthetic-schedule',
+            schedule_run_id: 'synthetic-schedule-run',
+          }),
+        );
+      }
+      let callContext = '';
+      if (surface === 'voice') {
+        const api = jest.requireActual('@librechat/api');
+        req.viventiumCallSession = {
+          userId: 'owner',
+          callSessionId: 'synthetic-call',
+          agentId: 'main',
+          mode: 'call',
+          requestedVoiceRoute: { stt: { provider: 'whisper' }, tts: { provider: 'xai' } },
+        };
+        expect(api.bindCurrentCallContext(req)).toBe(true);
+        callContext = api.getCurrentCallContext(req);
+      }
+      const client = new AgentClient({
+        req,
+        agent: {
+          id: 'main',
+          provider: 'openAI',
+          instructions: 'SYNTHETIC MAIN IDENTITY.',
+          model_parameters: { model: 'gpt-4' },
+          tools: [],
+        },
+        maxContextTokens: 128000,
+      });
+      client.responseMessageId = 'result-event';
+      client.conversationId = 'conversation';
+      client.useMemory = jest.fn(async () => {
+        client.memoryReadAvailability = 'available';
+        return 'SYNTHETIC SAVED PREFERENCE.';
+      });
+      client.chatCompletion = jest.fn();
+      client.sendMessage = jest.fn();
+      client.startDeferredMemoryWriter = jest.fn();
+      client.startEmotionalReaction = jest.fn();
+      const correction = 'Exact correction.\n'.repeat(100) + ' END CURRENT CORRECTION';
+      const result = await client.prepareMainResultContext(
+        [
+          { messageId: 'correction', sender: 'User', isCreatedByUser: true, text: correction },
+          {
+            messageId: 'result-event',
+            parentMessageId: 'correction',
+            sender: 'User',
+            isCreatedByUser: true,
+            text: 'Verified evidence.',
+          },
+        ],
+        'result-event',
+      );
+      expect(Number.isSafeInteger(result.selectedCarrierBytes)).toBe(true);
+      expect(result.selectedCarrierBytes).toBeGreaterThan(0);
+      expect(result.messages.at(-1)._getType()).toBe('human');
+      expect(result.instructions).toContain('SYNTHETIC MAIN IDENTITY.');
+      expect(result.instructions).not.toContain('owner_layer:');
+      expect(result.instructions).not.toMatch(/^---\n(?:id|version):/m);
+      expect(
+        result.instructions.split(
+          jest.requireActual('@librechat/api').getRequiredPromptText('main.user_fact_guard'),
+        ),
+      ).toHaveLength(2);
+      expect(native ? result.memoryContext : result.instructions).toContain(
+        'SYNTHETIC SAVED PREFERENCE.',
+      );
+      if (native) expect(result.instructions).not.toContain('SYNTHETIC SAVED PREFERENCE.');
+      const prompts = require('~/server/services/viventium/surfacePrompts');
+      const rules =
+        origin === 'scheduler'
+          ? prompts.buildScheduledCanonicalOutputInstructions()
+          : surface === 'telegram'
+            ? prompts.buildTelegramTextInstructions()
+            : surface === 'voice'
+              ? prompts.buildVoiceModeInstructions('')
+              : surface === 'playground'
+                ? prompts.buildPlaygroundTextInstructions()
+                : surface === 'unknown'
+                  ? ''
+                  : prompts.buildWebTextInstructions();
+      if (rules) {
+        expect(result.instructions.split(rules)).toHaveLength(2);
+        expect(JSON.stringify(result.messages)).not.toContain(rules);
+      } else {
+        expect(result.instructions).not.toContain(prompts.buildWebTextInstructions());
+      }
+      if (origin === 'scheduler') {
+        expect(result.instructions).not.toContain(prompts.buildWebTextInstructions());
+        expect(result.instructions).not.toContain(prompts.buildTelegramTextInstructions());
+      }
+      if (callContext) {
+        const carrier = native
+          ? Buffer.from(req.body.viventiumGlassHiveTurnContextB64, 'base64').toString('utf8')
+          : result.instructions;
+        expect(carrier.split(callContext)).toHaveLength(2);
+        if (native) expect(result.instructions).not.toContain(callContext);
+        expect(JSON.stringify(result.messages)).not.toContain(callContext);
+      }
+      expect(JSON.stringify(result.messages)).toContain('END CURRENT CORRECTION');
+      expect(req._viventiumGlassHiveWorkerMemory).toBe('SYNTHETIC SAVED PREFERENCE.');
+      if (feelingsIsolated) {
+        expect(req._viventiumGlassHiveWorkerFeelings).toBeFalsy();
+        expect(result.instructions).not.toContain('Current synthetic state.');
+        expect(req._viventiumFeelingReadFailureClass).toBe('temporary_eval_isolation');
+        expect(result.developerInstructionTail).toBe('');
+      } else {
+        expect(req._viventiumGlassHiveWorkerFeelings).toContain('Current synthetic state.');
+        expect(result.developerInstructionTail).toBe(
+          '<viventium_feeling_state>Current synthetic state.</viventium_feeling_state>',
+        );
+        expect(result.instructions.split(result.developerInstructionTail)).toHaveLength(2);
+      }
+      expect(client.chatCompletion).not.toHaveBeenCalled();
+      expect(client.sendMessage).not.toHaveBeenCalled();
+      expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
+      expect(client.startEmotionalReaction).not.toHaveBeenCalled();
     },
   );
 });

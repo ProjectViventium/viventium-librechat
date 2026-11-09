@@ -4,6 +4,7 @@ import { logger } from '@librechat/data-schemas';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { CacheKeys, KnownEndpoints, EModelEndpoint, defaultModels, extractEnvVariable, normalizeEndpointName } from 'librechat-data-provider';
 import type { IUser } from '@librechat/data-schemas';
+import type { ScopedNativeHistoryBudget } from '../glasshive/nativeHistoryBudget';
 import {
   processModelData,
   extractBaseURL,
@@ -15,8 +16,7 @@ import {
 } from '~/utils';
 import { standardCache } from '~/cache';
 import { trustedUploadedFilesFromRequestBody } from '~/glasshive/sourceSelection';
-import { GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES, GLASSHIVE_NATIVE_MEDIA_MAX_BYTES,
-  GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES } from '~/glasshive/nativeMedia';
+import { GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES } from '~/glasshive/nativeMedia';
 
 /** Authenticated discovery metadata only; reads never fetch or delay a conversation turn. */
 const nativeHistoryModelCache = standardCache(CacheKeys.CONFIG_STORE);
@@ -33,6 +33,7 @@ export async function getNativeConversationReplayBudget(name: string, baseURL: s
 export async function getNativeConversationReplayBudgetForRoutes(
   routes: Array<{ endpoint?: string; provider?: string; model?: string }>,
   endpoints: Array<{ name?: string; baseURL?: string }> | undefined,
+  observed?: ScopedNativeHistoryBudget | null,
 ) {
   if (!routes.length || !Array.isArray(endpoints)) return null;
   const values = await Promise.all(routes.map(async route => {
@@ -40,6 +41,9 @@ export async function getNativeConversationReplayBudgetForRoutes(
     const endpoint = endpoints.find(item => normalizeEndpointName(String(item.name || '')) === normalizeEndpointName(name));
     const baseURL = extractEnvVariable(String(endpoint?.baseURL || ''));
     if (!baseURL || isUserProvided(baseURL) || baseURL.includes('${')) return null;
+    if (observed && normalizeEndpointName(observed.providerId) === normalizeEndpointName(name) &&
+        observed.modelId === String(route.model || '') && Number.isSafeInteger(observed.budgetBytes) &&
+        observed.budgetBytes > 0) return observed.budgetBytes;
     return getNativeConversationReplayBudget(name, baseURL, String(route.model || ''));
   }));
   return values.some(value => value === null) ? null : Math.min(...values as number[]);
@@ -67,8 +71,6 @@ export function nativeConversationContextBudget(
   if (![budgetBytes, sourceMetadataBytes].every(Number.isSafeInteger) ||
       budgetBytes <= 0 || sourceMetadataBytes < 0) return null;
   try {
-    let inlineImageCount = 0;
-    let inlineImageBytes = 0;
     const visible = messages.filter(message => !['system', 'developer'].includes(String(message.role)))
       .map(({ role, content, tool_call_id, call_id, name }) => ({ role,
         // The native reader renders these declared content kinds. Other typed display/tool
@@ -83,8 +85,8 @@ export function nativeConversationContextBudget(
               const url = typeof part.image_url === 'object' && part.image_url !== null
                 ? part.image_url.url : part.image_url;
               if (typeof url === 'string' && url.startsWith('data:')) {
-                // Match the existing native inline-image ingress before claiming replay fits.
-                // Duplicate images are conservatively counted; the native owner may deduplicate.
+                // Retained originals keep Native per-image validation. Native separately owns
+                // the verified current inference batch, not a lifetime history aggregate.
                 if (url.length > Math.ceil(GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES / 3) * 4 + 64)
                   throw new TypeError('native_media_capacity');
                 const data = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
@@ -98,12 +100,8 @@ export function nativeConversationContextBudget(
                   'image/webp': bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
                     bytes.subarray(8, 12).toString('ascii') === 'WEBP',
                 };
-                inlineImageCount += 1;
-                inlineImageBytes += bytes.length;
                 if (!bytes.length || bytes.length > GLASSHIVE_NATIVE_MEDIA_MAX_IMAGE_BYTES ||
-                    bytes.toString('base64') !== data[2] || !signatures[data[1]] ||
-                    inlineImageCount > GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES ||
-                    inlineImageBytes > GLASSHIVE_NATIVE_MEDIA_MAX_BYTES)
+                    bytes.toString('base64') !== data[2] || !signatures[data[1]])
                   throw new TypeError('native_media_capacity');
               }
             }

@@ -4,12 +4,12 @@
  * Feature: Conversation legacy continuity.
  * Purpose: A conversation whose visible history holds answers without a Core Main context stamp
  * must carry that history intact through the protected source guard. Native body routes defer
- * opportunistic prefix migration to the existing idle runner only after a positive fit against
- * discovered native replay floors; unknown, over-budget and header-only routes reconcile first
- * when required. The existing Main compaction runner reviews each oldest whole-turn prefix on the
+ * opportunistic prefix migration to the existing idle runner. Native admission owns its actual
+ * context capacity; header-only routes still reconcile first when required. The existing Main
+ * compaction runner reviews each oldest whole-turn prefix on the
  * configured Main route and binds it to the exact covered rows. Main receives only that accepted
  * summary plus every newer row, or all original rows until review completes. Stored history is
- * never rewritten, truncated or reset. Carrier bounds remain unchanged; covered source changes
+ * never rewritten, truncated or reset. Actual carrier bounds remain enforced; covered source changes
  * invalidate the summary and restore full protection.
  * === VIVENTIUM END === */
 
@@ -575,7 +575,6 @@ async function resolveConversationContinuity({
   Model = require('~/db/models').ViventiumConversationContinuity,
   MessageModel = require('~/db/models').Message,
   nativeBodyCarrier = false,
-  nativeReplayBudgetKnown = false,
   ...options
 } = {}) {
   const rows = Array.isArray(orderedMessages) ? orderedMessages : [];
@@ -584,20 +583,20 @@ async function resolveConversationContinuity({
   if (rows.length <= TAIL_TARGET_ROWS || !hasUnreconciledMainHistory(rows)) return null;
   let record = await Model.findOne({ ownerId, conversationId }).lean();
   const existing = projectConversationContinuity(record, rows);
-  // A positive conservative fit permits reuse of an exact reviewed prefix and intact tail.
-  // False or unavailable estimates retain the existing reconciliation/admission owners;
-  // this estimate is not the Native rendered-source limit and cannot reject a turn.
+  // The Native body owner admits complete source against its actual context capacity.
+  // Legacy backfill is idle maintenance, never an extra model call before that admission.
   const fits =
+    nativeBodyCarrier !== true &&
     typeof options.canCarryWholeHistory === 'function' &&
     (await options.canCarryWholeHistory(
       existing.record ? existing.messages : rows,
       existing.record ? existing.capsule : '',
     )) === true;
-  if (fits && !(nativeBodyCarrier === true && nativeReplayBudgetKnown === true)) {
+  if (fits) {
     return existing.record ? existing : null;
   }
   if (planConversationContinuityClaim({ record, orderedMessages: rows })) {
-    if (nativeBodyCarrier === true && nativeReplayBudgetKnown === true && fits) {
+    if (nativeBodyCarrier === true) {
       const compaction = options.compaction || require('./ViventiumMainCompactionService');
       compaction.scheduleMainContinuityMaintenance({
         ownerId,

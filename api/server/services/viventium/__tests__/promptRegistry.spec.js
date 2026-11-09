@@ -71,7 +71,16 @@ describe('promptRegistry', () => {
     expect(main).toContain('If the user asks you to act yourself or excludes handoffs');
     expect(main).toContain('Do not defer immediate current-state checks to background cortices');
     expect(main).toContain('An explicit focused preference limits new automatic delegation');
-    expect(main).toContain('Report a launch only after its receipt');
+    expect(
+      main.split(
+        'Report acceptance only after its receipt; acknowledge the accepted work once and end the turn.',
+      ),
+    ).toHaveLength(2);
+    expect(
+      main.split(
+        'Never say work was delegated, accepted, queued, or is running unless a successful delegation-tool receipt proves it.',
+      ),
+    ).toHaveLength(2);
   });
 
   test('renders compiled prompt with includes and variables from memory only', () => {

@@ -3,7 +3,7 @@ import type { StandardGraph } from '@librechat/agents';
 import type { NativeAcceptedSource, NativePredecessor } from '../../glasshive/nativeSupersession';
 import type { InteractionSourceSegment } from '../../glasshive/interactionSourceSegments';
 export type { InteractionSourceSegment } from '../../glasshive/interactionSourceSegments';
-import type { ReadyInputContinuation } from '../../agents/interactionContext';
+import type { InteractionOrigin, ReadyInputContinuation } from '../../agents/interactionContext';
 import type { NativeResponseIdentity, NativeResponseCommit } from '@librechat/data-schemas';
 import type { ServerSentEvent } from '../../types/events';
 import type { VoiceWorkAuthorityBinding } from '../../voice/engagementAuthority';
@@ -25,7 +25,7 @@ export type JobStatus = 'running' | 'complete' | 'error' | 'aborted' | 'supersed
 /** Trusted, server-authored context shared by generation and delivery adapters. */
 export interface InteractionContext {
   actor_kind: 'external_user' | 'system' | 'worker';
-  origin: 'interactive' | 'scheduler' | 'callback';
+  origin: InteractionOrigin;
   surface: 'web' | 'telegram' | 'voice' | 'workbench';
   conversation_id: string;
   logical_turn_id?: string;

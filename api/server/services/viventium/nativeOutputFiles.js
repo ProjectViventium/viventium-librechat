@@ -17,6 +17,7 @@ const {
   selectGlassHiveNativeMediaFiles,
   nativeMediaOutputFilesForMessage,
   resolveGlassHiveNativeMediaMessageSelection,
+  resolveGlassHiveRetainedResultFileAccess,
   bindGlassHiveNativeMediaAttachmentReferences,
   fenceGlassHiveTerminalCallbackAcceptedOperation,
 } = require('@librechat/api');
@@ -245,6 +246,7 @@ async function prepareMissionOutputFiles({
     const files = [...canonicalFiles, ...mediaOnlyFiles].filter(
       (file) => !seen.has(nativeOutputFileDescriptorKey(file)),
     );
+    if (!files.length) continue;
     const identity = {
       userId: ownerId,
       conversationId: message.conversationId,
@@ -570,46 +572,65 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
       : {}),
   };
 }
-async function prepareNativeResponseOutputFiles(req, response, identity, text) {
+function retainedNativeMediaStore() {
   const mongoose = require('mongoose');
   const ResultModel = require('~/db/models').GlassHiveTerminalCallbackResult;
+  return {
+    readEvidence: async (selector) => {
+      const cursor = await mongoose.connection
+        .collection('viventium_glasshive_mission_evidence')
+        .find(selector, {
+          projection: {
+            ownerId: 1,
+            conversationId: 1,
+            originRef: 1,
+            workRef: 1,
+            runId: 1,
+            attemptId: 1,
+            attemptNumber: 1,
+            nativeMedia: 1,
+            outputFiles: 1,
+            terminalCallbackResultKey: 1,
+            terminalCallbackAcceptedOperationId: 1,
+            terminalCallbackId: 1,
+            terminalCallbackResultRevision: 1,
+            terminalCallbackResultDigest: 1,
+            terminalCallbackEffectGeneration: 1,
+          },
+        });
+      return cursor.toArray();
+    },
+    readAccepted: (selector) =>
+      ResultModel.find(selector)
+        .select(
+          '_id ownerId originRef workRef runId attemptNumber callbackId resultRevision resultDigest acceptedOperationId acceptedOperationGeneration',
+        )
+        .lean(),
+    isAccepted: async (selector) => Boolean(await ResultModel.findOne(selector).lean()),
+    fenceAccepted: (reference, session) =>
+      fenceGlassHiveTerminalCallbackAcceptedOperation({
+        ResultModel,
+        reference,
+        session,
+      }),
+  };
+}
+async function loadRetainedNativeResultFileAccess(ownerId, conversationId) {
+  return resolveGlassHiveRetainedResultFileAccess(
+    { ownerId, conversationId },
+    retainedNativeMediaStore(),
+  );
+}
+async function prepareNativeResponseOutputFiles(req, response, identity, text) {
   const selected = await resolveGlassHiveNativeMediaMessageSelection(
     {
       text,
       ownerId: identity.userId,
       conversationId: identity.conversationId,
+      selectedFileSha256s:
+        response.glasshive?.output_files?.files?.map((file) => file.sha256) || [],
     },
-    {
-      readEvidence: (selector) =>
-        mongoose.connection
-          .collection('viventium_glasshive_mission_evidence')
-          .find(selector, {
-            projection: {
-              ownerId: 1,
-              conversationId: 1,
-              originRef: 1,
-              workRef: 1,
-              runId: 1,
-              attemptId: 1,
-              attemptNumber: 1,
-              nativeMedia: 1,
-              terminalCallbackResultKey: 1,
-              terminalCallbackAcceptedOperationId: 1,
-              terminalCallbackId: 1,
-              terminalCallbackResultRevision: 1,
-              terminalCallbackResultDigest: 1,
-              terminalCallbackEffectGeneration: 1,
-            },
-          })
-          .toArray(),
-      isAccepted: async (selector) => Boolean(await ResultModel.findOne(selector).lean()),
-      fenceAccepted: (reference, session) =>
-        fenceGlassHiveTerminalCallbackAcceptedOperation({
-          ResultModel,
-          reference,
-          session,
-        }),
-    },
+    retainedNativeMediaStore(),
   );
   const envelope = response.glasshive?.output_files;
   const imported = await prepareNativeOutputFiles(req, envelope, identity);
@@ -703,6 +724,7 @@ async function prepareCurrentNativeOutputFiles(req, carrier, agentId, streamId) 
   return prepareNativeOutputFiles(req, carrier.envelope, identity);
 }
 module.exports = {
+  loadRetainedNativeResultFileAccess,
   nativeOutputFileLimit,
   nativeOutputFileLimits,
   prepareNativeOutputFiles,

@@ -2,12 +2,113 @@ import { createHash } from 'crypto';
 import {
   buildMainGenerationPresentation,
   createMainGenerationPresentationVerifier,
+  nativeCoordinatorResultVoiceTurnId,
 } from './mainGenerationPresentation';
 import type { MainGenerationDelivery, MainGenerationMessage } from './mainGenerationPresentation';
 import type {
   ScheduleDueAdmission,
   ScheduledConversationBinding,
 } from '../scheduling/scheduleDueReceiver';
+
+function nativeFixture() {
+  const f = fixture('voice');
+  const source = {
+    bindingRef: 'native-binding',
+    nativeConversationId: 'native-conversation',
+    goalId: 'goal-one',
+    runId: 'native-run',
+    resultRevision: 1,
+    resultDigest: 'sha256:' + 'a'.repeat(64),
+    sourceTurnId: 'native-turn',
+    sourceCallSessionId: 'call-a',
+  };
+  f.row.originRef = source.bindingRef;
+  f.row.mainGenerationPresentation = buildMainGenerationPresentation(
+    { nativeCoordinatorResult: source },
+    f.message.messageId,
+    f.message.text!,
+  )!;
+  const native = jest.fn(async () => true);
+  const active = jest.fn(async () => ({ callSessionId: 'call-a' }));
+  return {
+    ...f,
+    source,
+    native,
+    active,
+    verify: createMainGenerationPresentationVerifier({
+      ...f.deps,
+      readNativeCoordinatorResult: native,
+      readActiveCall: active,
+    }),
+  };
+}
+
+test('Native result v2 uses its genuine source without a fabricated Main job or schedule admission', async () => {
+  const f = nativeFixture();
+  expect(f.row.mainGenerationPresentation).toMatchObject({
+    version: 2,
+    nativeCoordinatorResult: { kind: 'native_coordinator_goal', ...f.source },
+  });
+  expect(f.row.mainGenerationPresentation).not.toHaveProperty('streamId');
+  expect(f.row.mainGenerationPresentation).not.toHaveProperty('admissionId');
+  expect(await f.verify(f.row)).toBe(true);
+  expect(f.deps.readAdmission).not.toHaveBeenCalled();
+  expect(f.deps.readBinding).not.toHaveBeenCalled();
+  expect(nativeCoordinatorResultVoiceTurnId(f.source, f.message.messageId)).toMatch(
+    /^native-result-[a-f0-9]{64}$/,
+  );
+  expect(nativeCoordinatorResultVoiceTurnId(f.source, f.message.messageId)).toBe(
+    nativeCoordinatorResultVoiceTurnId(f.source, f.message.messageId),
+  );
+});
+
+test.each([
+  'ended',
+  'moved_call',
+  'foreign_owner',
+  'foreign_conversation',
+  'source_changed',
+  'message_changed',
+])(
+  'Native result audio rejects %s while its linked text remains independently persisted',
+  async (change) => {
+    const f = nativeFixture();
+    if (change === 'ended') f.call.status = 'ended';
+    if (change === 'moved_call') f.active.mockResolvedValue({ callSessionId: 'different-call' });
+    if (change === 'foreign_owner') f.call.userId = 'foreign';
+    if (change === 'foreign_conversation') f.call.conversationId = 'foreign';
+    if (change === 'source_changed') f.native.mockResolvedValue(false);
+    if (change === 'message_changed') f.message.text = 'Different source text';
+    expect(await f.verify(f.row)).toBe(false);
+    expect(f.message.messageId).toBe('message-a');
+  },
+);
+
+test('Native result Telegram uses current owner mapping and source proof independently of an ended Call', async () => {
+  const f = nativeFixture();
+  f.row.surface = 'telegram';
+  f.call.status = 'ended';
+  f.active.mockResolvedValue({ callSessionId: 'another-call' });
+  expect(await f.verify(f.row)).toBe(true);
+  expect(f.active).not.toHaveBeenCalled();
+  expect(f.native).toHaveBeenCalledWith(expect.objectContaining({ destination: f.row }));
+  f.row.telegramChatId = 'foreign-chat';
+  expect(await f.verify(f.row)).toBe(false);
+});
+
+test('Native result Telegram requires no invented Call while Voice still requires the original Call', async () => {
+  const f = nativeFixture();
+  const source = { ...f.source, sourceCallSessionId: '' };
+  f.row.mainGenerationPresentation = buildMainGenerationPresentation(
+    { nativeCoordinatorResult: source },
+    f.message.messageId,
+    f.message.text!,
+  );
+  f.row.surface = 'telegram';
+  expect(await f.verify(f.row)).toBe(true);
+  f.row.surface = 'voice';
+  expect(await f.verify(f.row)).toBe(false);
+});
 
 function fixture(surface: 'telegram' | 'voice' = 'telegram') {
   const binding: ScheduledConversationBinding = {
@@ -243,3 +344,86 @@ test.each(['wing', 'listen_only'])(
     expect(await f.verify(f.row)).toBe(false);
   },
 );
+
+describe('distinct Native turn result source', () => {
+  const goal = {
+    bindingRef: 'binding',
+    nativeConversationId: 'native',
+    goalId: 'goal',
+    runId: 'run',
+    resultRevision: 1,
+    resultDigest: 'sha256:' + 'a'.repeat(64),
+    sourceTurnId: 'source',
+    sourceCallSessionId: '',
+  };
+  const turn = {
+    kind: 'native_coordinator_turn' as const,
+    bindingRef: 'binding',
+    nativeConversationId: 'native',
+    turnId: 'turn',
+    requestId: 'request',
+    runId: 'run',
+    resultRevision: 1,
+    resultDigest: goal.resultDigest,
+    sourceTurnId: 'source',
+    sourceCallSessionId: '',
+  };
+  test('preserves legacy goal authority bytes and Voice identity exactly', () => {
+    expect(
+      JSON.stringify(
+        buildMainGenerationPresentation(
+          { nativeCoordinatorResult: goal },
+          'message',
+          'Native reply.',
+        ),
+      ),
+    ).toBe(
+      '{"version":2,"nativeCoordinatorResult":{"bindingRef":"binding","nativeConversationId":"native","goalId":"goal","runId":"run","resultRevision":1,"resultDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sourceTurnId":"source","sourceCallSessionId":"","kind":"native_coordinator_goal"},"responseMessageId":"message","responseDigest":"sha256:d622399f41a0d48539b51a710529b67b09de3efbf8a3d1e83c1a70b82a661809"}',
+    );
+    expect(nativeCoordinatorResultVoiceTurnId(goal, 'message')).toBe(
+      'native-result-b6694a91700d976ad01882df973cbfdcfaea5b2518aabbaa17e46aefc2fc6d70',
+    );
+  });
+  test('retains a distinct turn/request source without a goal', () => {
+    const built = buildMainGenerationPresentation(
+      { nativeCoordinatorResult: turn },
+      'message',
+      'Native reply.',
+    )!;
+    expect(built).toMatchObject({ version: 2, nativeCoordinatorResult: turn });
+    expect(built).not.toHaveProperty('nativeCoordinatorResult.goalId');
+    expect(nativeCoordinatorResultVoiceTurnId(turn, 'message')).toMatch(
+      /^native-turn-result-[a-f0-9]{64}$/,
+    );
+    expect(nativeCoordinatorResultVoiceTurnId(turn, 'message')).not.toBe(
+      nativeCoordinatorResultVoiceTurnId({ ...turn, requestId: 'other-request' }, 'message'),
+    );
+  });
+  test.each([
+    { ...turn, goalId: 'fake-goal' },
+    { ...goal, kind: 'native_coordinator_turn' },
+    { ...goal, kind: 'native_coordinator_goal', turnId: 'cross-kind' },
+    { ...turn, requestId: '' },
+    { ...turn, kind: 'unknown' },
+  ])('rejects cross-kind or incomplete sources', (value) => {
+    const { nativeCoordinatorResultSource } = jest.requireActual('./mainGenerationPresentation');
+    expect(nativeCoordinatorResultSource(value)).toBeNull();
+  });
+  test('uses the same live Call and current Main guards for a turn source', async () => {
+    const f = nativeFixture();
+    f.row.mainGenerationPresentation = buildMainGenerationPresentation(
+      {
+        nativeCoordinatorResult: {
+          ...turn,
+          bindingRef: f.source.bindingRef,
+          sourceCallSessionId: f.source.sourceCallSessionId,
+        },
+      },
+      f.message.messageId,
+      f.message.text!,
+    );
+    expect(await f.verify(f.row)).toBe(true);
+    f.call.status = 'ended';
+    expect(await f.verify(f.row)).toBe(false);
+  });
+});

@@ -39,7 +39,6 @@ import type {
   SourceOrderObservationResult,
   CortexPresentationBinding,
 } from '~/stream/interfaces/IJobStore';
-import { SOURCE_SEGMENTS_MAX_BYTES, SOURCE_SEGMENTS_MAX_COUNT } from '~/stream/sourceSegments';
 
 function streamClaimIdentity(scopeDigest: string, sourceEventId: string): string {
   return createHash('sha256')
@@ -907,7 +906,7 @@ export class RedisJobStore implements IJobStore {
         `if (redis.call('HGET', KEYS[1], 'pendingInputs') or '') ~= ARGV[7]
           or (redis.call('HGET', KEYS[1], 'currentContext') or '') ~= ARGV[8]
           or (redis.call('HGET', KEYS[1], 'active') or '') ~= ARGV[9]
-          or (redis.call('HGET', KEYS[1], 'logicalTurnId') or '') ~= ARGV[14] then
+          or (redis.call('HGET', KEYS[1], 'logicalTurnId') or '') ~= ARGV[12] then
          return {'retry', '', '{}', '', ''}
        end
        local receipt_key = 'receipt:' .. ARGV[2]
@@ -931,7 +930,7 @@ export class RedisJobStore implements IJobStore {
          local previous_sequence = presentation and presentation.presentation_source_sequence or previous.source_sequence
          local removed_predecessor = before_state == 'partial_removed'
            and redis.call('HGET', KEYS[5], 'state') == 'revoked' and identity
-           and identity.userId == ARGV[15]
+           and identity.userId == ARGV[13]
            and identity.conversationId == incoming.conversation_id
            and identity.streamId == redis.call('HGET', KEYS[1], 'currentStreamId')
            and identity.logicalTurnId == before_logical
@@ -1016,7 +1015,7 @@ export class RedisJobStore implements IJobStore {
          revision = revision + 1
        else
          -- Retiring a turn keeps each revision claimed before author ledgers existed decidable.
-         if logical_id and logical_id == ARGV[14] then
+         if logical_id and logical_id == ARGV[12] then
            for old = 1, revision do
              local field = tostring(old)
              local stream = redis.call('HGET', KEYS[1], 'streamForRevision:' .. field)
@@ -1036,7 +1035,6 @@ export class RedisJobStore implements IJobStore {
        local context = cjson.decode(ARGV[4])
        local accumulated = {}
        local seen_events = {}
-       local total_bytes = 0
        local overflow_count = tonumber(context.source_segments_overflow_count or '0') or 0
        if active or continues_pending then
          overflow_count = overflow_count + tonumber(
@@ -1049,7 +1047,6 @@ export class RedisJobStore implements IJobStore {
              local identity = string.len(segment.source_event_id) .. ':' ..
                segment.source_event_id .. ':' .. tostring(segment.source_index or 0)
              seen_events[identity] = true
-             total_bytes = total_bytes + string.len(segment.text or '')
            end
          end
        end
@@ -1064,15 +1061,8 @@ export class RedisJobStore implements IJobStore {
              segment.authoring_revision = revision
              table.insert(accumulated, segment)
              seen_events[identity] = true
-             total_bytes = total_bytes + string.len(segment.text or '')
            end
          end
-       end
-       while #accumulated > tonumber(ARGV[12]) or total_bytes > tonumber(ARGV[13]) do
-         local evicted = table.remove(accumulated, 1)
-         if not evicted then break end
-         total_bytes = total_bytes - string.len(evicted.text or '')
-         overflow_count = overflow_count + 1
        end
        if #accumulated > 0 then
          for index, segment in ipairs(accumulated) do segment.ordinal = index - 1 end
@@ -1145,8 +1135,6 @@ export class RedisJobStore implements IJobStore {
           Number.isSafeInteger(interactionContext.source_sequence)
           ? String(interactionContext.source_sequence)
           : '',
-        SOURCE_SEGMENTS_MAX_COUNT,
-        SOURCE_SEGMENTS_MAX_BYTES,
         turnId ?? '',
         userId,
       )) as [string, string, string, string, string];

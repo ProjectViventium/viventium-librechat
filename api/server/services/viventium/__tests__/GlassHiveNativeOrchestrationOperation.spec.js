@@ -62,7 +62,7 @@ describe('GlassHive native orchestration operation tokens', () => {
       toolName: DELEGATION_TOOL_NAME,
       args: {
         title: 'Mission A',
-        instruction: 'Keep the exact evidence.',
+        instruction: ' Keep the exact evidence. ',
         resourceClass: 'standard',
         sourceOrdinals: [1, 2],
         ignored: 'canonical arguments deliberately ignore me',
@@ -105,7 +105,7 @@ describe('GlassHive native orchestration operation tokens', () => {
     expect(reserializedReplay.invocationId).toBe(verified.invocationId);
     expect(verified.args).toEqual({
       title: 'Mission A',
-      instruction: 'Keep the exact evidence.',
+      instruction: ' Keep the exact evidence. ',
       resourceClass: 'standard',
       sourceOrdinals: [1, 2],
     });
@@ -153,7 +153,7 @@ describe('GlassHive native orchestration operation tokens', () => {
       toolName: DELEGATION_TOOL_NAME,
       args: {
         title: 'Mission A',
-        instruction: 'Keep the exact evidence.',
+        instruction: ' Keep the exact evidence. ',
         resourceClass: 'standard',
         sourceOrdinals: [1, 2],
         ignored: 'not part of the canonical operation',
@@ -191,7 +191,7 @@ describe('GlassHive native orchestration operation tokens', () => {
         operationId: expect.stringMatching(/^ghno_[a-f0-9]{64}$/),
         args: {
           title: 'Mission A',
-          instruction: 'Keep the exact evidence.',
+          instruction: ' Keep the exact evidence. ',
           resourceClass: 'standard',
           sourceOrdinals: [1, 2],
         },

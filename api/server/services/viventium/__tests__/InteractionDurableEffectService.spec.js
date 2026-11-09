@@ -143,6 +143,7 @@ describe('InteractionDurableEffectService', () => {
 
   test.each([
     ['glasshive.worker_delegate.v1', 'durable_work_accepted', 'worker_delegate_once'],
+    ['xperfect.coordinator.accept.v1', 'durable_work_accepted', 'accept_turn'],
     ['glasshive.work_action.v1', 'durable_work_action_accepted', 'steer'],
     ['mcp.provider_mutation.v1', 'provider_mutation_returned', 'provider_action'],
   ])(
@@ -192,6 +193,28 @@ describe('InteractionDurableEffectService', () => {
     });
     expect(await EffectModel.countDocuments({})).toBe(0);
   });
+
+  test.each([
+    { adapterId: 'unregistered.adapter.v1' },
+    { providerIdempotencyKey: undefined },
+    { providerIdempotencyMode: undefined },
+  ])(
+    'coordinator reservation retains the adapter and provider identity guards: %j',
+    async (change) => {
+      typedService();
+      await expect(
+        service.prepareDurableEffect(
+          input(undefined, {
+            adapterId: 'xperfect.coordinator.accept.v1',
+            effectKind: 'durable_work_accepted',
+            operation: 'accept_turn',
+            ...change,
+          }),
+        ),
+      ).rejects.toMatchObject({ code: 'durable_effect_invalid_input', status: 400 });
+      expect(await EffectModel.countDocuments({})).toBe(0);
+    },
+  );
 
   test.each(['foreign-owner', 'wrong-call', 'forged-fingerprint', 'mixed-audio'])(
     'typed Call rejects an invalid retained binding: %s',

@@ -1229,6 +1229,7 @@ async function offerMissionEvidenceToCurrentMain({
   mainAgentId,
   insights,
   onPending,
+  expectedSourceOrderScope,
 }) {
   if (!ownerId || !conversationId || !currentLeafMessageId || !mainAgentId) return false;
   const byId = new Map((messages || []).map((message) => [message.messageId, message]));
@@ -1244,6 +1245,7 @@ async function offerMissionEvidenceToCurrentMain({
     const identity = row?.nativeResponse;
     if (!identity || identity.agentId !== mainAgentId) continue;
     if (
+      (expectedSourceOrderScope && identity.sourceOrderScope !== expectedSourceOrderScope) ||
       row.deletedAt ||
       row.isCreatedByUser !== false ||
       String(row.user) !== ownerId ||

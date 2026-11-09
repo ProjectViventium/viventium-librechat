@@ -304,6 +304,187 @@ describe('ViventiumCortexInsightDelivery standalone batch lock', () => {
     await mongoServer?.stop();
   });
 
+  function publicationFixture(suffix) {
+    let sequence = 0;
+    const ownerId = `owner-publication-${suffix}`;
+    const parentMessageId = `original-main-ack-${suffix}`;
+    const service = createCortexInsightDeliveryService({
+      DeliveryModel: Delivery,
+      now: () => new Date('2026-08-22T12:00:00.000Z'),
+      randomUUID: () => `publication-${suffix}-${++sequence}`,
+      runtimeSlot: `publication-${suffix}`,
+      runtimeEpoch: 'publication-boot',
+    });
+    const input = (event) => ({
+      ownerId,
+      conversationId: `conversation-${suffix}`,
+      parentMessageId,
+      publicationId: event,
+      surface: 'web',
+      insights: [{ cortexId: event, status: 'completed', insight: `Independent result ${event}.` }],
+    });
+    return { service, input, ownerId, parentMessageId };
+  }
+
+  test.each(['concurrent', 'sent-first', 'silent-first'])(
+    'keeps independent %s publications under their original parent once',
+    async (mode) => {
+      const { service, input, ownerId, parentMessageId } = publicationFixture(mode);
+      const first = input('native-event-one');
+      const second = input('native-event-two');
+      let one, two;
+      if (mode === 'concurrent')
+        [one, two] = await Promise.all([service.claimBatch(first), service.claimBatch(second)]);
+      else {
+        one = await service.claimBatch(first);
+        if (mode === 'silent-first')
+          await service.markDropped({
+            ownerId,
+            claims: one.claimed,
+            dropReason: 'semantic_suppression',
+          });
+        else
+          await service.markSent({
+            ownerId,
+            claims: one.claimed,
+            persistedMessageId: `result-${mode}`,
+            presentationReceipts: one.claimed[0].requiredSurfaces.map((surface) => ({
+              surface,
+              presentationRef: `fixture:${mode}`,
+            })),
+          });
+        two = await service.claimBatch(second);
+      }
+      expect(one.claimed).toHaveLength(1);
+      expect(two.claimed).toHaveLength(1);
+      const before = await Delivery.find({ userId: ownerId })
+        .select('+publicationId +parentAdmissionKey +events')
+        .lean();
+      expect(before).toHaveLength(2);
+      expect(new Set(before.map((row) => row.batchId)).size).toBe(2);
+      expect(new Set(before.map((row) => row.parentAdmissionKey)).size).toBe(2);
+      expect(before.every((row) => row.parentMessageId === parentMessageId)).toBe(true);
+      await service.recordBatch(first);
+      await service.recordBatch(second);
+      const after = await Delivery.find({ userId: ownerId }).select('+events').lean();
+      expect(after.map((row) => row.events.length)).toEqual(before.map((row) => row.events.length));
+      expect(await service.listByParent({ ownerId, parentMessageId })).toEqual([]);
+      const read = await service.listByParent({
+        ownerId,
+        parentMessageId,
+        deliveryIds: [one.deliveries[0].deliveryId],
+      });
+      expect(read).toHaveLength(1);
+      expect(read[0].publicationId).toBe(first.publicationId);
+    },
+  );
+
+  test('retains strict legacy and same-publication envelopes while rejecting mixed explicit delivery IDs', async () => {
+    const { service, input, ownerId, parentMessageId } = publicationFixture('scope-fences');
+    const a = await service.recordBatch(input('event-a'));
+    const b = await service.recordBatch(input('event-b'));
+    await expect(
+      service.recordBatch({
+        ...input('event-a'),
+        insights: [{ cortexId: 'changed', insight: 'Changed same publication.' }],
+      }),
+    ).rejects.toMatchObject({ code: 'cortex_insight_delivery_batch_mixed_envelope' });
+    const ids = [a.deliveries[0].deliveryId, b.deliveries[0].deliveryId];
+    await expect(
+      service.listByParent({ ownerId, parentMessageId, deliveryIds: ids }),
+    ).rejects.toMatchObject({ code: 'cortex_insight_delivery_batch_mixed_envelope' });
+    await expect(
+      service.claimPendingByParent({
+        ownerId,
+        parentMessageId,
+        surface: 'web',
+        publicationId: 'event-b',
+        deliveryIds: [ids[0]],
+      }),
+    ).rejects.toMatchObject({ code: 'cortex_insight_delivery_batch_mixed_envelope' });
+    await expect(
+      service.listByParent({ ownerId: 'foreign', parentMessageId, deliveryIds: [ids[0]] }),
+    ).resolves.toEqual([]);
+    const legacy = input('legacy-result');
+    delete legacy.publicationId;
+    const saved = await service.recordBatch(legacy);
+    await expect(
+      service.recordBatch({
+        ...legacy,
+        insights: [{ cortexId: 'different', insight: 'Not this finite batch.' }],
+      }),
+    ).rejects.toMatchObject({ code: 'cortex_insight_delivery_batch_mixed_envelope' });
+    expect(
+      (await service.listByParent({ ownerId, parentMessageId })).map((row) => row.deliveryId),
+    ).toEqual(saved.deliveries.map((row) => row.deliveryId));
+    const exactLegacy = await service.listByParent({
+      ownerId,
+      parentMessageId,
+      deliveryIds: saved.deliveries.map((row) => row.deliveryId),
+    });
+    expect(exactLegacy[0].publicationId || '').toBe('');
+    expect(await Delivery.countDocuments({ userId: ownerId })).toBe(3);
+  });
+
+  test('scopes recovery and by-parent presentation before examining live sibling claims', async () => {
+    const { service, input, ownerId, parentMessageId } = publicationFixture('presentation');
+    const first = await service.claimBatch(input('event-a'));
+    const second = await service.claimBatch(input('event-b'));
+    await service.markPersisted({
+      ownerId,
+      claims: first.claimed,
+      persistedMessageId: 'message-a',
+    });
+    await service.markPersisted({
+      ownerId,
+      claims: second.claimed,
+      persistedMessageId: 'message-b',
+    });
+    const ids = first.claimed.map((row) => row.deliveryId);
+    const fence = await service.fencePresentationByParent({
+      ownerId,
+      parentMessageId,
+      surface: 'web',
+      persistedMessageId: 'message-a',
+      expectedDeliveryIds: ids,
+    });
+    expect(fence.deliveryIds).toEqual(ids);
+    await service.markPresentationByParent({
+      ownerId,
+      parentMessageId,
+      surface: 'web',
+      persistedMessageId: 'message-a',
+      presentationGeneration: fence.generation,
+      presentationClaimToken: fence.claimToken,
+      expectedPresentationLeaseToken: fence.presentationLeaseToken,
+      expectedDeliveryIds: ids,
+      expectedDeliveryReceipts: fence.deliveryReceipts,
+      presentationRef: 'fixture:event-a',
+    });
+    expect((await Delivery.findOne({ deliveryId: ids[0] }).lean()).status).toBe('sent');
+    expect(
+      (await Delivery.findOne({ deliveryId: second.claimed[0].deliveryId }).lean()).status,
+    ).toBe('claimed');
+    await service.recordBatch(input('event-c'));
+    const recoverable = (await service.listRecoverableParents()).filter(
+      (row) => row.ownerId === ownerId,
+    );
+    expect(recoverable.some((row) => row.publicationId === 'event-c')).toBe(true);
+    await service.deferRecoverableParent({
+      ownerId,
+      parentMessageId,
+      publicationId: 'event-c',
+      surface: 'web',
+    });
+    const events = await service.listEvents({ ownerId, parentMessageId, publicationId: 'event-c' });
+    expect(events.some((event) => event.transition === 'recovery_deferred')).toBe(true);
+    expect(
+      (await service.listEvents({ ownerId, parentMessageId, deliveryIds: ids })).some(
+        (event) => event.transition === 'recovery_deferred',
+      ),
+    ).toBe(false);
+  });
+
   test('gives one standalone worker every sibling lease and one complete settlement', async () => {
     const services = ['standalone-a', 'standalone-b'].map((worker) =>
       createCortexInsightDeliveryService({
@@ -1606,6 +1787,7 @@ describe('ViventiumCortexInsightDelivery persistence', () => {
       'userId',
       'conversationId',
       'parentMessageId',
+      'publicationId',
       'cortexId',
       'cortexName',
       'sourceRevision',
@@ -3541,6 +3723,7 @@ describe('ViventiumCortexInsightDelivery persistence', () => {
       'presented',
       'failure',
       'claimed',
+      'persisted',
       'presented',
       'sent',
     ]);

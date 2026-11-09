@@ -105,13 +105,13 @@ test('new current File metadata replaces old display metadata and duplicate refs
   expect(await resolveSelectedHistoryAttachments(scope, db)).toEqual([{ ...current, media_group_index: 0 }]);
 });
 
-test('prior native results preserve the existing 64 selected-file bound', async () => {
+test('retains every owned result in selected ancestry', async () => {
   const ids = Array.from({ length: 70 }, (_, n) => 'native_' + n.toString(16).padStart(64, '0'));
   const db = {
     getMessages: jest.fn().mockResolvedValue([{ messageId: parent, attachments: ids.map(file) }]),
-    getFiles: jest.fn().mockResolvedValue(ids.slice(0, 64).map(file)),
+    getFiles: jest.fn().mockResolvedValue(ids.map(file)),
   };
-  expect((await resolveSelectedHistoryAttachments(scope, db)).map((row) => row.file_id)).toEqual(ids.slice(0, 64));
+  expect((await resolveSelectedHistoryAttachments(scope, db)).map((row) => row.file_id)).toEqual(ids);
 });
 
 
@@ -177,11 +177,11 @@ describe('exact mission attachment selection', () => {
       .toEqual({ error: 'delegation_file_selection_unauthorized' });
   });
 
-  test('rejects an oversized combined selection instead of dropping the selected original file', async () => {
+  test('retains every current and selected historical file without a courier count limit', async () => {
     const currentFiles = Array.from({ length: 64 }, (_, index) =>
       file('native_' + index.toString(16).padStart(64, '0')));
     expect(await resolveSelectedDelegationAttachments(scope, currentFiles, [document], makeDb()))
-      .toEqual({ error: 'delegation_file_selection_unauthorized' });
+      .toEqual({ files: [...currentFiles, { ...historical, media_group_index: 0 }] });
   });
 
   test('does not reclassify an unselected current sibling as historical ancestry', async () => {

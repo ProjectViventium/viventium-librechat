@@ -290,28 +290,50 @@ function isPublicTextEnvelope(envelope: unknown): boolean {
 
 /** Only the unmerged native chunk binds completion to its request and public part. */
 export function inspectProviderPublicPartCompletion(value: unknown): PublicPartCompletion | null {
+  return inspectProviderPublicPartCompletionState(value).completion;
+}
+
+export type PublicPartCompletionInspection = {
+  completion: PublicPartCompletion | null;
+  reason:
+    | 'raw_response_missing'
+    | 'raw_envelope_invalid'
+    | 'raw_choice_invalid'
+    | 'non_public_envelope'
+    | 'completion_carrier_absent'
+    | 'completion_marker_invalid'
+    | 'completion_marker_valid';
+};
+
+/** Structural diagnostics share the same validator; reasons never contain provider content. */
+export function inspectProviderPublicPartCompletionState(
+  value: unknown,
+): PublicPartCompletionInspection {
   const root = isRecord(value) ? value : null;
   const additional = recordAt(root, 'additional_kwargs');
   const raw = recordAt(additional, '__raw_response') ?? recordAt(root, '__raw_response') ?? root;
+  if (!raw || raw.object == null)
+    return { completion: null, reason: 'raw_response_missing' };
   if (
-    !raw ||
     raw.object !== 'chat.completion.chunk' ||
     typeof raw.id !== 'string' ||
     !Array.isArray(raw.choices) ||
     raw.choices.length !== 1 ||
     raw.error != null
   )
-    return null;
+    return { completion: null, reason: 'raw_envelope_invalid' };
   const choice = isRecord(raw.choices[0]) ? raw.choices[0] : null;
-  if (!choice || choice.index !== 0 || choice.finish_reason != null) return null;
+  if (!choice || choice.index !== 0 || choice.finish_reason != null)
+    return { completion: null, reason: 'raw_choice_invalid' };
   const envelopes = [root, additional, recordAt(choice, 'delta'), recordAt(choice, 'message')];
-  if (!envelopes.every(isPublicTextEnvelope)) return null;
+  if (!envelopes.every(isPublicTextEnvelope))
+    return { completion: null, reason: 'non_public_envelope' };
   const candidates = envelopes
     .map((envelope) => recordAt(recordAt(envelope, 'provider_specific_fields'), 'viventium'))
     .filter(
       (carrier) => carrier && Object.prototype.hasOwnProperty.call(carrier, 'public_part_complete'),
     );
-  if (!candidates.length) return null;
+  if (!candidates.length) return { completion: null, reason: 'completion_carrier_absent' };
   const completions = candidates.map((carrier) =>
     validatePublicPartCompletion(carrier?.public_part_complete),
   );
@@ -325,8 +347,8 @@ export function inspectProviderPublicPartCompletion(value: unknown): PublicPartC
         JSON.stringify(candidate) !== JSON.stringify(completion),
     )
   )
-    return null;
-  return completion;
+    return { completion: null, reason: 'completion_marker_invalid' };
+  return { completion, reason: 'completion_marker_valid' };
 }
 
 /** The SDK awaits text dispatch; completion-only chunks still reach the ordered hook. */

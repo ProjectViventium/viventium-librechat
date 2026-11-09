@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { logger } from '@librechat/data-schemas';
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
@@ -1144,7 +1145,7 @@ describe('GenerationJobManager logical turns', () => {
     await manager.destroy();
   });
 
-  test('keeps the newest rapid source identity when three large segments exceed the bounded ledger', async () => {
+  test('keeps every original rapid source and prior claim when three large segments exceed former courier bounds', async () => {
     const manager = new GenerationJobManagerClass({
       jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
       eventTransport: new InMemoryEventTransport(),
@@ -1163,14 +1164,16 @@ describe('GenerationJobManager logical turns', () => {
       ],
     });
 
-    await manager.createJob('large-a', 'user-1', 'conversation-large-sources', {
+    const first = await manager.createJob('large-a', 'user-1', 'conversation-large-sources', {
       interactionContext: largeContext('event-large-a', 'a'),
       adapterCapabilities: webCapabilities,
     });
-    await manager.createJob('large-b', 'user-1', 'conversation-large-sources', {
+    const firstBefore = JSON.parse(JSON.stringify(first.metadata.interactionContext));
+    const second = await manager.createJob('large-b', 'user-1', 'conversation-large-sources', {
       interactionContext: largeContext('event-large-b', 'b'),
       adapterCapabilities: webCapabilities,
     });
+    const secondBefore = JSON.parse(JSON.stringify(second.metadata.interactionContext));
     const third = await manager.createJob('large-c', 'user-1', 'conversation-large-sources', {
       interactionContext: largeContext('event-large-c', 'c'),
       adapterCapabilities: webCapabilities,
@@ -1178,11 +1181,27 @@ describe('GenerationJobManager logical turns', () => {
 
     expect(third.metadata.interactionContext).toMatchObject({
       source_event_id: 'event-large-c',
-      source_segments_overflow_count: 1,
+      revision: 3,
+      logical_turn_id: first.metadata.interactionContext?.logical_turn_id,
     });
+    const expected = ['a', 'b', 'c'].map((fill, index) => ({
+      ordinal: index,
+      source_event_id: `event-large-${fill}`,
+      source_index: 0,
+      text: fill.repeat(30 * 1024),
+      authoring_revision: index + 1,
+    }));
+    expect(third.metadata.interactionContext?.source_segments).toEqual(expected);
     expect(
-      third.metadata.interactionContext?.source_segments?.map((segment) => segment.source_event_id),
-    ).toEqual(['event-large-b', 'event-large-c']);
+      third.metadata.interactionContext?.source_segments?.map((segment) =>
+        createHash('sha256').update(segment.text, 'utf8').digest('hex'),
+      ),
+    ).toEqual(
+      expected.map((segment) => createHash('sha256').update(segment.text, 'utf8').digest('hex')),
+    );
+    expect(third.metadata.interactionContext?.source_segments_overflow_count ?? 0).toBe(0);
+    expect(first.metadata.interactionContext).toEqual(firstBefore);
+    expect(second.metadata.interactionContext).toEqual(secondBefore);
     await manager.destroy();
   });
 

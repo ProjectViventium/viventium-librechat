@@ -151,6 +151,12 @@ function invalidGate(): GlassHiveTerminalCallbackGate {
   };
 }
 
+/** A successful run can finish while another run still owns the WorkRef. */
+export function isGlassHiveRunOnlyCompletion(body: GlassHiveTerminalCallbackBody): boolean {
+  return body.event === 'run.completed' && body.work_terminal === false &&
+    body.result_state === 'completed' && CALLBACK_ID.test(normalized(body.callback_id, 512));
+}
+
 export async function receiveGlassHiveTerminalCallbackResult({
   ResultModel,
   body,
@@ -207,8 +213,9 @@ export async function receiveGlassHiveTerminalCallbackResult({
     CALLBACK_ID.test(callbackId) &&
     callbackId === exactCallbackId &&
     TERMINAL_STATE_BY_EVENT.get(event) === resultState &&
-    workState === resultState &&
-    body.work_terminal === true &&
+    ((workState === resultState && body.work_terminal === true) ||
+      (isGlassHiveRunOnlyCompletion(body) &&
+        ['queued', 'running', 'paused', 'needs_input', 'settling', 'completed', 'failed', 'cancelled'].includes(workState))) &&
     resultEndedAt &&
     Number.isFinite(Date.parse(resultEndedAt)) &&
     normalized(headers.callbackId, 512) === callbackId &&

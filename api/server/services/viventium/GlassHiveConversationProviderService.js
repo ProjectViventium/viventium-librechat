@@ -1,5 +1,8 @@
 const { VOICE_TASK_TOOL_NAME, voiceTaskBrokerResources } = require('./VoiceTaskManagementTool');
-const { configuredBackgroundWorkerRoute } = require('@librechat/api');
+const {
+  configuredBackgroundWorkerRoute,
+  inheritNativeConversationCapabilityInventory,
+} = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive core-provider capability projection
  * Purpose: Attach a signed, Agent-declared MCP broker bundle to an authenticated harness request
@@ -2050,18 +2053,16 @@ async function attachConversationProviderCapabilityBundle({
     capability,
   );
   const workerRoute = configuredConversationOrchestrationWorkerRoute(mcpCapabilitySource);
-  const modelDefinition = capability.models?.find(
-    (item) => item.id === (targetAgent.model || targetAgent.model_parameters?.model),
-  );
-  const coordinationOnly =
-    mcpCapabilitySource?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
-    ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(modelDefinition?.harnessProfile);
-  const inheritedConversation = coordinationOnly
+  const coordinationPolicy =
+    mcpCapabilitySource?.glasshive_options?.orchestration?.tool_mode === 'coordination';
+  const nativeActionTools =
+    capability?.native_tools === true || capability?.worker_native_tools === true;
+  const inheritedConversation = coordinationPolicy
     ? suppliedInheritedConversation ||
       require('./ViventiumMainContextService').getMainContextAttemptState(req)
         ?.inheritedConversation
     : undefined;
-  if (coordinationOnly && !inheritedConversation) {
+  if (coordinationPolicy && !inheritedConversation) {
     throw new Error('coordination_context_unavailable');
   }
   const unavailableInstructions = applyHostEvidenceBoundaryInstructions(
@@ -2072,7 +2073,8 @@ async function attachConversationProviderCapabilityBundle({
     allowedServerNames.length === 0 &&
     hostToolCapabilityState.authorizedHostTools.length === 0 &&
     allowedConversationOrchestrationTools.length === 0 &&
-    uploadedFiles.length === 0
+    uploadedFiles.length === 0 &&
+    (!nativeActionTools || coordinationPolicy)
   ) {
     setConversationProviderInstructionAppend(targetAgent, unavailableInstructions);
     return false;
@@ -2088,7 +2090,9 @@ async function attachConversationProviderCapabilityBundle({
       user: req?.user,
       requestBody: trustedRequestBody,
       allowedServerNames,
-      ...(coordinationOnly ? { conversationToolMode: 'coordination', inheritedConversation } : {}),
+      ...(coordinationPolicy
+        ? { conversationToolMode: 'coordination', inheritedConversation }
+        : {}),
       allowedHostTools: hostToolCapabilityState.authorizedHostTools,
       hostToolResources: hostToolCapabilityState.hostToolResources,
       ...(allowedConversationOrchestrationTools.length > 0
@@ -2149,10 +2153,35 @@ async function attachConversationProviderCapabilityBundle({
     setConversationProviderInstructionAppend(targetAgent, unavailableInstructions);
     return false;
   }
-  if (coordinationOnly) bundle.conversation_tool_mode = 'coordination';
+  if (coordinationPolicy) bundle.conversation_tool_mode = 'coordination';
+  /* === VIVENTIUM START === Honor the participant's saved coordination policy. === */
+  // Keep the signed broker, its work controls and original-context handoff. Native action
+  // tools belong to independently launched workers, whose bundles have their own policy.
+  if (coordinationPolicy) {
+    bundle = {
+      ...bundle,
+      provider_capabilities: {
+        ...bundle.provider_capabilities,
+        native_tools: false,
+        ...(mcpCapabilitySource?.glasshive_options?.orchestration?.conversation_process_reuse ===
+          true &&
+        capability?.models?.find((model) => model.id === targetAgent?.model)?.harnessProfile ===
+          'claude-code' &&
+        (declaredAgent?.viventiumProviderSessionMode ||
+          targetAgent?.viventiumProviderSessionMode) !== 'stateless' &&
+        configuration.defaultHeaders?.['X-GlassHive-Provider-Session-Mode'] !== 'stateless'
+          ? { conversation_process_reuse: true }
+          : {}),
+      },
+    };
+  }
+  /* === VIVENTIUM END === */
+  bundle = inheritNativeConversationCapabilityInventory(bundle, {
+    nativeTools: nativeActionTools,
+  });
   /* === VIVENTIUM START === Fast Queen defers schedule setup to actual native handoff. === */
   if (
-    !coordinationOnly &&
+    !coordinationPolicy &&
     !req?._viventiumCortexToolEvidence &&
     process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED === 'true'
   ) {
@@ -2166,7 +2195,10 @@ async function attachConversationProviderCapabilityBundle({
             ? req?.viventiumSchedulerDueAdmissionId
             : undefined,
         viventiumStreamId:
-          req?._resumableStreamId || req?.body?.streamId || trustedRequestBody.viventiumStreamId,
+          req?.viventiumSchedulerDueStreamId ||
+          req?._resumableStreamId ||
+          req?.body?.streamId ||
+          trustedRequestBody.viventiumStreamId,
       },
     });
   }
@@ -2194,6 +2226,18 @@ async function attachConversationProviderCapabilityBundle({
       [unavailableInstructions, brokerUnavailableInstructions].filter(Boolean).join('\n\n'),
     );
     return false;
+  }
+  // File inventory is independent of connected-tool availability and grants no new paths.
+  try {
+    const access = await require('./nativeOutputFiles').loadRetainedNativeResultFileAccess(
+      String(req?.user?.id || req?.user?._id || ''),
+      String(trustedRequestBody.conversationId || ''),
+    );
+    if (access.length) bundle.authorized_result_files = access;
+  } catch (error) {
+    logger.warn('[VIVENTIUM][native-result-files] Current source scope unavailable', {
+      code: String(error?.code || 'retained_result_file_scope_unavailable'),
+    });
   }
   return attachConversationProviderBootstrapBundle({
     targetAgent,

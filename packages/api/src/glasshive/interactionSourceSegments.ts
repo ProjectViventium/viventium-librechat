@@ -1,15 +1,10 @@
-/* === VIVENTIUM START === Bounded trusted interaction-source projection for delegation. === */
+/* === VIVENTIUM START === Exact trusted interaction sources; UI previews are bounded separately. === */
 import { createHash } from 'crypto';
 
 import {
   normalizeInteractionReplyContext,
   type InteractionReplyContext,
 } from '../agents/interactionReplyContext';
-
-const SOURCE_SEGMENT_MAX_BYTES = 32 * 1024;
-const SOURCE_SEGMENTS_MAX_BYTES = 64 * 1024;
-const SOURCE_SEGMENTS_MAX_COUNT = 32;
-const SOURCE_FILES_MAX_PER_SEGMENT = 32;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -23,19 +18,6 @@ function boundedIdentifier(value: unknown, maxLength = 160): string {
   return String(value || '')
     .trim()
     .slice(0, maxLength);
-}
-
-function clipUtf8(value: string, maxBytes: number): { text: string; truncated: boolean } {
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return { text: value, truncated: false };
-  let low = 0;
-  let high = value.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(value.slice(0, middle), 'utf8') <= maxBytes) low = middle;
-    else high = middle - 1;
-  }
-  if (low > 0 && /[\uD800-\uDBFF]/.test(value[low - 1] || '')) low -= 1;
-  return { text: value.slice(0, low), truncated: true };
 }
 
 export interface InteractionSourceFile {
@@ -66,13 +48,10 @@ export interface InteractionSourceSegment {
   original_sha256?: string;
 }
 
-export function normalizeInteractionSourceFiles(
-  candidates: unknown,
-): readonly InteractionSourceFile[] {
+export function normalizeInteractionSourceFiles(candidates: unknown): readonly InteractionSourceFile[] {
   const result: InteractionSourceFile[] = [];
   const seen = new Set<string>();
   for (const value of Array.isArray(candidates) ? candidates : []) {
-    if (result.length >= SOURCE_FILES_MAX_PER_SEGMENT) break;
     const candidate = recordFrom(value);
     const fileId = boundedIdentifier(candidate.file_id || candidate.temp_file_id, 256);
     if (!fileId || seen.has(fileId)) continue;
@@ -107,8 +86,7 @@ export function normalizeInteractionSourceSegments(
 ): Readonly<{ segments: readonly InteractionSourceSegment[]; overflowCount: number }> {
   const result: InteractionSourceSegment[] = [];
   const seen = new Set<string>();
-  let totalBytes = 0;
-  let overflowCount = Math.max(0, Math.floor(Number(priorOverflowCount) || 0));
+  const overflowCount = Math.max(0, Math.floor(Number(priorOverflowCount) || 0));
   for (const value of Array.isArray(candidates) ? candidates : []) {
     const candidate = recordFrom(value);
     const sourceEventId = boundedIdentifier(candidate.source_event_id);
@@ -116,31 +94,23 @@ export function normalizeInteractionSourceSegments(
     const identity = `${sourceEventId}\0${sourceIndex}`;
     const sourceFiles = normalizeInteractionSourceFiles(candidate.source_files);
     if (!sourceEventId || seen.has(identity) || typeof candidate.text !== 'string') continue;
-    const clipped = clipUtf8(candidate.text, SOURCE_SEGMENT_MAX_BYTES);
-    if (!clipped.text.length && sourceFiles.length === 0) continue;
+    if (!candidate.text.length && sourceFiles.length === 0) continue;
     const suppliedDigest = boundedIdentifier(candidate.original_sha256, 64).toLowerCase();
-    const truncated = candidate.truncated === true || clipped.truncated;
+    const truncated = candidate.truncated === true;
     const replyContext = normalizeInteractionReplyContext(candidate.reply_context);
     result.push(
       Object.freeze({
         ordinal: 0,
         source_event_id: sourceEventId,
         source_index: sourceIndex,
-        ...(Number.isSafeInteger(candidate.source_received_at) &&
-        Number(candidate.source_received_at) > 0
-          ? { source_received_at: Number(candidate.source_received_at) }
-          : {}),
+        ...(Number.isSafeInteger(candidate.source_received_at) && Number(candidate.source_received_at) > 0
+          ? { source_received_at: Number(candidate.source_received_at) } : {}),
         ...(Number.isSafeInteger(candidate.source_sequence) && Number(candidate.source_sequence) > 0
-          ? { source_sequence: Number(candidate.source_sequence) }
-          : {}),
+          ? { source_sequence: Number(candidate.source_sequence) } : {}),
         ...(candidate.source_persisted === true ? { source_persisted: true as const } : {}),
-        ...(boundedIdentifier(candidate.source_message_id)
-          ? { source_message_id: boundedIdentifier(candidate.source_message_id) }
-          : {}),
-        ...(boundedIdentifier(candidate.source_parent_message_id)
-          ? { source_parent_message_id: boundedIdentifier(candidate.source_parent_message_id) }
-          : {}),
-        text: clipped.text,
+        ...(boundedIdentifier(candidate.source_message_id) ? { source_message_id: boundedIdentifier(candidate.source_message_id) } : {}),
+        ...(boundedIdentifier(candidate.source_parent_message_id) ? { source_parent_message_id: boundedIdentifier(candidate.source_parent_message_id) } : {}),
+        text: candidate.text,
         ...(sourceFiles.length ? { source_files: sourceFiles } : {}),
         ...(replyContext ? { reply_context: replyContext } : {}),
         ...(Number.isSafeInteger(candidate.authoring_revision) &&
@@ -158,13 +128,6 @@ export function normalizeInteractionSourceSegments(
       }),
     );
     seen.add(identity);
-    totalBytes += Buffer.byteLength(clipped.text, 'utf8');
-    while (result.length > SOURCE_SEGMENTS_MAX_COUNT || totalBytes > SOURCE_SEGMENTS_MAX_BYTES) {
-      const evicted = result.shift();
-      if (!evicted) break;
-      totalBytes -= Buffer.byteLength(evicted.text, 'utf8');
-      overflowCount += 1;
-    }
   }
   return Object.freeze({
     segments: Object.freeze(

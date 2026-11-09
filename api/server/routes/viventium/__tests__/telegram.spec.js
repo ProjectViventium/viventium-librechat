@@ -343,6 +343,7 @@ jest.mock('~/models/Agent', () => ({
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   GenerationJobManager: {
+    hasLocalGenerationProducer: jest.fn(() => true),
     getJob: (...args) => mockGetJob(...args),
     getJobStore: () => ({ getJob: (...args) => mockGetPersistedJob(...args) }),
     getResumeState: (...args) => mockGetResumeState(...args),
@@ -484,6 +485,7 @@ function createMockRes() {
     }),
     end: jest.fn(() => {
       res.writableEnded = true;
+      emitter.emit('finish');
       if (res._resolve) {
         res._resolve();
       }
@@ -819,6 +821,9 @@ describe('/api/viventium/telegram', () => {
     process.env.DOMAIN_SERVER = 'http://example.com';
     process.env.VIVENTIUM_PLAYGROUND_URL = 'http://localhost:3300';
     process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = '';
+    process.env.VIVENTIUM_LAN_PLAYGROUND_URL = '';
+    delete process.env.VIVENTIUM_LAN_DOMAIN;
+    delete process.env.VIVENTIUM_LAN_IP;
     process.env.VIVENTIUM_VOICE_GATEWAY_AGENT_NAME = 'librechat-voice-gateway';
     process.env.VIVENTIUM_PARALLEL_WORK_AVAILABLE = 'true';
     process.env.VIVENTIUM_PARALLEL_WORK_RELEASE_GATE_FILE = releasePath;
@@ -1702,9 +1707,9 @@ describe('/api/viventium/telegram', () => {
         parentMessageId: row.sourceMessageId,
         isCreatedByUser: false,
         sender: 'Assistant',
-        text: 'Transient response.',
+        text: 'Later response.',
         createdAt: new Date(4000),
-        // A stable descendant exercises the ancestry fence; a live draft is skipped by design.
+        // A live draft is excluded from the reusable head; this case needs a real descendant head.
         unfinished: mode !== 'descendant head',
       });
     if (mode === 'already repaired') source.parentMessageId = 'base-answer';
@@ -2059,27 +2064,29 @@ describe('/api/viventium/telegram', () => {
       );
       const end = controller.indexOf('        const startPartialCheckpointing = () => {', start);
       const source = {
-        _id: 'synthetic-source-row',
+        _id: 'synthetic-source-db-id',
         messageId: sourceMessageId,
-        conversationId,
+        parentMessageId: req.body.parentMessageId,
         text: 'First input',
+        content: [],
+        files: [],
       };
-      const { nativeResponseSource } = jest.requireActual('@librechat/data-schemas');
       const sandbox = {
         req,
         Date,
-        getTrustedInteractionContext: require('~/server/services/viventium/interactionContext')
-          .getTrustedInteractionContext,
-        nativeResponseSource,
-        require: (name) => {
-          if (name === '@librechat/api') return jest.requireActual(name);
-          throw new Error(`Unexpected source reread: ${name}`);
-        },
-        jobCreatedAt: 1,
         streamId: 'stream_1',
         conversationId,
         userId: row.libreChatUserId,
         claimedInteractionContext: context,
+        jobCreatedAt: 1000,
+        job: { abortController: new AbortController() },
+        require: (name) => {
+          if (name === '@librechat/api') return jest.requireActual(name);
+          throw new Error(`Unexpected source reread: ${name}`);
+        },
+        getTrustedInteractionContext: require('~/server/services/viventium/interactionContext')
+          .getTrustedInteractionContext,
+        nativeResponseSource: require('@librechat/data-schemas').nativeResponseSource,
         sender: 'AI',
         voiceLatencyEnabled: false,
         assistantTerminalPersistenceStarted: false,
@@ -2109,11 +2116,9 @@ describe('/api/viventium/telegram', () => {
         userId: row.libreChatUserId,
         conversationId,
         responseMessageId: 'new-assistant',
-        streamId: 'stream_1',
-        jobCreatedAt: 1,
         logicalTurnId: 'new-turn',
         revision: 1,
-        source: nativeResponseSource(source),
+        source: jest.requireActual('@librechat/data-schemas').nativeResponseSource(source),
       });
     };
     const { res, done } = continueRetainedInput(row);
@@ -4673,13 +4678,252 @@ describe('/api/viventium/telegram', () => {
     });
   });
 
-  test('POST /call-link requires a public HTTPS playground URL for Telegram launches', async () => {
+  test('POST /call-link managed bases follow current ready state without a process restart', () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const directory = fs.mkdtempSync(require('node:path').join(os.tmpdir(), 'call-network-'));
+    const file = require('node:path').join(directory, 'state.json');
+    const previous = process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE;
+    process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE = file;
+    process.env.VIVENTIUM_LAN_DOMAIN = 'lan.example.test';
+    jest
+      .spyOn(os, 'networkInterfaces')
+      .mockReturnValue({ en0: [{ address: '10.0.0.20', internal: false }] });
+    const {
+      resolveLocalPlaygroundBaseUrl: local,
+      resolveTelegramPublicPlaygroundBaseUrl: publicBase,
+    } = require('~/server/services/viventium/callLaunch');
+    const state = {
+      lan_ip: '192.168.1.20',
+      lan_runtime_ready: true,
+      lan_playground_url: 'https://playground.lan.example.test:8443',
+      public_playground_url: 'https://voice.example.test',
+    };
+    try {
+      fs.writeFileSync(file, JSON.stringify(state));
+      expect(local()).toBe('');
+      expect(publicBase()).toBe('');
+      state.lan_ip = '10.0.0.20';
+      state.lan_runtime_ready = false;
+      fs.writeFileSync(file, JSON.stringify(state));
+      expect(local()).toBe('');
+      expect(publicBase()).toBe('');
+      state.lan_runtime_ready = true;
+      state.lan_playground_url = 'https://playground.lan.example.test:9443';
+      fs.writeFileSync(file, JSON.stringify(state));
+      expect(local()).toBe(state.lan_playground_url);
+      expect(publicBase()).toBe(state.public_playground_url);
+      fs.writeFileSync(
+        file,
+        JSON.stringify({
+          lan_error: 'certificate_unavailable',
+          public_playground_url: state.public_playground_url,
+        }),
+      );
+      expect(local()).toBe('');
+      expect(publicBase()).toBe(state.public_playground_url);
+      fs.writeFileSync(file, '{');
+      expect(local()).toBe('');
+      expect(publicBase()).toBe('');
+    } finally {
+      if (previous === undefined) delete process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE;
+      else process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE = previous;
+      delete process.env.VIVENTIUM_LAN_DOMAIN;
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('POST /call-link provides an explicit local choice on the same one-use launch', async () => {
+    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.example.test';
+    process.env.VIVENTIUM_PLAYGROUND_URL = 'http://localhost:3300';
+    process.env.VIVENTIUM_LAN_PLAYGROUND_URL = 'https://192.168.1.20:8443';
+    jest
+      .spyOn(require('node:os'), 'networkInterfaces')
+      .mockReturnValue({ en0: [{ address: '192.168.1.20', internal: false, family: 'IPv4' }] });
+    const app = createTestApp(require('../telegram'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/call-link',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: { conversationId: 'conv-original', telegramUserId: 'tg-1' },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(200);
+    const local = new URL(res.body.localCallUrl);
+    const remote = new URL(res.body.callUrl);
+    expect(local.origin).toBe('https://192.168.1.20:8443');
+    expect(local.pathname).toBe(remote.pathname);
+    expect(local.search).toBe(remote.search);
+    expect(local.hash).toBe(remote.hash);
+    expect(local.searchParams.has('conversationId')).toBe(false);
+    expect(mockCreateCallSession).toHaveBeenCalledTimes(1);
+    expect(mockCreateCallSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user_1',
+        conversationId: 'conv-original',
+      }),
+    );
+    expect(mockCreateCallBrowserLaunch).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(['local', 'auto', undefined])(
+    'POST /call-link uses ready LAN without public configuration: %s',
+    async (launchTarget) => {
+      process.env.VIVENTIUM_PLAYGROUND_URL = 'http://localhost:3300';
+      process.env.VIVENTIUM_LAN_PLAYGROUND_URL = 'https://192.168.1.20:8443';
+      jest
+        .spyOn(require('node:os'), 'networkInterfaces')
+        .mockReturnValue({ en0: [{ address: '192.168.1.20', internal: false, family: 'IPv4' }] });
+      const app = createTestApp(require('../telegram'));
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/telegram/call-link',
+          headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+          body: { conversationId: 'new', telegramUserId: 'tg-1', launchTarget },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(new URL(res.body.callUrl).origin).toBe('https://192.168.1.20:8443');
+      expect(res.body.callUrl).toBe(res.body.localCallUrl);
+      expect(res.body.launchTarget).toBe('local');
+      expect(res.body.publicCallUrl).toBe('');
+      expect(mockAssertVoiceAgentAccess).toHaveBeenCalled();
+    },
+  );
+
+  test.each([
+    ['https://playground.lan.example.test:8443', '192.168.1.20', true],
+    ['https://other.example.test:8443', '192.168.1.20', false],
+    ['https://playground.lan.example.test:8443', '192.168.1.99', false],
+  ])(
+    'POST /call-link validates a trusted LAN hostname and its current bound address: %s',
+    async (url, ip, accepted) => {
+      process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.example.test';
+      process.env.VIVENTIUM_LAN_DOMAIN = 'lan.example.test';
+      process.env.VIVENTIUM_LAN_IP = ip;
+      process.env.VIVENTIUM_LAN_PLAYGROUND_URL = url;
+      jest
+        .spyOn(require('node:os'), 'networkInterfaces')
+        .mockReturnValue({ en0: [{ address: '192.168.1.20', internal: false, family: 'IPv4' }] });
+      const app = createTestApp(require('../telegram'));
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/telegram/call-link',
+          headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+          body: { conversationId: 'conv-original', telegramUserId: 'tg-1' },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      if (accepted) {
+        const local = new URL(res.body.localCallUrl);
+        const remote = new URL(res.body.callUrl);
+        expect(local.origin).toBe(url);
+        expect(local.search).toBe(remote.search);
+        expect(local.hash).toBe(remote.hash);
+      } else {
+        expect(res.body.localCallUrl).toBe('');
+      }
+      expect(mockCreateCallSession).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test('POST /call-link refuses an invalid launch target without creating authority', async () => {
+    const app = createTestApp(require('../telegram'));
+    const res = createMockRes();
+    await dispatch(
+      app,
+      createMockReq({
+        url: '/api/viventium/telegram/call-link',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: { telegramUserId: 'tg-1', launchTarget: 'https://other.example.test' },
+      }),
+      res,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(mockCreateCallSession).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    'http://internal-service:3300',
+    'https://127.0.0.1:8443',
+    'http://192.168.1.20:8443',
+    'https://192.168.1.20',
+    'https://198.51.100.20:8443',
+    'http://192.0.2.10:3300',
+    'ftp://localhost:3300',
+    'http://user:secret@localhost:3300',
+  ])(
+    'POST /call-link never publishes a non-loopback or credentialed local choice: %s',
+    async (baseUrl) => {
+      process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.example.test';
+      process.env.VIVENTIUM_LAN_PLAYGROUND_URL = baseUrl;
+      const app = createTestApp(require('../telegram'));
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/telegram/call-link',
+          headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+          body: { telegramUserId: 'tg-1' },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(new URL(res.body.callUrl).origin).toBe('https://voice.example.test');
+      expect(res.body.localCallUrl).toBe('');
+      const denied = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/telegram/call-link',
+          headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+          body: { telegramUserId: 'tg-1', launchTarget: 'local' },
+        }),
+        denied,
+      );
+      expect(denied.statusCode).toBe(409);
+      expect(denied.body.localPlaygroundRequired).toBe(true);
+      expect(mockCreateCallSession).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each(['auto', undefined])(
+    'POST /call-link gives local recovery when neither route is ready: %s',
+    async (launchTarget) => {
+      const app = createTestApp(require('../telegram'));
+      const res = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/telegram/call-link',
+          headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+          body: { conversationId: 'new', telegramUserId: 'tg-1', launchTarget },
+        }),
+        res,
+      );
+      expect(res.statusCode).toBe(409);
+      expect(res.body.localPlaygroundRequired).toBe(true);
+      expect(res.body.publicPlaygroundRequired).toBeUndefined();
+      expect(mockCreateCallSession).not.toHaveBeenCalled();
+    },
+  );
+
+  test('POST /call-link requires a public HTTPS playground URL for explicit public launches', async () => {
     const telegramRouter = require('../telegram');
     const app = createTestApp(telegramRouter);
     const req = createMockReq({
       url: '/api/viventium/telegram/call-link',
       headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
-      body: { conversationId: 'new', telegramUserId: 'tg-1' },
+      body: { conversationId: 'new', telegramUserId: 'tg-1', launchTarget: 'public' },
     });
     const res = createMockRes();
 
@@ -4761,31 +5005,39 @@ describe('/api/viventium/telegram', () => {
     );
   });
 
-  test('POST /call-link denies a foreign or revoked agent before creating call authority', async () => {
-    process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.viventium.ai';
-    const error = new Error('Voice assistant is unavailable');
-    error.status = 404;
-    error.code = 'no_route';
-    mockAssertVoiceAgentAccess.mockRejectedValueOnce(error);
-    const telegramRouter = require('../telegram');
-    const app = createTestApp(telegramRouter);
-    const req = createMockReq({
-      url: '/api/viventium/telegram/call-link',
-      headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
-      body: { conversationId: 'new', telegramUserId: 'tg-1', agentId: 'agent_foreign' },
-    });
-    const res = createMockRes();
+  test.each(['public', 'local'])(
+    'POST /call-link denies a foreign or revoked agent for %s before creating call authority',
+    async (launchTarget) => {
+      process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL = 'https://voice.viventium.ai';
+      const error = new Error('Voice assistant is unavailable');
+      error.status = 404;
+      error.code = 'no_route';
+      mockAssertVoiceAgentAccess.mockRejectedValueOnce(error);
+      const telegramRouter = require('../telegram');
+      const app = createTestApp(telegramRouter);
+      const req = createMockReq({
+        url: '/api/viventium/telegram/call-link',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          conversationId: 'new',
+          telegramUserId: 'tg-1',
+          agentId: 'agent_foreign',
+          launchTarget,
+        },
+      });
+      const res = createMockRes();
 
-    await dispatch(app, req, res);
+      await dispatch(app, req, res);
 
-    expect(res.statusCode).toBe(404);
-    expect(res.body).toEqual({
-      code: 'no_route',
-      message: 'Voice assistant is unavailable.',
-      retryable: false,
-    });
-    expect(mockCreateCallSession).not.toHaveBeenCalled();
-  });
+      expect(res.statusCode).toBe(404);
+      expect(res.body).toEqual({
+        code: 'no_route',
+        message: 'Voice assistant is unavailable.',
+        retryable: false,
+      });
+      expect(mockCreateCallSession).not.toHaveBeenCalled();
+    },
+  );
 
   test('POST /call-link returns linkRequired when telegram user is unlinked', async () => {
     mockTelegramMappingFindOne.mockReturnValue({
@@ -5267,6 +5519,44 @@ describe('/api/viventium/telegram', () => {
     expect(res.flushHeaders).not.toHaveBeenCalled();
     res._resolve();
     await dispatched;
+  });
+
+  test('quiet active streams send transport comments and release them on disconnect', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    const unsubscribe = jest.fn();
+    let subscribed;
+    const ready = new Promise((resolve) => {
+      subscribed = resolve;
+    });
+    mockSubscribe.mockImplementation(async () => {
+      subscribed();
+      return { unsubscribe };
+    });
+    const res = createMockRes();
+    try {
+      const done = dispatch(
+        createTestApp(require('../telegram')),
+        createMockReq({
+          method: 'GET',
+          url: '/api/viventium/telegram/stream/quiet?telegramUserId=tg-1',
+          headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+          query: { telegramUserId: 'tg-1' },
+        }),
+        res,
+      );
+      await ready;
+      await Promise.resolve();
+      jest.advanceTimersByTime(15000);
+      expect(res.write.mock.calls).toEqual([[': keep-alive\n\n']]);
+      res.emit('close');
+      res._resolve();
+      await done;
+      jest.advanceTimersByTime(30000);
+      expect(res.write).toHaveBeenCalledTimes(1);
+      expect(unsubscribe).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('GET stream forwards attachment events in SSE payload', async () => {
@@ -5861,6 +6151,7 @@ describe('/api/viventium/telegram', () => {
       ownerId: 'user_1',
       path: '/v1/work/ghw_test/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: {
         action: 'message',
         instruction: 'Add the new source without interrupting.',
@@ -5997,6 +6288,7 @@ describe('/api/viventium/telegram', () => {
       ownerId: 'user_1',
       path: '/v1/work/ghw_test/actions',
       method: 'POST',
+      fetchImpl: expect.any(Function),
       body: {
         action: 'resume',
         idempotencyKey: 'trusted-action-key',

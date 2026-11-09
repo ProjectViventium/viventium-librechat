@@ -10,7 +10,7 @@ const {
   nativeIdentityJson,
   createDeliveryDispositionStreamHandler,
   getStreamDeliveryDisposition,
-  inspectProviderPublicPartCompletion,
+  inspectProviderPublicPartCompletionState,
   createReleasedMainPublicPartOwner,
   supportsMessagingDeliveryDisposition,
   isAudioDeliveryRequested,
@@ -1031,58 +1031,101 @@ function getDefaultHandlers({
   /* === VIVENTIUM START === Native completion is an ordered audio control, not final text. === */
   const completedPublicParts = new Set();
   const emitPublicPartCompletion = async (_event, data, metadata, graph) => {
-    const completion = inspectProviderPublicPartCompletion(data?.chunk);
+    const traceGate = (result) => {
+      if (markVoiceOrchEvent(req, `public_part_completion:${result}`)?.firstSeen)
+        logVoiceLatencyStage(req, 'public_part_completion_gate', null, `result=${result}`);
+    };
+    const inspection = inspectProviderPublicPartCompletionState(data?.chunk);
+    const completion = inspection.completion;
+    if (!completion) {
+      traceGate(inspection.reason);
+      return;
+    }
+    traceGate('marker_observed');
     const deliveryDisposition = getStreamDeliveryDisposition(metadata);
     if (
-      !completion ||
       deliveryDisposition?.audio !== 'eligible' ||
       deliveryDisposition.valid !== true ||
       deliveryDisposition.source !== 'model'
-    )
+    ) {
+      traceGate('disposition_ineligible');
       return;
+    }
     const identity = req?._viventiumNativeResponseIdentity;
     const interaction =
       require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
-    if (
-      !identity ||
-      !streamId ||
-      req?._viventiumHarnessExecutionEnabled !== true ||
-      !isAudioDeliveryRequested(req) ||
-      interaction?.actor_kind !== 'external_user' ||
-      interaction?.origin !== 'interactive' ||
-      interaction.logical_turn_id !== identity.logicalTurnId ||
-      interaction.revision !== identity.revision ||
-      req.user?.id !== identity.userId ||
-      identity.streamId !== streamId ||
-      completion.stream_id !== streamId ||
-      completion.message_id !== identity.responseMessageId ||
-      metadata?.agentId !== identity.agentId ||
-      !shouldEmitAgentOutput(metadata, identity.agentId) ||
-      graph?.getAgentContext(metadata)?.currentTokenType !== ContentTypes.TEXT
-    )
+    const identityRejection = !identity
+      ? 'identity_missing'
+      : !streamId
+        ? 'stream_missing'
+        : req?._viventiumHarnessExecutionEnabled !== true
+          ? 'execution_disabled'
+          : !isAudioDeliveryRequested(req)
+            ? 'audio_not_requested'
+            : interaction?.actor_kind !== 'external_user'
+              ? 'actor_mismatch'
+              : interaction?.origin !== 'interactive'
+                ? 'origin_mismatch'
+                : interaction.logical_turn_id !== identity.logicalTurnId
+                  ? 'logical_turn_mismatch'
+                  : interaction.revision !== identity.revision
+                    ? 'revision_mismatch'
+                    : req.user?.id !== identity.userId
+                      ? 'owner_mismatch'
+                      : identity.streamId !== streamId
+                        ? 'identity_stream_mismatch'
+                        : completion.stream_id !== streamId
+                          ? 'completion_stream_mismatch'
+                          : completion.message_id !== identity.responseMessageId
+                            ? 'message_mismatch'
+                            : metadata?.agentId !== identity.agentId
+                              ? 'agent_mismatch'
+                              : !shouldEmitAgentOutput(metadata, identity.agentId)
+                                ? 'agent_not_visible'
+                                : graph?.getAgentContext(metadata)?.currentTokenType !==
+                                    ContentTypes.TEXT
+                                  ? 'content_not_text'
+                                  : '';
+    if (identityRejection) {
+      traceGate(identityRejection);
       return;
+    }
     const stepKey = graph.getStepKey(metadata);
-    if (graph.getRunStep(graph.getStepIdByKey(stepKey))?.type !== StepTypes.MESSAGE_CREATION)
+    if (graph.getRunStep(graph.getStepIdByKey(stepKey))?.type !== StepTypes.MESSAGE_CREATION) {
+      traceGate('step_not_message');
       return;
+    }
     const key = JSON.stringify([
       identity.invocationId,
       completion.request_id,
       completion.run_id,
       completion.part_id,
     ]);
-    if (completedPublicParts.has(key)) return;
-    const job = await GenerationJobManager.getJobStore().getJob(streamId);
-    if (
-      !nativeJobMatches(job, identity) ||
-      job.status !== 'running' ||
-      job.generationCompleted === true ||
-      job.nativeResponseCancelled === true ||
-      (job.nativeResponse &&
-        (job.nativeResponseSettled === true ||
-          nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity))) ||
-      completedPublicParts.has(key)
-    )
+    if (completedPublicParts.has(key)) {
+      traceGate('duplicate');
       return;
+    }
+    const job = await GenerationJobManager.getJobStore().getJob(streamId);
+    const jobRejection = !nativeJobMatches(job, identity)
+      ? 'job_binding_mismatch'
+      : job.status !== 'running'
+        ? 'job_not_running'
+        : job.generationCompleted === true
+          ? 'generation_completed'
+          : job.nativeResponseCancelled === true
+            ? 'native_response_cancelled'
+            : job.nativeResponse && job.nativeResponseSettled === true
+              ? 'native_response_settled'
+              : job.nativeResponse &&
+                  nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
+                ? 'native_response_binding_mismatch'
+                : completedPublicParts.has(key)
+                  ? 'duplicate_after_read'
+                  : '';
+    if (jobRejection) {
+      traceGate(jobRejection);
+      return;
+    }
     completedPublicParts.add(key);
     await GenerationJobManager.emitChunk(
       streamId,
@@ -1094,6 +1137,7 @@ function getDefaultHandlers({
         ? identity
         : { publicPartOwner: createReleasedMainPublicPartOwner(identity, require('~/models')) },
     );
+    traceGate('emitted');
   };
   /* === VIVENTIUM END === */
   /* === VIVENTIUM START ===

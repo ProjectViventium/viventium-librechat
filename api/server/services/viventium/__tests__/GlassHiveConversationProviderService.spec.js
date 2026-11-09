@@ -31,6 +31,11 @@ jest.mock('~/models', () => ({
   getMessages: jest.fn(async () => []),
   getFiles: jest.fn(async () => []),
 }));
+const mockRetainedFileAccess = jest.fn().mockResolvedValue([]);
+jest.mock('../nativeOutputFiles', () => ({
+  ...jest.requireActual('../nativeOutputFiles'),
+  loadRetainedNativeResultFileAccess: (...args) => mockRetainedFileAccess(...args),
+}));
 const { getMessages, getFiles } = require('~/models');
 const {
   applyHostEvidenceBoundaryInstructions,
@@ -60,6 +65,32 @@ const {
   restrictedConversationProviderBootstrapHeaders,
   resolveConversationProviderUploadedFiles,
 } = require('../GlassHiveConversationProviderService');
+
+let promptDirectory;
+const previousPromptBundle = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+beforeAll(() => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  promptDirectory = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'native-inventory-'));
+  const {
+    buildPromptBundleFixture,
+  } = require('../../../../../scripts/test-support/promptBundle.cjs');
+  const bundle = path.join(promptDirectory, 'bundle.json');
+  fs.writeFileSync(
+    bundle,
+    JSON.stringify(
+      buildPromptBundleFixture(
+        path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts'),
+      ),
+    ),
+  );
+  process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundle;
+});
+afterAll(() => {
+  if (previousPromptBundle === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousPromptBundle;
+  require('node:fs').rmSync(promptDirectory, { recursive: true, force: true });
+});
 
 describe('GlassHiveConversationProviderService', () => {
   describe('read-only text compactor signed zero-tool capability', () => {
@@ -230,10 +261,59 @@ describe('GlassHiveConversationProviderService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRetainedFileAccess.mockResolvedValue([]);
     getMessages.mockResolvedValue([]);
     getFiles.mockResolvedValue([]);
     process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-bundle-secret';
   });
+
+  test.each(['current', 'unavailable', 'forged-input'])(
+    'signed prior-file scope keeps independent handoff capability (%s)',
+    async (mode) => {
+      const grants = [
+        { run_id: 'run-source', attempt_id: 'attempt-source', sha256: 'a'.repeat(64) },
+      ];
+      if (mode === 'current') mockRetainedFileAccess.mockResolvedValueOnce(grants);
+      if (mode === 'unavailable')
+        mockRetainedFileAccess.mockRejectedValueOnce(new Error('Synthetic inventory failure'));
+      buildConversationProviderBootstrapBundle.mockResolvedValue({
+        glasshive_capability_broker: {
+          grant_id: 'synthetic-grant',
+          grant_token: 'synthetic-token',
+        },
+      });
+      const targetAgent = {
+        id: 'main',
+        tools: [`lookup${Constants.mcp_delimiter}declared`],
+        model_parameters: {},
+      };
+      const req = {
+        user: { id: 'owner' },
+        body: {
+          conversationId: 'conversation',
+          ...(mode === 'forged-input' ? { authorized_result_files: grants } : {}),
+        },
+      };
+      expect(
+        await attachConversationProviderCapabilityBundle({
+          targetAgent,
+          req,
+          capability: { workspace_binding: true },
+        }),
+      ).toBe(true);
+      const headers = targetAgent.model_parameters.configuration.defaultHeaders;
+      const encoded = headers['X-GlassHive-Bootstrap-Bundle-B64'];
+      const bundle = JSON.parse(Buffer.from(encoded, 'base64').toString());
+      expect(bundle.glasshive_capability_broker.grant_id).toBe('synthetic-grant');
+      expect(bundle.authorized_result_files || []).toEqual(mode === 'current' ? grants : []);
+      expect(mockRetainedFileAccess).toHaveBeenCalledWith('owner', 'conversation');
+      const expected = require('node:crypto')
+        .createHmac('sha256', 'synthetic-bundle-secret')
+        .update(`v1\n${headers['X-GlassHive-Bootstrap-Timestamp']}\n${encoded}`)
+        .digest('hex');
+      expect(headers['X-GlassHive-Bootstrap-Signature']).toBe(`sha256=${expected}`);
+    },
+  );
 
   test('defers only graph-owned minting and preserves the exact invocation-fresh capability', async () => {
     const now = jest.spyOn(Date, 'now').mockReturnValue(1700000000000);
@@ -2025,6 +2105,8 @@ describe('GlassHiveConversationProviderService', () => {
 
   test.each([
     ['direct-xai', 'coordination', false, false],
+    ['codex-cli', 'coordination', false, false],
+    ['claude-code', 'coordination', false, false],
     ['codex-cli', 'native', true, false],
     ['codex-cli', 'native', false, true],
   ])(
@@ -2068,6 +2150,112 @@ describe('GlassHiveConversationProviderService', () => {
       }
     },
   );
+
+  test.each(['codex-cli', 'claude-code', 'direct-xai'])(
+    'saved coordination policy narrows only its own native tools and keeps the broker (%s)',
+    async (harnessProfile) => {
+      const original = {
+        agents_md: 'Existing context',
+        provider_capabilities: { native_tools: true, self_delegation: false },
+        glasshive_capability_broker: { grant_token: 'synthetic-grant' },
+        native_tool_catalog: { version: 1, tools: [{ name: 'active_work_list' }] },
+      };
+      buildConversationProviderBootstrapBundle.mockImplementation(async () =>
+        structuredClone(original),
+      );
+      const agent = (toolMode) => ({
+        model: 'model-synthetic',
+        tools: ['active_work_list'],
+        glasshive_options: { orchestration: { parallel_available: true, tool_mode: toolMode } },
+        model_parameters: { configuration: { defaultHeaders: {} } },
+      });
+      const attach = async (targetAgent) => {
+        await attachConversationProviderCapabilityBundle({
+          targetAgent,
+          declaredAgent: targetAgent,
+          req: { user: { id: 'owner-synthetic' } },
+          requestBody: { conversationId: 'conversation-synthetic', messageId: 'source-synthetic' },
+          inheritedConversation: {
+            version: 1,
+            sources: [],
+            conversation_id: 'conversation-synthetic',
+          },
+          capability: {
+            workspace_binding: true,
+            host_tools_transport: 'broker_mcp',
+            worker_native_tools: true,
+            conversation_orchestration_tools: ['active_work_list'],
+            models: [{ id: 'model-synthetic', harnessProfile }],
+          },
+        });
+        return JSON.parse(
+          Buffer.from(
+            targetAgent.model_parameters.configuration.defaultHeaders[
+              'X-GlassHive-Bootstrap-Bundle-B64'
+            ],
+            'base64',
+          ).toString(),
+        );
+      };
+      const main = await attach(agent('coordination'));
+      expect(main.provider_capabilities).toEqual({ native_tools: false, self_delegation: false });
+      expect(main.glasshive_capability_broker).toEqual(original.glasshive_capability_broker);
+      expect(main.native_tool_catalog).toEqual(original.native_tool_catalog);
+      expect(main.agents_md).toBe('Existing context');
+      const buildArgs = buildConversationProviderBootstrapBundle.mock.calls.at(-1)[0];
+      expect(buildArgs.conversationToolMode).toBe('coordination');
+      expect(buildArgs.inheritedConversation).toEqual({
+        version: 1,
+        sources: [],
+        conversation_id: 'conversation-synthetic',
+      });
+      expect(main.conversation_tool_mode).toBe('coordination');
+      const reusable = agent('coordination');
+      reusable.glasshive_options.orchestration.conversation_process_reuse = true;
+      const retained = await attach(reusable);
+      expect(retained.provider_capabilities.conversation_process_reuse).toBe(
+        harnessProfile === 'claude-code' ? true : undefined,
+      );
+      expect(retained.provider_capabilities.native_tools).toBe(false);
+      expect(retained.glasshive_capability_broker).toEqual(original.glasshive_capability_broker);
+      reusable.viventiumProviderSessionMode = 'stateless';
+      const stateless = await attach(reusable);
+      expect(stateless.provider_capabilities.conversation_process_reuse).toBeUndefined();
+      // A separately launched action worker does not inherit Main's restriction.
+      const worker = await attach(agent('native'));
+      expect(worker.provider_capabilities.native_tools).toBe(true);
+      const inventory = require('@librechat/api').getRequiredPromptText(
+        'worker.native_capability_inventory',
+      );
+      expect(worker.agents_md).toBe(`Existing context\n\n${inventory}`);
+      expect(worker.agents_md.split(inventory)).toHaveLength(2);
+      expect(original.provider_capabilities.native_tools).toBe(true);
+    },
+  );
+
+  test('full Native capability inheritance works without an optional connector', async () => {
+    const targetAgent = { tools: [], model_parameters: {} };
+    buildConversationProviderBootstrapBundle.mockResolvedValue({});
+    expect(
+      await attachConversationProviderCapabilityBundle({
+        targetAgent,
+        req: { user: { id: 'owner' }, body: { conversationId: 'conversation' } },
+        capability: { workspace_binding: true, native_tools: true },
+      }),
+    ).toBe(true);
+    const bundle = JSON.parse(
+      Buffer.from(
+        targetAgent.model_parameters.configuration.defaultHeaders[
+          'X-GlassHive-Bootstrap-Bundle-B64'
+        ],
+        'base64',
+      ).toString(),
+    );
+    expect(bundle.agents_md).toBe(
+      require('@librechat/api').getRequiredPromptText('worker.native_capability_inventory'),
+    );
+    expect(bundle).not.toHaveProperty('glasshive_capability_broker');
+  });
 
   test.each(['scheduler', 'interactive', 'forged-body'])(
     'full native invocation projects only server-owned due provenance (%s)',

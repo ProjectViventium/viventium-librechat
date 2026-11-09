@@ -690,6 +690,17 @@ describe('existing deferral owner re-arms idle legacy continuation', () => {
   beforeEach(() => { jest.useFakeTimers(); resetMainCompactionSchedulingForTests(); });
   afterEach(() => { resetMainCompactionSchedulingForTests(); jest.useRealTimers(); });
 
+  test('continuous degraded turns keep the first repair time and use the latest contract', async () => {
+    const scheduled = jest.fn(async (_generation: number) => {});
+    for (let generation = 0; generation < 9; generation++) {
+      deferAcceptedMainCompactionForIdle({ ownerId: 'owner', domainKey: 'responsive-domain',
+        shouldYield: () => false, onError: jest.fn(), preservePending: true,
+        schedule: () => scheduled(generation) });
+      await jest.advanceTimersByTimeAsync(20000);
+    }
+    expect(scheduled.mock.calls.map(([generation]) => generation)).toEqual([1, 3, 5, 7]);
+  });
+
   test('continues after an idle window without another accepted user turn', async () => {
     let batches = 0;
     const input = { ownerId: 'owner', domainKey: 'idle-domain', shouldYield: () => false,
@@ -823,170 +834,50 @@ describe('terminal size exhaustion under monotone allocation', () => {
   });
 });
 
-describe('parallel Main carrier dependency recovery', () => {
-  const gate = () => {
-    let resolve!: () => void;
-    const promise = new Promise<void>((done) => {
-      resolve = done;
-    });
-    return { promise, resolve };
-  };
-  test('a fitting Main never reads or waits for active memory', async () => {
-    const getActiveCompactions = jest.fn(() => [new Promise<void>(() => {})]);
-    const ensure = jest.fn();
-    const load = jest.fn(async () => ({ status: 'available' }));
-    expect(
-      await recoverMainContinuityCarrierForAdmission({
-        identityKey: 'domain',
-        load,
-        ensure,
-        getActiveCompactions,
-      }),
-    ).toEqual({ status: 'available' });
-    expect(getActiveCompactions).not.toHaveBeenCalled();
-    expect(ensure).not.toHaveBeenCalled();
+describe('responsive Main continuity admission', () => {
+  test('a fitting Main never schedules memory work', async () => {
+    const defer = jest.fn();
+    const context = { status: 'available' };
+    expect(await recoverMainContinuityCarrierForAdmission({ identityKey: 'domain',
+      load: async () => context, defer })).toBe(context);
+    expect(defer).not.toHaveBeenCalled();
   });
-  test('rechecks the next bounded claim across the idle continuation boundary', async () => {
-    const first = gate(),
-      second = gate();
-    let active = [first.promise],
-      fits = false;
-    first.promise.then(() =>
-      setImmediate(() => {
-        active = [second.promise];
-      }),
-    );
-    second.promise.then(() => {
-      active = [];
-      fits = true;
-    });
-    const ensure = jest.fn(async () => ({ status: 'busy' }));
-    const load = jest.fn(async () => ({ status: fits ? 'available' : 'context_budget' }));
-    const waiting = recoverMainContinuityCarrierForAdmission({
-      identityKey: 'domain',
-      load,
-      ensure,
-      getActiveCompactions: () => active,
-    });
-    void waiting.catch(() => {});
-    await Promise.resolve();
-    expect(ensure).not.toHaveBeenCalled();
-    first.resolve();
-    await new Promise<void>((done) => setImmediate(done));
-    await new Promise<void>((done) => setImmediate(done));
-    expect(ensure).not.toHaveBeenCalled();
-    second.resolve();
-    expect(await waiting).toEqual({ status: 'available' });
-    expect(ensure).not.toHaveBeenCalled();
+
+  test('returns the marked context without awaiting background work and coalesces per request', async () => {
+    const request = {}, background = new Promise<void>(() => {});
+    const defer = jest.fn(() => { void background; });
+    const context = { status: 'available', continuityDegraded: true, capsule: 'Temporary gap.' };
+    const input = { request, identityKey: 'domain', load: async () => context, defer };
+    expect(await recoverMainContinuityCarrierForAdmission(input)).toBe(context);
+    expect(await recoverMainContinuityCarrierForAdmission(input)).toBe(context);
+    expect(defer).toHaveBeenCalledTimes(1);
   });
-  test('settlement without a fitting reviewed result uses the existing ensure once', async () => {
-    const first = gate();
-    let active = [first.promise],
-      fits = false;
-    first.promise.then(() => {
-      active = [];
-    });
-    const ensure = jest.fn(async () => {
-      fits = true;
-    });
-    const request = {};
-    const waiting = recoverMainContinuityCarrierForAdmission({
-      request,
-      identityKey: 'domain',
-      load: async () => ({ status: fits ? 'available' : 'context_budget' }),
-      ensure,
-      getActiveCompactions: () => active,
-    });
-    await Promise.resolve();
-    expect(ensure).not.toHaveBeenCalled();
-    first.resolve();
-    expect(await waiting).toEqual({ status: 'available' });
-    expect(ensure).toHaveBeenCalledTimes(1);
+
+  test('a later completed compaction is read normally without another repair', async () => {
+    const defer = jest.fn();
+    const degraded = { status: 'available', continuityDegraded: true };
+    const repaired = { status: 'available', continuityDegraded: false };
+    const load = jest.fn().mockResolvedValueOnce(degraded).mockResolvedValue(repaired);
+    const input = { identityKey: 'domain', load, defer };
+    expect(await recoverMainContinuityCarrierForAdmission(input)).toBe(degraded);
+    expect(await recoverMainContinuityCarrierForAdmission(input)).toBe(repaired);
+    expect(defer).toHaveBeenCalledTimes(1);
   });
-  test('a stopped waiting request does not cancel its shared producer or spend recovery', async () => {
-    const first = gate(),
-      controller = new AbortController(),
-      request = {};
-    const ensure = jest.fn();
-    let active = [first.promise];
-    const waiting = recoverMainContinuityCarrierForAdmission({
-      request,
-      identityKey: 'domain',
-      load: async () => ({ status: 'context_budget' }),
-      ensure,
-      signal: controller.signal,
-      getActiveCompactions: () => active,
-    });
-    void waiting.catch(() => {});
-    await Promise.resolve();
-    controller.abort('user_stop');
-    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
-    expect(request).not.toHaveProperty('_viventiumAcceptedMainCarrierRecovery');
-    expect(ensure).not.toHaveBeenCalled();
-    active = [];
-    first.resolve();
+
+  test('still rejects when even the factual disclosure cannot fit', async () => {
+    const defer = jest.fn();
+    await expect(recoverMainContinuityCarrierForAdmission({ identityKey: 'domain', defer,
+      load: async () => ({ status: 'context_budget' }) }))
+      .rejects.toMatchObject({ code: 'source_context_unavailable', status: 413 });
+    expect(defer).not.toHaveBeenCalled();
   });
-  test('a late busy ensure rechecks the already-started same-domain producer', async () => {
-    const first = gate();
-    let active: Promise<void>[] = [],
-      fits = false;
-    const ensure = jest.fn(async () => {
-      active = [first.promise];
-      return { status: 'busy' };
-    });
-    first.promise.then(() => {
-      active = [];
-      fits = true;
-    });
-    const waiting = recoverMainContinuityCarrierForAdmission({
-      identityKey: 'domain',
-      load: async () => ({ status: fits ? 'available' : 'context_budget' }),
-      ensure,
-      getActiveCompactions: () => active,
-    });
-    void waiting.catch(() => {});
-    await new Promise<void>((done) => setImmediate(done));
-    first.resolve();
-    expect(await waiting).toEqual({ status: 'available' });
-    expect(ensure).toHaveBeenCalledTimes(1);
+
+  test('a stopped request spends no maintenance schedule', async () => {
+    const controller = new AbortController(), defer = jest.fn();
+    controller.abort();
+    await expect(recoverMainContinuityCarrierForAdmission({ identityKey: 'domain', defer,
+      signal: controller.signal, load: async () => ({ status: 'available', continuityDegraded: true }) }))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(defer).not.toHaveBeenCalled();
   });
-  test.each([false, true])(
-    'a non-fitting late producer retries only an unclaimed busy result, dispatched=%s',
-    async (dispatched) => {
-      const first = gate();
-      let active: Promise<void>[] = [],
-        fits = false;
-      const ensure = jest.fn(async () => {
-        if (ensure.mock.calls.length === 1) {
-          active = [first.promise];
-          return { status: 'busy', ...(dispatched ? { attempts: 1 } : {}) };
-        }
-        fits = true;
-        return { status: 'compacted', attempts: 1 };
-      });
-      first.promise.then(() => {
-        active = [];
-      });
-      const waiting = recoverMainContinuityCarrierForAdmission({
-        request: {},
-        identityKey: 'domain',
-        load: async () => ({ status: fits ? 'available' : 'context_budget' }),
-        ensure,
-        getActiveCompactions: () => active,
-      });
-      void waiting.catch(() => {});
-      await new Promise<void>((done) => setImmediate(done));
-      first.resolve();
-      if (dispatched) {
-        await expect(waiting).rejects.toMatchObject({
-          code: 'source_context_unavailable',
-          status: 413,
-        });
-        expect(ensure).toHaveBeenCalledTimes(1);
-      } else {
-        expect(await waiting).toEqual({ status: 'available' });
-        expect(ensure).toHaveBeenCalledTimes(2);
-      }
-    },
-  );
 });

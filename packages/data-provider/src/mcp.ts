@@ -77,6 +77,8 @@ const BaseOptionsSchema = z.object({
       writePolicy: z.enum(['deny', 'confirm', 'allow']).optional(),
       riskClass: z.string().optional(),
       reexportNativeTools: z.boolean().optional(),
+      /** Exact inherited Native MCP IDs replaced by this reviewed Core broker server. */
+      nativeServerIds: z.array(z.string().min(1).refine((value) => value.trim() === value)).optional(),
       toolPolicies: z
         .record(
           z.string(),

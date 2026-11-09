@@ -297,12 +297,7 @@ async function loadActiveWorkTurnContext({
     mode !== 'parallel' && knownWork !== true
       ? { snapshot: 'unavailable', work: null, overflowCount: null }
       : await getActiveWorkSnapshotImpl({ ownerId });
-  const model = request?.config?.endpoints?.agents?.providerCapabilities?.[
-    agent?.endpoint || agent?.provider
-  ]?.models?.find((item) => item.id === (agent?.model || agent?.model_parameters?.model));
-  const coordinationOnly =
-    agent?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
-    ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(model?.harnessProfile);
+  const coordinationOnly = agent?.glasshive_options?.orchestration?.tool_mode === 'coordination';
   const projection = {
     coordinationOnly,
     mode,

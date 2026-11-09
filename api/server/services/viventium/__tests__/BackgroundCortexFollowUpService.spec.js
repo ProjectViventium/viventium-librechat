@@ -9,6 +9,25 @@
  * === VIVENTIUM END === */
 
 const fs = require('node:fs');
+const mockMainAuthorPreparation = jest.fn();
+// These provider/persistence units use their supplied agent; persisted configuration has its own bank.
+jest.mock('~/models/Agent', () => ({
+  ...jest.requireActual('~/models/Agent'),
+  getAgent: jest.fn().mockResolvedValue(null),
+}));
+jest.mock('@librechat/api', () => {
+  const actual = jest.requireActual('@librechat/api');
+  return {
+    ...actual,
+    prepareMainAuthorContext: (...args) => {
+      const prepared = require('~/test/helpers/mainAuthorContext').mockMainAuthorContext(
+        actual.prepareMainAuthorContext,
+        ...args,
+      );
+      return mockMainAuthorPreparation(prepared) || prepared;
+    },
+  };
+});
 const os = require('node:os');
 const path = require('node:path');
 const {
@@ -236,10 +255,11 @@ describe('Phase B prompt registry ownership', () => {
 
   test('routes Phase B system prompts through the prompt registry', () => {
     jest.resetModules();
-    const getPromptText = jest.fn((_promptId, fallback) => fallback);
+    const actualRegistry = jest.requireActual('~/server/services/viventium/promptRegistry');
+    const getRequiredPromptText = jest.fn(actualRegistry.getRequiredPromptText);
     jest.doMock('~/server/services/viventium/promptRegistry', () => ({
-      ...jest.requireActual('~/server/services/viventium/promptRegistry'),
-      getPromptText,
+      ...actualRegistry,
+      getRequiredPromptText,
     }));
     const {
       buildFollowUpSystemPrompt: registryBuildFollowUpSystemPrompt,
@@ -250,9 +270,8 @@ describe('Phase B prompt registry ownership', () => {
       noResponseInstructions: 'Use {NTA} when no reply is needed.',
     });
 
-    expect(getPromptText).toHaveBeenCalledWith(
+    expect(getRequiredPromptText).toHaveBeenCalledWith(
       'cortex.follow_up_phase_b.primary_system',
-      expect.any(String),
       expect.objectContaining({
         no_response_instructions: 'Use {NTA} when no reply is needed.',
       }),
@@ -555,8 +574,10 @@ describe('Phase B actual native author binding', () => {
       },
     }));
     const previous = process.env.XAI_API_KEY;
+    const previousSigningSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
     try {
       process.env.XAI_API_KEY = 'synthetic-key';
+      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-presentation-signer';
       const prepared = await prepareCortexFollowUpMessage({
         req: {
           user: { id: 'owner' },
@@ -593,6 +614,9 @@ describe('Phase B actual native author binding', () => {
     } finally {
       if (previous === undefined) delete process.env.XAI_API_KEY;
       else process.env.XAI_API_KEY = previous;
+      if (previousSigningSecret === undefined)
+        delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = previousSigningSecret;
       service.mockRestore();
       getMessage.mockRestore();
       getMessages.mockRestore();
@@ -1063,6 +1087,28 @@ describe('forced follow-up onto an empty primary answer', () => {
 });
 
 describe('formatFollowUpPrompt', () => {
+  test.each(['native_coordinator_result', 'native_coordinator_turn_result'])(
+    'preserves exact report and failure authority for %s evidence',
+    (kind) => {
+      const insight = {
+        cortexName: 'Native evidence',
+        insight: '  Provider returned a partial explanation.\n  ',
+        authority: {
+          kind,
+          state: 'failed',
+          failureClass: 'provider_unavailable',
+          runId: 'run',
+          resultRevision: 2,
+          resultDigest: `sha256:${'a'.repeat(64)}`,
+        },
+      };
+      const prompt = formatFollowUpPrompt({ insights: [insight], surface: 'telegram' });
+      expect(prompt).toContain(
+        JSON.stringify({ report: insight.insight, authority: insight.authority }),
+      );
+      expect(prompt).not.toContain('"runInput"');
+    },
+  );
   const missionReports = (prompt) =>
     prompt
       .split('\n')
@@ -1234,7 +1280,7 @@ describe('formatFollowUpPrompt', () => {
     },
   );
 
-  test('defaults web follow-ups to markdown-friendly web text rules', () => {
+  test('leaves default web rules to ordinary Main preparation', () => {
     const prompt = formatFollowUpPrompt({
       insights: [{ cortexName: 'planner', insight: 'Use bullets.\n\nKeep sections tight.' }],
       recentResponse: 'Initial reply already covered the high-level recommendation.',
@@ -1242,13 +1288,13 @@ describe('formatFollowUpPrompt', () => {
       surface: '',
     });
 
-    expect(prompt).toContain('WEB TEXT MODE:');
-    expect(prompt).toContain('Use standard Markdown formatting');
-    expect(prompt).toContain('Prefer short paragraphs and bullet lists');
+    expect(prompt).not.toContain('WEB TEXT MODE:');
+    expect(prompt).not.toContain('Use standard Markdown formatting');
+    expect(prompt).not.toContain('Prefer short paragraphs and bullet lists');
     expect(prompt).toContain('preserve helpful structure');
   });
 
-  test('keeps playground follow-ups plain text', () => {
+  test('does not repeat ordinary Main playground rules', () => {
     const prompt = formatFollowUpPrompt({
       insights: [{ cortexName: 'planner', insight: 'Keep it simple.' }],
       recentResponse: 'Initial reply already covered the basics.',
@@ -1256,11 +1302,11 @@ describe('formatFollowUpPrompt', () => {
       surface: 'playground',
     });
 
-    expect(prompt).toContain('PLAYGROUND TEXT MODE:');
+    expect(prompt).not.toContain('PLAYGROUND TEXT MODE:');
     expect(prompt).not.toContain('WEB TEXT MODE:');
   });
 
-  test('teaches smart optional audio only to Telegram follow-ups that can attach audio', () => {
+  test('leaves Telegram text and eligible audio rules to ordinary Main preparation', () => {
     const base = {
       insights: [{ cortexName: 'planner', insight: 'The synthetic draft is ready.' }],
       recentResponse: 'I started checking it.',
@@ -1275,11 +1321,11 @@ describe('formatFollowUpPrompt', () => {
       voiceProvider: 'xai',
     });
 
-    expect(textOnlyPrompt).toContain('{MSG_BREAK}');
+    expect(textOnlyPrompt).not.toContain('{MSG_BREAK}');
     expect(textOnlyPrompt).not.toContain('{SKIP_VOICE}');
-    expect(audioEligiblePrompt).toContain('{MSG_BREAK}');
-    expect(audioEligiblePrompt).toContain('{SKIP_VOICE}');
-    expect(audioEligiblePrompt).toContain('explicitly asks to hear, read aloud, speak');
+    expect(audioEligiblePrompt).not.toContain('{MSG_BREAK}');
+    expect(audioEligiblePrompt).not.toContain('{SKIP_VOICE}');
+    expect(audioEligiblePrompt).not.toContain('explicitly asks to hear, read aloud, speak');
   });
 
   test('keeps Wing Mode follow-ups silence-first', () => {
@@ -1548,6 +1594,33 @@ describe('resolveUserRequestTextFromMessages', () => {
 });
 
 describe('resolveFollowUpPersistenceText', () => {
+  test('projects Voice-origin controls out of the linked text result after hangup', () => {
+    const result = resolveFollowUpPersistenceText({
+      generatedText:
+        'The file is ready. [chuckle] [Open it](https://files.example.test/report.html)',
+      insightsData: { insights: [{ cortexName: 'Verified result', insight: 'File created.' }] },
+      voiceMode: false,
+      surface: 'voice',
+    });
+    expect(result.text).toBe(
+      'The file is ready. [Open it](https://files.example.test/report.html)',
+    );
+    expect(result.decision.selectedStrategy).toBe('llm_generated');
+  });
+
+  test.each(['web', 'telegram'])(
+    'preserves literal stage-direction text authored for the ordinary %s surface',
+    (surface) => {
+      const result = resolveFollowUpPersistenceText({
+        generatedText: 'The script contains [chuckle] as a literal stage direction.',
+        insightsData: { insights: [] },
+        voiceMode: false,
+        surface,
+      });
+      expect(result.text).toBe('The script contains [chuckle] as a literal stage direction.');
+    },
+  );
+
   test.each(['web', 'telegram'])(
     'does not publish raw optional insights when %s follow-up generation fails',
     (surface) => {
@@ -2839,6 +2912,7 @@ test('terminal mission synthesis27 defers to the current Main and keeps ordinary
     },
   };
   const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+  const parent = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
   try {
     expect(await prepareCortexFollowUpMessage(input)).toEqual({
       currentMainPending: true,
@@ -2862,6 +2936,7 @@ test('terminal mission synthesis27 defers to the current Main and keeps ordinary
     else native.offerMissionEvidenceToCurrentMain = previous;
     create.mockRestore();
     messages.mockRestore();
+    parent.mockRestore();
     service.mockRestore();
     if (oldKey == null) delete process.env.XAI_API_KEY;
     else process.env.XAI_API_KEY = oldKey;
@@ -2983,6 +3058,7 @@ describe('Phase B retained File publication', () => {
     'normal follow-up persists only after its original File source guard, revoked=%s explicitHook=%s',
     async (revoked, explicitHook) => {
       const transaction = require('../GlassHiveTerminalCallbackTransaction');
+      const getMessage = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
       const session = { inTransaction: () => true };
       const order = [];
       const runTransaction = jest
@@ -3060,6 +3136,7 @@ describe('Phase B retained File publication', () => {
           );
       } finally {
         runTransaction.mockRestore();
+        getMessage.mockRestore();
         save.mockRestore();
         prepareFiles.mockRestore();
         if (priorBase === undefined) delete process.env.GLASSHIVE_ARTIFACT_BASE_URL;
@@ -3245,14 +3322,14 @@ describe('canonical written details in Voice follow-up', () => {
   test('uses the same canonical Voice contract instead of offering the requested details again', () => {
     const rules = require('../surfacePrompts').buildVoiceModeInstructions('xai');
     const rendered = formatFollowUpPrompt(input);
-    expect(rendered).toContain(rules);
-    expect(rendered).toContain(
+    expect(rendered).not.toContain(rules);
+    expect(rendered).not.toContain(
       'Include requested URLs and email addresses in the written reply without asking again.',
     );
     expect(rendered).not.toContain('say you can send the details');
     expect(rendered).toContain('{NTA}');
   });
-  test('renders exact admitted Call facts as data beside the selected provider rules', () => {
+  test('leaves admitted Call facts in ordinary Main context', () => {
     const req = {
       user: { id: 'owner-1' },
       body: { voiceMode: true },
@@ -3266,15 +3343,15 @@ describe('canonical written details in Voice follow-up', () => {
     expect(bindCurrentCallContext(req)).toBe(true);
     const currentCallContext = getCurrentCallContext(req);
     const rendered = formatFollowUpPrompt({ ...input, currentCallContext });
-    expect(rendered.split(currentCallContext)).toHaveLength(2);
-    expect(rendered).toContain('"requestedRoute"');
-    expect(rendered).toContain('"actualPlaybackRoute":null');
-    expect(rendered).toContain('[chuckle]');
+    expect(rendered).not.toContain(currentCallContext);
+    expect(rendered).not.toContain('"requestedRoute"');
+    expect(rendered).not.toContain('"actualPlaybackRoute":null');
+    expect(rendered).not.toContain('[chuckle]');
     expect(formatFollowUpPrompt({ ...input, voiceMode: false, currentCallContext })).not.toContain(
       currentCallContext,
     );
   });
-  test('passes the bound Call data through the actual Phase-B generation consumer', async () => {
+  test('preserves the admitted Call on the fresh author request without repeating it in evidence', async () => {
     const req = {
       user: { id: 'owner-1' },
       body: { voiceMode: true, voiceProvider: 'xai' },
@@ -3305,8 +3382,10 @@ describe('canonical written details in Voice follow-up', () => {
       };
       await generateFollowUpText(args);
       const transmitted = JSON.stringify(processStream.mock.calls[0][0]);
-      expect(transmitted).toContain(JSON.stringify(capsule).slice(1, -1));
-      expect(transmitted).toContain('[chuckle]');
+      const prepared = await mockMainAuthorPreparation.mock.calls.at(-1)[0];
+      expect(getCurrentCallContext(prepared.req)).toBe(capsule);
+      expect(transmitted).not.toContain('viventium_current_call_v1');
+      expect(transmitted).not.toContain('[chuckle]');
       req.body.voiceMode = false;
       await generateFollowUpText(args);
       expect(JSON.stringify(processStream.mock.calls[1][0])).not.toContain(
@@ -3372,8 +3451,6 @@ describe('authored no-response primary preparation', () => {
         expect(prepared.text).toBe(expected);
         expect(prepared.followUpDecisionRecord.generationFailed).toBe(false);
         expect(processStream).toHaveBeenCalledTimes(1);
-        const instructions = createRun.mock.calls[0][0].graphConfig.instructions;
-        expect(instructions.includes('completing a deferred response')).toBe(forced);
         if (recentResponse.trim() && !forced) {
           expect(processStream.mock.calls[0][0].messages[0].content).toContain(
             recentResponse.trim(),
@@ -3419,3 +3496,140 @@ describe('authored no-response primary preparation', () => {
   });
 });
 /* VIVENTIUM END */
+
+describe('Main follow-up preserves full admitted context', () => {
+  test.each([false, true])(
+    'preserves complete requests and Cortex evidence in primary mode %s',
+    (primaryResponseMode) => {
+      const userRequest = 'Original source. '.repeat(900) + ' END REQUEST RESTRICTION';
+      const insight = 'Actual evidence. '.repeat(1000) + ' END EVIDENCE';
+      const continuationContext = 'Newer original context. '.repeat(200) + ' END NEWER CORRECTION';
+      const prompt = formatFollowUpPrompt({
+        insights: [{ cortexName: 'Synthetic Cortex', insight, maxPromptChars: 1 }],
+        recentResponse: 'Accepted.',
+        userRequest,
+        continuationContext,
+        primaryResponseMode,
+      });
+      expect(prompt).toContain(userRequest);
+      expect(prompt).toContain(insight);
+      expect(prompt).toContain(continuationContext);
+    },
+  );
+
+  test('preserves every authorized descendant and long multi-line corrections', () => {
+    const text = 'Keep this formatting.\n'.repeat(100) + ' END EXACT CORRECTION';
+    const messages = [{ messageId: 'anchor', sender: 'AI', text: 'Working.' }];
+    for (let i = 0; i < 12; i++)
+      messages.push({
+        messageId: `child-${i}`,
+        parentMessageId: i ? `child-${i - 1}` : 'anchor',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: i === 0 ? text : `Original follow-up ${i}`,
+      });
+    const result = resolveFollowUpContinuationContext(messages, 'anchor');
+    expect(result.messageCount).toBe(12);
+    expect(result.contextText).toContain(text);
+    for (let i = 1; i < 12; i++) expect(result.contextText).toContain(`Original follow-up ${i}`);
+  });
+});
+
+describe('prepared result event integrity', () => {
+  test.each(['wrong_role', 'changed_text', 'attached_media'])(
+    'fails before generation instead of discarding an unexpected final event (%s)',
+    async (shape) => {
+      const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
+      const priorKey = process.env.XAI_API_KEY;
+      process.env.XAI_API_KEY = 'synthetic-key';
+      const processStream = jest.fn();
+      const create = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      mockMainAuthorPreparation.mockImplementationOnce(async (promise) => {
+        const prepared = await promise;
+        const original = prepared.messages.at(-1).content;
+        prepared.messages[prepared.messages.length - 1] =
+          shape === 'wrong_role'
+            ? new AIMessage(original)
+            : new HumanMessage(
+                shape === 'changed_text'
+                  ? 'Changed evidence.'
+                  : [
+                      { type: 'text', text: original },
+                      { type: 'image_url', image_url: 'synthetic' },
+                    ],
+              );
+        return prepared;
+      });
+      try {
+        await expect(
+          generateFollowUpText({
+            req: { user: { id: 'owner' }, body: {} },
+            agent: { id: 'main', provider: 'xai', model: 'synthetic', model_parameters: {} },
+            insightsData: {
+              insights: [{ cortexName: 'Synthetic', insight: 'Verified evidence.' }],
+            },
+          }),
+        ).rejects.toThrow('main_author_event_context_mismatch');
+        expect(processStream).not.toHaveBeenCalled();
+      } finally {
+        create.mockRestore();
+        mockMainAuthorPreparation.mockReset();
+        if (priorKey === undefined) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = priorKey;
+      }
+    },
+  );
+});
+
+describe('typed durable synthesis failures', () => {
+  test.each([
+    [503, 'host_capacity_unavailable', true],
+    [429, 'rate_limit_exceeded', true],
+    [400, 'invalid_request', false],
+    [413, 'source_context_unavailable', false],
+    [500, 'internal_error', false],
+    [501, 'not_implemented', false],
+    [502, 'bad_gateway', true],
+    [504, 'gateway_timeout', true],
+  ])('preserves wrapped status %s and its recovery policy', async (status, code, retryable) => {
+    const processStream = jest.fn().mockRejectedValue(
+      new Error('SDK wrapper', {
+        cause: Object.assign(new Error('Synthetic failure'), { status, code }),
+      }),
+    );
+    const create = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    const prior = process.env.XAI_API_KEY;
+    const history = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
+    const parent = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
+    const current = jest
+      .spyOn(require('../nativeResponseService'), 'offerMissionEvidenceToCurrentMain')
+      .mockResolvedValue(false);
+    try {
+      process.env.XAI_API_KEY = 'synthetic-key';
+      const result = await prepareCortexFollowUpMessage({
+        req: { user: { id: 'owner' }, body: {} },
+        agent: { provider: 'xai', model: 'synthetic', model_parameters: {} },
+        runId: 'synthetic-failure',
+        recentResponse: 'Working.',
+        insightsData: {
+          insights: [
+            {
+              cortexName: 'Synthetic',
+              insight: 'Retained result.',
+              authority: { kind: 'durable_terminal_callback' },
+            },
+          ],
+        },
+      });
+      expect(result.followUpDecisionRecord.generationFailure).toEqual({ status, code, retryable });
+      expect(result.followUpDecisionRecord.generationFailed).toBe(true);
+    } finally {
+      create.mockRestore();
+      history.mockRestore();
+      parent.mockRestore();
+      current.mockRestore();
+      if (prior == null) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = prior;
+    }
+  });
+});

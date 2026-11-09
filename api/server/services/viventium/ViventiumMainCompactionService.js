@@ -10,6 +10,8 @@ const crypto = require('crypto');
 const { HumanMessage } = require('@langchain/core/messages');
 const {
   inspectMainCompactionCandidate,
+  mainCompactionFieldRepairInput,
+  applyMainCompactionFieldRepair,
   canContinueMainCompactionRepair,
   normalizeMainCompactionSizeRepair,
   normalizeMainCompactionOutputContract,
@@ -63,7 +65,6 @@ const COMPACTOR_TIMEOUT_MS = 240 * 1000;
 const MAX_TRANSPORT_RETRIES = MAIN_COMPACTION_MAX_TRANSPORT_RETRIES;
 const TRANSIENT_RETRY_DELAY_MS = 5 * 1000;
 const MAX_TRANSIENT_RETRY_DELAY_MS = 30 * 1000;
-const activeCompactionsByOwnerId = new Map();
 
 function sleep(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -137,12 +138,20 @@ function buildCompactionPrompt(claim, correctionReason = '', candidate = null) {
         : {}),
     };
   }
+  const repairInput = candidate
+    ? null
+    : mainCompactionFieldRepairInput(
+        claim.previousSemanticCompaction,
+        correctionReason,
+        claim.outputContract,
+      );
   const payload = JSON.stringify({
     version: 1,
     sourceDigest: claim.sourceDigest,
     previousSemanticCompaction: claim.previousSemanticCompaction || null,
     acceptedOlderTurns: claim.sourceTurns || [],
     outputConstraints: claim.outputContract || mainCompactionOutputConstraints,
+    ...(repairInput ? { fieldRepair: repairInput.contract } : {}),
     ...(claim.legacyInputs?.length ? { legacyInputs: claim.legacyInputs } : {}),
     ...(candidate
       ? {
@@ -363,6 +372,7 @@ function scheduleMainContinuityMaintenance(input = {}) {
     ownerId,
     domainKey: compactionEpochKey(input),
     schedule: input.schedule,
+    preservePending: input.preservePending === true,
     shouldYield: () => input.signal?.aborted === true,
     onError: (error) =>
       logger.warn('[VIVENTIUM][main-continuity] Deferred maintenance unavailable', {
@@ -428,14 +438,8 @@ async function runAcceptedMainCompaction(input = {}) {
   // A reservation or continuity-store claim does not own provider capacity. Mark it releasable
   // until the compactor invocation starts, then require an explicit native release outcome.
   const active = {
-    domainKey: compactionEpochKey(input),
-    controller,
-    settled,
     capacityReleaseAcknowledged: true,
   };
-  const ownerCompactions = activeCompactionsByOwnerId.get(ownerId) || new Set();
-  ownerCompactions.add(active);
-  activeCompactionsByOwnerId.set(ownerId, ownerCompactions);
   const inputSignal = input.signal;
   let releaseCancellationDelivery = () => {};
   const abortFromInput = () => {
@@ -906,7 +910,18 @@ async function runAcceptedMainCompaction(input = {}) {
       }
       semanticAttempts += 1;
       if (repairingFidelity) fidelityRepairAttempts += 1;
-      const proposal = parseSemanticCompactionOutput(raw);
+      const decodedProposal = parseSemanticCompactionOutput(raw);
+      const repairInput = mainCompactionFieldRepairInput(
+        claim.previousSemanticCompaction,
+        correctionReason,
+        claim.outputContract,
+      );
+      const proposal = applyMainCompactionFieldRepair(
+        decodedProposal,
+        repairInput?.candidate,
+        repairInput?.contract || null,
+      );
+      if (proposal && proposal !== decodedProposal) raw = JSON.stringify(proposal);
       let prepared = inspectMainCompactionCandidate(proposal, claim.outputContract, {
         previousSemanticCompaction: claim.previousSemanticCompaction || null,
         sourceTurns: claim.sourceTurns || [],
@@ -1168,13 +1183,6 @@ async function runAcceptedMainCompaction(input = {}) {
     };
   } finally {
     inputSignal?.removeEventListener?.('abort', abortFromInput);
-    ownerCompactions.delete(active);
-    if (
-      ownerCompactions.size === 0 &&
-      activeCompactionsByOwnerId.get(ownerId) === ownerCompactions
-    ) {
-      activeCompactionsByOwnerId.delete(ownerId);
-    }
     settleActive();
     releaseCancellationDelivery();
   }
@@ -1193,34 +1201,40 @@ function loadAcceptedMainContextForAdmission(input = {}) {
     request: input.req,
     identityKey: `${input.agentId}:${input.stableAuthoritySha256}`,
     signal: input.signal,
-    getActiveCompactions: () => {
-      const domainKey = compactionEpochKey(input);
-      discardDeferredMainCompaction(domainKey);
-      return Array.from(activeCompactionsByOwnerId.get(String(input.ownerId || '').trim()) || [])
-        .filter((active) => active.domainKey === domainKey)
-        .map(async (active) => {
-          await active.settled;
-          if (active.capacityReleaseAcknowledged !== true)
-            throw Object.assign(new Error('Native memory capacity release is unconfirmed.'), {
-              code: 'main_compaction_native_release_unconfirmed',
-            });
-        });
-    },
-    load: () => {
+    load: async () => {
+      let context;
       if (usePinned) {
         usePinned = false;
-        return Promise.resolve(
-          renderAcceptedMainContextForCarrier(pinned.context, input.outputCarrier),
-        );
-      }
-      return (input.loadContext || loadAcceptedMainContext)(input);
+        context = pinned.context;
+      } else context = await (input.loadContext || loadAcceptedMainContext)(input);
+      const rendered = renderAcceptedMainContextForCarrier(context, input.outputCarrier, {
+        allowDegraded: true,
+      });
+      return rendered.continuityDegraded
+        ? renderAcceptedMainContextForCarrier(context, input.outputCarrier, {
+            allowDegraded: true,
+            unavailableInstructions: getRequiredPromptText('main.continuity_availability'),
+          })
+        : rendered;
     },
-    ensure: () =>
-      (input.ensureCompaction || ensureAcceptedMainCompaction)({
+    defer: () =>
+      scheduleMainContinuityMaintenance({
         ...input,
-        trigger: 'context_carrier',
-        foreground: true,
-        reallocateOutputCarrier: true,
+        signal: undefined,
+        preservePending: true,
+        schedule: () => {
+          const backgroundReq = Object.create(input.req || null);
+          backgroundReq.viventiumSchedulerAuthoringDeadlineAt = undefined;
+          return (input.ensureCompaction || runBackgroundMainCompaction)({
+            ...input,
+            req: backgroundReq,
+            trigger: 'context_carrier',
+            foreground: false,
+            signal: undefined,
+            deadlineAt: undefined,
+            reallocateOutputCarrier: true,
+          });
+        },
       }),
   });
 }

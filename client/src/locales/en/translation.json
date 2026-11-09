@@ -2236,6 +2236,7 @@
   "com_ui_parallel_work_state_running": "Working",
   "com_ui_parallel_work_state_settling": "Finishing",
   "com_ui_parallel_work_state_paused": "Paused",
+  "com_ui_parallel_work_state_blocked": "Could not start",
   "com_ui_parallel_work_state_needs_input": "Needs your input",
   "com_ui_parallel_work_state_stopping": "Stopping",
   "com_ui_parallel_work_state_completed": "Complete",

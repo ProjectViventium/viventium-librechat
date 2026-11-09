@@ -254,10 +254,19 @@ async function acknowledgeRetainedTelegramFailure(
       )
         return { status: 'not_found' };
       const nativeFailure = terminal.nativeFailure;
+      // The Native owner persists an unsupported graph interruption as a typed
+      // terminal error without a replay snapshot. Acknowledge that exact failure
+      // once; an active or unproved response still cannot settle its input.
+      const unsupportedTerminal =
+        nativeFailure?.status === 'unsupported' &&
+        terminal.error_class === 'native_response_unsupported';
       if (
         nativeFailure &&
-        (!['failed', 'cancelled'].includes(nativeFailure.status) ||
-          !(nativeFailure.finalReplayStoredAt > 0) ||
+        (!(
+          unsupportedTerminal ||
+          (['failed', 'cancelled'].includes(nativeFailure.status) &&
+            nativeFailure.finalReplayStoredAt > 0)
+        ) ||
           nativeFailure.userId !== record.libreChatUserId ||
           nativeFailure.conversationId !== record.conversationId ||
           nativeFailure.streamId !== record.streamId ||

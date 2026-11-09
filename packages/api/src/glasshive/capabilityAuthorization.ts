@@ -7,6 +7,8 @@
  * === VIVENTIUM END === */
 
 import crypto from 'node:crypto';
+import { EToolResources } from 'librechat-data-provider';
+import { conversationRecallResourceAuthority } from '../agents/conversationRecall';
 
 type ValueRecord = { [key: string]: unknown };
 
@@ -226,7 +228,6 @@ const ADMISSION_VERSION = 'v1';
 const MAX_AUTHORIZATION_SECONDS = 24 * 60 * 60;
 const AUTHORIZATION_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 const MAX_ADMISSION_SKEW_SECONDS = 60;
-const DEFAULT_RESOURCE_MAX_BYTES = 512 * 1024;
 const SIMPLE_REF = /^[A-Za-z0-9][A-Za-z0-9._:@-]{7,191}$/;
 const CONTAINER_GENERATION_ID = /^[a-f0-9]{64}$/;
 let indexesPromise: Promise<unknown[]> | undefined;
@@ -301,13 +302,30 @@ function serverDiscoveryPartition(
   return { eagerServers: eager, deferredServers: deferred };
 }
 
-function matchesAuthorizationEnvelope(record: AuthorizationRecord, envelope: ValueRecord): boolean {
+function resourceAuthorityEnvelope(envelope: ValueRecord): ValueRecord {
+  const resources = recordFrom(envelope.hostToolResources);
+  return { ...envelope, hostToolResources: Object.fromEntries(Object.entries(resources).map(([name, value]) => {
+    const resource = recordFrom(value);
+    if (name !== EToolResources.file_search || !Array.isArray(resource.files)) return [name, value];
+    return [name, { ...resource, files: resource.files.map((file: unknown) =>
+      file && typeof file === 'object' && !Array.isArray(file)
+        ? conversationRecallResourceAuthority(file as ValueRecord) : file) }];
+  })) };
+}
+
+function matchesAuthorizationEnvelope(record: AuthorizationRecord, envelope: ValueRecord, nowMs: number): boolean {
   // A rollout must not migrate an already prepared origin to a different signed discovery scope.
-  if (record.eagerServers === undefined && record.deferredServers === undefined) {
-    const { eagerServers: _eager, deferredServers: _deferred, ...legacyEnvelope } = envelope;
-    return record.scopeFingerprint === scopeFingerprint(legacyEnvelope);
-  }
-  return record.scopeFingerprint === scopeFingerprint(envelope);
+  const { eagerServers: _eager, deferredServers: _deferred, ...legacyEnvelope } = envelope;
+  const candidate = record.eagerServers === undefined && record.deferredServers === undefined
+    ? legacyEnvelope : envelope;
+  if (record.scopeFingerprint === scopeFingerprint(candidate)) return true;
+  if (!Number.isFinite(nowMs) || record.status !== 'active' || record.workRef || record.workerId || record.currentRunId ||
+      record.currentGrantId || record.currentContainerGenerationId || record.currentHostStartupLeaseId ||
+      !Number.isFinite(new Date(record.maxExpiresAt).getTime()) ||
+      new Date(record.maxExpiresAt).getTime() <= nowMs) return false;
+  const saved = Object.fromEntries(Object.keys(candidate).map((key) => [key, record[key]]));
+  if (record.scopeFingerprint !== scopeFingerprint(saved)) return false;
+  return stableJson(resourceAuthorityEnvelope(saved)) === stableJson(resourceAuthorityEnvelope(candidate));
 }
 /* VIVENTIUM END */
 
@@ -425,18 +443,6 @@ function scopedHostToolResources(resources: unknown, allowedHostTools: string[])
     const copied = copyJson<ValueRecord | null>(value, null);
     if (copied) result[toolName] = copied;
   }
-  const configured = Number(process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RESOURCE_MAX_BYTES);
-  const maxBytes = Math.max(
-    16 * 1024,
-    Number.isFinite(configured) ? Math.floor(configured) : DEFAULT_RESOURCE_MAX_BYTES,
-  );
-  if (Buffer.byteLength(stableJson(result), 'utf8') > maxBytes) {
-    throw new CapabilityAuthorizationError(
-      'capability_authorization_scope_too_large',
-      'The mission capability authorization scope is too large.',
-      { status: 413, needsInput: false },
-    );
-  }
   return result;
 }
 
@@ -504,7 +510,7 @@ export async function createCapabilityAuthorization({
     originRef: normalizedOriginRef,
   });
   if (existing) {
-    if (!matchesAuthorizationEnvelope(existing, envelope)) {
+    if (!matchesAuthorizationEnvelope(existing, envelope, nowMs)) {
       throw new CapabilityAuthorizationError(
         'capability_authorization_conflict',
         'The mission origin already has a different capability authorization.',
@@ -539,7 +545,7 @@ export async function createCapabilityAuthorization({
       ownerId,
       originRef: normalizedOriginRef,
     });
-    if (!raced || !matchesAuthorizationEnvelope(raced, envelope)) {
+    if (!raced || !matchesAuthorizationEnvelope(raced, envelope, nowMs)) {
       throw new CapabilityAuthorizationError(
         'capability_authorization_conflict',
         'The mission origin already has a different capability authorization.',
@@ -1139,6 +1145,20 @@ function authorizationDateMs(value: unknown): number {
   } catch {
     return NaN;
   }
+}
+
+/** Read the existing mission ceiling without renewal, grants, or authority changes. */
+export async function readCapabilityAuthorizationServerScope({ ownerId, workRef }: ReauthorizeInput = {}) {
+  const normalizedOwner = String(ownerId || '').trim();
+  const normalizedWork = String(workRef || '').trim();
+  if (!normalizedOwner || !SIMPLE_REF.test(normalizedWork)) return null;
+  const record = await authorizationCollection().findOne({
+    ownerId: normalizedOwner, workRef: normalizedWork, status: 'active',
+  });
+  if (!record || !Array.isArray(record.allowedServers) ||
+      record.allowedServers.some((server) => typeof server !== 'string' || !server || server.trim() !== server))
+    return null;
+  return [...new Set(record.allowedServers)];
 }
 
 /** Read a historical descriptor candidate; the native action digest alone owns receipt recovery. */

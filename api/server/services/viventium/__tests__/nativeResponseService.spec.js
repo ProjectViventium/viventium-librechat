@@ -1711,6 +1711,22 @@ describe('terminal mission current Native Main courier', () => {
       .mockResolvedValue({ status: 'queued', deliveryId: 'd'.repeat(64) });
   });
   afterEach(() => offer.mockRestore());
+  test('offers Telegram evidence only to Main in the accepted source order scope', async () => {
+    expect(
+      await native.offerMissionEvidenceToCurrentMain({
+        ...input,
+        expectedSourceOrderScope: 'different-topic',
+      }),
+    ).toBe(false);
+    expect(offer).not.toHaveBeenCalled();
+    expect(
+      await native.offerMissionEvidenceToCurrentMain({
+        ...input,
+        expectedSourceOrderScope: identity.sourceOrderScope,
+      }),
+    ).toBe(true);
+    expect(offer).toHaveBeenCalledTimes(1);
+  });
   test('offers exact evidence through Native and defers without claiming consumption', async () => {
     expect(await native.offerMissionEvidenceToCurrentMain(input)).toBe(true);
     expect(offer).toHaveBeenCalledWith(

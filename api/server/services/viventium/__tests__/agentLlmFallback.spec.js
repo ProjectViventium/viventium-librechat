@@ -841,3 +841,21 @@ test.each([402, 403])('typed Direct HTTP%s access denial keeps configured fallba
   ).toBe(true);
 });
 /* === VIVENTIUM END === */
+
+/* === VIVENTIUM START === File publication is a courier failure, not another AI attempt. === */
+test.each(['error_class', 'code', 'error_code'])(
+  'file courier failure never retries the model (%s)',
+  (field) => {
+    expect(
+      shouldRetryWithFallback([
+        {
+          type: ContentTypes.ERROR,
+          error: 'Synthetic provider failure',
+          error_class: 'provider_response_failed',
+          [field]: 'native_output_files_identity_unavailable',
+        },
+      ]),
+    ).toBe(false);
+  },
+);
+/* === VIVENTIUM END === */

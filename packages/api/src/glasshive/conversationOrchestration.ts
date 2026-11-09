@@ -20,6 +20,9 @@ interface DelegationRequest extends UnknownRecord {
 }
 
 export const DELEGATION_TOOL_NAME = 'worker_delegate_once_mcp_glasshive-workers-projects';
+export const COORDINATION_CONTROL_CONTRACT_META = Object.freeze({
+  'xperfect.coordination/contract': 'original-context-v1',
+});
 export const CONVERSATION_ORCHESTRATION_TOOLS = Object.freeze([
   DELEGATION_TOOL_NAME,
   'active_work_list',
@@ -42,8 +45,6 @@ export const MAIN_DELEGATION_DESCRIPTION =
 
 export const MAIN_DELEGATION_STRING_LIMITS = Object.freeze({
   title: 200,
-  instruction: 100000,
-  goal: 10000,
   workerName: 200,
   workerRole: 500,
   profile: 100,
@@ -69,9 +70,8 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
       description:
         'Work the new worker must perform. Main already owns this launch. Preserve the goal, constraints and output shape; original selected source wording is retained separately. Do not assign orchestration already performed by this call. With inheritContext=true, this optional value must be an exact verbatim clause from a selected original input for this one assignment. Omit it to use the whole selected input; do not summarize or paraphrase it. Full conversation context stays available.',
       minLength: 1,
-      maxLength: MAIN_DELEGATION_STRING_LIMITS.instruction,
     },
-    goal: { type: 'string', minLength: 1, maxLength: MAIN_DELEGATION_STRING_LIMITS.goal },
+    goal: { type: 'string', minLength: 1 },
     workerName: {
       type: 'string',
       minLength: 1,
@@ -108,15 +108,13 @@ export const MAIN_DELEGATION_JSON_SCHEMA = Object.freeze({
     },
     sourceOrdinals: {
       type: 'array',
-      maxItems: 32,
       description:
         'Required when trusted turn context lists S1/S2/etc. Select exactly which rapid user inputs this mission owns.',
-      items: { type: 'integer', minimum: 1, maximum: 32 },
+      items: { type: 'integer', minimum: 1 },
     },
     fileIds: {
       type: 'array',
       minItems: 0,
-      maxItems: 64,
       uniqueItems: true,
       items: { type: 'string', minLength: 1, maxLength: 256 },
       description:
@@ -138,10 +136,7 @@ export function mainDelegationJsonSchema(
       : undefined;
   const count = Array.isArray(sources) ? sources.length : 0;
   if (count <= 1 && !historicalFileChoices.length) return MAIN_DELEGATION_JSON_SCHEMA;
-  const maximum = Math.min(
-    count,
-    MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.items.maximum,
-  );
+  const maximum = count;
   return {
     ...MAIN_DELEGATION_JSON_SCHEMA,
     properties: {
@@ -218,7 +213,7 @@ export const ACTIVE_WORK_ACTION_JSON_SCHEMA = Object.freeze({
       enum: ['queue', 'message', 'steer', 'pause', 'resume', 'stop', 'retry', 'dismiss'],
       description: ACTIVE_WORK_ACTION_SEMANTICS,
     },
-    instruction: { type: 'string', minLength: 1, maxLength: 8000 },
+    instruction: { type: 'string', minLength: 1 },
     nativeInput: {
       type: 'object',
       additionalProperties: false,
@@ -281,6 +276,93 @@ function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** The same MCP view serves native and Direct coordinators over existing work owners. */
+export function coordinationToolDefinitions(definitions: UnknownRecord[]): UnknownRecord[] {
+  const start = definitions.find((item) => item.name === DELEGATION_TOOL_NAME);
+  const control = definitions.find((item) => item.name === 'active_work_action');
+  const roster = definitions.find((item) => item.name === 'active_work_list');
+  const output: UnknownRecord[] = roster ? [{ ...roster, name: 'list_workers' }] : [];
+  if (!start && !control) return output;
+  const startSchema = isRecord(start?.inputSchema) ? start.inputSchema : {};
+  const controlSchema = isRecord(control?.inputSchema) ? control.inputSchema : {};
+  const startProperties = isRecord(startSchema.properties) ? startSchema.properties : {};
+  const controlProperties = isRecord(controlSchema.properties) ? controlSchema.properties : {};
+  const fields = control ? ['workRef', 'sourceOrdinals', 'nativeInput', 'instruction', 'fileIds'] : [];
+  const properties = Object.fromEntries(fields.flatMap((key) => {
+    const value = key === 'sourceOrdinals' || key === 'instruction'
+      ? startProperties[key] ?? controlProperties[key]
+      : controlProperties[key] ?? startProperties[key];
+    if (key === 'sourceOrdinals' && isRecord(value)) {
+      return [[key, { ...value, description:
+        'Optional exact selection of current original inputs for guidance to this existing workRef.' }]];
+    }
+    if (key === 'instruction' && isRecord(value)) {
+      return [[key, { ...value, description:
+        'Normally omit: the current original guidance is inherited automatically for this existing workRef. An optional narrower clause must be byte-exact original text; do not paraphrase or add conditions.' }]];
+    }
+    if (key === 'workRef' && isRecord(value))
+      return [[key, { ...value, description: 'Required exact existing workRef from the current work roster.' }]];
+    if (isRecord(value) && typeof value.description === 'string')
+      return [[key, { ...value, description: value.description.replaceAll('active_work_list', 'list_workers') }]];
+    return value ? [[key, value]] : [];
+  }));
+  if (start) output.push({
+    ...start,
+    name: 'hand_off_to',
+    description: 'Accept the complete current original input once for new background work, including sibling objectives and shared conditions. Call with no arguments. The background coordinator chooses and manages Workers, files and execution after durable acceptance. Original context and authorized capabilities stay available. Return after the acceptance receipt and acknowledge naturally; later execution evidence proves starts or completion. For existing work, use active_work_action instead.',
+    inputSchema: {
+      type: 'object',
+      properties: { action: { type: 'string', const: 'start',
+        description: 'Optional new-work flag. The complete original input and authorized context are inherited.' } },
+      additionalProperties: false,
+    },
+  });
+  if (control) output.push({
+    ...control,
+    name: 'active_work_action',
+    _meta: { ...(isRecord(control._meta) ? control._meta : {}), ...COORDINATION_CONTROL_CONTRACT_META },
+    description: `Control one existing work item. Both its exact current workRef and an offered action are required. Current original guidance and authorized context are inherited automatically; omit instruction unless selecting a narrower exact original clause. ${ACTIVE_WORK_ACTION_SEMANTICS.replaceAll('active_work_list', 'list_workers')}`,
+    inputSchema: {
+      type: 'object',
+      properties: { ...properties, action: { type: 'string',
+        enum: ACTIVE_WORK_ACTION_JSON_SCHEMA.properties.action.enum,
+        description: 'Required. One action offered for this exact existing workRef.' } },
+      required: ['action', 'workRef'],
+      additionalProperties: false,
+    },
+  });
+  return output;
+}
+
+/** Translate names only; authorization, source selection and execution retain their owners. */
+export function coordinationToolCall(name: string, args: UnknownRecord): {
+  toolName: string; args: UnknownRecord;
+} {
+  if (name === 'list_workers') return { toolName: 'active_work_list', args };
+  if (name === 'active_work_action')
+    return { toolName: name, args };
+  const permitted = ['action', 'workRef', 'sourceOrdinals', 'fileIds', 'nativeInput', 'instruction'];
+  if (name !== 'hand_off_to' || Object.keys(args).some((key) => !permitted.includes(key))) {
+    throw new TypeError('coordination_arguments_invalid');
+  }
+  const { action: suppliedAction, ...input } = args;
+  const action = suppliedAction === undefined ? (input.workRef === undefined ? 'start' : undefined) : suppliedAction;
+  if (action === undefined) {
+    throw new TypeError('action is required: use start for new work, or an offered action with the exact existing workRef');
+  }
+  if (action === 'start') {
+    if (Object.keys(input).length) {
+      throw new TypeError('coordination_start_arguments_invalid');
+    }
+    return { toolName: DELEGATION_TOOL_NAME, args: { ...input, inheritContext: true } };
+  }
+  if (!ACTIVE_WORK_ACTION_JSON_SCHEMA.properties.action.enum.includes(String(action)) || !input.workRef) {
+    throw new TypeError('coordination_action_invalid');
+  }
+  return { toolName: 'active_work_action', args: { ...input, action,
+    ...(['queue', 'message', 'steer', 'retry'].includes(String(action)) ? { inheritContext: true } : {}) } };
+}
+
 function boundedString(value: unknown, maxLength: number): string {
   if (typeof value !== 'string') return '';
   const trimmed = value.trim();
@@ -298,9 +380,8 @@ function canonicalSourceOrdinals(value: unknown): number[] {
   return Array.from(
     new Set(
       value
-        .slice(0, 32)
         .map(Number)
-        .filter((item) => Number.isInteger(item) && item >= 1 && item <= 32),
+        .filter((item) => Number.isSafeInteger(item) && item >= 1),
     ),
   ).sort((left, right) => left - right);
 }
@@ -326,10 +407,9 @@ export function canonicalConversationOrchestrationArguments(
     }
     const output: UnknownRecord = {
       title: boundedString(input.title, MAIN_DELEGATION_STRING_LIMITS.title),
-      instruction: boundedString(input.instruction, MAIN_DELEGATION_STRING_LIMITS.instruction),
+      instruction: typeof input.instruction === 'string' ? input.instruction : '',
     };
     const optionalStrings: Array<[string, number]> = [
-      ['goal', MAIN_DELEGATION_STRING_LIMITS.goal],
       ['workerName', MAIN_DELEGATION_STRING_LIMITS.workerName],
       ['workerRole', MAIN_DELEGATION_STRING_LIMITS.workerRole],
       ['profile', MAIN_DELEGATION_STRING_LIMITS.profile],
@@ -339,6 +419,7 @@ export function canonicalConversationOrchestrationArguments(
       const value = boundedString(input[key], maxLength);
       if (value) output[key] = value;
     }
+    if (typeof input.goal === 'string' && input.goal.trim()) output.goal = input.goal;
     if (input.workspaceRoot !== undefined) {
       if (typeof input.workspaceRoot !== 'string') {
         throw new TypeError('workspaceRoot must be a string');
@@ -348,13 +429,13 @@ export function canonicalConversationOrchestrationArguments(
     if (input.requiresHostAccess === true) output.requiresHostAccess = true;
     if (input.longMission === true) output.longMission = true;
     output.resourceClass = input.resourceClass;
+    if (input.inheritContext === true) output.inheritContext = true;
     const sourceOrdinals = canonicalSourceOrdinals(input.sourceOrdinals);
     if (sourceOrdinals.length) output.sourceOrdinals = sourceOrdinals;
     const fileIds = input.fileIds;
     if (
       fileIds !== undefined &&
       (!Array.isArray(fileIds) ||
-        fileIds.length > 64 ||
         fileIds.some(
           (id) => typeof id !== 'string' || !id.trim() || id.trim() !== id || id.length > 256,
         ) ||
@@ -366,26 +447,10 @@ export function canonicalConversationOrchestrationArguments(
     return output;
   }
   if (toolName === 'active_work_action') {
-    if (
-      Object.prototype.hasOwnProperty.call(input, 'nativeHumanInput') ||
-      Object.prototype.hasOwnProperty.call(input, 'ownerInputControl')
-    ) {
+    if (Object.prototype.hasOwnProperty.call(input, 'nativeHumanInput') || Object.prototype.hasOwnProperty.call(input, 'ownerInputControl')) {
       throw new TypeError('native owner input authority is server-owned');
     }
-    if (
-      input.inheritContext === true &&
-      typeof input.instruction === 'string' &&
-      input.instruction.length > 100000
-    ) {
-      throw Object.assign(
-        new TypeError('Inherited action input exceeds the native instruction limit.'),
-        { code: 'inherited_instruction_too_large' },
-      );
-    }
-    const instruction = boundedString(
-      input.instruction,
-      input.inheritContext === true ? 100000 : 8000,
-    );
+    const instruction = typeof input.instruction === 'string' ? input.instruction : '';
     const fileIds = input.fileIds;
     const nativeInput =
       input.nativeInput === undefined
@@ -416,12 +481,9 @@ export function canonicalConversationOrchestrationArguments(
     return {
       workRef: boundedString(input.workRef, 160),
       action: boundedString(input.action, 32).toLowerCase(),
-      ...(input.inheritContext === true
-        ? {
-            inheritContext: true,
-            sourceOrdinals: canonicalSourceOrdinals(input.sourceOrdinals),
-          }
-        : {}),
+      ...(input.inheritContext === true ? {
+        inheritContext: true, sourceOrdinals: canonicalSourceOrdinals(input.sourceOrdinals),
+      } : {}),
       ...(instruction ? { instruction } : {}),
       ...(nativeInput ? { nativeInput } : {}),
       ...(Array.isArray(fileIds) && fileIds.length ? { fileIds: [...(fileIds as string[])] } : {}),
@@ -545,8 +607,10 @@ export function recordMainDelegationOutcome(
   const key = boundedString(invocationId, 192) || `attempt-${outcomes.size + 1}`;
   const status = boundedString(row.status, 32).toLowerCase();
   const workRef = boundedString(row.workRef || row.work_ref, 160);
+  const handoffRef = boundedString(row.handoffRef, 160);
   outcomes.set(key, {
-    confirmed: status === 'ok' && WORK_REF_PATTERN.test(workRef),
+    confirmed: status === 'ok' && (WORK_REF_PATTERN.test(workRef) ||
+      (row.accepted === true && WORK_REF_PATTERN.test(handoffRef))),
     retryable: row.retryable === true,
     needsInput: row.needsInput === true || row.needs_input === true,
   });

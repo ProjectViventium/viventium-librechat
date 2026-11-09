@@ -44,6 +44,34 @@ export interface GlassHiveWorkActionInput {
   voiceAuthorityContext?: { callSessionId?: unknown; binding?: VoiceWorkAuthorityBinding };
 }
 
+export function buildGlassHiveWorkActionRequest(input: {
+  action: string;
+  idempotencyKey: string;
+  instruction?: unknown;
+  runtimeBundle?: object;
+  nativeInput?: object;
+  nativeHumanInput?: object;
+  capabilityReauthorization?: unknown;
+  sourceContext?: object | null;
+  inheritedConversation?: object;
+  fileInputs?: object[];
+}) {
+  return {
+    action: input.action,
+    ...(input.runtimeBundle ? { runtimeBundle: input.runtimeBundle } : {}),
+    ...(input.instruction ? { instruction: input.instruction } : {}),
+    idempotencyKey: input.idempotencyKey,
+    ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
+    ...(input.nativeHumanInput ? { nativeHumanInput: input.nativeHumanInput } : {}),
+    ...(input.capabilityReauthorization
+      ? { capabilityReauthorization: input.capabilityReauthorization }
+      : {}),
+    ...(input.sourceContext ? { sourceContext: input.sourceContext } : {}),
+    ...(input.inheritedConversation ? { inheritedConversation: input.inheritedConversation } : {}),
+    ...(input.fileInputs?.length ? { fileInputs: input.fileInputs } : {}),
+  };
+}
+
 interface GenerationJobManagerAdapter {
   getJob(streamId: string): Promise<unknown>;
 }
@@ -112,6 +140,57 @@ function actionSourceRef(prefix: string, values: unknown[]): string {
     .createHash('sha256')
     .update(values.map((value) => String(value || '')).join('\0'), 'utf8')
     .digest('hex')}`;
+}
+
+export function buildGlassHiveWorkActionSourceContext(
+  {
+    ownerId,
+    workRef,
+    action,
+    operationId,
+    sourceSurface,
+    durableEffectContext,
+  }: GlassHiveWorkActionInput,
+  originValue: unknown,
+): UnknownRecord | null {
+  const actionName = normalizedText(action).toLowerCase();
+  if (!RUN_PRODUCING_ACTIONS.has(actionName)) return null;
+  const originRef = normalizedText(originValue);
+  if (!originRef)
+    throw Object.assign(new Error('glasshive_action_origin_unavailable'), {
+      code: 'glasshive_action_origin_unavailable',
+      status: 409,
+    });
+  let surface: string;
+  let sourceAnchor = '';
+  let sourceRevision = 1;
+  if (durableEffectContext) {
+    surface = normalizedText(durableEffectContext.sourceSurface).toLowerCase();
+    sourceAnchor = normalizedText(durableEffectContext.sourceEventId);
+    sourceRevision = Number(durableEffectContext.sourceRevision);
+    if (
+      !ACTION_SOURCE_SURFACES.has(surface) ||
+      !sourceAnchor ||
+      !Number.isSafeInteger(sourceRevision) ||
+      sourceRevision < 1
+    )
+      throw Object.assign(new Error('glasshive_action_source_context_unavailable'), {
+        code: 'glasshive_action_source_context_unavailable',
+        status: 409,
+      });
+  } else {
+    const requested = normalizedText(sourceSurface).toLowerCase();
+    surface = ACTION_SOURCE_SURFACES.has(requested) ? requested : 'web';
+  }
+  const identity = [ownerId, workRef, actionName, operationId, surface];
+  return {
+    version: 1,
+    originRef,
+    sourceEventId: actionSourceRef('work_action_event', [...identity, sourceAnchor]),
+    sourceRevision,
+    surface,
+    outputContract: { mode: 'inherit' },
+  };
 }
 
 export function needsCapabilityReauthorization(detail: unknown = {}): boolean {
@@ -261,46 +340,11 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     sourceSurface,
     durableEffectContext,
   }: GlassHiveWorkActionInput): Promise<UnknownRecord | null> {
-    const actionName = normalizedText(action).toLowerCase();
-    if (!RUN_PRODUCING_ACTIONS.has(actionName)) return null;
-    const originRef = normalizedText(await deps.getCoreWorkOriginRef({ ownerId, workRef }));
-    if (!originRef) {
-      throw Object.assign(new Error('glasshive_action_origin_unavailable'), {
-        code: 'glasshive_action_origin_unavailable',
-        status: 409,
-      });
-    }
-    let surface: string;
-    let sourceAnchor = '';
-    let sourceRevision = 1;
-    if (durableEffectContext) {
-      surface = normalizedText(durableEffectContext.sourceSurface).toLowerCase();
-      sourceAnchor = normalizedText(durableEffectContext.sourceEventId);
-      sourceRevision = Number(durableEffectContext.sourceRevision);
-      if (
-        !ACTION_SOURCE_SURFACES.has(surface) ||
-        !sourceAnchor ||
-        !Number.isSafeInteger(sourceRevision) ||
-        sourceRevision < 1
-      ) {
-        throw Object.assign(new Error('glasshive_action_source_context_unavailable'), {
-          code: 'glasshive_action_source_context_unavailable',
-          status: 409,
-        });
-      }
-    } else {
-      const requestedSurface = normalizedText(sourceSurface).toLowerCase();
-      surface = ACTION_SOURCE_SURFACES.has(requestedSurface) ? requestedSurface : 'web';
-    }
-    const identity = [ownerId, workRef, actionName, operationId, surface];
-    return {
-      version: 1,
-      originRef,
-      sourceEventId: actionSourceRef('work_action_event', [...identity, sourceAnchor]),
-      sourceRevision,
-      surface,
-      outputContract: { mode: 'inherit' },
-    };
+    if (!RUN_PRODUCING_ACTIONS.has(normalizedText(action).toLowerCase())) return null;
+    return buildGlassHiveWorkActionSourceContext(
+      { ownerId, workRef, action, operationId, sourceSurface, durableEffectContext },
+      await deps.getCoreWorkOriginRef({ ownerId, workRef }),
+    );
   }
 
   async function traceAcceptedVoiceAction(
@@ -509,6 +553,82 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         });
       }
     }
+    if (action === 'retry' && nativeDetail === undefined) {
+      await assertCurrentVoiceAuthority();
+      nativeDetail = await deps.requestAccountApi({
+        ownerId,
+        path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}`,
+      });
+    }
+    const detail = recordFrom(nativeDetail);
+    if (
+      action === 'retry' &&
+      detail.managementKind === 'native_coordinator' &&
+      (detail.workRef !== workRef ||
+        !normalizedText(detail.nativeGoalId) ||
+        !normalizedText(detail.nativeConversationId) ||
+        typeof detail.nativeRunId !== 'string')
+    ) {
+      throw Object.assign(new Error('coordinator_work_detail_invalid'), {
+        code: 'coordinator_work_detail_invalid',
+        status: 409,
+      });
+    }
+    const dispatchRetry =
+      action === 'retry' &&
+      detail.workRef === workRef &&
+      detail.managementKind === 'native_coordinator' &&
+      typeof detail.nativeGoalId === 'string' &&
+      typeof detail.nativeConversationId === 'string' &&
+      detail.nativeRunId === '' &&
+      !detail.nativeWorkRef;
+    const planningRetry =
+      action === 'retry' &&
+      detail.workRef === workRef &&
+      detail.managementKind === 'native_coordinator_turn' &&
+      typeof detail.nativeTurnId === 'string' &&
+      Boolean(detail.nativeTurnId) &&
+      typeof detail.nativeConversationId === 'string' &&
+      Boolean(detail.nativeConversationId) &&
+      !detail.nativeWorkRef;
+    if (
+      action === 'retry' &&
+      detail.managementKind === 'native_coordinator_turn' &&
+      !planningRetry
+    ) {
+      throw Object.assign(new Error('coordinator_work_detail_invalid'), {
+        code: 'coordinator_work_detail_invalid',
+        status: 409,
+      });
+    }
+    if (
+      dispatchRetry &&
+      (detail.state !== 'blocked' ||
+        !Array.isArray(detail.actions) ||
+        !detail.actions.includes('retry') ||
+        instruction ||
+        input.fileIds?.length ||
+        input.nativeInput)
+    ) {
+      throw Object.assign(new Error('coordinator_dispatch_retry_unavailable'), {
+        code: 'coordinator_dispatch_retry_unavailable',
+        status: 409,
+      });
+    }
+    if (
+      planningRetry &&
+      (((!Array.isArray(detail.actions) || !detail.actions.includes('retry')) &&
+        !detail.nativeRetryTurnId) ||
+        instruction ||
+        input.fileIds?.length ||
+        input.nativeInput)
+    ) {
+      throw Object.assign(new Error('coordinator_planning_retry_unavailable'), {
+        code: 'coordinator_planning_retry_unavailable',
+        status: 409,
+      });
+    }
+    const controlOnlyRetry = dispatchRetry || planningRetry;
     const capabilityReauthorization = await trustedCapabilityRefresh(
       {
         ownerId,
@@ -525,41 +645,49 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
       action,
       operationId,
     });
-    const sourceContext = await trustedActionSourceContext({
-      ownerId,
-      workRef,
-      action,
-      operationId,
-      sourceSurface,
-      durableEffectContext,
-    });
+    const sourceContext = controlOnlyRetry
+      ? null
+      : await trustedActionSourceContext({
+          ownerId,
+          workRef,
+          action,
+          operationId,
+          sourceSurface,
+          durableEffectContext,
+        });
     await assertCurrentVoiceAuthority();
-    const fileInputs = await prepareFileInputs(input, idempotencyKey);
+    const fileInputs = controlOnlyRetry
+      ? undefined
+      : await prepareFileInputs(input, idempotencyKey);
     await assertCurrentVoiceAuthority();
     if (input.inheritedConversation && !RUN_PRODUCING_ACTIONS.has(action)) {
       throw new Error('inherited_context_action_invalid');
     }
     const runtimeBundle =
-      input.requestBody && (RUN_PRODUCING_ACTIONS.has(action) || action === 'resume')
+      !controlOnlyRetry &&
+      input.requestBody &&
+      (RUN_PRODUCING_ACTIONS.has(action) || action === 'resume')
         ? await deps.prepareActionRuntimeBundle?.({
             ownerId: normalizedText(ownerId),
             requestBody: input.requestBody,
           })
         : undefined;
     await assertCurrentVoiceAuthority();
-    const actionBody = {
+    const actionBody = buildGlassHiveWorkActionRequest({
       action,
-      ...(runtimeBundle ? { runtimeBundle } : {}),
-      ...(instruction ? { instruction } : {}),
+      runtimeBundle,
+      instruction,
       idempotencyKey,
-      ...(input.nativeInput ? { nativeInput: input.nativeInput } : {}),
-      ...(nativeHumanInput ? { nativeHumanInput } : {}),
-      ...(capabilityReauthorization ? { capabilityReauthorization } : {}),
-      ...(sourceContext ? { sourceContext } : {}),
-      ...(input.inheritedConversation
-        ? { inheritedConversation: input.inheritedConversation }
-        : {}),
-      ...(fileInputs.length ? { fileInputs } : {}),
+      nativeInput: input.nativeInput,
+      nativeHumanInput,
+      capabilityReauthorization,
+      sourceContext,
+      inheritedConversation: controlOnlyRetry ? undefined : input.inheritedConversation,
+      fileInputs,
+    });
+    const fetchWithVoiceAuthority = async (...args: Parameters<typeof fetch>) => {
+      await assertCurrentVoiceAuthority();
+      return (deps.fetchImpl || globalThis.fetch)(...args);
     };
     let result: unknown;
     try {
@@ -567,6 +695,7 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
         ownerId,
         path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions`,
         method: 'POST',
+        fetchImpl: fetchWithVoiceAuthority,
         ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
         body: actionBody,
       });
@@ -580,6 +709,7 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
             ownerId,
             path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions/receipt`,
             method: 'POST',
+            fetchImpl: fetchWithVoiceAuthority,
             ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
             body: actionBody,
           });
@@ -615,6 +745,7 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
           ownerId,
           path: `/v1/work/${encodeURIComponent(normalizedText(workRef))}/actions/receipt`,
           method: 'POST',
+          fetchImpl: fetchWithVoiceAuthority,
           ...(input.nativeInput ? { ownerNativeInput: input.nativeInput } : {}),
           body: { ...actionBody, capabilityReauthorization: candidate },
         });

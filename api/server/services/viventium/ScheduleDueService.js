@@ -338,6 +338,7 @@ async function wakeScheduleDueResult(scope) {
 module.exports = {
   applyConversationScheduleAccess,
   wakeScheduleDueResult,
+  ensureApplicationWakeDestination: service.ensureDestination,
   receiveScheduleDue: (req) =>
     service.receive({
       rawBody: req.viventiumScheduleDueRawBody,

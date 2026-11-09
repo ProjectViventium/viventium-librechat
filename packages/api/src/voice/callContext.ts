@@ -87,4 +87,18 @@ export function bindCurrentCallContext(
 export function getCurrentCallContext(request: CurrentCallRequest): string {
   return admittedCallContexts.get(request) || '';
 }
+
+export function inheritCurrentCallContext(
+  source: CurrentCallRequest,
+  target: CurrentCallRequest,
+): boolean {
+  const context = admittedCallContexts.get(source);
+  if (!context || !source.user?.id || source.user.id !== target.user?.id ||
+      target.body?.voiceMode !== true ||
+      source.viventiumCallSession?.callSessionId !== target.viventiumCallSession?.callSessionId) {
+    return false;
+  }
+  admittedCallContexts.set(target, context);
+  return true;
+}
 /* === VIVENTIUM END === */

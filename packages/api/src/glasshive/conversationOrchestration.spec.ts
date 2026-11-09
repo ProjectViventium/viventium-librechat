@@ -7,14 +7,98 @@ import {
   ACTIVE_WORK_LIST_DESCRIPTION,
   ACTIVE_WORK_LIST_JSON_SCHEMA,
   DELEGATION_TOOL_NAME,
+  COORDINATION_CONTROL_CONTRACT_META,
   MAIN_DELEGATION_DESCRIPTION,
   MAIN_DELEGATION_JSON_SCHEMA,
   mainDelegationJsonSchema,
   canonicalConversationOrchestrationArguments,
+  coordinationToolDefinitions,
+  coordinationToolCall,
   mainDelegationTurnTruth,
   mainOrchestrationInvocationIdentity,
   recordMainDelegationOutcome,
 } from './conversationOrchestration';
+
+describe('shared native and Direct coordination view', () => {
+  const start = { name: DELEGATION_TOOL_NAME, inputSchema: {
+    ...MAIN_DELEGATION_JSON_SCHEMA,
+    properties: { ...MAIN_DELEGATION_JSON_SCHEMA.properties, inheritContext: { const: true },
+      fileIds: { type: 'array', items: { enum: ['file-owned'] } } },
+    required: ['sourceOrdinals', 'fileIds'],
+  } };
+  const control = { name: 'active_work_action', inputSchema: ACTIVE_WORK_ACTION_JSON_SCHEMA };
+  const roster = { name: 'active_work_list', inputSchema: ACTIVE_WORK_LIST_JSON_SCHEMA };
+  test('separates the new original-source flag from existing controls and roster', () => {
+    const view = coordinationToolDefinitions([start, control, roster, { name: 'web_search' }]);
+    expect(view.map((item) => item.name)).toEqual(['list_workers', 'hand_off_to', 'active_work_action']);
+    expect(view[2]._meta).toEqual(COORDINATION_CONTROL_CONTRACT_META);
+    expect(view[0]).not.toHaveProperty('_meta');
+    expect(view[1]).not.toHaveProperty('_meta');
+    const validate = new Ajv({ strict: false }).compile(view[1].inputSchema as object);
+    expect(validate({ action: 'start', fileIds: ['file-owned'] })).toBe(false);
+    expect(validate({ action: 'start', fileIds: ['foreign'] })).toBe(false);
+    expect(validate({ action: 'steer', workRef: 'work-1', fileIds: ['current-guidance-file'] })).toBe(false);
+    const validateControl = new Ajv({ strict: false }).compile(view[2].inputSchema as object);
+    expect(validateControl({ action: 'steer', workRef: 'work-1', fileIds: ['current-guidance-file'] })).toBe(true);
+    expect(validateControl({ action: 'start' })).toBe(false);
+    expect(validateControl({ workRef: 'work-1' })).toBe(false);
+    expect(validate({})).toBe(true);
+    expect(validate({ action: 'start' })).toBe(true);
+    expect(coordinationToolCall('hand_off_to', { action: 'start' }))
+      .toEqual({ toolName: DELEGATION_TOOL_NAME, args: { inheritContext: true } });
+  });
+  test.each(['queue', 'message', 'steer', 'retry'])('preserves source inheritance on %s', (action) => {
+    const original = { action, workRef: 'work-a', sourceOrdinals: [2], instruction: 'Original guidance.' };
+    expect(coordinationToolCall('active_work_action', original)).toEqual({ toolName: 'active_work_action', args: original });
+    /* Retained old hand_off_to control calls keep their original receipt path. */
+    expect(coordinationToolCall('hand_off_to', { action, workRef: 'work-a', sourceOrdinals: [2], instruction: 'Original guidance.' }))
+      .toEqual({ toolName: 'active_work_action', args: { action, workRef: 'work-a', sourceOrdinals: [2], instruction: 'Original guidance.', inheritContext: true } });
+  });
+  test('defaults an empty handoff to new work without choosing Worker resources', () => {
+    const args = { action: 'start' };
+    expect(coordinationToolCall('hand_off_to', args)).toEqual({ toolName: DELEGATION_TOOL_NAME,
+      args: { inheritContext: true } });
+    for (const definition of coordinationToolDefinitions([start, control]))
+      expect((definition.inputSchema as { properties: object }).properties).not.toHaveProperty('requiresHostAccess');
+    expect(coordinationToolCall('hand_off_to', {}))
+      .toEqual({ toolName: DELEGATION_TOOL_NAME, args: { inheritContext: true } });
+    expect(() => coordinationToolCall('hand_off_to', { workRef: 'work-a' }))
+      .toThrow('action is required');
+    expect(() => coordinationToolCall('hand_off_to', { action: 'steer', workRef: 'work-a', requiresHostAccess: true }))
+      .toThrow('coordination_arguments_invalid');
+  });
+  test.each([undefined, 'start'])('new start %s cannot author an assignment or select original fragments', (action) => {
+    const validate = new Ajv({ strict: false }).compile(coordinationToolDefinitions([start, control])[0].inputSchema as object);
+    for (const selection of [{ instruction: 'Exact A clause.' }, { sourceOrdinals: [1] }, { fileIds: [] }]) {
+      const args = { ...(action ? { action } : {}), ...selection };
+      expect(validate(args)).toBe(false);
+      expect(() => coordinationToolCall('hand_off_to', args)).toThrow('coordination_start_arguments_invalid');
+    }
+    expect(validate({ action: 'steer', workRef: 'work-a', instruction: 'Exact guidance.', sourceOrdinals: [1] })).toBe(false);
+    const startOnly = coordinationToolDefinitions([start])[0].inputSchema as { properties: object };
+    expect(Object.keys(startOnly.properties)).toEqual(['action']);
+    expect(startOnly.properties).not.toHaveProperty('action.default');
+    expect(validate({ ...(action ? { action } : {}), requiresHostAccess: true })).toBe(false);
+    expect(() => coordinationToolCall('hand_off_to', { ...(action ? { action } : {}), requiresHostAccess: true }))
+      .toThrow('coordination_arguments_invalid');
+  });
+  test.each(['pause', 'resume', 'stop', 'dismiss'])('retains exact control without inventing task input for %s', (action) => {
+    expect(coordinationToolCall('hand_off_to', { action, workRef: 'work-a' }))
+      .toEqual({ toolName: 'active_work_action', args: { action, workRef: 'work-a' } });
+  });
+  test('cannot invent an unavailable operation or suppress source inheritance', () => {
+    for (const args of [{ action: 'start', inheritContext: false }, { action: 'start', workRef: 'work-a' },
+      { action: 'steer' }, { action: 'delete', workRef: 'work-a' }]) {
+      expect(() => coordinationToolCall('hand_off_to', args)).toThrow();
+    }
+    const controlOnly = coordinationToolDefinitions([control, roster]);
+    expect(controlOnly.map((tool) => tool.name)).toEqual(['list_workers', 'active_work_action']);
+    expect(coordinationToolDefinitions([control])[0]._meta).toEqual(COORDINATION_CONTROL_CONTRACT_META);
+    const schema = controlOnly[1].inputSchema as { properties: { action: { enum: string[] } } };
+    expect(schema.properties.action.enum).not.toContain('start');
+    expect(coordinationToolDefinitions([roster]).map((item) => item.name)).toEqual(['list_workers']);
+  });
+});
 
 test('native Queen canonical action preserves exact clarification keys, including reserved own keys', () => {
   const nativeInput = JSON.parse('{"version":1,"requestId":"question-1","requestFingerprint":"'+ 'a'.repeat(64) +'","action":"accept","content":{"answers":{"__proto__":["Blue"],"constructor":["Other"]}}}');
@@ -191,7 +275,7 @@ describe('GlassHive conversation orchestration contract', () => {
       ...ordinaryMission, fileIds: [],
     }).fileIds).toEqual([]);
     for (const invalid of [[''], [' spaced'], ['duplicate', 'duplicate'], [42],
-      ['x'.repeat(257)], Array.from({ length: 65 }, (_, i) => String(i))]) {
+      ['x'.repeat(257)]]) {
       expect(() => canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, {
         ...ordinaryMission, fileIds: invalid,
       })).toThrow('fileIds require exact unique file references');
@@ -293,6 +377,22 @@ describe('GlassHive conversation orchestration contract', () => {
     });
     expect(Object.keys(request)).toEqual([]);
   });
+
+  it('confirms a durably accepted original handoff without inventing a Worker', () => {
+    const request = {};
+    recordMainDelegationOutcome(request, 'handoff', {
+      status: 'ok', accepted: true, handoffRef: 'coordinator-1:handoff-1',
+    });
+    recordMainDelegationOutcome(request, 'unaccepted', {
+      status: 'ok', accepted: false, handoffRef: 'coordinator-1:handoff-2',
+    });
+    recordMainDelegationOutcome(request, 'invalid', {
+      status: 'ok', accepted: true, handoffRef: 'not a receipt',
+    });
+    expect(mainDelegationTurnTruth(request)).toMatchObject({
+      attemptedCount: 3, confirmedCount: 1, unconfirmedCount: 2,
+    });
+  });
 });
 
 
@@ -309,7 +409,7 @@ describe('trusted delegation source schema', () => {
     expect(schema.properties.sourceOrdinals).toMatchObject({ minItems: 1, maxItems: 3,
       items: { type: 'integer', minimum: 1, maximum: 3 } });
     expect(MAIN_DELEGATION_JSON_SCHEMA.required).not.toContain('sourceOrdinals');
-    expect(MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.maxItems).toBe(32);
+    expect(MAIN_DELEGATION_JSON_SCHEMA.properties.sourceOrdinals.maxItems).toBeUndefined();
   });
 });
 
@@ -359,7 +459,7 @@ describe('advertised historical file choices', () => {
       { file_id: '11111111-1111-4111-8111-111111111111', filename: 'original.csv' }]);
     expect(schema.required).toContain('fileIds');
     expect(schema.required).not.toContain('sourceOrdinals');
-    expect(schema.properties.fileIds).toMatchObject({ minItems: 0, maxItems: 64,
+    expect(schema.properties.fileIds).toMatchObject({ minItems: 0,
       items: { type: 'string', enum: ['native_' + 'a'.repeat(64),
         '11111111-1111-4111-8111-111111111111'] } });
     expect(MAIN_DELEGATION_JSON_SCHEMA.required).not.toContain('fileIds');
@@ -385,7 +485,10 @@ test('inherited control input is not silently truncated at the legacy brief limi
   const input = { workRef: 'work-1', action: 'steer', inheritContext: true,
     sourceOrdinals: [1], instruction: 'x'.repeat(9000) };
   expect(canonicalConversationOrchestrationArguments('active_work_action', input).instruction).toBe(input.instruction);
-  expect(() => canonicalConversationOrchestrationArguments('active_work_action', {
-    ...input, instruction: 'x'.repeat(100001),
-  })).toThrow('Inherited action input exceeds the native instruction limit.');
+  for (const inheritContext of [true, false]) {
+    const instruction = 'x'.repeat(100001) + '\nDo not publish this work.';
+    expect(canonicalConversationOrchestrationArguments('active_work_action', {
+      ...input, inheritContext, instruction,
+    }).instruction === instruction).toBe(true);
+  }
 });

@@ -38,7 +38,7 @@ const {
   Message,
   ViventiumGlassHiveCallbackDelivery,
 } = require('~/db/models');
-const { getCallSession } = require('./CallSessionService');
+const { getCallSession, getActiveCallSessionForConversation } = require('./CallSessionService');
 const { stripVoiceControlTagsForDisplay } = require('./surfacePrompts');
 const {
   fenceGlassHiveCallbackRunState,
@@ -196,6 +196,10 @@ const exactMainGenerationPresentation = createMainGenerationPresentationVerifier
       : null;
   },
   readCall: getCallSession,
+  readActiveCall: (userId, conversationId) =>
+    getActiveCallSessionForConversation({ userId, conversationId }),
+  readNativeCoordinatorResult: (input) =>
+    require('./NativeCoordinatorVoicePresentationService')(input),
 });
 const mainGenerationDispatch = createGlassHiveCallbackDeliveryDispatchService({
   DeliveryModel: ViventiumGlassHiveCallbackDelivery,
@@ -1384,6 +1388,34 @@ async function recordSurfaceOutcomeBestEffort(originRef, state, candidate = null
   const projectionStartedAt = nowDate();
   try {
     const project = async (session) => {
+      if (mainGenerationPresentation(candidate)?.version === 2) {
+        if (
+          candidate.status === 'sent' &&
+          !(await require('./NativeCoordinatorPresentationService').settle(candidate))
+        )
+          throw new Error('coordinator_presentation_settlement_unconfirmed');
+        const applied = await ViventiumGlassHiveCallbackDelivery.updateOne(
+          {
+            deliveryId: candidate.deliveryId,
+            userId: candidate.userId,
+            callbackMessageId: candidate.callbackMessageId,
+            status: candidate.status,
+          },
+          {
+            $set: {
+              projectionPendingAt: null,
+              projectionAppliedAt: projectionStartedAt,
+              projectionNextAttemptAt: null,
+              projectionAttempts: 0,
+              projectionErrorCode: '',
+            },
+          },
+          { session },
+        );
+        if (Number(applied?.matchedCount ?? applied?.n ?? 0) !== 1)
+          throw new Error('coordinator_presentation_projection_snapshot_changed');
+        return candidate;
+      }
       let presentation = null;
       if (plainWorkerCompletionPresentation(candidate)) {
         presentation = await exactCanonicalWorkerCompletionPresentation(
@@ -1574,7 +1606,9 @@ async function recordSurfaceOutcomeBestEffort(originRef, state, candidate = null
       // delivery truth and error; only a new existing delivery transition can re-arm projection.
       const superseded = error?.projectionSuperseded === true;
       await ViventiumGlassHiveCallbackDelivery.updateMany(
-        plainWorkerCompletionPresentation(candidate) || candidate?.workerCompletionBindings?.length
+        plainWorkerCompletionPresentation(candidate) ||
+          candidate?.workerCompletionBindings?.length ||
+          mainGenerationPresentation(candidate)?.version === 2
           ? {
               deliveryId: candidate.deliveryId,
               userId: candidate.userId,
@@ -1817,8 +1851,8 @@ async function recordGlassHiveLinkedWebDelivery({
           sentAt: now,
           text: stored.text,
           attachments,
-          projectionPendingAt: now,
-          projectionNextAttemptAt: now,
+          // This receipt and its exact projection settle together in this transaction.
+          projectionAppliedAt: now,
           expiresAt: new Date(now.getTime() + DELIVERY_RETENTION_MS),
           ...terminalCallbackFields(reference),
         },
@@ -1843,6 +1877,7 @@ async function recordGlassHiveLinkedWebDelivery({
   const { recordGlassHiveSurfaceDeliveryOutcome } = require('./GlassHiveCallbackBindingService');
   await recordGlassHiveSurfaceDeliveryOutcome({
     originRef,
+    ownerId,
     state: aggregateSurfaceState(new Set(rows.map((item) => item.status)), 'sent'),
     body: {
       ...body,
@@ -2375,7 +2410,7 @@ function claimFilter({
       filter.$and.push({
         $or: [
           { 'workerCompletionPresentation.version': 1 },
-          { event: 'main.followup', 'mainGenerationPresentation.version': 1 },
+          { event: 'main.followup', 'mainGenerationPresentation.version': { $in: [1, 2] } },
           { event: 'run.needs_input', 'nativeInputBinding.version': 1 },
         ],
       });
@@ -4324,7 +4359,7 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
         surface: 'voice',
         status: 'pending',
         event: 'main.followup',
-        'mainGenerationPresentation.version': 1,
+        'mainGenerationPresentation.version': { $in: [1, 2] },
         $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
       },
       {

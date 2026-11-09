@@ -19,7 +19,6 @@ const FALLBACK_REPLAY_CACHE = new Map();
 const FALLBACK_RATE_LIMIT_CACHE = new Map();
 const FALLBACK_REVOCATION_CACHE = new Map();
 const FALLBACK_GRANT_RESOURCE_CACHE = new Map();
-const DEFAULT_GRANT_RESOURCE_MAX_BYTES = 512 * 1024;
 let BROKER_REVOCATION_CACHE;
 
 /* === VIVENTIUM START ===
@@ -146,24 +145,13 @@ function sanitizeHostToolResources(resources, allowedHostTools) {
   return result;
 }
 
-function grantResourceMaxBytes() {
-  const configured = Number(
-    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_RESOURCE_MAX_BYTES ||
-      DEFAULT_GRANT_RESOURCE_MAX_BYTES,
-  );
-  return Math.max(
-    16 * 1024,
-    Number.isFinite(configured) ? Math.floor(configured) : DEFAULT_GRANT_RESOURCE_MAX_BYTES,
-  );
-}
-
 function grantResourceCacheKey(grantId) {
   return `glasshive-capability-broker:resources:${String(grantId || '').trim()}`;
 }
 
 // Conversation text is an immutable source, not a capability descriptor. Reuse the
-// resource cache with an owner/conversation/digest key so it cannot exhaust the
-// small grant descriptor budget or be substituted across owners.
+// resource cache with an owner/conversation/digest key to avoid duplicate copies
+// and prevent substitution across owners.
 function inheritedContextKey(scope, digest) {
   return `context:${valueHash([scope.tenant_id, scope.user_id, scope.conversation_id, digest])}`;
 }
@@ -180,14 +168,6 @@ function rememberGrantResourcesFallback(record, nowMs = Date.now()) {
 function resourceRecordForGrant({ grantId, resources, expiresAt, nowMs = Date.now() }) {
   const serialized = stableJson(resources);
   const sizeBytes = Buffer.byteLength(serialized, 'utf8');
-  if (sizeBytes > grantResourceMaxBytes()) {
-    const error = new Error(
-      'GlassHive capability broker resource scope exceeds the configured limit',
-    );
-    error.resourceBytes = sizeBytes;
-    error.resourceLimitBytes = grantResourceMaxBytes();
-    throw error;
-  }
   return {
     grant_id: grantId,
     resource_ref: valueHash(resources),

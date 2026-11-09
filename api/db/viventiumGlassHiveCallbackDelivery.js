@@ -163,11 +163,87 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
     { _id: false, strict: 'throw' },
   );
 
+  const nativeCoordinatorResultSchema = new mongoose.Schema(
+    {
+      kind: {
+        type: String,
+        enum: ['native_coordinator_goal', 'native_coordinator_turn'],
+        required: true,
+        immutable: true,
+      },
+      bindingRef: { type: String, required: true, maxlength: 512, immutable: true },
+      nativeConversationId: { type: String, required: true, maxlength: 512, immutable: true },
+      goalId: {
+        type: String,
+        required: function () {
+          return this.kind === 'native_coordinator_goal';
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      turnId: {
+        type: String,
+        required: function () {
+          return this.kind === 'native_coordinator_turn';
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      requestId: {
+        type: String,
+        required: function () {
+          return this.kind === 'native_coordinator_turn';
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      runId: { type: String, required: true, maxlength: 512, immutable: true },
+      resultRevision: { type: Number, required: true, min: 1, immutable: true },
+      resultDigest: {
+        type: String,
+        required: true,
+        match: /^sha256:[a-f0-9]{64}$/,
+        immutable: true,
+      },
+      sourceTurnId: { type: String, required: true, maxlength: 512, immutable: true },
+      sourceCallSessionId: { type: String, default: '', maxlength: 512, immutable: true },
+    },
+    { _id: false, strict: 'throw' },
+  );
+  nativeCoordinatorResultSchema.pre('validate', function (next) {
+    const forbidden =
+      this.kind === 'native_coordinator_turn' ? ['goalId'] : ['turnId', 'requestId'];
+    for (const field of forbidden)
+      if (this[field] !== undefined)
+        this.invalidate(field, 'native_coordinator_result_source_variant_invalid');
+    next();
+  });
   const mainGenerationPresentationSchema = new mongoose.Schema(
     {
-      version: { type: Number, enum: [1], required: true, immutable: true },
-      streamId: { type: String, required: true, maxlength: 512, immutable: true },
-      admissionId: { type: String, required: true, maxlength: 512, immutable: true },
+      version: { type: Number, enum: [1, 2], required: true, immutable: true },
+      streamId: {
+        type: String,
+        required: function () {
+          return this.version === 1;
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      admissionId: {
+        type: String,
+        required: function () {
+          return this.version === 1;
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      nativeCoordinatorResult: {
+        type: nativeCoordinatorResultSchema,
+        required: function () {
+          return this.version === 2;
+        },
+        immutable: true,
+      },
       responseMessageId: { type: String, required: true, maxlength: 512, immutable: true },
       responseDigest: {
         type: String,
@@ -178,6 +254,14 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
     },
     { _id: false, strict: 'throw' },
   );
+  mainGenerationPresentationSchema.pre('validate', function (next) {
+    const invalid =
+      this.version === 1
+        ? this.nativeCoordinatorResult !== undefined
+        : this.streamId !== undefined || this.admissionId !== undefined;
+    if (invalid) this.invalidate('version', 'main_generation_source_variant_invalid');
+    next();
+  });
 
   const attachmentSchema = new mongoose.Schema(
     {

@@ -2,6 +2,7 @@
 import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import type { ScheduledTaskSource } from './scheduledTaskSource';
 import { scheduleDueUnknownRecovery } from './scheduleDueRecovery';
+import { schedulerDispatchDocumentId } from './scheduleOccurrenceOwner';
 
 export interface ScheduledDestination {
   surface: 'librechat' | 'telegram' | 'voice';
@@ -183,7 +184,7 @@ export function scheduleDueDispatchIdentity(envelope: ScheduleDueEnvelope) {
       envelope.occurrence_id,
     ]),
   )}`;
-  const documentId = hash(`${envelope.principal.owner_id}\0${idempotencyKey}`);
+  const documentId = schedulerDispatchDocumentId(envelope.principal.owner_id, idempotencyKey);
   return {
     documentId,
     idempotencyKey,

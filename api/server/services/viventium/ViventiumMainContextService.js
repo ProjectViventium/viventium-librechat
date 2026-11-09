@@ -21,7 +21,6 @@ const {
   ownedInteractionSources,
   prepareMainContinuityCarrier,
   NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
   MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER,
   visibleMessageChain: buildMainContinuityMessageChain,
 } = require('@librechat/api');
@@ -1350,12 +1349,7 @@ function captureMainContextSnapshot(
     ...body,
     snapshotSha256: digest(body),
   };
-  const configuredModel = req.config?.endpoints?.agents?.providerCapabilities?.[
-    agent?.endpoint || agent?.provider
-  ]?.models?.find((model) => model.id === (agent?.model || agent?.model_parameters?.model));
-  const inheritConversation =
-    agent?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
-    ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(configuredModel?.harnessProfile);
+  const inheritConversation = agent?.glasshive_options?.orchestration?.tool_mode === 'coordination';
   /* === VIVENTIUM START ===
    * Feature: Exact local attempt replay.
    * Purpose: The public/provider contract carries only digests, while fallback and retry inside
@@ -1703,13 +1697,9 @@ function applyMainContextAttempt({
         trustedAttemptAuthority,
         snapshot,
         maximumBytes: usesNativeBody
-          ? Math.min(
-              NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
-              Number.isSafeInteger(local.turnContextMaximumBytes) &&
-                local.turnContextMaximumBytes > 0
-                ? local.turnContextMaximumBytes
-                : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-            )
+          ? Number.isSafeInteger(local.turnContextMaximumBytes) && local.turnContextMaximumBytes > 0
+            ? local.turnContextMaximumBytes
+            : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
           : TURN_CONTEXT_MAX_DECODED_BYTES,
         onStateBlocks: (value) => {
           stateBlocks = value;
@@ -1781,13 +1771,10 @@ function bindMainContextCarrier(targetAgent, snapshot) {
         ...(headers['X-GlassHive-Agent-Id']
           ? {
               [MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER]: String(
-                Math.min(
-                  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
-                  Number.isSafeInteger(snapshot[LOCAL_ATTEMPT_STATE]?.turnContextMaximumBytes) &&
-                    snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes > 0
-                    ? snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes
-                    : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-                ),
+                Number.isSafeInteger(snapshot[LOCAL_ATTEMPT_STATE]?.turnContextMaximumBytes) &&
+                  snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes > 0
+                  ? snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes
+                  : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
               ),
             }
           : {}),

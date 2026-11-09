@@ -48,6 +48,7 @@ const IMMUTABLE_DELIVERY_PATHS = new Set([
   'userId',
   'conversationId',
   'parentMessageId',
+  'publicationId',
   'cortexId',
   'cortexName',
   'insight',
@@ -334,6 +335,10 @@ const cortexInsightDeliverySchema = new Schema<IViventiumCortexInsightDelivery>(
         },
         message: 'sent delivery requires presentationReceiptHashes for every required surface',
       },
+    },
+    publicationId: {
+      type: String, default: '', select: false, immutable: true,
+      set: immutableDeliverySetter('publicationId'),
     },
     streamId: {
       type: String,

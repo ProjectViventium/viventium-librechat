@@ -52,6 +52,8 @@ jest.mock('@librechat/api', () => ({
   getStreamDeliveryDisposition: jest.requireActual('@librechat/api').getStreamDeliveryDisposition,
   inspectProviderPublicPartCompletion:
     jest.requireActual('@librechat/api').inspectProviderPublicPartCompletion,
+  inspectProviderPublicPartCompletionState:
+    jest.requireActual('@librechat/api').inspectProviderPublicPartCompletionState,
   createReleasedMainPublicPartOwner: jest.fn((identity) => ({
     identity,
     verifySource: jest.fn(async () => true),
@@ -2359,6 +2361,7 @@ describe('typed native output attachments at the actual SDK callback boundary', 
 
 /* === VIVENTIUM START === Complete public parts use the existing native producer fence. === */
 describe('native public content part completion', () => {
+  const { logger } = require('@librechat/data-schemas');
   const { getDefaultHandlers } = require('../callbacks');
   const { GenerationJobManager, createReleasedMainPublicPartOwner } = require('@librechat/api');
   const identity = {
@@ -2562,6 +2565,36 @@ describe('native public content part completion', () => {
     const { emit, controls } = setup();
     await Promise.all([emit(), emit(), emit()]);
     expect(controls()).toHaveLength(1);
+  });
+  it('bounds structural marker telemetry and never logs the public content', async () => {
+    const f = setup();
+    f.req.viventiumVoiceLogLatency = true;
+    const absent = makeChunk('PRIVATE_MARKER_TEXT');
+    delete absent.chunk.additional_kwargs.__raw_response.choices[0].delta.provider_specific_fields
+      .viventium.public_part_complete;
+    for (let index = 0; index < 3; index++) await f.emit(absent);
+    await f.emit();
+    await f.emit();
+    const logs = logger.info.mock.calls
+      .map(([line]) => String(line))
+      .filter((line) => line.includes('stage=public_part_completion_gate'));
+    expect(logs).toHaveLength(4);
+    for (const result of ['completion_carrier_absent', 'marker_observed', 'emitted', 'duplicate'])
+      expect(logs.filter((line) => line.includes(`result=${result}`))).toHaveLength(1);
+    expect(logs.join('\n')).not.toContain('PRIVATE_MARKER_TEXT');
+    expect(f.controls()).toHaveLength(1);
+  });
+  it('records the existing settled-job rejection without weakening its fence', async () => {
+    const f = setup();
+    f.req.viventiumVoiceLogLatency = true;
+    f.job.nativeResponseSettled = true;
+    await f.emit();
+    expect(
+      logger.info.mock.calls.some(([line]) =>
+        String(line).includes('result=native_response_settled'),
+      ),
+    ).toBe(true);
+    expect(f.controls()).toHaveLength(0);
   });
   it.each([
     'foreign-owner',

@@ -57,7 +57,6 @@ const {
   loadFeelingsReadContext,
   isFeelingsReadIsolated,
   NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
   conversationContinuityContextReserveBytes,
   mainContinuityOutputCarrier,
   getCurrentCallContext,
@@ -516,7 +515,7 @@ function nativeMainContinuityAllocation(
   return {
     carrierMaxUtf8Bytes:
       fits === true && Number.isSafeInteger(capacity) && capacity > defaultCarrierBytes
-        ? Math.min(capacity, NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES)
+        ? capacity
         : defaultCarrierBytes,
     fits,
     sizingReceipt,
@@ -1992,8 +1991,8 @@ function enforceMainDelegationTurnTruth(contentParts, req) {
   const truth = mainDelegationTurnTruth(req);
   if (!truth || truth.unconfirmedCount === 0) return false;
   const message = truth.confirmedCount
-    ? `${truth.confirmedCount} background task${truth.confirmedCount === 1 ? '' : 's'} started, but ${truth.unconfirmedCount} requested launch${truth.unconfirmedCount === 1 ? '' : 'es'} could not be confirmed. Check Active work before retrying.`
-    : 'I could not confirm that the requested background work started. Check Active work before retrying.';
+    ? `${truth.confirmedCount} background task${truth.confirmedCount === 1 ? '' : 's'} accepted, but ${truth.unconfirmedCount} requested handoff${truth.unconfirmedCount === 1 ? '' : 's'} could not be confirmed. Check Active work before retrying.`
+    : 'I could not confirm that the requested background work was accepted. Check Active work before retrying.';
   const firstTextIndex = contentParts.findIndex((part) => part?.type === ContentTypes.TEXT);
   const firstText = firstTextIndex >= 0 ? contentParts[firstTextIndex] : null;
   const replacement = {
@@ -2379,6 +2378,7 @@ function classifyCompletionErrorForLog(err) {
   if (codes.includes('native_response_parent_changed')) return 'source_context_unavailable';
   if (codes.includes('provider_unavailable')) return 'provider_temporarily_unavailable';
   for (const structuredCode of [
+    'native_output_files_identity_unavailable',
     'native_input_declined',
     'native_input_expired',
     'native_input_cancelled',
@@ -2888,6 +2888,7 @@ function createCompletionErrorContentPart(err) {
       'This turn needs a fresh connected-tool authorization. Retry the turn to continue.',
     conversation_session_authority_conflict:
       'This conversation was still finishing an earlier reply, so this request did not start.',
+    native_output_files_identity_unavailable: 'The selected file could not be attached.',
     source_context_unavailable:
       'The conversation context could not be preserved. Please retry this turn.',
     completion_error: 'Viventium could not complete this request. Please try again.',
@@ -4274,6 +4275,10 @@ function buildViventiumMcpRequestBody({
     viventiumStreamId: req?.body?.streamId || req?._resumableStreamId,
     viventiumVoiceRequestId: req?.viventiumVoiceRequestId,
     viventiumVoiceCallSessionId: req?.viventiumCallSession?.callSessionId,
+    viventiumCallSessionId: req?.viventiumCallSession?.callSessionId,
+    viventiumVoiceTaskId: req?.viventiumCallSession?.callSessionId
+      ? req?.body?.viventiumVoiceTaskId
+      : undefined,
     viventiumVoiceWorkAuthority: req?.viventiumVoiceWorkAuthority,
     viventiumVoiceStartAtMs: req?.viventiumVoiceStartAt,
     viventiumVoiceStartPerfMs: req?.viventiumVoicePerfStartAt,
@@ -4985,6 +4990,466 @@ class AgentClient extends BaseClient {
     return files;
   }
 
+  /* === VIVENTIUM START ===
+   * Ordinary turns and durable result authors use the same runtime instruction preparation.
+   * This prepares context only; generation, maintenance and delivery keep their existing owners.
+   */
+  async prepareMainRuntimeInstructions({
+    config = {},
+    abortController = new AbortController(),
+    userMCPAuthMap,
+    allowMemoryWriter = true,
+  } = {}) {
+    const req = this.options.req;
+    const voiceMode = this.options.req?.body?.voiceMode === true;
+    const voiceProvider = this.options.req?.body?.voiceProvider;
+    /* === VIVENTIUM START ===
+     * Feature: Prompt-frame telemetry for surface/runtime prompt injections.
+     * === VIVENTIUM END === */
+    const surfacePromptLayers = {
+      instructions_before_surface_injection: this.options.agent?.instructions || '',
+    };
+    /* === VIVENTIUM NOTE === */
+    const inputMode = (this.options.req?.body?.viventiumInputMode || '').toString().toLowerCase();
+    const surface = resolveViventiumSurface(this.options.req);
+    const trustedInteractionContext = getTrustedInteractionContext(this.options.req);
+    const replaysPinnedMainContext =
+      req?._viventiumFallbackLlmAttempt === true && Boolean(req?._viventiumMainContextSnapshotV1);
+    const wingModeActive = isWingModeEnabledForRequest(this.options.req, inputMode);
+    const isTelegramSurface = surface === 'telegram';
+    const isPlaygroundSurface = surface === 'playground';
+    const isWorkbenchSurface = surface === 'workbench';
+    const telegramAudioRequestRaw =
+      this.options.req?.body?.telegramAudioRequested ??
+      this.options.req?.body?.viventiumAudioRequested ??
+      this.options.req?.body?.audioRequested;
+    const telegramAudioRequested =
+      telegramAudioRequestRaw === true ||
+      telegramAudioRequestRaw === 1 ||
+      telegramAudioRequestRaw === '1' ||
+      String(telegramAudioRequestRaw).toLowerCase() === 'true';
+    /* === VIVENTIUM NOTE END === */
+
+    /* === VIVENTIUM START ===
+     * Feature: Durable Telegram reply provenance.
+     * Purpose: Present server-resolved quoted-message ownership as invocation-local evidence,
+     * outside the user text and outside persistent native-session identity.
+     * === VIVENTIUM END === */
+    const telegramReplyContext = replaysPinnedMainContext
+      ? ''
+      : buildTurnReplyContextCapsules(
+          trustedInteractionContext,
+          getTrustedAdapterCapabilities(this.options.req),
+        );
+    if (telegramReplyContext) {
+      surfacePromptLayers.telegram_reply_context = telegramReplyContext;
+    }
+
+    // Handle Voice Gateway insight delivery requests.
+    const viventiumInsightInstructions = this.options.req?.body?.viventiumInsightInstructions;
+    if (!replaysPinnedMainContext && viventiumInsightInstructions) {
+      logger.info('[AgentClient] Voice Gateway insight delivery - injecting insight instructions');
+      surfacePromptLayers.voice_gateway_insight_instructions = viventiumInsightInstructions;
+      this.options.agent.instructions = [
+        this.options.agent.instructions || '',
+        viventiumInsightInstructions,
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+    }
+
+    // Voice-mode prompt injection (Cartesia-friendly tags)
+    if (!replaysPinnedMainContext && voiceMode) {
+      const voiceInstructions = buildVoiceModeInstructions(voiceProvider);
+      if (voiceInstructions) {
+        surfacePromptLayers.voice_mode = voiceInstructions;
+        this.options.agent.instructions = [this.options.agent.instructions || '', voiceInstructions]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+    /* === VIVENTIUM NOTE ===
+     * Feature: Voice note transcription hints + Telegram text formatting.
+     */
+    if (!replaysPinnedMainContext && inputMode === 'voice_note') {
+      const voiceNoteInstructions = buildVoiceNoteInputInstructions();
+      if (voiceNoteInstructions) {
+        surfacePromptLayers.voice_note_input = voiceNoteInstructions;
+        this.options.agent.instructions = [
+          this.options.agent.instructions || '',
+          voiceNoteInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+    if (!replaysPinnedMainContext && inputMode === 'voice_call') {
+      const voiceCallInstructions = buildVoiceCallInputInstructions();
+      if (voiceCallInstructions) {
+        surfacePromptLayers.voice_call_input = voiceCallInstructions;
+        this.options.agent.instructions = [
+          this.options.agent.instructions || '',
+          voiceCallInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+
+      const wingModeInstructions = wingModeActive ? buildWingModeInstructions() : '';
+      if (wingModeInstructions) {
+        surfacePromptLayers.wing_mode = wingModeInstructions;
+        this.options.agent.instructions = [
+          this.options.agent.instructions || '',
+          wingModeInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+
+    if (!replaysPinnedMainContext && isTelegramSurface && !voiceMode) {
+      const telegramInstructions = buildTelegramTextInstructions();
+      if (telegramInstructions) {
+        surfacePromptLayers.telegram_text = telegramInstructions;
+        this.options.agent.instructions = [
+          this.options.agent.instructions || '',
+          telegramInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+    if (!replaysPinnedMainContext && isTelegramSurface && !voiceMode && telegramAudioRequested) {
+      const telegramAudioInstructions = buildTelegramAudioOutputInstructions(voiceProvider);
+      if (telegramAudioInstructions) {
+        surfacePromptLayers.telegram_audio_output = telegramAudioInstructions;
+        this.options.agent.instructions = [
+          this.options.agent.instructions || '',
+          telegramAudioInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+    if (!replaysPinnedMainContext && isPlaygroundSurface && !voiceMode) {
+      const playgroundInstructions = buildPlaygroundTextInstructions();
+      if (playgroundInstructions) {
+        surfacePromptLayers.playground_text = playgroundInstructions;
+        this.options.agent.instructions = [
+          this.options.agent.instructions || '',
+          playgroundInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+    if (
+      !replaysPinnedMainContext &&
+      !voiceMode &&
+      (isWorkbenchSurface || surface === 'web' || surface === '')
+    ) {
+      const scheduledCanonicalOutput = trustedInteractionContext?.origin === 'scheduler';
+      const workbenchInstructions = scheduledCanonicalOutput
+        ? buildScheduledCanonicalOutputInstructions()
+        : buildWebTextInstructions();
+      if (workbenchInstructions) {
+        surfacePromptLayers[
+          scheduledCanonicalOutput ? 'scheduled_canonical_output' : 'workbench_text'
+        ] = workbenchInstructions;
+        this.options.agent.instructions = [
+          this.options.agent.instructions || '',
+          workbenchInstructions,
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+
+    /* === VIVENTIUM NOTE ===
+     * Feature: Time context injection for scheduling awareness
+     * Purpose: Provide LLM with user's current local time from client timestamp/timezone.
+     * Added: 2026-01-31
+     */
+    const timeContextInstructions = replaysPinnedMainContext
+      ? ''
+      : buildTimeContextInstructions(this.options.req);
+    const activeWorkContextInstructions = replaysPinnedMainContext
+      ? ''
+      : (this.options.req._viventiumContinuityActiveWorkContext ??
+        (await resolveActiveWorkTurnContext(this.options.req)));
+    const sourceSelectionContextInstructions = sourceSelectionTurnContext(
+      this.options.req,
+      replaysPinnedMainContext,
+    );
+    const acceptedMainIdentity = replaysPinnedMainContext
+      ? null
+      : this.options.req?._viventiumAcceptedMainCompactionIdentityV1 || {
+          ownerId: String(this.options.req?.user?.id || ''),
+          agentId: String(this.options.agent?.id || ''),
+          stableAuthoritySha256: stableAuthorityDigest(this.options.agent),
+        };
+    if (
+      acceptedMainIdentity &&
+      !Object.prototype.hasOwnProperty.call(
+        this.options.req,
+        '_viventiumAcceptedMainCompactionIdentityV1',
+      )
+    ) {
+      Object.defineProperty(this.options.req, '_viventiumAcceptedMainCompactionIdentityV1', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: Object.freeze({ ...acceptedMainIdentity }),
+      });
+    }
+    const recurrenceStateInstructions = replaysPinnedMainContext
+      ? ''
+      : buildRecurrenceStateCapsule(this.options.req, this.options.req?.body?.recurrenceState);
+    /* === VIVENTIUM START === Keep Main's save acknowledgement aligned with the detached writer. === */
+    const automaticMemoryWriterEligible =
+      allowMemoryWriter &&
+      Boolean(this.memoryWriterState) &&
+      !evalIsolationForRequest(this.options.req).savedMemory &&
+      this.options.req?.body?.viventiumDeferVoiceMemory !== true &&
+      !isCancelledVoiceTask(this.options.req) &&
+      !shouldSkipAutomaticMemoryWriter(this.options.req);
+    const savedMemoryWriterTurnContext = buildSavedMemoryWriterTurnContext(
+      automaticMemoryWriterEligible,
+    );
+    const currentCallContextInstructions = replaysPinnedMainContext
+      ? ''
+      : getCurrentCallContext(this.options.req);
+    /* === VIVENTIUM END === */
+    let selectedCarrierBytes = conversationProviderUsesInvocationLocalTime(req, this.options.agent)
+      ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
+      : MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES;
+    // Reuse the native whole-source estimator after history and attachments are prepared.
+    // The final consumer owns one aggregate body budget, not a fixed 128 KiB context partition.
+    // Unknown/mixed routes retain the existing bound and recovery owner.
+    const nativeContextRoutes = [
+      this.options.agent,
+      this.options.agent?.viventiumFallbackLlm ||
+        this.options.agent?.viventiumFallbackLlmAssignment,
+      ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
+    ].filter(Boolean);
+    if (
+      !replaysPinnedMainContext &&
+      conversationProviderUsesNativeBody(req, this.options.agent, { requireTransport: true }) &&
+      conversationProviderUsesNativeBody(req, this.options.agent, {
+        alternates: nativeContextRoutes.slice(1),
+      })
+    ) {
+      const replayBudget = await getNativeConversationReplayBudgetForRoutes(
+        nativeContextRoutes,
+        req?.config?.endpoints?.custom,
+        req?._viventiumNativeHistoryBudgetV1,
+      ).catch(() => null);
+      if (replayBudget !== null) {
+        const nativeHistoryUploads = await resolveConversationProviderUploadedFiles(
+          req,
+          config?.configurable?.requestBody,
+        ).catch(() => null);
+        const allocation = nativeMainContinuityAllocation(
+          req,
+          this.options.agent,
+          this._viventiumVisibleMessagesV1,
+          {
+            attachments: this.options.attachments,
+            currentAttachmentPreparation: this._viventiumCurrentAttachmentPreparation,
+            nativeHistoryUploads,
+            contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
+            userName: this.options.name,
+            assistantName: this.options.modelLabel,
+          },
+          replayBudget,
+          selectedCarrierBytes,
+        );
+        selectedCarrierBytes = allocation.carrierMaxUtf8Bytes;
+        const { sizingReceipt, fits } = allocation;
+        logger.info(
+          '[VIVENTIUM][main-context-allocation] ' +
+            JSON.stringify({
+              nativeBudgetBytes: replayBudget,
+              nativeBudgetSource: req?._viventiumNativeHistoryBudgetV1
+                ? 'native_session_receipt'
+                : 'discovery_floor',
+              contextCapacityBytes: sizingReceipt.contextBudgetBytes ?? null,
+              authorizedAttachmentBoundBytes: sizingReceipt.attachmentBoundBytes ?? null,
+              selectedCarrierBytes,
+              fitOutcome: fits === null ? 'unknown' : fits ? 'fit' : 'over_bound',
+            }),
+        );
+      }
+    }
+    const authorityReserveBytes = mainAttemptFactsAuthorityReserveBytes(req, this.options.agent);
+    const coreOutputCarrier = mainContinuityOutputCarrier(
+      mainContinuityCarrierPeerParts({
+        currentCallContext: currentCallContextInstructions,
+        conversationContinuityContext: replaysPinnedMainContext
+          ? ''
+          : this._viventiumConversationContinuityCapsule || '',
+        optionalContexts: [
+          telegramReplyContext,
+          savedMemoryWriterTurnContext,
+          recurrenceStateInstructions,
+          timeContextInstructions,
+          activeWorkContextInstructions,
+          sourceSelectionContextInstructions,
+        ],
+        carrierMaxUtf8Bytes: selectedCarrierBytes,
+      }),
+      authorityReserveBytes,
+      selectedCarrierBytes,
+    );
+    req._viventiumAcceptedMainOutputCarrierV1 = Object.freeze(coreOutputCarrier);
+    const acceptedMainContext = replaysPinnedMainContext
+      ? { status: 'pinned_replay', capsule: '', turns: [] }
+      : await loadAcceptedMainContextForAdmission({
+          ...acceptedMainIdentity,
+          req,
+          agent: this.options.agent,
+          outputCarrier: coreOutputCarrier,
+          signal: abortController?.signal,
+        });
+    const acceptedMainContextInstructions = acceptedMainContext.capsule || '';
+    const turnContextInstructions = combineTurnContextInstructions(
+      timeContextInstructions,
+      activeWorkContextInstructions,
+      sourceSelectionContextInstructions,
+      telegramReplyContext,
+      acceptedMainContextInstructions,
+      recurrenceStateInstructions,
+      savedMemoryWriterTurnContext,
+      replaysPinnedMainContext ? '' : this._viventiumConversationContinuityCapsule || '',
+      selectedCarrierBytes === MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES
+        ? selectedCarrierBytes - authorityReserveBytes
+        : selectedCarrierBytes,
+      currentCallContextInstructions,
+    );
+    if (turnContextInstructions) {
+      surfacePromptLayers.time_context = timeContextInstructions;
+      if (currentCallContextInstructions) {
+        surfacePromptLayers.current_call = currentCallContextInstructions;
+      }
+      if (activeWorkContextInstructions) {
+        surfacePromptLayers.active_work_context = activeWorkContextInstructions;
+      }
+      if (sourceSelectionContextInstructions) {
+        surfacePromptLayers.rapid_source_selection = sourceSelectionContextInstructions;
+      }
+      if (acceptedMainContextInstructions) {
+        surfacePromptLayers.main_continuity = acceptedMainContextInstructions;
+      }
+      if (recurrenceStateInstructions) {
+        surfacePromptLayers.recurrence_state = recurrenceStateInstructions;
+      }
+      if (savedMemoryWriterTurnContext) {
+        surfacePromptLayers.saved_memory_writer = savedMemoryWriterTurnContext;
+      }
+      const providerCapabilities =
+        this.options.req?.config?.endpoints?.agents?.providerCapabilities || {};
+      const providerCapability =
+        this.options.req?.viventiumTimeContextDelivery === 'per_turn_header'
+          ? { workspace_binding: true, conversation_session: true }
+          : providerCapabilities[this.options.agent?.provider] ||
+            providerCapabilities[this.options.agent?.endpoint];
+      this.options.agent.instructions = applyTimeContextDelivery({
+        req: this.options.req,
+        requestBody: config?.configurable?.requestBody,
+        instructions: this.options.agent.instructions || '',
+        timeContextInstructions: turnContextInstructions,
+        providerCapability,
+      });
+    }
+    /* === VIVENTIUM NOTE END === */
+    surfacePromptLayers.final_runtime_instructions = this.options.agent?.instructions || '';
+    logPromptFrame(
+      logger,
+      promptFrameTelemetry.buildPromptFrame({
+        promptFamily: 'main_runtime',
+        surface,
+        ...promptFrameExecutionLineage(this.options.req, this.options.agent),
+        provider: resolveConversationProviderId(this.options.agent),
+        model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
+        agentId: this.options.agent?.id,
+        requestIdentity: {
+          ownerId: this.options.req?.user?.id || this.options.req?.user?._id,
+          interactionContext: trustedInteractionContext,
+        },
+        authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
+        layers: surfacePromptLayers,
+        promptSourceFiles: {
+          agent_client: __filename,
+        },
+        flags: {
+          voice_mode: voiceMode,
+          input_mode: inputMode,
+          telegram_surface: isTelegramSurface,
+          playground_surface: isPlaygroundSurface,
+          tool_count: Array.isArray(this.options.agent?.tools)
+            ? this.options.agent.tools.length
+            : 0,
+          has_user_mcp_auth_map: !!userMCPAuthMap,
+        },
+        mcpInstructionSources: this.options.agent?.viventiumMCPInstructionSources || {},
+        voiceText: surfacePromptLayers.final_runtime_instructions,
+      }),
+    );
+    return {
+      voiceMode,
+      wingModeActive,
+      voiceProvider,
+      inputMode,
+      isTelegramSurface,
+      telegramAudioRequested,
+      acceptedMainContext,
+      surfacePromptLayers,
+      acceptedMainContextInstructions,
+      recurrenceStateInstructions,
+      currentCallContextInstructions,
+      surface,
+      selectedCarrierBytes,
+      turnContextInstructions,
+      activeWorkContextInstructions,
+      telegramReplyContext,
+      replaysPinnedMainContext,
+      savedMemoryWriterTurnContext,
+      timeContextInstructions,
+      sourceSelectionContextInstructions,
+      trustedInteractionContext,
+    };
+  }
+  /* === VIVENTIUM END === */
+
+  /* === VIVENTIUM START === Context-only preparation for the existing result author. === */
+  async prepareMainResultContext(messages, parentMessageId) {
+    const { prompt } = await this.buildMessages(messages, parentMessageId);
+    const { selectedCarrierBytes } = await this.prepareMainRuntimeInstructions({
+      config: { configurable: { requestBody: this.options.req.body } },
+      allowMemoryWriter: false,
+    });
+    const inherited =
+      require('~/server/services/viventium/ViventiumMainContextService').prependInheritedConversationPayload(
+        prompt,
+        this.options.req._viventiumInheritedConversationContext,
+      );
+    const payload = normalizeTextPartsInPayload(stripInternalContentParts(inherited));
+    const tools = new Set((this.options.agent.tools || []).map((tool) => tool?.name));
+    const formatted = formatAgentMessages(payload, this.indexTokenCountMap, tools);
+    return {
+      instructions: this.options.agent.instructions,
+      memoryContext: this.savedMemoryTailForAgent(this.options.agent.id),
+      developerInstructionTail: feelingTailForAgent({
+        snapshot: this.feelingSnapshot,
+        agentId: this.options.agent.id,
+        primaryAgentId: this.options.agent.id,
+      }),
+      selectedCarrierBytes,
+      messages: sanitizeProviderFormattedMessages(this.options.agent.provider, formatted.messages),
+    };
+  }
+  /* === VIVENTIUM END === */
+
   async buildMessages(messages, parentMessageId, _buildOptions, opts) {
     const req = this.options.req;
     startActiveWorkTurnContext(req, this.options.agent);
@@ -5174,6 +5639,35 @@ class AgentClient extends BaseClient {
         this.options.agent?.viventiumFallbackLlmAssignment,
       ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
     ].filter(Boolean);
+    /* === VIVENTIUM START === Observe the native owner's current session budget before maintenance. === */
+    const nativeHistoryBudget = conversationProviderUsesNativeBody(req, this.options.agent, {
+      requireTransport: true,
+    })
+      ? await require('@librechat/api').readNativeConversationHistoryBudget({
+          ownerId: String(req?.user?.id || ''),
+          conversationId: String(this.conversationId || req?.body?.conversationId || ''),
+          agentId: String(this.options.agent?.id || ''),
+          contextEpoch: stableAuthorityDigest(this.options.agent),
+          modelId: String(
+            this.options.agent?.model || this.options.agent?.model_parameters?.model || '',
+          ),
+          messages: orderedMessages,
+          signal: opts?.abortController?.signal,
+          readAdmission: async (ownerId, messageId) =>
+            (await require('~/models').getNativeResponse(ownerId, messageId))?.nativeResponse ||
+            null,
+          readResult: (identity) =>
+            require('~/server/services/viventium/nativeResponseService')
+              .getService()
+              .readResult(identity),
+        })
+      : null;
+    Object.defineProperty(req, '_viventiumNativeHistoryBudgetV1', {
+      value: nativeHistoryBudget,
+      configurable: true,
+      enumerable: false,
+    });
+    /* === VIVENTIUM END === */
     const nativeReplayBudget =
       conversationProviderUsesNativeBody(req, this.options.agent, { requireTransport: true }) &&
       conversationProviderUsesNativeBody(req, this.options.agent, {
@@ -5182,6 +5676,7 @@ class AgentClient extends BaseClient {
         ? await getNativeConversationReplayBudgetForRoutes(
             nativeHistoryRoutes,
             req?.config?.endpoints?.custom,
+            nativeHistoryBudget,
           ).catch(() => null)
         : null;
     const conversationContinuity = await resolveConversationContinuity({
@@ -5200,7 +5695,6 @@ class AgentClient extends BaseClient {
             ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
           ].filter(Boolean),
         }),
-      nativeReplayBudgetKnown: nativeReplayBudget !== null,
       resolveOutputCarrier: resolveLegacyOutputCarrier,
       canCarryWholeHistory: async (rows, capsule = '') => {
         if (
@@ -5219,18 +5713,19 @@ class AgentClient extends BaseClient {
             : await resolveConversationProviderUploadedFiles(req, nativeUploadRequestBody).catch(
                 () => null,
               );
-        // The final native producer enforces this whole turn_context cap, including every
-        // summary and later dynamic section; a forecast cannot under-reserve later growth.
-        let turnContextReserveBytes = NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES;
-        if (nativeReplayBudget === null) {
-          const legacyCarrier = await resolveLegacyOutputCarrier();
-          if (!legacyCarrier) return false;
-          turnContextReserveBytes =
-            legacyCarrier.reservedContextUtf8Bytes +
-            (capsule
-              ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
-              : 0);
-        }
+        // The body allocation can exceed 128 KiB. Price the pinned Core and peers plus
+        // the already rendered legacy capsule before deferring required reconciliation.
+        const legacyCarrier = await resolveLegacyOutputCarrier();
+        if (!legacyCarrier) return false;
+        const actualReserveBytes =
+          legacyCarrier.reservedContextUtf8Bytes +
+          (capsule
+            ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
+            : 0);
+        const turnContextReserveBytes =
+          nativeReplayBudget === null
+            ? actualReserveBytes
+            : Math.max(NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES, actualReserveBytes);
         const sizingReceipt = {};
         const fit = nativeWholeHistoryFits(
           req,
@@ -5252,6 +5747,9 @@ class AgentClient extends BaseClient {
           '[VIVENTIUM][native-history-fit] ' +
             JSON.stringify({
               nativeBudgetKnown: nativeReplayBudget !== null,
+              nativeBudgetSource: req?._viventiumNativeHistoryBudgetV1
+                ? 'native_session_receipt'
+                : 'discovery_floor',
               fitOutcome: fit === null ? 'unknown' : fit ? 'fit' : 'over_bound',
               selectedHistoryCount: rows.length,
               nativeBudgetBytes: nativeReplayBudget,
@@ -8363,399 +8861,29 @@ class AgentClient extends BaseClient {
 
       const toolSet = new Set((this.options.agent.tools ?? []).map((tool) => tool && tool.name));
 
-      const voiceMode = this.options.req?.body?.voiceMode === true;
-      const voiceProvider = this.options.req?.body?.voiceProvider;
-      /* === VIVENTIUM START ===
-       * Feature: Prompt-frame telemetry for surface/runtime prompt injections.
-       * === VIVENTIUM END === */
-      const surfacePromptLayers = {
-        instructions_before_surface_injection: this.options.agent?.instructions || '',
-      };
-      /* === VIVENTIUM NOTE === */
-      const inputMode = (this.options.req?.body?.viventiumInputMode || '').toString().toLowerCase();
-      const surface = resolveViventiumSurface(this.options.req);
-      const trustedInteractionContext = getTrustedInteractionContext(this.options.req);
-      const replaysPinnedMainContext =
-        req?._viventiumFallbackLlmAttempt === true && Boolean(req?._viventiumMainContextSnapshotV1);
-      const wingModeActive = isWingModeEnabledForRequest(this.options.req, inputMode);
-      const isTelegramSurface = surface === 'telegram';
-      const isPlaygroundSurface = surface === 'playground';
-      const isWorkbenchSurface = surface === 'workbench';
-      const telegramAudioRequestRaw =
-        this.options.req?.body?.telegramAudioRequested ??
-        this.options.req?.body?.viventiumAudioRequested ??
-        this.options.req?.body?.audioRequested;
-      const telegramAudioRequested =
-        telegramAudioRequestRaw === true ||
-        telegramAudioRequestRaw === 1 ||
-        telegramAudioRequestRaw === '1' ||
-        String(telegramAudioRequestRaw).toLowerCase() === 'true';
-      /* === VIVENTIUM NOTE END === */
-
-      /* === VIVENTIUM START ===
-       * Feature: Durable Telegram reply provenance.
-       * Purpose: Present server-resolved quoted-message ownership as invocation-local evidence,
-       * outside the user text and outside persistent native-session identity.
-       * === VIVENTIUM END === */
-      const telegramReplyContext = replaysPinnedMainContext
-        ? ''
-        : buildTurnReplyContextCapsules(
-            trustedInteractionContext,
-            getTrustedAdapterCapabilities(this.options.req),
-          );
-      if (telegramReplyContext) {
-        surfacePromptLayers.telegram_reply_context = telegramReplyContext;
-      }
-
-      // Handle Voice Gateway insight delivery requests.
-      const viventiumInsightInstructions = this.options.req?.body?.viventiumInsightInstructions;
-      if (!replaysPinnedMainContext && viventiumInsightInstructions) {
-        logger.info(
-          '[AgentClient] Voice Gateway insight delivery - injecting insight instructions',
-        );
-        surfacePromptLayers.voice_gateway_insight_instructions = viventiumInsightInstructions;
-        this.options.agent.instructions = [
-          this.options.agent.instructions || '',
-          viventiumInsightInstructions,
-        ]
-          .filter(Boolean)
-          .join('\n\n');
-      }
-
-      // Voice-mode prompt injection (Cartesia-friendly tags)
-      if (!replaysPinnedMainContext && voiceMode) {
-        const voiceInstructions = buildVoiceModeInstructions(voiceProvider);
-        if (voiceInstructions) {
-          surfacePromptLayers.voice_mode = voiceInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            voiceInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-      }
-      /* === VIVENTIUM NOTE ===
-       * Feature: Voice note transcription hints + Telegram text formatting.
-       */
-      if (!replaysPinnedMainContext && inputMode === 'voice_note') {
-        const voiceNoteInstructions = buildVoiceNoteInputInstructions();
-        if (voiceNoteInstructions) {
-          surfacePromptLayers.voice_note_input = voiceNoteInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            voiceNoteInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-      }
-      if (!replaysPinnedMainContext && inputMode === 'voice_call') {
-        const voiceCallInstructions = buildVoiceCallInputInstructions();
-        if (voiceCallInstructions) {
-          surfacePromptLayers.voice_call_input = voiceCallInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            voiceCallInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-
-        const wingModeInstructions = wingModeActive ? buildWingModeInstructions() : '';
-        if (wingModeInstructions) {
-          surfacePromptLayers.wing_mode = wingModeInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            wingModeInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-      }
-
-      if (!replaysPinnedMainContext && isTelegramSurface && !voiceMode) {
-        const telegramInstructions = buildTelegramTextInstructions();
-        if (telegramInstructions) {
-          surfacePromptLayers.telegram_text = telegramInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            telegramInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-      }
-      if (!replaysPinnedMainContext && isTelegramSurface && !voiceMode && telegramAudioRequested) {
-        const telegramAudioInstructions = buildTelegramAudioOutputInstructions(voiceProvider);
-        if (telegramAudioInstructions) {
-          surfacePromptLayers.telegram_audio_output = telegramAudioInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            telegramAudioInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-      }
-      if (!replaysPinnedMainContext && isPlaygroundSurface && !voiceMode) {
-        const playgroundInstructions = buildPlaygroundTextInstructions();
-        if (playgroundInstructions) {
-          surfacePromptLayers.playground_text = playgroundInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            playgroundInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-      }
-      if (!replaysPinnedMainContext && isWorkbenchSurface && !voiceMode) {
-        const scheduledCanonicalOutput = trustedInteractionContext?.origin === 'scheduler';
-        const workbenchInstructions = scheduledCanonicalOutput
-          ? buildScheduledCanonicalOutputInstructions()
-          : buildWebTextInstructions();
-        if (workbenchInstructions) {
-          surfacePromptLayers[
-            scheduledCanonicalOutput ? 'scheduled_canonical_output' : 'workbench_text'
-          ] = workbenchInstructions;
-          this.options.agent.instructions = [
-            this.options.agent.instructions || '',
-            workbenchInstructions,
-          ]
-            .filter(Boolean)
-            .join('\n\n');
-        }
-      }
-
-      /* === VIVENTIUM NOTE ===
-       * Feature: Time context injection for scheduling awareness
-       * Purpose: Provide LLM with user's current local time from client timestamp/timezone.
-       * Added: 2026-01-31
-       */
-      const timeContextInstructions = replaysPinnedMainContext
-        ? ''
-        : buildTimeContextInstructions(this.options.req);
-      const activeWorkContextInstructions = replaysPinnedMainContext
-        ? ''
-        : (this.options.req._viventiumContinuityActiveWorkContext ??
-          (await resolveActiveWorkTurnContext(this.options.req)));
-      const sourceSelectionContextInstructions = sourceSelectionTurnContext(
-        this.options.req,
-        replaysPinnedMainContext,
-      );
-      const acceptedMainIdentity = replaysPinnedMainContext
-        ? null
-        : this.options.req?._viventiumAcceptedMainCompactionIdentityV1 || {
-            ownerId: String(this.options.req?.user?.id || ''),
-            agentId: String(this.options.agent?.id || ''),
-            stableAuthoritySha256: stableAuthorityDigest(this.options.agent),
-          };
-      if (
-        acceptedMainIdentity &&
-        !Object.prototype.hasOwnProperty.call(
-          this.options.req,
-          '_viventiumAcceptedMainCompactionIdentityV1',
-        )
-      ) {
-        Object.defineProperty(this.options.req, '_viventiumAcceptedMainCompactionIdentityV1', {
-          configurable: false,
-          enumerable: false,
-          writable: false,
-          value: Object.freeze({ ...acceptedMainIdentity }),
-        });
-      }
-      const recurrenceStateInstructions = replaysPinnedMainContext
-        ? ''
-        : buildRecurrenceStateCapsule(this.options.req, this.options.req?.body?.recurrenceState);
-      /* === VIVENTIUM START === Keep Main's save acknowledgement aligned with the detached writer. === */
-      const automaticMemoryWriterEligible =
-        Boolean(this.memoryWriterState) &&
-        !evalIsolationForRequest(this.options.req).savedMemory &&
-        this.options.req?.body?.viventiumDeferVoiceMemory !== true &&
-        !isCancelledVoiceTask(this.options.req) &&
-        !shouldSkipAutomaticMemoryWriter(this.options.req);
-      const savedMemoryWriterTurnContext = buildSavedMemoryWriterTurnContext(
-        automaticMemoryWriterEligible,
-      );
-      const currentCallContextInstructions = replaysPinnedMainContext
-        ? ''
-        : getCurrentCallContext(this.options.req);
-      /* === VIVENTIUM END === */
-      let selectedCarrierBytes = conversationProviderUsesInvocationLocalTime(
-        req,
-        this.options.agent,
-      )
-        ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
-        : MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES;
-      // Reuse the native whole-source estimator after history and attachments are prepared.
-      // The final consumer owns one aggregate body budget, not a fixed 128 KiB context partition.
-      // Unknown/mixed routes retain the existing bound and recovery owner.
-      const nativeContextRoutes = [
-        this.options.agent,
-        this.options.agent?.viventiumFallbackLlm ||
-          this.options.agent?.viventiumFallbackLlmAssignment,
-        ...(this.options.agent?.viventiumGraphLlmFallbacks || []),
-      ].filter(Boolean);
-      if (
-        !replaysPinnedMainContext &&
-        conversationProviderUsesNativeBody(req, this.options.agent, { requireTransport: true }) &&
-        conversationProviderUsesNativeBody(req, this.options.agent, {
-          alternates: nativeContextRoutes.slice(1),
-        })
-      ) {
-        const replayBudget = await getNativeConversationReplayBudgetForRoutes(
-          nativeContextRoutes,
-          req?.config?.endpoints?.custom,
-        ).catch(() => null);
-        if (replayBudget !== null) {
-          const nativeHistoryUploads = await resolveConversationProviderUploadedFiles(
-            req,
-            config?.configurable?.requestBody,
-          ).catch(() => null);
-          const allocation = nativeMainContinuityAllocation(
-            req,
-            this.options.agent,
-            this._viventiumVisibleMessagesV1,
-            {
-              attachments: this.options.attachments,
-              currentAttachmentPreparation: this._viventiumCurrentAttachmentPreparation,
-              nativeHistoryUploads,
-              contextHandlers: this.contextHandlers || !isAgentsEndpoint(this.options.endpoint),
-              userName: this.options.name,
-              assistantName: this.options.modelLabel,
-            },
-            replayBudget,
-            selectedCarrierBytes,
-          );
-          selectedCarrierBytes = allocation.carrierMaxUtf8Bytes;
-          const { sizingReceipt, fits } = allocation;
-          logger.info(
-            '[VIVENTIUM][main-context-allocation] ' +
-              JSON.stringify({
-                nativeBudgetBytes: replayBudget,
-                contextCapacityBytes: sizingReceipt.contextBudgetBytes ?? null,
-                authorizedAttachmentBoundBytes: sizingReceipt.attachmentBoundBytes ?? null,
-                selectedCarrierBytes,
-                fitOutcome: fits === null ? 'unknown' : fits ? 'fit' : 'over_bound',
-              }),
-          );
-        }
-      }
-      const authorityReserveBytes = mainAttemptFactsAuthorityReserveBytes(req, this.options.agent);
-      const coreOutputCarrier = mainContinuityOutputCarrier(
-        mainContinuityCarrierPeerParts({
-          currentCallContext: currentCallContextInstructions,
-          conversationContinuityContext: replaysPinnedMainContext
-            ? ''
-            : this._viventiumConversationContinuityCapsule || '',
-          optionalContexts: [
-            telegramReplyContext,
-            savedMemoryWriterTurnContext,
-            recurrenceStateInstructions,
-            timeContextInstructions,
-            activeWorkContextInstructions,
-            sourceSelectionContextInstructions,
-          ],
-          carrierMaxUtf8Bytes: selectedCarrierBytes,
-        }),
-        authorityReserveBytes,
-        selectedCarrierBytes,
-      );
-      req._viventiumAcceptedMainOutputCarrierV1 = Object.freeze(coreOutputCarrier);
-      const acceptedMainContext = replaysPinnedMainContext
-        ? { status: 'pinned_replay', capsule: '', turns: [] }
-        : await loadAcceptedMainContextForAdmission({
-            ...acceptedMainIdentity,
-            req,
-            agent: this.options.agent,
-            outputCarrier: coreOutputCarrier,
-            signal: abortController?.signal,
-          });
-      const acceptedMainContextInstructions = acceptedMainContext.capsule || '';
-      const turnContextInstructions = combineTurnContextInstructions(
-        timeContextInstructions,
-        activeWorkContextInstructions,
-        sourceSelectionContextInstructions,
-        telegramReplyContext,
+      const {
+        voiceMode,
+        wingModeActive,
+        voiceProvider,
+        inputMode,
+        isTelegramSurface,
+        telegramAudioRequested,
+        acceptedMainContext,
+        surfacePromptLayers,
         acceptedMainContextInstructions,
         recurrenceStateInstructions,
-        savedMemoryWriterTurnContext,
-        replaysPinnedMainContext ? '' : this._viventiumConversationContinuityCapsule || '',
-        selectedCarrierBytes === MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES
-          ? selectedCarrierBytes - authorityReserveBytes
-          : selectedCarrierBytes,
         currentCallContextInstructions,
-      );
-      if (turnContextInstructions) {
-        surfacePromptLayers.time_context = timeContextInstructions;
-        if (currentCallContextInstructions) {
-          surfacePromptLayers.current_call = currentCallContextInstructions;
-        }
-        if (activeWorkContextInstructions) {
-          surfacePromptLayers.active_work_context = activeWorkContextInstructions;
-        }
-        if (sourceSelectionContextInstructions) {
-          surfacePromptLayers.rapid_source_selection = sourceSelectionContextInstructions;
-        }
-        if (acceptedMainContextInstructions) {
-          surfacePromptLayers.main_continuity = acceptedMainContextInstructions;
-        }
-        if (recurrenceStateInstructions) {
-          surfacePromptLayers.recurrence_state = recurrenceStateInstructions;
-        }
-        if (savedMemoryWriterTurnContext) {
-          surfacePromptLayers.saved_memory_writer = savedMemoryWriterTurnContext;
-        }
-        const providerCapabilities =
-          this.options.req?.config?.endpoints?.agents?.providerCapabilities || {};
-        const providerCapability =
-          this.options.req?.viventiumTimeContextDelivery === 'per_turn_header'
-            ? { workspace_binding: true, conversation_session: true }
-            : providerCapabilities[this.options.agent?.provider] ||
-              providerCapabilities[this.options.agent?.endpoint];
-        this.options.agent.instructions = applyTimeContextDelivery({
-          req: this.options.req,
-          requestBody: config?.configurable?.requestBody,
-          instructions: this.options.agent.instructions || '',
-          timeContextInstructions: turnContextInstructions,
-          providerCapability,
-        });
-      }
-      /* === VIVENTIUM NOTE END === */
-      surfacePromptLayers.final_runtime_instructions = this.options.agent?.instructions || '';
-      logPromptFrame(
-        logger,
-        promptFrameTelemetry.buildPromptFrame({
-          promptFamily: 'main_runtime',
-          surface,
-          ...promptFrameExecutionLineage(this.options.req, this.options.agent),
-          provider: resolveConversationProviderId(this.options.agent),
-          model: this.options.agent?.model_parameters?.model || this.options.agent?.model,
-          agentId: this.options.agent?.id,
-          requestIdentity: {
-            ownerId: this.options.req?.user?.id || this.options.req?.user?._id,
-            interactionContext: trustedInteractionContext,
-          },
-          authClass: userMCPAuthMap ? 'connected_account_runtime' : 'user_runtime',
-          layers: surfacePromptLayers,
-          promptSourceFiles: {
-            agent_client: __filename,
-          },
-          flags: {
-            voice_mode: voiceMode,
-            input_mode: inputMode,
-            telegram_surface: isTelegramSurface,
-            playground_surface: isPlaygroundSurface,
-            tool_count: Array.isArray(this.options.agent?.tools)
-              ? this.options.agent.tools.length
-              : 0,
-            has_user_mcp_auth_map: !!userMCPAuthMap,
-          },
-          mcpInstructionSources: this.options.agent?.viventiumMCPInstructionSources || {},
-          voiceText: surfacePromptLayers.final_runtime_instructions,
-        }),
-      );
+        surface,
+        selectedCarrierBytes,
+        turnContextInstructions,
+        activeWorkContextInstructions,
+        telegramReplyContext,
+        replaysPinnedMainContext,
+        savedMemoryWriterTurnContext,
+        timeContextInstructions,
+        sourceSelectionContextInstructions,
+        trustedInteractionContext,
+      } = await this.prepareMainRuntimeInstructions({ config, abortController, userMCPAuthMap });
 
       /* === VIVENTIUM NOTE ===
        * Feature: Sanitize agent payload content parts before formatting.

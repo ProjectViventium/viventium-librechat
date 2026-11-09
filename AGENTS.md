@@ -30,6 +30,13 @@ The source code for `@librechat/agents` is managed as a separate local component
 - For browser-visible Viventium behavior, Jest and mocked hooks are supporting evidence; follow the
   parent real-browser acceptance contract.
 
+For Viventium work, the parent `AGENTS.md` and approved QA mode control the upstream contribution
+recipe in `.github/CONTRIBUTING.md`. Preserve the active checkout and browser state. Install only
+changed or missing dependencies; use development reload for edits and build affected production
+assets once the candidate is coherent. Select tests by traced relevance. Do not run update/reinstall,
+clear cookies, rebuild everything or run every suite merely because that numbered recipe exists.
+It remains upstream contribution guidance.
+
 ### Agent Sync Safety
 
 - Before any user-level agent push, run
@@ -99,7 +106,8 @@ The source code for `@librechat/agents` is managed as a separate local component
 - **Limit `unknown`** — avoid `unknown`, `Record<string, unknown>`, and `as unknown as T` assertions. A `Record<string, unknown>` almost always signals a missing explicit type definition.
 - **Don't duplicate types** — before defining a new type, check whether it already exists in the project (especially `packages/data-provider`). Reuse and extend existing types rather than creating redundant definitions.
 - Use union types, generics, and interfaces appropriately.
-- All TypeScript and ESLint warnings/errors must be addressed — do not leave unresolved diagnostics.
+- Resolve TypeScript/ESLint diagnostics introduced by the change or blocking its selected checks.
+  Record unrelated baseline diagnostics in the task or PR; do not expand the task to clear them.
 
 ### Comments and Documentation
 
@@ -195,4 +203,4 @@ Multi-line imports count total character length across all lines. Consolidate va
 
 ## Formatting
 
-Fix all formatting lint errors (trailing spaces, tabs, newlines, indentation) using auto-fix when available. All TypeScript/ESLint warnings and errors **must** be resolved.
+Fix formatting and TypeScript/ESLint diagnostics in changed or causally affected code. Scope auto-fix to owned files. Preserve unrelated work and record pre-existing diagnostics instead of starting a repository-wide cleanup.

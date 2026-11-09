@@ -21,6 +21,30 @@ import { isEnabled } from '~/utils/common';
 
 export type ConversationRecallRuntimeScope = 'none' | 'all' | 'agent';
 export type ConversationRecallAttachmentMode = 'vector' | 'source_only';
+
+/** Corpus observations and retrieval readiness are not access scope; other fields retain authority. */
+export function conversationRecallResourceAuthority(file: Record<string, unknown>): Record<string, unknown> {
+  if (file.context !== FileContext.conversation_recall ||
+      !['vector', 'source_only'].includes(String(file.viventiumConversationRecallMode)) ||
+      !file.metadata || typeof file.metadata !== 'object' || Array.isArray(file.metadata)) return file;
+  const {
+    viventiumConversationRecallMode: _mode,
+    viventiumConversationRecallAttachmentReason: _reason,
+    ...descriptorAuthority
+  } = file;
+  const {
+    conversationRecallCharCount: _chars,
+    conversationRecallTurnCount: _turns,
+    conversationRecallDigest: _digest,
+    conversationRecallSourceDigest: _sourceDigest,
+    conversationRecallUploadedDigest: _uploadedDigest,
+    conversationRecallSourceTurnCount: _sourceTurns,
+    conversationRecallSourceCharCount: _sourceChars,
+    conversationRecallUsedReducedUploadWindow: _reducedUpload,
+    ...authority
+  } = file.metadata as Record<string, unknown>;
+  return { ...descriptorAuthority, metadata: authority };
+}
 export type ConversationRecallAttachmentReason =
   | 'vector_ready'
   | 'missing_corpus'

@@ -39,6 +39,13 @@ describe('current native tool catalog', () => {
     expect(JSON.stringify(tools)).toBe(before);
   });
 
+  test('retains standard MCP tool metadata without changing the model schema', () => {
+    const marked = { ...tools[1], _meta: { 'xperfect.coordination/contract': 'original-context-v1' } };
+    const result = createNativeToolCatalog({ ...scope, tools: [marked] });
+    expect(result?.tools[0]).toEqual({ ...marked, description: '' });
+    expect(result?.tools[0].inputSchema).toBe(marked.inputSchema);
+  });
+
   test('omits the entire catalog when count or byte bound cannot hold it', () => {
     expect(
       createNativeToolCatalog({

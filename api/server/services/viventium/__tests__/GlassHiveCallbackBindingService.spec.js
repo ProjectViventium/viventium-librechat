@@ -6,6 +6,8 @@
 
 let mockTerminalFindOne;
 let mockSchedulerDispatchFindOne;
+let mockActionReceiptFindOne;
+let mockMissionEvidenceFindOne;
 let mockBindingFindOne;
 let mockBindingUpdateOne;
 let mockExternalFind;
@@ -80,10 +82,15 @@ jest.mock('mongoose', () => {
             updateOne: (...args) => mockExternalUpdateOne(...args),
           };
         }
+        if (name === 'viventium_glasshive_mission_evidence') {
+          return { findOne: (...args) => mockMissionEvidenceFindOne(...args) };
+        }
+        if (name === 'viventium_interaction_durable_effects') {
+          return { findOne: (...args) => mockActionReceiptFindOne(...args) };
+        }
         if (name === 'viventium_scheduler_dispatch_intents') {
           return { findOne: (...args) => mockSchedulerDispatchFindOne(...args) };
         }
-        if (name === 'viventium_glasshive_mission_evidence') return {};
         if (name === 'viventium_glasshive_callback_results')
           return { findOne: (...args) => mockTerminalFindOne(...args) };
         throw new Error(`Unexpected collection ${name}`);
@@ -164,6 +171,8 @@ describe('GlassHiveCallbackBindingService', () => {
     mockInvalidateActiveWorkSnapshot.mockClear();
     mockTerminalFindOne = jest.fn().mockResolvedValue(null);
     mockSchedulerDispatchFindOne = jest.fn().mockResolvedValue(null);
+    mockActionReceiptFindOne = jest.fn().mockResolvedValue(null);
+    mockMissionEvidenceFindOne = jest.fn().mockResolvedValue(null);
     mockBindingFindOne = jest.fn();
     mockBindingUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockExternalCursor = {
@@ -1484,6 +1493,79 @@ describe('GlassHiveCallbackBindingService', () => {
       ).rejects.toMatchObject({ code: 'glasshive_callback_run_binding_not_ready' });
       expect(mockExternalUpdateOne).toHaveBeenCalledTimes(1);
     });
+  });
+
+  test('routes an accepted Web-origin continuation to its exact Telegram topic', async () => {
+    mockBindingFindOne.mockResolvedValue({
+      _id: 'ghi-origin-1',
+      workRef: 'gh-work-1',
+      ownerId: 'user-1',
+      conversationId: 'conversation-1',
+      anchorMessageId: 'web-anchor',
+      requestedParentMessageId: 'web-source',
+      configuredDestinations: [{ surface: 'librechat' }],
+    });
+    mockRequestAccountApi.mockResolvedValue({
+      valid: true,
+      originRef: 'ghi-origin-1',
+      workRef: 'gh-work-1',
+      runId: 'run-1',
+      sourceActionKey: 'accepted-action',
+    });
+    mockActionReceiptFindOne.mockResolvedValue({ sourceEventId: 'telegram-source-event' });
+    mockGetMessages.mockResolvedValue([
+      {
+        messageId: 'telegram-source',
+        metadata: {
+          viventium: {
+            telegramInput: {
+              preparation: {
+                message: {
+                  chat: { id: -100 },
+                  from: { id: 123 },
+                  message_id: 44,
+                  message_thread_id: 5,
+                },
+              },
+            },
+          },
+        },
+      },
+    ]);
+    const context = await resolveGlassHiveCallbackContext(
+      {
+        origin_ref: 'ghi-origin-1',
+        work_ref: 'gh-work-1',
+        worker_id: 'worker-1',
+        run_id: 'run-1',
+        event: 'run.completed',
+        work_terminal: true,
+        work_state: 'completed',
+        telegram_chat_id: 'untrusted',
+      },
+      { deferConfirmation: true },
+    );
+    expect(mockActionReceiptFindOne).toHaveBeenCalledWith(
+      {
+        ownerId: 'user-1',
+        conversationId: 'conversation-1',
+        providerIdempotencyKey: 'accepted-action',
+        adapterId: 'glasshive.work_action.v1',
+        surface: 'telegram',
+      },
+      expect.anything(),
+    );
+    expect(context.anchorMessageId).toBe('web-anchor');
+    expect(context.destinations).toEqual([
+      {
+        surface: 'telegram',
+        telegramChatId: '-100',
+        telegramUserId: '123',
+        telegramMessageId: '44',
+        telegramMessageThreadId: '5',
+      },
+      { surface: 'librechat' },
+    ]);
   });
 
   test('resolves by launch origin, verifies the authoritative GlassHive association, and ignores callback targets', async () => {

@@ -15,7 +15,6 @@ const {
   buildTrustedActionIdempotencyKey,
   getActiveWorkSnapshot,
   invalidateActiveWorkSnapshot,
-  requestAccountApi,
 } = require('./GlassHiveAccountService');
 const {
   dismissCoreOnlyPreDispatchAttention,
@@ -43,7 +42,8 @@ module.exports = createGlassHiveWorkActionService({
   buildTrustedActionIdempotencyKey,
   getActiveWorkSnapshot,
   invalidateActiveWorkSnapshot,
-  requestAccountApi,
+  requestAccountApi: (input) =>
+    require('./NativeCoordinatorWorkService').requestNativeCoordinatorWork(input),
   prepareActionRuntimeBundle: async ({ ownerId, requestBody }) => {
     if (process.env.VIVENTIUM_XPERFECT_SCHEDULED_WAKES_ENABLED !== 'true') return undefined;
     // Failure to prepare the current source must not reuse a previous task's create grant.

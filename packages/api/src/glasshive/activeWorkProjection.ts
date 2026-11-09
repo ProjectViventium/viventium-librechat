@@ -6,6 +6,7 @@
 
 import { evidenceId } from './missionEvidenceIdentity';
 import { normalizeWorkDeliveryScope } from './workDeliveryScope';
+import { nativeCoordinatorWorkRef } from './nativeCoordinatorWork';
 
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
 const DISMISS_SAFE_DELIVERY_STATES = new Set(['delivered', 'acknowledged', 'silent']);
@@ -67,6 +68,14 @@ function isRecord(value: unknown): value is UnknownRecord {
 
 function recordFrom(value: unknown): UnknownRecord {
   return isRecord(value) ? value : {};
+}
+
+function executionWorkRef(item: UnknownRecord): string {
+  if (item.managementKind === 'native_coordinator' &&
+      typeof item.nativeConversationId === 'string' && typeof item.nativeGoalId === 'string' &&
+      item.workRef === nativeCoordinatorWorkRef(item.nativeConversationId, item.nativeGoalId))
+    return normalizeText(item.nativeWorkRef);
+  return normalizeText(item.workRef);
 }
 
 function normalizeText(value: unknown, maxLength = 160): string {
@@ -593,7 +602,7 @@ export function createGlassHiveActiveWorkProjectionService(
     }
     const sourceWork: unknown[] = Array.isArray(snapshot.work) ? snapshot.work : [];
     const workRefs = [
-      ...new Set(sourceWork.map((item) => normalizeText(recordFrom(item).workRef)).filter(Boolean)),
+      ...new Set(sourceWork.map((item) => executionWorkRef(recordFrom(item))).filter(Boolean)),
     ];
     if (!workRefs.length && !includeCoreProjection) {
       return snapshot;
@@ -630,7 +639,7 @@ export function createGlassHiveActiveWorkProjectionService(
       sourceWork
         .filter((itemValue) => {
           const item = recordFrom(itemValue);
-          const row = byRef.get(normalizeText(item.workRef));
+          const row = byRef.get(executionWorkRef(item));
           return (
             row &&
             TERMINAL_STATES.has(normalizeText(item.state, 32).toLowerCase()) &&
@@ -641,19 +650,24 @@ export function createGlassHiveActiveWorkProjectionService(
           const item = recordFrom(itemValue);
           return reconcileAuthoritativeGlassHiveWorkState({
             ownerId: normalizedOwnerId,
-            item,
-            row: byRef.get(normalizeText(item.workRef)),
+            item: { ...item, workRef: executionWorkRef(item) },
+            row: byRef.get(executionWorkRef(item)),
           });
         }),
     );
     const projectedWork = sourceWork.map((itemValue): UnknownRecord => {
       const item = recordFrom(itemValue);
-      const row = byRef.get(normalizeText(item.workRef));
-      const delivery = projectedDelivery(item, row, missionStates.get(normalizeText(item.workRef)));
+      const canonicalRef = executionWorkRef(item);
+      const row = byRef.get(canonicalRef);
+      const currentResult = item.managementKind !== 'native_coordinator' ||
+        (normalizeText(item.nativeRunId) && normalizeText(item.nativeRunId) === normalizeText(row?.terminalCallbackRunId));
+      const delivery = currentResult
+        ? projectedDelivery(item, row, missionStates.get(canonicalRef))
+        : { state: 'unknown', unreadTerminal: TERMINAL_STATES.has(normalizeText(item.state, 32)) };
       const actions = Array.isArray(item.actions) ? item.actions : [];
       const coreUpdatedAt = isoDate(row?.updatedAt);
       const executionUpdatedAt = isoDate(item.updatedAt);
-      const deliveryScope = row
+      const deliveryScope = row && currentResult
         ? normalizeWorkDeliveryScope({
             originConversationId: row.conversationId,
             destinations: row.configuredDestinations,

@@ -14,7 +14,11 @@
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const { GenerationJobManager, isCurrentCallPreparationDispatch } = require('@librechat/api');
+const {
+  GenerationJobManager,
+  isCurrentCallPreparationDispatch,
+  schedulerDispatchDocumentId,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
 const {
@@ -101,10 +105,6 @@ function normalizeSchedulerIdempotencyKey(value) {
     throw new Error('Scheduler idempotency key is too long');
   }
   return key;
-}
-
-function schedulerDispatchDocumentId(userId, idempotencyKey) {
-  return crypto.createHash('sha256').update(`${userId}\0${idempotencyKey}`).digest('hex');
 }
 
 const SCHEDULER_MESSAGE_UUID_NAMESPACE = Buffer.from('6ba7b8119dad11d180b400c04fd430c8', 'hex');
@@ -541,6 +541,17 @@ router.post('/targets', schedulerAuth, async (req, res) => {
 });
 
 router.post('/due', async (req, res) => {
+  if (
+    [
+      'coordinator.turn_due',
+      'coordinator.dispatch_due',
+      'coordinator.action_due',
+      'coordinator.result_ready',
+      'coordinator.turn_result_ready',
+    ].includes(req.body?.type)
+  ) {
+    return require('~/server/services/viventium/NativeCoordinatorService').receive(req, res);
+  }
   const {
     receiveScheduleDue,
     reconcileScheduleDueAdmissions,
@@ -997,6 +1008,62 @@ router.get('/dispatches/:idempotencyKey', schedulerAuth, async (req, res) => {
     return res.status(404).json({ error: 'Scheduler dispatch not found' });
   }
   const job = await GenerationJobManager.getJob(dispatch.streamId);
+  let finalEvent;
+  if (!job && dispatch.status === 'accepted') {
+    const retained =
+      await require('~/server/services/viventium/nativeResponseService').readRetainedMainFinal({
+        userId: String(req.user.id),
+        streamId: dispatch.streamId,
+        conversationId: dispatch.conversationId,
+        includeSettled: true,
+      });
+    if (
+      retained?.interactionContext?.origin === 'scheduler' &&
+      retained.interactionContext.source_event_id === idempotencyKey
+    ) {
+      finalEvent = attachLogicalTurnMetadata(retained.finalEvent, retained.interactionContext);
+    } else {
+      // Failed authoring has no successful native-final receipt. Recover only the exact
+      // canonical scheduler source and its one completed error, never a neighboring turn.
+      const sourceId = schedulerMessageId(req.user.id, dispatch.streamId);
+      const sources = await getMessages({
+        user: String(req.user.id),
+        conversationId: dispatch.conversationId,
+        messageId: sourceId,
+        isCreatedByUser: true,
+        deletedAt: null,
+      });
+      const failures =
+        sources.length === 1
+          ? await getMessages({
+              user: String(req.user.id),
+              conversationId: dispatch.conversationId,
+              parentMessageId: sourceId,
+              isCreatedByUser: false,
+              unfinished: false,
+              error: true,
+              deletedAt: null,
+              'metadata.viventium.interactionContext.origin': 'scheduler',
+              'metadata.viventium.interactionContext.source_event_id': idempotencyKey,
+            })
+          : [];
+      if (failures.length === 1) {
+        const failure = failures[0];
+        const context = failure.metadata?.viventium?.interactionContext;
+        const sourceContext = sources[0].metadata?.viventium?.interactionContext;
+        if (
+          context?.logical_turn_id &&
+          context.logical_turn_id === sourceContext?.logical_turn_id &&
+          context.revision === sourceContext.revision
+        ) {
+          finalEvent = attachLogicalTurnMetadata(
+            { final: true, responseMessage: failure },
+            context,
+          );
+        }
+      }
+    }
+  }
   const externalWork = await getSchedulerExternalWorkSummary({
     ownerId: String(req.user?.id || ''),
     schedulerDispatchDocumentId: documentId,
@@ -1006,7 +1073,12 @@ router.get('/dispatches/:idempotencyKey', schedulerAuth, async (req, res) => {
     streamId: dispatch.streamId,
     conversationId: dispatch.conversationId,
     idempotencyKey,
-    state: job ? 'accepted' : 'reserved',
+    state: finalEvent
+      ? 'terminal'
+      : job || dispatch.status === 'accepted'
+        ? 'accepted'
+        : 'reserved',
+    ...(finalEvent ? { finalEvent } : {}),
     externalWork,
   });
 });

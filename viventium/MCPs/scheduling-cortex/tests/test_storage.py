@@ -57,6 +57,28 @@ def _build_task(
 
 
 class StorageDeliveryLedgerTests(unittest.TestCase):
+    def test_delivery_and_heartbeat_cannot_resurrect_an_expired_attempt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / 'schedules.db')))
+            claim = store.claim_scheduled_prompt_occurrence(task_id='task-fence', user_id='owner',
+                executor='viventium_agent', due_at='2026-08-10T12:00:00Z',
+                lease_owner='worker-1', now='2026-08-10T12:00:00Z', lease_seconds=60)
+            run_id = claim['run']['run_id']
+            self.assertFalse(store.renew_scheduled_prompt_run_lease(run_id, lease_owner='worker-1',
+                now='2026-08-10T12:01:01Z', lease_seconds=60))
+            args = dict(run_id=run_id, occurrence_key=None, channel='telegram', part_index=0,
+                payload_hash='synthetic', lease_owner='sender', now='2026-08-10T12:01:01Z',
+                lease_seconds=30, expected_run_lease_owner='worker-1', expected_run_attempt=1)
+            self.assertEqual(store.claim_scheduled_prompt_delivery(**args)['reason'], 'stale_attempt')
+            self.assertEqual(store.list_scheduled_prompt_deliveries(run_id=run_id, channel='telegram'), [])
+            renewed = store.claim_scheduled_prompt_occurrence(task_id='task-fence', user_id='owner',
+                executor='viventium_agent', due_at='2026-08-10T12:00:00Z',
+                lease_owner='worker-2', now='2026-08-10T12:01:01Z', lease_seconds=60)
+            self.assertTrue(renewed['claimed'])
+            self.assertEqual(store.claim_scheduled_prompt_delivery(**args)['reason'], 'stale_attempt')
+            args.update(expected_run_lease_owner='worker-2', expected_run_attempt=2)
+            self.assertTrue(store.claim_scheduled_prompt_delivery(**args)['claimed'])
+
     def test_schedule_search_finds_a_topic_when_the_user_paraphrases_the_saved_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))

@@ -31,6 +31,12 @@ function preparationOwner(interactionContext = null) {
   const continuity = jest.fn(async (options) => ({ messages: options.orderedMessages }));
   const scope = {
     module: { exports: {} },
+    require: (id) => {
+      if (id === '@librechat/api') return jest.requireActual('@librechat/api');
+      throw new Error(`Unexpected attachment preparation dependency: ${id}`);
+    },
+    stableAuthorityDigest: require('~/server/services/viventium/ViventiumMainContextService')
+      .stableAuthorityDigest,
     startActiveWorkTurnContext: () => {},
     startDeepTiming: () => null,
     isVoiceLatencyEnabled: () => false,

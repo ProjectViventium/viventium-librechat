@@ -1202,7 +1202,6 @@ describe('GlassHiveCallbackDeliveryService', () => {
       'sha256:' + require('crypto').createHash('sha256').update(text).digest('hex'),
     );
   });
-
   test('Main presentation identity excludes raw callback rows and cannot rewrite a sent receipt', async () => {
     const rows = new Map();
     const rawKey = `owner:origin:telegram:${canonicalCallbackRef('same-callback')}`;
@@ -1902,6 +1901,7 @@ describe('GlassHiveCallbackDeliveryService', () => {
           text: '',
           attachments: input.message.attachments,
           callbackMessageId: input.message.messageId,
+          projectionAppliedAt: expect.any(Date),
           terminalCallbackResultKey: binding.resultKey,
           terminalCallbackAcceptedOperationId: binding.acceptedOperationId,
           terminalCallbackEffectGeneration: binding.effectGeneration,

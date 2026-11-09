@@ -1,3 +1,7 @@
+const mockReceiveNativeCoordinator = jest.fn();
+jest.mock('~/server/services/viventium/NativeCoordinatorService', () => ({
+  receive: (...args) => mockReceiveNativeCoordinator(...args),
+}));
 /* === VIVENTIUM START ===
  * Feature: Scheduler gateway tests (Telegram mapping resolve)
  * Added: 2026-01-17
@@ -124,6 +128,10 @@ jest.mock(
     res.json({ streamId: req.body.streamId, conversationId: req.body.conversationId || 'new' });
   },
 );
+
+jest.mock('~/server/services/viventium/nativeResponseService', () => ({
+  readRetainedMainFinal: jest.fn().mockResolvedValue(null),
+}));
 
 jest.mock('mongoose', () => {
   const mongoose = jest.requireActual('mongoose');
@@ -1257,6 +1265,99 @@ describe('/api/viventium/scheduler/chat', () => {
     expect(reconciled.body.state).toBe('accepted');
     expect(agentControllerCalls).toBe(1);
   });
+
+  test.each(['missing', 'failed', 'foreign_revision', 'duplicate'])(
+    'accepted dispatch survives cache loss and recovers only exact terminal proof: %s',
+    async (kind) => {
+      const app = createTestApp(require('../scheduler'));
+      const idempotencyKey = 'schedule:retained-result';
+      const accepted = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          url: '/api/viventium/scheduler/chat',
+          headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+          body: {
+            userId: 'user_1',
+            text: 'Synthetic work',
+            agentId: 'agent_test',
+            conversationId: 'conversation-1',
+            idempotencyKey,
+            source_event_id: idempotencyKey,
+          },
+        }),
+        accepted,
+      );
+      mockGetJob.mockResolvedValue(null);
+      const context = { ...lastInteractionContext, logical_turn_id: 'synthetic-logical-turn' };
+      const failure = {
+        user: 'user_1',
+        conversationId: 'conversation-1',
+        messageId: 'failed-result',
+        parentMessageId: lastSchedulerMessageId,
+        isCreatedByUser: false,
+        unfinished: false,
+        error: true,
+        content: [
+          {
+            type: 'error',
+            error: 'Provider failed',
+            error_class: 'provider_response_failed',
+            failure_retryable: true,
+          },
+        ],
+        metadata: {
+          viventium: {
+            interactionContext: {
+              ...context,
+              revision: kind === 'foreign_revision' ? context.revision + 1 : context.revision,
+            },
+          },
+        },
+      };
+      mockGetMessage.mockResolvedValue(
+        kind === 'missing'
+          ? null
+          : {
+              messageId: lastSchedulerMessageId,
+              metadata: { viventium: { interactionContext: context } },
+            },
+      );
+      mockGetMessages.mockImplementation(async (query) =>
+        kind === 'missing'
+          ? []
+          : query.messageId
+            ? [
+                {
+                  messageId: lastSchedulerMessageId,
+                  metadata: { viventium: { interactionContext: context } },
+                },
+              ]
+            : kind === 'duplicate'
+              ? [failure, failure]
+              : [failure],
+      );
+      const result = createMockRes();
+      await dispatch(
+        app,
+        createMockReq({
+          method: 'GET',
+          url: `/api/viventium/scheduler/dispatches/${encodeURIComponent(idempotencyKey)}?userId=user_1`,
+          headers: { 'x-viventium-scheduler-secret': 'scheduler_secret' },
+          query: { userId: 'user_1' },
+        }),
+        result,
+      );
+      expect(result.statusCode).toBe(200);
+      expect(result.body.state).toBe(kind === 'failed' ? 'terminal' : 'accepted');
+      if (kind === 'failed')
+        expect(result.body.finalEvent.responseMessage.content[0].error_class).toBe(
+          'provider_response_failed',
+        );
+      else expect(result.body.finalEvent).toBeUndefined();
+      expect(agentControllerCalls).toBe(1);
+    },
+  );
 
   test('authors one deterministic server-owned message identity for a scheduled occurrence', async () => {
     const schedulerRouter = require('../scheduler');
@@ -2769,4 +2870,25 @@ Holding Examples
     },
   );
   /* === VIVENTIUM END === */
+});
+
+describe('existing due transport Native event routing', () => {
+  test.each([
+    'coordinator.turn_due',
+    'coordinator.dispatch_due',
+    'coordinator.action_due',
+    'coordinator.result_ready',
+    'coordinator.turn_result_ready',
+  ])('couriers the original request to the signed Native receiver for %s', async (type) => {
+    mockReceiveNativeCoordinator
+      .mockReset()
+      .mockImplementation(async (_req, res) => res.status(202).json({ accepted: true }));
+    const app = createTestApp(require('../scheduler'));
+    const req = createMockReq({ url: '/api/viventium/scheduler/due', body: { type } });
+    req.viventiumScheduleDueRawBody = Buffer.from(JSON.stringify(req.body));
+    const res = createMockRes();
+    await dispatch(app, req, res);
+    expect(mockReceiveNativeCoordinator).toHaveBeenCalledWith(req, res);
+    expect(res.statusCode).toBe(202);
+  });
 });

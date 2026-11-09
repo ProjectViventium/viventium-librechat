@@ -104,6 +104,16 @@ describe('GlassHive account client', () => {
     });
     expect(timeoutSpy).toHaveBeenLastCalledWith(15000);
 
+    await requestAccountApi({ ownerId: 'owner-1',
+      path: '/v1/coordinator/conversations/c-1/goals/g-1/actions?run_id=run-1',
+      method: 'POST', body: { action: 'steer' }, fetchImpl });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(15000);
+
+    await requestAccountApi({ ownerId: 'owner-1',
+      path: '/v1/coordinator/conversations/c-1/goals/g-1/actions/receipt?run_id=run-1',
+      method: 'POST', body: { action: 'steer' }, fetchImpl });
+    expect(timeoutSpy).toHaveBeenLastCalledWith(5000);
+
     await requestAccountApi({ ownerId: 'owner-1', path: '/v1/work/work-1', fetchImpl });
     expect(timeoutSpy).toHaveBeenLastCalledWith(5000);
 
@@ -153,6 +163,19 @@ describe('GlassHive account client', () => {
         { ownerId: 'owner-1' },
       ),
     ).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('defers complete Native context capacity only when the trusted adapter explicitly selects it', async () => {
+    const original = '🟦 original '.repeat(30_000);
+    const fetchImpl = jest.fn(async () => new Response(JSON.stringify({ original }), {
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    await expect(requestAccountApi({ ownerId: 'owner-1',
+      path: '/v1/coordinator/conversations/c-1/goals/g-1/dispatch', fetchImpl }))
+      .rejects.toThrow('glasshive_account_response_oversized');
+    await expect(requestAccountApi({ ownerId: 'owner-1',
+      path: '/v1/coordinator/conversations/c-1/goals/g-1/dispatch',
+      maxResponseBytes: null, fetchImpl })).resolves.toEqual({ original });
   });
   it('binds explicit owner input to the exact transmitted body including Unicode and numbers', async () => {
     const nativeInput = {

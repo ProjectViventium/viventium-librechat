@@ -699,6 +699,15 @@ describe('cached native history admission floor', () => {
     const routes = [{ provider: 'native', model: 'codex-cli:gpt-6.1-sol' },
       { provider: 'native', model: 'claude-code:claude-opus-5-5' }];
     expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints)).toBe(237500);
+    expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints,
+      { providerId: 'native', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 487824 })).toBe(487824);
+    expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints,
+      { providerId: 'native', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 131072 })).toBe(131072);
+    expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints,
+      { providerId: 'foreign', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 487824 })).toBe(237500);
+    expect(await getNativeConversationReplayBudgetForRoutes([
+      ...routes, { provider: 'native', model: 'operator-capped' },
+    ], endpoints, { providerId: 'native', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 487824 })).toBe(65536);
     expect(await getNativeConversationReplayBudgetForRoutes([
       ...routes, { provider: 'native', model: 'operator-capped' },
     ], endpoints)).toBe(65536);
@@ -706,6 +715,38 @@ describe('cached native history admission floor', () => {
       ...routes, { provider: 'native', model: 'unknown' },
     ], endpoints)).toBeNull();
     expect(mockedAxios.get).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['large-owner-budget', 'native', 'owner-model', 1024 * 1024, 1024 * 1024],
+    ['small-owner-budget', 'native', 'owner-model', 131072, 131072],
+    ['foreign-provider', 'other', 'owner-model', 1024 * 1024, 237500],
+    ['foreign-model', 'native', 'other-model', 1024 * 1024, 237500],
+    ['not-a-number', 'native', 'owner-model', Number.NaN, 237500],
+    ['infinite', 'native', 'owner-model', Number.POSITIVE_INFINITY, 237500],
+    ['unsafe-integer', 'native', 'owner-model', Number.MAX_SAFE_INTEGER + 1, 237500],
+    ['negative', 'native', 'owner-model', -1, 237500],
+    ['zero', 'native', 'owner-model', 0, 237500],
+    ['fractional', 'native', 'owner-model', 1000.5, 237500],
+  ])('honors only an exact valid Native capacity owner receipt: %s', async (_name, providerId, modelId, budgetBytes, expected) => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { data: [
+      { id: 'owner-model', native_history_admission_v1: { replay_budget_floor_bytes: 237500 } },
+    ] } });
+    await fetchModels({ apiKey: 'synthetic', name: 'native', baseURL: 'https://native.example/v1' });
+    const [key, value] = cache.set.mock.calls.at(-1);
+    cache.get.mockImplementation(async (requested: string) => requested === key ? value : undefined);
+    mockedAxios.get.mockClear();
+    const observed = { providerId: String(providerId), modelId: String(modelId), budgetBytes: Number(budgetBytes) };
+    expect(await getNativeConversationReplayBudgetForRoutes(
+      [{ provider: 'native', model: 'owner-model' }],
+      [{ name: 'native', baseURL: 'https://native.example/v1' }], observed,
+    )).toBe(expected);
+    expect(mockedAxios.get).not.toHaveBeenCalled();
+  });
+  it('keeps complete source intact when an authenticated Native budget exceeds the old courier ceiling', async () => {
+    const messages = [{ role: 'user', content: 'Synthetic retained original. '.repeat(24000) }];
+    const before = JSON.stringify(messages);
+    expect(nativeConversationHistoryFits(messages, 1024 * 1024, 0)).toBe(true);
+    expect(JSON.stringify(messages)).toBe(before);
   });
   it('counts replay data while excluding separately configured native static instructions', () => {
     const visible = [{ role: 'user', content: 'Original words.'.repeat(5000) }];
@@ -768,19 +809,26 @@ test.each([7, true, {}, [], ['label']])('non-string native media label %j cannot
 });
 
 
-describe('native replay media admission retains existing media capacity guards', () => {
+describe('native replay archives preserve per-image validation without fresh-batch aggregates', () => {
   const image = (bytes = 16) => ({ type: 'image_url', image_url: { url: 'data:image/png;base64,' +
     Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(bytes - 8)]).toString('base64') } });
   const fits = (parts: unknown[]) => nativeConversationHistoryFits([{ role: 'user', content: parts }], 196608, 131072);
-  test('two valid historical images fit, while25 retain foreground reconciliation', () => {
+  test('valid historical images fit without a lifetime observation-batch count', () => {
     expect(fits([image(), image()])).toBe(true);
-    expect(fits(Array.from({ length: 25 }, () => image()))).toBe(false);
+    expect(fits(Array.from({ length: 25 }, () => image()))).toBe(true);
   });
-  test('the existing per-image and total native media limits still bound a positive fit', () => {
+  test('per-image ingress remains bounded while lifetime aggregate bytes belong to the archive owner', () => {
     expect(fits([image(8 * 1024 * 1024)])).toBe(true);
     expect(fits([image(8 * 1024 * 1024 + 1)])).toBe(false);
     expect(fits(Array.from({ length: 4 }, () => image(8 * 1024 * 1024)))).toBe(true);
-    expect(fits([...Array.from({ length: 4 }, () => image(8 * 1024 * 1024)), image()])).toBe(false);
+    expect(fits([...Array.from({ length: 4 }, () => image(8 * 1024 * 1024)), image()])).toBe(true);
+  });
+  test.each(['text', 'current-photo'])('25 historical photos preserve complete source with a new %s turn', current => {
+    const history = Array.from({ length: 25 }, () => ({ role: 'user', content: [image()] }));
+    const messages = [...history, { role: 'user', content: current === 'text' ? 'Current original words.' : [image()] }];
+    const original = JSON.stringify(messages);
+    expect(nativeConversationHistoryFits(messages, 196608, 131072)).toBe(true);
+    expect(JSON.stringify(messages)).toBe(original);
   });
   test.each(['data:image/png;base64,broken', 'data:image/png;base64,YQ==',
     'data:image/unknown;base64,iVBORw0KGgo=', 'data:image/png,notbase64'])('invalid native inline media cannot claim fit (%s)', url => {

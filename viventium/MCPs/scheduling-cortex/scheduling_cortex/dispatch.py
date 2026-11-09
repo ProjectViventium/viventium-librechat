@@ -54,6 +54,7 @@ if _SHARED_PATH and str(_SHARED_PATH) not in sys.path:
 import scheduler_prompt_contract as _scheduler_prompt_contract
 import telegram_tts as _telegram_tts
 from telegram_audio import package_telegram_audio, TelegramAudioError
+from delivery_controls import parse_delivery_controls
 
 CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID = (
     _scheduler_prompt_contract.CONSCIOUSNESS_CONTINUITY_OPPORTUNITY_PROMPT_ID
@@ -231,6 +232,7 @@ SCHEDULED_RUNTIME_FAILURE_RETRYABILITY = {
     "runtime_io_failed": True,
     "runtime_sandbox_unavailable": True,
     "scheduler_gateway_unavailable": True,
+    "scheduler_result_unconfirmed": False,
     "unsupported_runtime_configuration": False,
 }
 SCHEDULED_PROVIDER_ROUTE_DECISIONS = frozenset(
@@ -377,6 +379,9 @@ def _scheduled_generation_failure_notice(
     next_attempt_at: Any = None,
 ) -> str:
     normalized = normalized_scheduled_generation_failure_class(error_class)
+    if normalized == "scheduler_result_unconfirmed":
+        return ("Scheduled work lost its connection. Its result is not confirmed. "
+                "Check its status before starting it again.")
     retry_time = str(next_attempt_at or "").strip()
     terminal_suffix = {
         "retry_scheduled": (
@@ -778,6 +783,13 @@ class SchedulerAdmissionRefused(RuntimeError):
 
     failure_class = "scheduler_gateway_unavailable"
     failure_retryable = True
+
+
+class SchedulerResultUnconfirmed(RuntimeError):
+    """An accepted operation has neither a saved final result nor a confirmed stop."""
+
+    failure_class = "scheduler_result_unconfirmed"
+    failure_retryable = False
 
 
 class WorkbenchCapabilityRequiresIsolation(RuntimeError):
@@ -1534,9 +1546,12 @@ def _iter_sse_payloads(
     timeout_s: int,
 ) -> Iterable[str]:
     req = urllib.request.Request(url, headers=headers, method="GET")
+    deadline = time.time() + timeout_s
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         buffer: list[str] = []
         for raw in resp:
+            if time.time() >= deadline:
+                raise TimeoutError("Scheduler stream read window elapsed")
             line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
             if not line:
                 if buffer:
@@ -2058,6 +2073,7 @@ def _stream_scheduler_response(
     secret: str,
     timeout_s: int,
     return_metadata: bool = False,
+    final_event: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str, str] | Tuple[str, str, str, Dict[str, Any]]:
     params_data = {"userId": str(user_id)}
     params = urllib.parse.urlencode(params_data)
@@ -2068,7 +2084,9 @@ def _stream_scheduler_response(
     response_message_id = ""
     followup_text = ""
     stream_metadata: Dict[str, Any] = {}
-    for raw in _iter_sse_payloads(url, headers, timeout_s):
+    final_received = False
+    payloads = [json.dumps(final_event)] if final_event is not None else _iter_sse_payloads(url, headers, timeout_s)
+    for raw in payloads:
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -2134,7 +2152,10 @@ def _stream_scheduler_response(
         if not final_text:
             chunks.extend([c for c in _extract_text_deltas(payload) if c])
         if payload.get("final"):
+            final_received = True
             break
+    if not final_received:
+        raise TimeoutError("Scheduler stream ended without a final result")
     if not final_text:
         final_text = "".join(chunks).strip()
     base_result = (final_text.strip(), response_message_id, followup_text.strip())
@@ -2317,41 +2338,60 @@ def _run_scheduler_generation(
         }
     if not stream_id:
         raise RuntimeError("Scheduler dispatch missing streamId")
-    # Scheduled Main may inherit a long-running Agent Builder route. Keep the wait below the
-    # scheduler's 15-minute lease; the bounded worker pool prevents one long generation from
-    # blocking other schedules.
-    stream_timeout_s = int(os.getenv("SCHEDULER_STREAM_TIMEOUT_S", "600"))
-    try:
-        streamed = _stream_scheduler_response(
-            base_url,
-            stream_id,
-            str(task.get("user_id") or ""),
-            secret,
-            stream_timeout_s,
-            return_metadata=True,
-        )
-    except TimeoutError:
-        # A scheduled model turn is authoring, not an independently committed external effect.
-        # Explicitly cancel it when the scheduler's bounded wait expires so an unfinished
-        # placeholder cannot keep running forever after the ledger truthfully records failure.
-        cancel_url = (
-            f"{base_url}/api/viventium/scheduler/stream/"
-            f"{urllib.parse.quote(str(stream_id), safe='')}/cancel"
-        )
+    # Keep scheduled authoring within its original deadline and release the worker after
+    # reconciliation; a socket wait must not extend the occurrence across sleep.
+    # A socket interruption is not an authoring outcome. Reconcile the accepted identity
+    # before cancelling or reporting failure. Short read waits also reconnect promptly after sleep;
+    # the wall-clock deadline remains the original enclosing authoring budget.
+    stream_deadline = datetime.fromisoformat(payload["authoringDeadlineAt"]).timestamp()
+    reconnect_delay_s = 5
+    while True:
         try:
-            _post_json(
-                cancel_url,
-                {"userId": str(task.get("user_id") or ""), "reason": "stream_timeout"},
-                headers,
-                min(max(1, timeout_s), 10),
+            streamed = _stream_scheduler_response(
+                base_url, stream_id, str(task.get("user_id") or ""), secret,
+                max(1, min(30, int(stream_deadline - time.time()))), return_metadata=True,
             )
-        except Exception as cancel_error:
-            logger.warning(
-                "Scheduler timed-out stream cancellation failed for %s: %s",
-                stream_id,
-                cancel_error,
+            break
+        except (TimeoutError, urllib.error.URLError, ConnectionError) as stream_error:
+            reconciled = None
+            if idempotency_key:
+                reconcile_url = (
+                    f"{base_url}/api/viventium/scheduler/dispatches/"
+                    f"{urllib.parse.quote(idempotency_key, safe='')}?"
+                    f"{urllib.parse.urlencode({'userId': str(task.get('user_id') or '')})}"
+                )
+                try:
+                    reconciled = _get_json(reconcile_url, headers, min(timeout_s, 10))
+                except (urllib.error.URLError, TimeoutError, ConnectionError, HttpJsonError):
+                    pass
+            if (isinstance(reconciled, dict) and reconciled.get("streamId") == stream_id
+                    and isinstance(reconciled.get("finalEvent"), dict)):
+                streamed = _stream_scheduler_response(
+                    base_url, stream_id, str(task.get("user_id") or ""), secret, 1,
+                    return_metadata=True, final_event=reconciled["finalEvent"],
+                )
+                break
+            if time.time() < stream_deadline:
+                time.sleep(min(reconnect_delay_s, max(0, stream_deadline - time.time())))
+                reconnect_delay_s = min(30, reconnect_delay_s * 2)
+                continue
+            cancel_url = (
+                f"{base_url}/api/viventium/scheduler/stream/"
+                f"{urllib.parse.quote(str(stream_id), safe='')}/cancel"
             )
-        raise
+            try:
+                cancelled = _post_json(
+                    cancel_url,
+                    {"userId": str(task.get("user_id") or ""), "reason": "stream_timeout"},
+                    headers,
+                    min(max(1, timeout_s), 10),
+                )
+                if cancelled.get("success") is not True:
+                    raise SchedulerResultUnconfirmed("scheduler_result_unconfirmed")
+            except Exception as cancel_error:
+                logger.warning("Scheduler stop unconfirmed for %s", stream_id)
+                raise SchedulerResultUnconfirmed("scheduler_result_unconfirmed") from cancel_error
+            raise TimeoutError("Scheduler authoring deadline elapsed") from stream_error
     final_text, response_message_id, followup_text = streamed[:3]
     stream_metadata = streamed[3] if len(streamed) > 3 and isinstance(streamed[3], dict) else {}
     # Acceptance identifies the intended route, not the completed attempt: Main may still
@@ -2646,32 +2686,46 @@ class TelegramDefiniteRejection(RuntimeError):
     """Telegram explicitly rejected a request, so a fallback cannot duplicate it."""
 
 
-def _send_telegram_voice_or_text(
+def _send_telegram_optional_voice(
     chat_id: str,
     text: str,
     timeout_s: int,
-    voice_preferences: Dict[str, bool],
+    voice_preferences: Dict[str, Any],
 ) -> Optional[str]:
-    if not text:
+    if (not _should_send_scheduler_voice(text, voice_preferences)
+            or parse_delivery_controls(text).skip_voice):
         return None
-    if not _should_send_scheduler_voice(text, voice_preferences):
-        return _send_telegram_message(chat_id, text, timeout_s)
-
     if voice_preferences.get("speech_unavailable"):
         logger.warning("Telegram conversational speech unavailable: %s", voice_preferences["speech_unavailable"])
-        return _send_telegram_message(chat_id, text, timeout_s)
+        return None
     diagnostics = voice_preferences.setdefault("_speech_diagnostics", {})
     audio_bytes = _synthesize_tts(text, timeout_s, voice_route=voice_preferences.get("voice_route"),
                                   diagnostics=diagnostics)
     logger.info("Scheduler speech route: %s", json.dumps(diagnostics, sort_keys=True))
     if audio_bytes:
         try:
-            return _send_telegram_audio(chat_id, audio_bytes, timeout_s)
+            message_id = _send_telegram_audio(chat_id, audio_bytes, timeout_s)
+            if not message_id:
+                raise RuntimeError("telegram_audio_receipt_missing")
+            return message_id
         except (TelegramDefiniteRejection, TelegramAudioError) as exc:
             diagnostics["presentation_fallback"] = type(exc).__name__
             logger.warning("Telegram speech failed before send or was rejected: class=%s", type(exc).__name__)
+    return None
 
-    return _send_telegram_message(chat_id, text, timeout_s)
+
+def _send_telegram_voice_or_text(
+    chat_id: str,
+    text: str,
+    timeout_s: int,
+    voice_preferences: Dict[str, Any],
+) -> Optional[str]:
+    if not text:
+        return None
+    message_id = _send_telegram_message(chat_id, text, timeout_s)
+    if message_id:
+        _send_telegram_optional_voice(chat_id, text, timeout_s, voice_preferences)
+    return message_id
 
 
 def _resolve_conversation_id(task: Dict[str, Any]) -> str:
@@ -4663,7 +4717,11 @@ def _deliver_telegram_generated_text(
             "text" if presentation_kind == "status" else "voice_preference",
         )
 
-    parts = _split_telegram_message(final_text) + _split_telegram_message(followup_text)
+    speech_text = "\n\n".join(text for text in (final_text, followup_text) if text)
+    controls = parse_delivery_controls(speech_text)
+    parts = [chunk for text in (final_text, followup_text)
+             for segment in parse_delivery_controls(text).segments
+             for chunk in _split_telegram_message(segment)]
     run_id = str(task.get("_scheduled_prompt_run_id") or "").strip()
     occurrence_key = str(task.get("_scheduled_prompt_occurrence_key") or "").strip()
     if run_id and parts and not _get_telegram_bot_token():
@@ -4672,7 +4730,23 @@ def _deliver_telegram_generated_text(
         )
     delivery_storage = _scheduler_storage() if run_id and parts else None
     delivery_lease_owner = f"telegram:{uuid.uuid4().hex}"
-    for part_index, part in enumerate(parts):
+    include_audio = (
+        presentation_kind == "conversation"
+        and _should_send_scheduler_voice(speech_text, voice_preferences)
+        and not voice_preferences.get("speech_unavailable")
+        and not controls.skip_voice
+    )
+    if not include_audio and delivery_storage is not None and presentation_kind == "conversation":
+        existing_audio = delivery_storage.get_scheduled_prompt_delivery(
+            run_id=run_id, channel=ledger_channel, part_index=len(parts),
+        )
+        include_audio = isinstance(existing_audio, dict) and existing_audio.get("state") in {
+            "sent", "claimed", "delivery_unknown",
+        }
+    delivery_parts = [(part, "text") for part in parts]
+    if include_audio:
+        delivery_parts.append((speech_text, "audio"))
+    for part_index, (part, transport) in enumerate(delivery_parts):
         delivery_key = ""
         if delivery_storage is not None:
             payload_hash = _sha256_prefix(
@@ -4680,6 +4754,7 @@ def _deliver_telegram_generated_text(
                     {
                         "chat_id": str(telegram_chat_id),
                         "text": part,
+                        "transport": transport,
                         **(
                             {"presentation_kind": presentation_kind}
                             if presentation_kind != "conversation" else {}
@@ -4699,25 +4774,44 @@ def _deliver_telegram_generated_text(
                 lease_owner=delivery_lease_owner,
                 now=to_utc_iso(datetime.now(timezone.utc)),
                 lease_seconds=max(30, 4 * send_timeout_s + 15),
+                **({
+                    "expected_run_lease_owner": task["_scheduled_prompt_run_lease_owner"],
+                    "expected_run_attempt": int(task.get("_scheduled_prompt_attempt") or 0),
+                } if task.get("_scheduled_prompt_run_lease_owner") else {}),
             )
             delivery_key = str(claim.get("delivery_key") or "")
             if not claim.get("claimed"):
+                if claim.get("reason") == "stale_attempt":
+                    return {"channel": "telegram", "outcome": "suppressed", "reason": "stale_attempt"}
                 persisted = claim.get("delivery") if isinstance(claim.get("delivery"), dict) else {}
                 persisted_message_id = str(persisted.get("message_id") or "").strip()
                 if claim.get("reason") == "already_sent" and persisted_message_id:
                     telegram_message_ids.append(persisted_message_id)
                     delivery_receipt_state = "confirmed"
+                    if persisted.get("payload_hash") and persisted["payload_hash"] != payload_hash:
+                        # A prior layout is immutable, including its old chunk boundaries.
+                        prior = delivery_storage.list_scheduled_prompt_deliveries(
+                            run_id=run_id, channel=ledger_channel,
+                        )
+                        telegram_message_ids = [str(row["message_id"]) for row in prior
+                                                if row.get("state") == "sent" and row.get("message_id")]
+                        if any(row.get("state") in {"claimed", "delivery_unknown"} for row in prior):
+                            delivery_receipt_state = "unknown"
+                            delivery_unknown_reason = "legacy_delivery_unknown"
+                        break
+                    continue
+                if transport == "audio" and claim.get("reason") == "already_skipped":
                     continue
                 delivery_receipt_state = "unknown"
                 delivery_unknown_reason = str(claim.get("reason") or "delivery_unknown")
                 break
         try:
-            if presentation_kind == "status":
+            if transport == "text":
                 sent_message_id = _send_telegram_message(
                     str(telegram_chat_id), part, send_timeout_s
                 )
             else:
-                sent_message_id = _send_telegram_voice_or_text(
+                sent_message_id = _send_telegram_optional_voice(
                     str(telegram_chat_id),
                     part,
                     send_timeout_s,
@@ -4741,6 +4835,14 @@ def _deliver_telegram_generated_text(
             else ""
         )
         if not normalized_message_id:
+            if transport == "audio":
+                if delivery_storage is not None and delivery_key:
+                    delivery_storage.skip_scheduled_prompt_delivery(
+                        delivery_key=delivery_key,
+                        lease_owner=delivery_lease_owner,
+                        now=to_utc_iso(datetime.now(timezone.utc)),
+                    )
+                continue
             if delivery_storage is not None and delivery_key:
                 delivery_storage.mark_scheduled_prompt_delivery_unknown(
                     delivery_key=delivery_key,

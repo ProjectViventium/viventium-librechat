@@ -8,12 +8,13 @@ import {
   nativeMediaOutputFilesForMessage,
   collectGlassHiveNativeMediaReferences,
   resolveGlassHiveNativeMediaMessageSelection,
+  resolveGlassHiveRetainedResultFileAccess,
   bindGlassHiveNativeMediaAttachmentReferences,
   renderGlassHiveNativeMediaAttachmentLinks,
 } from './nativeMedia';
 import type { ClientSession } from 'mongoose';
 import type { NativeOutputDeliveryAttachment } from './nativeOutputFiles';
-import type { GlassHiveNativeMedia } from './nativeMedia';
+import type { GlassHiveNativeMedia, GlassHiveNativeMediaRetainedSource } from './nativeMedia';
 
 const bytes = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
@@ -777,9 +778,17 @@ const retainedMediaSource = {
   terminalCallbackResultDigest: `sha256:${'d'.repeat(64)}`,
   terminalCallbackEffectGeneration: 1,
 };
-function retainedStore(rows = [retainedMediaSource]) {
+function retainedStore(rows: GlassHiveNativeMediaRetainedSource[] = [retainedMediaSource]) {
   return {
     readEvidence: jest.fn().mockResolvedValue(rows),
+    readAccepted: jest.fn().mockResolvedValue(rows.map((row) => ({
+      _id: row.terminalCallbackResultKey, ownerId: row.ownerId,
+      originRef: row.originRef, workRef: row.workRef, runId: row.runId,
+      attemptNumber: row.attemptNumber, callbackId: row.terminalCallbackId,
+      resultRevision: row.terminalCallbackResultRevision, resultDigest: row.terminalCallbackResultDigest,
+      acceptedOperationId: row.terminalCallbackAcceptedOperationId,
+      acceptedOperationGeneration: row.terminalCallbackEffectGeneration,
+    }))),
     isAccepted: jest.fn().mockResolvedValue(true),
     fenceAccepted: jest.fn().mockResolvedValue(true),
   };
@@ -984,5 +993,126 @@ describe('ordinary Main retained image selections', () => {
     expect(collectGlassHiveNativeMediaReferences(authored)).toEqual([
       media.observations[0].open_url,
     ]);
+  });
+});
+
+
+describe('retained published file selections', () => {
+  const file = { filename: 'proof.txt', mime_type: 'text/plain', bytes: 9,
+    sha256: 'e'.repeat(64), download_url: download };
+  const source = { ...retainedMediaSource, nativeMedia: undefined, attemptId: 'attempt', outputFiles: {
+    version: 1 as const, owner_id: 'owner', run_id: 'run-original', attempt_id: 'attempt',
+    callback_id: retainedMediaSource.terminalCallbackId, origin_ref: 'origin', work_ref: 'work',
+    result_revision: 2, result_digest: retainedMediaSource.terminalCallbackResultDigest,
+    files: [file, { ...file, filename: 'unselected.txt', download_url: download + '-unselected' }],
+  } };
+  let prior: string | undefined;
+  beforeEach(() => { prior = process.env.GLASSHIVE_ARTIFACT_BASE_URL; process.env.GLASSHIVE_ARTIFACT_BASE_URL = artifactBaseUrl; });
+  afterEach(() => { if (prior === undefined) delete process.env.GLASSHIVE_ARTIFACT_BASE_URL; else process.env.GLASSHIVE_ARTIFACT_BASE_URL = prior; });
+  test('selects only the referenced file without an earlier authored attachment or image', async () => {
+    const store = retainedStore([source]);
+    const selected = await resolveGlassHiveNativeMediaMessageSelection({ text: `[Proof](${download})`, ownerId: 'owner', conversationId: 'conversation' }, store);
+    expect(selected?.rows[0].outputFiles?.files).toEqual([file]);
+    expect(selected?.selectedNativeMedia).toEqual([]);
+    expect(store.readEvidence.mock.calls[0][0].$or).toContainEqual({ 'outputFiles.files.download_url': { $in: [download] } });
+    await selected?.authorizePublication(retainedSession);
+    expect(store.fenceAccepted).toHaveBeenCalledTimes(1);
+    store.fenceAccepted.mockResolvedValue(false);
+    await expect(selected?.authorizePublication(retainedSession)).rejects.toMatchObject({ code: 'native_media_evidence_superseded' });
+  });
+  test('content-addressed prior files retain owner and accepted-operation commit fences', async () => {
+    const uniqueSource = { ...source, outputFiles: { ...source.outputFiles, files: [file] } };
+    const store = retainedStore([uniqueSource]);
+    const selected = await resolveGlassHiveNativeMediaMessageSelection({
+      text: `[Proof](artifact_sha256:${file.sha256})`, ownerId: 'owner', conversationId: 'conversation',
+    }, store);
+    expect(selected?.rows[0].outputFiles?.files).toEqual([file]);
+    expect(store.readEvidence.mock.calls[0][0].$or).toContainEqual({
+      'outputFiles.files.sha256': { $in: [file.sha256] },
+    });
+    await selected?.authorizePublication(retainedSession);
+    store.fenceAccepted.mockResolvedValue(false);
+    await expect(selected?.authorizePublication(retainedSession)).rejects.toMatchObject({
+      code: 'native_media_evidence_superseded',
+    });
+  });
+  test('a Native-published selected digest still rechecks its original accepted source', async () => {
+    const uniqueSource = { ...source, outputFiles: { ...source.outputFiles, files: [file] } };
+    const store = retainedStore([uniqueSource]);
+    const selected = await resolveGlassHiveNativeMediaMessageSelection({
+      text: '[Proof](https://native.invalid/new-reference)', ownerId: 'owner',
+      conversationId: 'conversation', selectedFileSha256s: [file.sha256],
+    }, store);
+    expect(selected?.rows[0].outputFiles?.files).toEqual([file]);
+    await selected?.authorizePublication(retainedSession);
+    expect(store.fenceAccepted).toHaveBeenCalledTimes(1);
+  });
+  test('the signed client scope excludes superseded sources and has no paths or URLs', async () => {
+    const store = retainedStore([source]);
+    expect(await resolveGlassHiveRetainedResultFileAccess({ ownerId: 'owner',
+      conversationId: 'conversation' }, store)).toEqual([
+      { run_id: 'run-original', attempt_id: 'attempt', sha256: file.sha256 },
+    ]);
+    expect(store.readEvidence).toHaveBeenCalledWith({ ownerId: 'owner',
+      conversationId: 'conversation', 'outputFiles.files.0': { $exists: true } });
+    store.readAccepted.mockResolvedValue([]);
+    expect(await resolveGlassHiveRetainedResultFileAccess({ ownerId: 'owner',
+      conversationId: 'conversation' }, store)).toEqual([]);
+  });
+  test('retained inventory uses one accepted-row batch for every proven source', async () => {
+    const rows = Array.from({ length: 100 }, (_, index) => {
+      const suffix = index.toString(16).padStart(64, '0');
+      const runId = `run-synthetic-${index}`;
+      const callbackId = `cb_terminal_${suffix}`;
+      return { ...source, runId, terminalCallbackResultKey: `ghtr_${suffix}`,
+        terminalCallbackId: callbackId,
+        outputFiles: { ...source.outputFiles, run_id: runId, callback_id: callbackId } };
+    });
+    const store = retainedStore(rows);
+    const result = await resolveGlassHiveRetainedResultFileAccess({
+      ownerId: 'owner', conversationId: 'conversation',
+    }, store);
+    expect(result).toHaveLength(rows.length);
+    expect(store.readEvidence).toHaveBeenCalledWith({ ownerId: 'owner',
+      conversationId: 'conversation', 'outputFiles.files.0': { $exists: true } });
+    expect(store.readAccepted).toHaveBeenCalledTimes(1);
+    expect(store.readAccepted).toHaveBeenCalledWith({ ownerId: 'owner',
+      _id: { $in: rows.map((row) => row.terminalCallbackResultKey) } });
+    expect(store.isAccepted).not.toHaveBeenCalled();
+  });
+  test.each(['missing-proof', 'malformed-envelope'])(
+    'an unprovable %s history row grants nothing without hiding a proven sibling', async (mode) => {
+      const invalid = mode === 'missing-proof'
+        ? { ...source, terminalCallbackAcceptedOperationId: '' }
+        : { ...source, outputFiles: { ...source.outputFiles, version: 2 } };
+      const store = retainedStore([invalid as GlassHiveNativeMediaRetainedSource, source]);
+      await expect(resolveGlassHiveRetainedResultFileAccess({ ownerId: 'owner',
+        conversationId: 'conversation' }, store)).resolves.toEqual([
+        { run_id: source.runId, attempt_id: 'attempt', sha256: file.sha256 },
+      ]);
+    },
+  );
+  test.each([
+    '_id', 'ownerId', 'originRef', 'workRef', 'runId', 'attemptNumber', 'callbackId',
+    'resultRevision', 'resultDigest', 'acceptedOperationId', 'acceptedOperationGeneration',
+  ])('batched retained acceptance still binds the exact %s authority', async (field) => {
+    const store = retainedStore([source]);
+    const [accepted] = await store.readAccepted();
+    store.readAccepted.mockResolvedValue([{ ...accepted,
+      [field]: typeof accepted[field] === 'number' ? accepted[field] + 1 : 'foreign',
+    }]);
+    await expect(resolveGlassHiveRetainedResultFileAccess({ ownerId: 'owner',
+      conversationId: 'conversation' }, store)).resolves.toEqual([]);
+  });
+  test.each(['ownerId', 'conversationId'])('a foreign %s cannot enter the signed file scope', async (field) => {
+    const store = retainedStore([{ ...source, [field]: 'foreign' }]);
+    await expect(resolveGlassHiveRetainedResultFileAccess({ ownerId: 'owner',
+      conversationId: 'conversation' }, store)).rejects.toMatchObject({ code: 'native_media_authority_invalid' });
+  });
+  test.each(['foreign-owner', 'foreign-conversation', 'superseded'])('rejects %s file evidence', async (mode) => {
+    const row = { ...source, ...(mode === 'foreign-owner' ? { ownerId: 'foreign' } : {}), ...(mode === 'foreign-conversation' ? { conversationId: 'foreign' } : {}) };
+    const store = retainedStore([row]);
+    if (mode === 'superseded') store.isAccepted.mockResolvedValue(false);
+    await expect(resolveGlassHiveNativeMediaMessageSelection({ text: `[Proof](${download})`, ownerId: 'owner', conversationId: 'conversation' }, store)).rejects.toBeDefined();
   });
 });

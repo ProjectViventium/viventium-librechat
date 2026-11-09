@@ -2,7 +2,7 @@
 import { createHash } from 'crypto';
 import { z } from 'zod';
 import { normalizeGlassHiveRunInput } from './missionInput';
-import { createNativeOutputFileFetch } from './nativeOutputFiles';
+import { createNativeOutputFileFetch, normalizeNativeCallbackOutputFiles } from './nativeOutputFiles';
 import { createAccountApiRoute } from './accountClient';
 import { sanitizeFilename } from '../utils/files';
 import type { GlassHiveRunInput } from './missionInput';
@@ -13,6 +13,7 @@ import type {
 } from '@librechat/data-schemas';
 import type {
   NativeOutputFiles,
+  NativeCallbackOutputFiles,
   NativeOutputFileIdentity,
   NativeOutputFile,
   NativeOutputFileFetch,
@@ -283,8 +284,10 @@ export function renderGlassHiveNativeMediaLinks(
   {
     artifactBaseUrl = process.env.GLASSHIVE_ARTIFACT_BASE_URL || '',
     onSelection,
+    fileReferences,
   }: {
     artifactBaseUrl?: string;
+    fileReferences?: ReadonlySet<string>;
     onSelection?: (selection: GlassHiveNativeMediaSelection) => void;
   } = {},
 ): string {
@@ -313,6 +316,7 @@ export function renderGlassHiveNativeMediaLinks(
   return mapNativeMediaMarkdownReferences(text, ({ reference, label }, original) => {
     const item = links.get(reference);
     if (!item) {
+      if (fileReferences?.has(reference)) return original;
       if (reference.startsWith('artifact_sha256:'))
         throw mediaError('native_media_selection_unavailable');
       return original;
@@ -444,6 +448,7 @@ export function nativeMediaOutputFilesForMessage(
 }
 
 export interface GlassHiveNativeMediaRetainedSource extends GlassHiveNativeMediaCallbackSource {
+  outputFiles?: NativeCallbackOutputFiles;
   conversationId: string;
   originRef: string;
   workRef: string;
@@ -452,7 +457,8 @@ export interface GlassHiveNativeMediaRetainedSource extends GlassHiveNativeMedia
 interface NativeMediaEvidenceSelector {
   ownerId: string;
   conversationId: string;
-  $or: Array<{ [field: string]: { $in: string[] } }>;
+  'outputFiles.files.0'?: { $exists: true };
+  $or?: Array<{ [field: string]: { $in: string[] } }>;
 }
 interface NativeMediaAcceptedSelector extends Pick<
   IGlassHiveTerminalCallbackResult,
@@ -479,13 +485,90 @@ export interface GlassHiveNativeMediaSourceStore {
     session: ClientSession,
   ) => Promise<boolean>;
 }
+export interface GlassHiveRetainedResultFileAccessStore
+  extends Pick<GlassHiveNativeMediaSourceStore, 'readEvidence'> {
+  readAccepted: (selector: {
+    ownerId: string;
+    _id: { $in: string[] };
+  }) => Promise<NativeMediaAcceptedSelector[]>;
+}
+
+function retainedAcceptedSource(row: GlassHiveNativeMediaRetainedSource): NativeMediaAcceptedSelector {
+  return {
+    _id: row.terminalCallbackResultKey, ownerId: row.ownerId,
+    originRef: row.originRef, workRef: row.workRef, runId: row.runId,
+    attemptNumber: row.attemptNumber, callbackId: row.terminalCallbackId,
+    resultRevision: row.terminalCallbackResultRevision, resultDigest: row.terminalCallbackResultDigest,
+    acceptedOperationId: row.terminalCallbackAcceptedOperationId,
+    acceptedOperationGeneration: row.terminalCallbackEffectGeneration,
+  };
+}
+
+function retainedAcceptedSourceKey(source: NativeMediaAcceptedSelector): string {
+  return JSON.stringify([
+    source._id, source.ownerId, source.originRef, source.workRef, source.runId,
+    source.attemptNumber, source.callbackId, source.resultRevision, source.resultDigest,
+    source.acceptedOperationId, source.acceptedOperationGeneration,
+  ]);
+}
+
+/** A signed Native client declaration carries only current accepted source identities. */
+export async function resolveGlassHiveRetainedResultFileAccess(
+  { ownerId, conversationId }: { ownerId: string; conversationId: string },
+  store: GlassHiveRetainedResultFileAccessStore,
+): Promise<Array<{ run_id: string; attempt_id: string; sha256: string }>> {
+  if (!ownerId || !conversationId) return [];
+  const rows = await store.readEvidence({ ownerId, conversationId,
+    'outputFiles.files.0': { $exists: true } });
+  const candidates: Array<{
+    row: GlassHiveNativeMediaRetainedSource;
+    output: NativeCallbackOutputFiles;
+    source: NativeMediaAcceptedSelector;
+  }> = [];
+  for (const row of rows) {
+    if (row.ownerId !== ownerId || row.conversationId !== conversationId)
+      throw mediaError('native_media_authority_invalid');
+    if (!Array.isArray(row.outputFiles?.files) || !row.outputFiles.files.length) continue;
+    // An older unprovable row grants nothing; it must not hide proven siblings.
+    if (!nativeMediaCallbackSourceProof.safeParse(row).success) continue;
+    let output: NativeCallbackOutputFiles | undefined;
+    try {
+      output = normalizeNativeCallbackOutputFiles(row.outputFiles, { ownerId,
+        runId: row.runId, workRef: row.workRef, originRef: row.originRef,
+        attemptId: row.attemptId || '', callbackId: row.terminalCallbackId,
+        resultRevision: row.terminalCallbackResultRevision,
+        resultDigest: row.terminalCallbackResultDigest });
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error &&
+          ['native_output_files_invalid', 'native_output_files_identity_invalid'].includes(String(error.code)))
+        continue;
+      throw error;
+    }
+    if (output) candidates.push({ row, output, source: retainedAcceptedSource(row) });
+  }
+  if (!candidates.length) return [];
+  const accepted = new Set((await store.readAccepted({ ownerId,
+    _id: { $in: [...new Set(candidates.map(({ source }) => source._id))] },
+  })).map(retainedAcceptedSourceKey));
+  const grants = new Map<string, { run_id: string; attempt_id: string; sha256: string }>();
+  for (const { row, output, source } of candidates) {
+    if (!accepted.has(retainedAcceptedSourceKey(source))) continue;
+    for (const file of output.files) {
+      const grant = { run_id: row.runId, attempt_id: output.attempt_id, sha256: file.sha256 };
+      grants.set(JSON.stringify(grant), grant);
+    }
+  }
+  return [...grants.values()];
+}
 
 /** Current Main may select retained evidence, but only its original accepted owner/run grants. */
 export async function resolveGlassHiveNativeMediaMessageSelection(
-  { text, ownerId, conversationId }: { text: string; ownerId: string; conversationId: string },
+  { text, ownerId, conversationId, selectedFileSha256s = [] }: { text: string; ownerId: string; conversationId: string; selectedFileSha256s?: string[] },
   store: GlassHiveNativeMediaSourceStore,
 ) {
-  const references = collectGlassHiveNativeMediaReferences(text);
+  const hashes = selectedFileSha256s.filter((value) => digest.safeParse(value).success);
+  const references = [...new Set([...collectGlassHiveNativeMediaReferences(text),
+    ...hashes.map((value) => `artifact_sha256:${value}`)])];
   if (!references.length) return undefined;
   if (!ownerId || !conversationId) throw mediaError('native_media_authority_invalid');
   const rows = await store.readEvidence({
@@ -495,6 +578,8 @@ export async function resolveGlassHiveNativeMediaMessageSelection(
       { 'nativeMedia.observations.artifact_ref': { $in: references } },
       { 'nativeMedia.observations.download_url': { $in: references } },
       { 'nativeMedia.observations.open_url': { $in: references } },
+      { 'outputFiles.files.download_url': { $in: references } },
+      { 'outputFiles.files.sha256': { $in: references.filter((ref) => ref.startsWith('artifact_sha256:')).map((ref) => ref.slice(16)) } },
     ],
   });
   for (const row of rows) {
@@ -509,6 +594,8 @@ export async function resolveGlassHiveNativeMediaMessageSelection(
       nativeMedia: row.nativeMedia,
     })),
     {
+      fileReferences: new Set(rows.flatMap((row) => row.outputFiles?.files.flatMap((file) =>
+        [file.download_url, `artifact_sha256:${file.sha256}`]) || [])),
       onSelection: (selection) =>
         selected.set(
           JSON.stringify([
@@ -521,9 +608,18 @@ export async function resolveGlassHiveNativeMediaMessageSelection(
         ),
     },
   );
-  if (!selected.size) return undefined;
   const files = selectGlassHiveNativeMediaFiles([...selected.values()], rows, ownerId);
-  const sources = rows.filter((row) => files.has(row.terminalCallbackId));
+  const sources = rows.flatMap((row) => {
+    const output = row.outputFiles && normalizeNativeCallbackOutputFiles(row.outputFiles, {
+      ownerId, runId: row.runId, workRef: row.workRef, originRef: row.originRef,
+      attemptId: row.attemptId || '', callbackId: row.terminalCallbackId,
+      resultRevision: row.terminalCallbackResultRevision, resultDigest: row.terminalCallbackResultDigest,
+    });
+    const selectedFiles = output?.files.filter((file) => references.includes(file.download_url) || references.includes(`artifact_sha256:${file.sha256}`)) || [];
+    if (!files.has(row.terminalCallbackId) && !selectedFiles.length) return [];
+    return [{ ...row, ...(output ? { outputFiles: { ...output, files: selectedFiles } } : {}) }];
+  });
+  if (!sources.length) return undefined;
   const acceptedReferences: GlassHiveTerminalCallbackAcceptedOperationReference[] = [];
   for (const row of sources) {
     if (!nativeMediaCallbackSourceProof.safeParse(row).success)

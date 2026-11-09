@@ -4,6 +4,9 @@
  * === VIVENTIUM END === */
 
 const DEFAULT_PLAYGROUND_URL = 'http://localhost:3000';
+const { isIP } = require('node:net');
+const os = require('node:os');
+const fs = require('node:fs');
 const DEFAULT_VOICE_AGENT_NAME = 'librechat-voice-gateway';
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const PLAYGROUND_HEALTH_TIMEOUT_MS = 2000;
@@ -66,7 +69,27 @@ function resolvePlaygroundBaseUrl({ preferPublicPlayground = false } = {}) {
 }
 
 function resolveTelegramPublicPlaygroundBaseUrl() {
-  const parsed = parseBaseUrl(process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL || '');
+  let publicUrl = process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL || '';
+  if (process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE) {
+    try {
+      const state = JSON.parse(
+        fs.readFileSync(process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE, 'utf8'),
+      );
+      if (
+        state.last_error ||
+        (state.lan_ip &&
+          (state.lan_runtime_ready !== true ||
+            !Object.values(os.networkInterfaces())
+              .flat()
+              .some((address) => address && !address.internal && address.address === state.lan_ip)))
+      )
+        return '';
+      publicUrl = state.public_playground_url || '';
+    } catch {
+      return '';
+    }
+  }
+  const parsed = parseBaseUrl(publicUrl);
   if (!parsed) {
     return '';
   }
@@ -75,6 +98,55 @@ function resolveTelegramPublicPlaygroundBaseUrl() {
     return '';
   }
 
+  return trimBaseUrl(parsed.toString());
+}
+
+function resolveLocalPlaygroundBaseUrl() {
+  let lanUrl = process.env.VIVENTIUM_LAN_PLAYGROUND_URL || '';
+  let lanIp = process.env.VIVENTIUM_LAN_IP;
+  const stateFile = process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE;
+  if (stateFile) {
+    try {
+      const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      if (state.lan_runtime_ready !== true) return '';
+      lanUrl = state.lan_playground_url;
+      lanIp = state.lan_ip;
+    } catch {
+      return '';
+    }
+  }
+  const parsed = parseBaseUrl(lanUrl);
+  const parts = parsed?.hostname.split('.').map(Number) || [];
+  const privateAddress =
+    isIP(parsed?.hostname || '') === 4 &&
+    (parts[0] === 10 ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+      (parts[0] === 192 && parts[1] === 168));
+  const lanDomain = String(process.env.VIVENTIUM_LAN_DOMAIN || '')
+    .trim()
+    .toLowerCase();
+  const configuredHostname = lanDomain && parsed?.hostname === `playground.${lanDomain}`;
+  const boundAddress = configuredHostname ? lanIp : parsed?.hostname;
+  if (
+    !parsed ||
+    parsed.protocol !== 'https:' ||
+    (!privateAddress && !configuredHostname) ||
+    !parsed.port ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.pathname !== '/' ||
+    parsed.username ||
+    parsed.password
+  ) {
+    return '';
+  }
+  if (
+    !Object.values(os.networkInterfaces())
+      .flat()
+      .some((address) => address && !address.internal && address.address === boundAddress)
+  ) {
+    return '';
+  }
   return trimBaseUrl(parsed.toString());
 }
 
@@ -289,9 +361,14 @@ function resolveVoiceAgentName() {
 
 function buildPlaygroundUrl(
   session,
-  { preferPublicPlayground = false, launchCapability = '', includeConversationId = false } = {},
+  {
+    preferPublicPlayground = false,
+    launchCapability = '',
+    includeConversationId = false,
+    baseUrl,
+  } = {},
 ) {
-  const playgroundBase = resolvePlaygroundBaseUrl({ preferPublicPlayground });
+  const playgroundBase = baseUrl || resolvePlaygroundBaseUrl({ preferPublicPlayground });
   const url = new URL(playgroundBase);
 
   url.pathname = `${url.pathname.replace(/\/$/, '')}/call-bootstrap`;
@@ -341,5 +418,6 @@ module.exports = {
   verifyPlaygroundReadiness,
   shouldPreferPublicPlaygroundForRequest,
   resolveTelegramPublicPlaygroundBaseUrl,
+  resolveLocalPlaygroundBaseUrl,
   resolveVoiceAgentName,
 };

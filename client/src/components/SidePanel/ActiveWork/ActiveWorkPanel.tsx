@@ -55,13 +55,14 @@ const STATE_LABELS = {
   running: 'com_ui_parallel_work_state_running',
   settling: 'com_ui_parallel_work_state_settling',
   paused: 'com_ui_parallel_work_state_paused',
+  blocked: 'com_ui_parallel_work_state_blocked',
   needs_input: 'com_ui_parallel_work_state_needs_input',
   stopping: 'com_ui_parallel_work_state_stopping',
   completed: 'com_ui_parallel_work_state_completed',
   failed: 'com_ui_parallel_work_state_failed',
   cancelled: 'com_ui_parallel_work_state_cancelled',
 } as const satisfies Record<WorkState, string>;
-const ATTENTION_STATES = new Set(['paused', 'needs_input']);
+const ATTENTION_STATES = new Set(['paused', 'needs_input', 'blocked']);
 
 function needsAttention(work: WorkSummary): boolean {
   return Boolean(

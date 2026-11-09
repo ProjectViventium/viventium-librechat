@@ -114,6 +114,18 @@ const base = {
 };
 
 describe('orchestration trace ledger', () => {
+  test('preserves the first identical launch failure while rejecting changed failure facts', async () => {
+    const store = new MemoryLedgerStore();
+    const failure = { ...base, eventKey: 'launch.failed:origin', stage: 'launch.failed' as const,
+      facts: { state: 'failed' as const, terminal: true } };
+    const first = await appendOrchestrationTraceEvent({ store, ...failure });
+    await expect(appendOrchestrationTraceEvent({ store, ...failure,
+      at: '2026-08-22T13:00:00.000Z' })).resolves.toEqual(first);
+    expect(store.rows).toHaveLength(1);
+    await expect(appendOrchestrationTraceEvent({ store, ...failure,
+      at: '2026-08-22T13:00:00.000Z', facts: { ...failure.facts, workRef: 'different-work' } }))
+      .rejects.toBeInstanceOf(OrchestrationTraceConflictError);
+  });
   test('retains joined cortex states and actual route facts without raw cortex identity', async () => {
     const store = new MemoryLedgerStore();
     await appendOrchestrationTraceEvent({ store, ...base, stage: 'cortex.completed', facts: {

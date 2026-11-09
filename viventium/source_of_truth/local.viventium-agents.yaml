@@ -26,6 +26,10 @@ config:
         prompt:
           promptRef: cortex.background_activation_policy
         direct_action_mcp_servers:
+          - server: chrome-devtools
+            owns: authorized signed-in Chrome tabs, page inspection, browser interaction, screenshots, and browser diagnostics
+            tool_names:
+              - list_pages_mcp_chrome-devtools
           - server: glasshive-workers-projects
             owns: persistent workers, project runs, browser/desktop/local computer execution, worker status, and completion reports
             tool_names:
@@ -126,6 +130,7 @@ mainAgent:
   model: codex-cli:gpt-6.1-sol
   recursion_limit: 40
   tools:
+    - list_pages_mcp_chrome-devtools
     - sys__server__sys_mcp_scheduling-cortex
     - schedule_create_mcp_scheduling-cortex
     - schedule_get_mcp_scheduling-cortex
@@ -148,6 +153,8 @@ mainAgent:
     - file_search
     - web_search
   tool_options:
+    list_pages_mcp_chrome-devtools:
+      defer_loading: true
     worker_delegate_once_mcp_glasshive-workers-projects:
       defer_loading: false
   tool_kwargs: []

@@ -302,6 +302,45 @@ describe('/api/viventium/glasshive/capabilities/mcp', () => {
       .expect(200);
   });
 
+  test('preserves standard canonical control metadata over authenticated MCP tools/list', async () => {
+    const {
+      mintBrokerGrant,
+    } = require('~/server/services/viventium/GlassHiveCapabilityBrokerAuth');
+    const { token } = mintBrokerGrant({
+      user: { id: 'user-control', role: 'USER' },
+      authorityKind: 'conversation_orchestrator',
+      allowedHostTools: ['active_work_action'],
+      hostToolResources: {
+        active_work_action: {
+          version: 1,
+          request_body: {
+            conversationId: 'control-conversation',
+            messageId: 'control-source',
+            viventiumInheritedConversation: { version: 1, sources: [] },
+          },
+        },
+      },
+      requestContext: { conversation_id: 'control-conversation', message_id: 'control-source' },
+    });
+    const control = {
+      name: 'active_work_action',
+      inputSchema: {
+        type: 'object',
+        properties: { action: { type: 'string' }, workRef: { type: 'string' } },
+        required: ['action', 'workRef'],
+      },
+      _meta: { 'xperfect.coordination/contract': 'original-context-v1' },
+    };
+    mockBuildCapabilityCatalog.mockResolvedValue({ tools: [] });
+    mockToolDefinitionsForMcp.mockReturnValue([control]);
+    const response = await request(appWithRoute())
+      .post('/api/viventium/glasshive/capabilities/mcp')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+      .expect(200);
+    expect(response.body.result.tools).toEqual([control]);
+  });
+
   test('rejects missing broker grant', async () => {
     const response = await request(appWithRoute())
       .post('/api/viventium/glasshive/capabilities/mcp')

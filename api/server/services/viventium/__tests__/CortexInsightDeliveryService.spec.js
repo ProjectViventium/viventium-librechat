@@ -118,7 +118,7 @@ function createBatchStateModel(
       row[key] = values;
     }
     for (const [key, value] of Object.entries(update.$push || {})) {
-      row[key] = [...(Array.isArray(row[key]) ? row[key] : []), value];
+      row[key] = [...(Array.isArray(row[key]) ? row[key] : []), ...(value?.$each || [value])];
     }
     return row;
   };
@@ -956,7 +956,7 @@ describe('CortexInsightDeliveryService', () => {
       Object.entries(filter).every(([key, expected]) => {
         if (key.startsWith('$')) return true;
         if (expected && typeof expected === 'object' && '$in' in expected) {
-          return expected.$in.includes(row[key]);
+          return expected.$in.includes(row[key] ?? null);
         }
         return row[key] === expected;
       });
@@ -1257,6 +1257,23 @@ describe('CortexInsightDeliveryService', () => {
       claimToken: 'cidl_claim-replay',
       claimGeneration: 1,
       leaseExpiresAt: new Date('2026-08-22T13:00:00.000Z'),
+      events: [
+        {
+          transition: 'persisted',
+          claimToken: 'cidl_claim-replay',
+          claimGeneration: 1,
+          receiptHash: crypto
+            .createHash('sha256')
+            .update(
+              JSON.stringify({
+                messageId: 'message-a',
+                revision: 1,
+                stage: 'persistence',
+              }),
+            )
+            .digest('hex'),
+        },
+      ],
     };
     const Model = {
       findOneAndUpdate: jest.fn(() => leanResult(null)),
@@ -2151,7 +2168,6 @@ describe('CortexInsightDeliveryService', () => {
       code: 'cortex_insight_delivery_settlement_conflict',
     });
   });
-
   test('returns the committed claim result after the transaction callback retries', async () => {
     const rows = ['a', 'b'].map((suffix) => ({
       deliveryId: `cidl_delivery-${suffix}`,
@@ -2199,6 +2215,292 @@ describe('CortexInsightDeliveryService', () => {
 });
 
 /* === VIVENTIUM START === Exact interrupted presentation fences survive expired leases. === */
+describe('persisted transport recovery keeps the current claim receipt', () => {
+  const checkedAt = new Date('2026-08-22T12:00:00.000Z');
+  const persistenceHash = (messageId = 'child-a', revision = 1) =>
+    crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ messageId, revision, stage: 'persistence' }))
+      .digest('hex');
+  const row = (overrides = {}) => ({
+    deliveryId: 'cidl_transport',
+    userId: 'owner-a',
+    conversationId: 'conversation-a',
+    parentMessageId: 'parent-a',
+    cortexId: 'review',
+    insight: 'Retained terminal result.',
+    insightHash: 'a'.repeat(64),
+    graphResultHash: 'a'.repeat(64),
+    surface: 'web',
+    requiredSurfaces: ['web'],
+    presentedSurfaces: [],
+    presentationReceiptHashes: [],
+    sourceRevision: 1,
+    presentationRevision: 1,
+    messageRevision: 1,
+    status: 'claimed',
+    persistenceStatus: 'persisted',
+    persistedMessageId: 'child-a',
+    persistedAt: new Date('2026-08-22T11:50:00.000Z'),
+    attemptNumber: 3,
+    claimGeneration: 3,
+    claimToken: 'claim-current',
+    claimedAt: new Date('2026-08-22T11:59:00.000Z'),
+    leaseExpiresAt: new Date('2026-08-22T13:00:00.000Z'),
+    expiresAt: null,
+    events: [
+      {
+        transition: 'persisted',
+        claimToken: 'claim-original',
+        claimGeneration: 1,
+        receiptHash: persistenceHash(),
+        eventAt: new Date('2026-08-22T11:50:00.000Z'),
+      },
+    ],
+    ...overrides,
+  });
+  const setup = (rows) => {
+    const model = createBatchStateModel(rows, { matchFilter: require('sift').default });
+    let sequence = 0;
+    return {
+      ...model,
+      service: createCortexInsightDeliveryService({
+        DeliveryModel: model.Model,
+        now: () => checkedAt,
+        randomUUID: () => `transport-${++sequence}`,
+      }),
+    };
+  };
+  const dropped = (overrides = {}) =>
+    row({
+      status: 'dropped',
+      dropReason: 'delivery_attempts_exhausted',
+      claimToken: '',
+      claimedAt: null,
+      leaseExpiresAt: null,
+      droppedAt: new Date('2026-08-22T11:59:00.000Z'),
+      expiresAt: new Date('2026-09-21T11:59:00.000Z'),
+      ...overrides,
+    });
+  const input = (overrides = {}) => ({
+    ownerId: 'owner-a',
+    conversationId: 'conversation-a',
+    parentMessageId: 'parent-a',
+    deliveryIds: ['cidl_transport'],
+    persistedMessageId: 'child-a',
+    messageRevision: 1,
+    ...overrides,
+  });
+
+  test('same persisted message under a new claim records that claim once and retains the old receipt', async () => {
+    const original = row();
+    const { service, state, Model } = setup([original]);
+    const persist = {
+      ownerId: 'owner-a',
+      claims: [original],
+      persistedMessageId: 'child-a',
+      messageRevision: 1,
+    };
+    await service.markPersisted(persist);
+    expect(state[0].events.filter((event) => event.transition === 'persisted')).toEqual([
+      original.events[0],
+      expect.objectContaining({
+        claimToken: 'claim-current',
+        claimGeneration: 3,
+        receiptHash: persistenceHash(),
+      }),
+    ]);
+    const writes = Model.findOneAndUpdate.mock.calls.length;
+    await service.markPersisted(persist);
+    expect(Model.findOneAndUpdate).toHaveBeenCalledTimes(writes);
+  });
+
+  test('a failed CAS cannot use an old-generation persistence event as the current receipt', async () => {
+    const original = row();
+    const { service, Model } = setup([original]);
+    Model.findOneAndUpdate.mockImplementation(() => leanResult(null));
+    await expect(
+      service.markPersisted({
+        ownerId: 'owner-a',
+        claims: [original],
+        persistedMessageId: 'child-a',
+        messageRevision: 1,
+      }),
+    ).rejects.toMatchObject({
+      code: 'cortex_insight_delivery_settlement_conflict',
+    });
+  });
+
+  test('resumes only transport retention, then records the same message under the next ordinary claim', async () => {
+    const original = dropped();
+    const { service, state } = setup([original]);
+    const beforeEvents = [...original.events];
+    await service.resumeTransportFailure(input());
+    expect(state[0]).toMatchObject({
+      status: 'pending',
+      persistenceStatus: 'persisted',
+      persistedMessageId: 'child-a',
+      attemptNumber: 3,
+      claimGeneration: 3,
+      expiresAt: null,
+    });
+    expect(state[0].events.slice(0, beforeEvents.length)).toEqual(beforeEvents);
+    const afterResume = state[0].events.length;
+    await service.resumeTransportFailure(input());
+    expect(state[0].events).toHaveLength(afterResume);
+    const claims = (
+      await service.claimPendingByParent({
+        ownerId: 'owner-a',
+        parentMessageId: 'parent-a',
+        surface: 'web',
+      })
+    ).claimed;
+    expect(claims).toHaveLength(1);
+    expect(claims[0]).toMatchObject({ attemptNumber: 4, claimGeneration: 4 });
+    await service.markPersisted({
+      ownerId: 'owner-a',
+      claims,
+      persistedMessageId: 'child-a',
+      messageRevision: 1,
+    });
+    expect(state[0].events).toContainEqual(
+      expect.objectContaining({
+        transition: 'persisted',
+        claimGeneration: 4,
+        claimToken: claims[0].claimToken,
+        receiptHash: persistenceHash(),
+      }),
+    );
+    const afterPersist = state[0].events.length;
+    await service.resumeTransportFailure(input());
+    expect(state[0].events).toHaveLength(afterPersist);
+  });
+
+  test.each([
+    ['foreign owner', { ownerId: 'foreign' }],
+    ['foreign conversation', { conversationId: 'foreign' }],
+    ['foreign parent', { parentMessageId: 'foreign' }],
+    ['missing sibling', { deliveryIds: [] }],
+    ['wrong delivery', { deliveryIds: ['foreign'] }],
+    ['duplicate delivery', { deliveryIds: ['cidl_transport', 'cidl_transport'] }],
+    ['different message', { persistedMessageId: 'other-child' }],
+    ['different revision', { messageRevision: 2 }],
+  ])('rejects %s without changing the retained row', async (_name, changed) => {
+    const original = dropped();
+    const { service, state, Model } = setup([original]);
+    await expect(service.resumeTransportFailure(input(changed))).rejects.toBeInstanceOf(Error);
+    expect(Model.findOneAndUpdate).not.toHaveBeenCalled();
+    expect(state[0].status).toBe('dropped');
+    expect(state[0].events).toEqual(original.events);
+  });
+
+  test.each([
+    ['semantic drop', { dropReason: 'semantic_suppression' }],
+    ['unknown outcome', { dropReason: 'delivery_outcome_unknown' }],
+    ['expired retention', { expiresAt: new Date('2026-08-22T11:59:00.000Z') }],
+    ['missing retention', { expiresAt: null }],
+    ['not persisted', { persistenceStatus: 'pending' }],
+    ['already presented', { presentedSurfaces: ['web'] }],
+    ['presentation receipt', { presentationReceiptHashes: ['b'.repeat(64)] }],
+    ['sent without resume receipt', { status: 'sent' }],
+    ['pending without resume receipt', { status: 'pending' }],
+  ])('does not reopen %s', async (_name, changed) => {
+    const { service, state, Model } = setup([dropped(changed)]);
+    await expect(service.resumeTransportFailure(input())).rejects.toBeInstanceOf(Error);
+    expect(Model.findOneAndUpdate).not.toHaveBeenCalled();
+    expect(state[0].status).toBe(changed.status || 'dropped');
+  });
+
+  test('a mixed sibling semantic drop rejects the entire exact batch before mutation', async () => {
+    const { service, Model } = setup([
+      dropped(),
+      dropped({
+        deliveryId: 'cidl_sibling',
+        cortexId: 'review-b',
+        insightHash: 'b'.repeat(64),
+        graphResultHash: 'b'.repeat(64),
+        dropReason: 'conversation_moved_on',
+      }),
+    ]);
+    await expect(
+      service.resumeTransportFailure(input({ deliveryIds: ['cidl_transport', 'cidl_sibling'] })),
+    ).rejects.toBeInstanceOf(Error);
+    expect(Model.findOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  test('resumes an unpublished operational drop without inventing or clearing a saved Main', async () => {
+    const original = dropped({
+      persistenceStatus: 'pending',
+      persistedMessageId: '',
+      persistedAt: null,
+    });
+    const { service, state } = setup([original]);
+    const pendingInput = input({ persistenceStatus: 'pending', persistedMessageId: '' });
+    await service.resumeTransportFailure(pendingInput);
+    expect(state[0]).toMatchObject({
+      status: 'pending',
+      persistenceStatus: 'pending',
+      persistedMessageId: '',
+      persistedAt: null,
+      attemptNumber: 3,
+      claimGeneration: 3,
+    });
+    expect(state[0].events.slice(0, original.events.length)).toEqual(original.events);
+    const eventCount = state[0].events.length;
+    await service.resumeTransportFailure(pendingInput);
+    expect(state[0].events).toHaveLength(eventCount);
+    const claims = (
+      await service.claimPendingByParent({
+        ownerId: 'owner-a',
+        parentMessageId: 'parent-a',
+        surface: 'web',
+        deliveryIds: ['cidl_transport'],
+      })
+    ).claimed;
+    expect(claims[0]).toMatchObject({ attemptNumber: 4, claimGeneration: 4 });
+    await service.markPersisted({
+      ownerId: 'owner-a',
+      claims,
+      persistedMessageId: 'first-real-main',
+    });
+    await expect(service.resumeTransportFailure(pendingInput)).rejects.toBeInstanceOf(Error);
+    expect(state[0].persistedMessageId).toBe('first-real-main');
+    expect(state[0].persistenceStatus).toBe('persisted');
+  });
+
+  test.each([
+    ['wrong owner', { ownerId: 'foreign' }, {}],
+    ['wrong revision', { messageRevision: 2 }, {}],
+    ['a supplied fake Main ID', { persistedMessageId: 'invented-main' }, {}],
+    [
+      'a real persisted Main',
+      {},
+      { persistenceStatus: 'persisted', persistedMessageId: 'real-main' },
+    ],
+    ['a pending row with a saved ID', {}, { persistedMessageId: 'real-main' }],
+    ['semantic silence', {}, { dropReason: 'semantic_suppression' }],
+    ['unknown delivery outcome', {}, { dropReason: 'delivery_outcome_unknown' }],
+    ['presented work', {}, { presentedSurfaces: ['web'] }],
+    ['expired retention', {}, { expiresAt: new Date('2026-08-22T11:59:00.000Z') }],
+  ])('unpublished resume rejects %s without mutation', async (_name, changedInput, changedRow) => {
+    const original = dropped({
+      persistenceStatus: 'pending',
+      persistedMessageId: '',
+      persistedAt: null,
+      ...changedRow,
+    });
+    const { service, state, Model } = setup([original]);
+    await expect(
+      service.resumeTransportFailure(
+        input({ persistenceStatus: 'pending', persistedMessageId: '', ...changedInput }),
+      ),
+    ).rejects.toBeInstanceOf(Error);
+    expect(Model.findOneAndUpdate).not.toHaveBeenCalled();
+    expect(state[0].persistedMessageId).toBe(original.persistedMessageId);
+    expect(state[0].events).toEqual(original.events);
+  });
+});
+
 describe('canonical interrupted Cortex presentation settlement', () => {
   const checkedAt = new Date('2026-08-22T12:00:00.000Z');
   const row = (overrides = {}) => ({

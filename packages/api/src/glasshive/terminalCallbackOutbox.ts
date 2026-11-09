@@ -5,6 +5,7 @@
  * === VIVENTIUM END === */
 
 import crypto from 'crypto';
+import { applicationOwnsScheduleOccurrence } from '../scheduling/scheduleOccurrenceOwner';
 
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const CLAIM_MS = 30_000;
@@ -115,6 +116,7 @@ export interface GlassHiveTerminalCallbackOutboxLogger {
 }
 
 export interface GlassHiveTerminalCallbackOutboxDependencies {
+  readScheduleAdmission(filter: Record<string, string>): Promise<unknown>;
   ResultModel: GlassHiveTerminalCallbackResultModel;
   OutboxModel: GlassHiveCallbackEffectOutboxModel;
   fenceAcceptedOperation(input: {
@@ -301,6 +303,7 @@ export function createGlassHiveTerminalCallbackOutboxService(
     releaseEffectLease,
     runTransaction,
     logger,
+    readScheduleAdmission,
   } = dependencies;
 
   async function acceptedOperationStillCurrent(
@@ -339,6 +342,17 @@ export function createGlassHiveTerminalCallbackOutboxService(
     const occurrenceKey = text(binding?.scheduleOccurrenceKey, 512);
     const ownerId = text(binding?.ownerId, 512);
     if (!occurrenceKey || !ownerId || !summary || Number(summary.requiredTotal) < 1) return null;
+    try {
+      if (await applicationOwnsScheduleOccurrence({ ownerId, occurrenceKey }, readScheduleAdmission)) {
+        return null;
+      }
+    } catch {
+      // Preserve the durable intent during a lookup outage. Dispatch must resolve
+      // ownership again and may not send while that lookup remains unavailable.
+      logger.warn('[VIVENTIUM][glasshive-callback-outbox] Schedule ownership lookup deferred', {
+        code: 'scheduler_ownership_lookup_unavailable',
+      });
+    }
     const current = reference(effectFence);
     const outboxId = outboxIdFor({ occurrenceKey, effectFence });
     const now = new Date();
@@ -395,7 +409,7 @@ export function createGlassHiveTerminalCallbackOutboxService(
     return row;
   }
 
-  async function supersedeOutbox(outboxId: string): Promise<void> {
+  async function supersedeOutbox(outboxId: string, reason = 'terminal_callback_revision_superseded'): Promise<void> {
     if (!outboxId) return;
     await OutboxModel.updateOne(
       { outboxId, status: { $in: ['pending', 'failed', 'claimed'] } },
@@ -408,7 +422,7 @@ export function createGlassHiveTerminalCallbackOutboxService(
           dispatchPermitGeneration: 0,
           dispatchPermitExpiresAt: null,
           nextAttemptAt: null,
-          lastError: 'terminal_callback_revision_superseded',
+          lastError: reason,
         },
       },
     );
@@ -442,7 +456,7 @@ export function createGlassHiveTerminalCallbackOutboxService(
             },
             $inc: { attempts: 1 },
           },
-          { sort: { createdAt: 1 }, new: true },
+          { sort: { nextAttemptAt: 1, createdAt: 1 }, new: true },
         ).lean(),
       );
     } catch (error: unknown) {
@@ -626,6 +640,35 @@ export function createGlassHiveTerminalCallbackOutboxService(
   }: DispatchGlassHiveSchedulerCallbackOutboxInput = {}): Promise<GlassHiveSchedulerCallbackDispatchResult> {
     const claimed = await claimCurrentSchedulerOutbox({ outboxId });
     if (!claimed) return { status: 'empty' };
+    // Retained rows may predate owner-aware enqueue. Preserve them, but do not notify
+    // the legacy clock about work whose durable admission belongs to the application.
+    let applicationOwned: boolean;
+    try {
+      applicationOwned = await applicationOwnsScheduleOccurrence(claimed, readScheduleAdmission);
+    } catch (error) {
+      const now = new Date();
+      // Expiry alone does not transfer ownership: a reclaimer changes claimId.
+      // Settle this claim even after a slow lookup, never a new claim/live permit.
+      const deferred = await OutboxModel.updateOne({
+        outboxId: claimed.outboxId, status: 'claimed', claimId: claimed.claimId,
+        $or: [{ dispatchPermitExpiresAt: null }, { dispatchPermitExpiresAt: { $lte: now } }],
+      }, { $set: {
+        status: 'failed', claimId: '', claimExpiresAt: null,
+        dispatchPermitId: '', dispatchPermitGeneration: 0, dispatchPermitExpiresAt: null,
+        nextAttemptAt: new Date(now.getTime() + RETRY_MS),
+        lastError: 'scheduler_ownership_lookup_unavailable',
+      } });
+      if (deferred.matchedCount !== 1) {
+        logger.warn('[VIVENTIUM][glasshive-callback-outbox] Ownership retry lost its claim', {
+          code: 'scheduler_ownership_retry_claim_changed',
+        });
+      }
+      throw error;
+    }
+    if (applicationOwned) {
+      await supersedeOutbox(claimed.outboxId, 'scheduler_occurrence_owned_by_application');
+      return { status: 'superseded', outboxId: claimed.outboxId };
+    }
     await beforeAuthorize?.(claimed);
     const authorized = await authorizeClaim(claimed);
     if (!authorized) return { status: 'superseded', outboxId: claimed.outboxId };
@@ -725,7 +768,8 @@ export function createGlassHiveTerminalCallbackOutboxService(
         logger.warn('[VIVENTIUM][glasshive-callback-outbox] Scheduler dispatch failed', {
           code: text(errorCode(error) || errorMessage(error) || 'unknown_error', 120),
         });
-        break;
+        // The failed row remains delayed or claimed. Other eligible callbacks must
+        // still progress; the bounded batch prevents an unavailable store spinning.
       }
     }
     return counts;

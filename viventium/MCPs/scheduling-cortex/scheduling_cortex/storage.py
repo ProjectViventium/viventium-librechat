@@ -2025,6 +2025,26 @@ class ScheduleStorage:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
+    def list_scheduled_prompt_deliveries(
+        self, *, run_id: str, channel: str,
+    ) -> list[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_prompt_deliveries WHERE run_id = ? AND channel = ? ORDER BY part_index",
+                (run_id, channel),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_scheduled_prompt_delivery(
+        self, *, run_id: str, channel: str, part_index: int,
+    ) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_prompt_deliveries WHERE delivery_key = ?",
+                (self._scheduled_prompt_delivery_key(run_id, channel, part_index),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def claim_scheduled_prompt_delivery(
         self,
         *,
@@ -2036,6 +2056,8 @@ class ScheduleStorage:
         lease_owner: str,
         now: str,
         lease_seconds: int,
+        expected_run_lease_owner: Optional[str] = None,
+        expected_run_attempt: Optional[int] = None,
     ) -> Dict[str, Any]:
         delivery_key = self._scheduled_prompt_delivery_key(run_id, channel, part_index)
         now_dt = self._parse_utc_instant(now) or datetime.now(timezone.utc)
@@ -2048,6 +2070,17 @@ class ScheduleStorage:
         row: Optional[sqlite3.Row] = None
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if expected_run_lease_owner is not None or expected_run_attempt is not None:
+                run = conn.execute(
+                    "SELECT lease_owner, attempt, status, lease_until FROM scheduled_prompt_runs WHERE run_id = ?",
+                    (str(run_id),),
+                ).fetchone()
+                if (run is None or run["lease_owner"] != expected_run_lease_owner
+                        or run["attempt"] != expected_run_attempt
+                        or run["status"] not in ACTIVE_SCHEDULED_PROMPT_RUN_STATUSES
+                        or not self._parse_utc_instant(run["lease_until"])
+                        or self._parse_utc_instant(run["lease_until"]) <= now_dt):
+                    return {"claimed": False, "reason": "stale_attempt", "delivery_key": delivery_key}
             row = conn.execute(
                 "SELECT * FROM scheduled_prompt_deliveries WHERE delivery_key = ?",
                 (delivery_key,),
@@ -2083,6 +2116,8 @@ class ScheduleStorage:
                 # fresh preferences. Return its original receipt before comparing new input.
                 if state == "sent":
                     reason = "already_sent"
+                elif state == "skipped":
+                    reason = "already_skipped"
                 elif state == "delivery_unknown":
                     reason = "delivery_unknown"
                 elif str(existing.get("payload_hash") or "") != str(payload_hash).strip():
@@ -2152,6 +2187,21 @@ class ScheduleStorage:
         if updated:
             self._sync_to_mirror()
         return {"updated": updated, "delivery": dict(row) if row is not None else None}
+
+    def skip_scheduled_prompt_delivery(
+        self, *, delivery_key: str, lease_owner: str, now: str,
+    ) -> None:
+        """Finish optional media that was not sent or was explicitly rejected."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE scheduled_prompt_deliveries
+                SET state = 'skipped', lease_owner = NULL, lease_until = NULL, updated_at = ?
+                WHERE delivery_key = ? AND state = 'claimed' AND lease_owner = ?
+                """,
+                (now, delivery_key, str(lease_owner).strip()),
+            )
+        self._sync_to_mirror()
 
     def mark_scheduled_prompt_delivery_unknown(
         self,
@@ -2554,7 +2604,7 @@ class ScheduleStorage:
                 UPDATE scheduled_prompt_runs
                 SET lease_until = ?, updated_at = ?
                 WHERE run_id = ? AND lease_owner = ?
-                  AND status IN ({placeholders})
+                  AND status IN ({placeholders}) AND julianday(lease_until) > julianday(?)
                 """,
                 (
                     lease_until,
@@ -2562,6 +2612,7 @@ class ScheduleStorage:
                     str(run_id).strip(),
                     str(lease_owner).strip(),
                     *ACTIVE_SCHEDULED_PROMPT_RUN_STATUSES,
+                    now_iso,
                 ),
             )
             updated = cursor.rowcount == 1

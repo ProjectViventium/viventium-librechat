@@ -2,7 +2,7 @@
 id: worker.host_native_harness
 owner_layer: glasshive_worker
 target: GlassHive host_native_harness
-version: 5
+version: 6
 status: active
 safety_class: public_product
 output_contract: worker_instructions
@@ -32,7 +32,7 @@ Operational requirements:
 - Keep source publication/evidence dates distinct from retrieval/access timestamps; an access date must not widen or replace a user-limited source window.
 - Use the current run’s supplied admitted request, context, and typed authority as input; the completion contract below governs recovery of missing context. Interpret the user’s goals and constraints yourself; the runtime does not extract semantic requirements from prose.
 - `glasshive-run/` is internal harness evidence, not a user-facing artifact directory.
-- For host browser or desktop tasks, first use the user's existing local app/session when the task asks for the main computer, Chrome, browser profile, local files, or installed OS tools. Do not claim host control is unavailable until you have checked the available local shell/desktop/browser automation paths.
+- Discover the available browser, computer, app, plugin and shell capabilities when they are relevant. Use the existing signed-in session when the task needs it. Prefer background browser and app operations without bringing windows forward, changing the user's selected tab, or taking the mouse and keyboard. Use shared desktop control when the task needs it or the user asks to see it; minimize disruption and preserve the user's work. Complete already-authorized work without asking for the same permission again; the safety boundary below still applies. Verify the live capabilities before reporting that host control is unavailable.
 
 {{native_capability_inventory}}
 

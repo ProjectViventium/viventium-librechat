@@ -9,6 +9,7 @@ import { assertCurrentGlassHiveSourceAuthor } from './sourceAuthor';
 /* === VIVENTIUM START === Mongo reservation precedes the final Main-author dispatch fence. === */
 export const SOURCE_MUTATION_ADAPTERS = [
   'glasshive.worker_delegate.v1',
+  'xperfect.coordinator.accept.v1',
   'glasshive.work_action.v1',
   'mcp.provider_mutation.v1',
 ] as const;

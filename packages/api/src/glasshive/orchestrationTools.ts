@@ -61,8 +61,8 @@ interface OrchestrationFacadeOptions {
 const delegationSchema = z
   .object({
     title: z.string().trim().min(1).max(MAIN_DELEGATION_STRING_LIMITS.title),
-    instruction: z.string().trim().min(1).max(MAIN_DELEGATION_STRING_LIMITS.instruction),
-    goal: z.string().trim().min(1).max(MAIN_DELEGATION_STRING_LIMITS.goal).optional(),
+    instruction: z.string().min(1),
+    goal: z.string().min(1).optional(),
     workerName: z.string().trim().min(1).max(MAIN_DELEGATION_STRING_LIMITS.workerName).optional(),
     workerRole: z.string().trim().min(1).max(MAIN_DELEGATION_STRING_LIMITS.workerRole).optional(),
     profile: z.enum([...MAIN_DELEGATION_PROFILES] as [string, ...string[]]).optional(),
@@ -70,7 +70,7 @@ const delegationSchema = z
     resourceClass: z.enum([...MAIN_DELEGATION_RESOURCE_CLASSES] as [string, ...string[]]),
     longMission: z.boolean().optional(),
     requiresHostAccess: z.boolean().optional(),
-    sourceOrdinals: z.array(z.number().int().min(1).max(32)).max(32).optional(),
+    sourceOrdinals: z.array(z.number().int().min(1)).optional(),
     fileIds: z
       .array(
         z
@@ -79,7 +79,6 @@ const delegationSchema = z
           .max(256)
           .refine((id) => id.trim() === id && !!id.trim()),
       )
-      .max(64)
       .refine((ids) => new Set(ids).size === ids.length)
       .optional(),
   })
@@ -151,12 +150,13 @@ export function createGlassHiveMainDelegationTool(
   const req = recordFrom(options.req);
   const agent = recordFrom(options.agent);
   const sourceSchema = mainDelegationJsonSchema(req.body);
-  const schema = sourceSchema.required.includes('sourceOrdinals')
+  const sources = sourceSchema.properties.sourceOrdinals;
+  const schema = 'maxItems' in sources && 'maximum' in sources.items
     ? delegationSchema.extend({
         sourceOrdinals: z
-          .array(z.number().int().min(1).max(sourceSchema.properties.sourceOrdinals.items.maximum))
+          .array(z.number().int().min(1).max(sources.items.maximum))
           .min(1)
-          .max(sourceSchema.properties.sourceOrdinals.maxItems),
+          .max(sources.maxItems),
       })
     : delegationSchema;
   return tool(

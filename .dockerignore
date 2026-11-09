@@ -41,3 +41,8 @@ uploads
 .env
 .env.local
 # === VIVENTIUM END ===
+
+# VIVENTIUM START: keep private QA evidence outside public source and build contexts.
+*.private.*
+*-private.*
+# VIVENTIUM END

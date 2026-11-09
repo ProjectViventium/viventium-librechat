@@ -22,6 +22,7 @@ const mime = require('mime');
 const { Readable } = require('stream');
 const {
   GenerationJobManager,
+  startSseKeepAlive,
   normalizeChannelEnvelope,
   normalizeChannelInputMode,
   buildChannelAgentRequest,
@@ -170,6 +171,7 @@ const {
 const {
   buildCallLaunchResponse,
   resolveTelegramPublicPlaygroundBaseUrl,
+  resolveLocalPlaygroundBaseUrl,
 } = require('~/server/services/viventium/callLaunch');
 const {
   assertVoiceAgentAccess,
@@ -1011,6 +1013,12 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const requestedTarget =
+      incoming.launchTarget === 'lan' ? 'local' : (incoming.launchTarget ?? 'auto');
+    if (!['auto', 'public', 'local'].includes(requestedTarget)) {
+      return res.status(400).json({ error: 'launchTarget must be auto, public or local' });
+    }
+
     const normalizedConversationId =
       typeof incoming.conversationId === 'string' && incoming.conversationId.trim()
         ? incoming.conversationId.trim()
@@ -1031,14 +1039,24 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
     await assertVoiceAgentAccess({ req, agentId: effectiveAgentId });
 
     /* === VIVENTIUM START ===
-     * Purpose: Telegram cannot open localhost browser-voice links.
-     * Contract: /call must fail honestly until a public HTTPS playground URL is configured.
+     * Purpose: Keep public and same-network phone calls on the same signed launch.
      * === VIVENTIUM END === */
     const telegramPlaygroundBase = resolveTelegramPublicPlaygroundBaseUrl();
-    if (!telegramPlaygroundBase) {
+    const localPlaygroundBase = resolveLocalPlaygroundBaseUrl();
+    const launchTarget =
+      requestedTarget === 'auto' ? (telegramPlaygroundBase ? 'public' : 'local') : requestedTarget;
+    if (launchTarget === 'public' && !telegramPlaygroundBase) {
       return res.status(409).json({
         error: TELEGRAM_PUBLIC_PLAYGROUND_REQUIRED_ERROR,
         publicPlaygroundRequired: true,
+      });
+    }
+
+    if (launchTarget === 'local' && !localPlaygroundBase) {
+      return res.status(409).json({
+        error:
+          'Same-Wi-Fi calling is not ready. Keep the Viventium computer awake and connected to Wi-Fi, then try again.',
+        localPlaygroundRequired: true,
       });
     }
 
@@ -1050,12 +1068,30 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
     const launch = await createCallBrowserLaunch(session.callSessionId);
     res.set('Cache-Control', 'no-store, private');
     res.set('Pragma', 'no-cache');
-    return res.json(
-      buildCallLaunchResponse(session, {
-        preferPublicPlayground: true,
-        launchCapability: launch.capability,
-      }),
-    );
+    const localLaunch = localPlaygroundBase
+      ? buildCallLaunchResponse(session, {
+          baseUrl: localPlaygroundBase,
+          launchCapability: launch.capability,
+        })
+      : null;
+    const selectedLaunch =
+      launchTarget === 'local'
+        ? localLaunch
+        : buildCallLaunchResponse(session, {
+            preferPublicPlayground: true,
+            launchCapability: launch.capability,
+          });
+    return res.json({
+      ...selectedLaunch,
+      launchTarget,
+      localCallUrl: localLaunch?.callUrl || '',
+      publicCallUrl: telegramPlaygroundBase
+        ? buildCallLaunchResponse(session, {
+            baseUrl: telegramPlaygroundBase,
+            launchCapability: launch.capability,
+          }).callUrl
+        : '',
+    });
   } catch (err) {
     if (err?.code === 'no_route' && err?.status === 404) {
       return res.status(404).json({
@@ -1290,7 +1326,7 @@ router.post('/source-order', telegramAuth, async (req, res) => {
           claimToken: inputReceipt.claimToken,
         });
         if (deferred.state === 'preparing' && deferred.leaseUntil === 0) {
-          const { claimToken: _claimToken, ...retainedReceipt } = inputReceipt;
+          const { claimToken, ...retainedReceipt } = inputReceipt;
           inputReceipt = {
             ...retainedReceipt,
             state: deferred.state,
@@ -2694,6 +2730,10 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
+  const stopKeepAlive = startSseKeepAlive(res, () =>
+    GenerationJobManager.hasLocalGenerationProducer(streamId, job.createdAt),
+  );
+
   logger.debug(`[TelegramStream] Client subscribed to ${streamId}, resume: ${isResume}`);
   traceTelegram(
     '[VIVENTIUM][telegram/stream] Open streamId=%s resume=%s lingerMs=%s',
@@ -2773,6 +2813,7 @@ router.get('/stream/:streamId', telegramAuth, async (req, res) => {
         }
       },
       (event) => {
+        stopKeepAlive();
         if (TELEGRAM_TRACE_ENABLED && event && typeof event === 'object') {
           const eventName = event.event;
           if (event?.final || eventName === 'on_cortex_followup') {

@@ -106,6 +106,11 @@ export function createGlassHiveWorkResultService(
       outputText: row.evidence,
       nativeMedia: normalizeGlassHiveNativeMedia(row.nativeMedia, row.runId) || null,
       outputFiles,
+      ...(outputFiles?.files.length ? { attachmentDelivery: {
+        scope: 'origin_conversation',
+        sourceReference: 'download_url',
+        publicNetworkRequired: false,
+      } } : {}),
       deliveryScope: normalizeWorkDeliveryScope({
         originConversationId: row.conversationId,
         destinations: row.destinations?.map((destination) => destination.surface),

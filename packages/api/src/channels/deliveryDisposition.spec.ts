@@ -11,6 +11,7 @@ import {
   createDeliveryDispositionStreamHandler,
   getStreamDeliveryDisposition,
   inspectProviderPublicPartCompletion,
+  inspectProviderPublicPartCompletionState,
   createReleasedMainPublicPartOwner,
 } from './deliveryDisposition';
 import {
@@ -271,6 +272,25 @@ describe('public part completion carrier', () => {
     additional_kwargs: {
       __raw_response: rawChunk(content),
     },
+  });
+  it.each([
+    ['raw_response_missing', () => ({ content: 'PRIVATE_PROVIDER_TEXT' })],
+    ['raw_envelope_invalid', () => ({ ...rawChunk(), object: 'other' })],
+    ['raw_choice_invalid', () => ({
+      ...rawChunk(), choices: [{ index: 1, finish_reason: null, delta: { content: '' } }],
+    })],
+    ['non_public_envelope', () => ({ ...rawChunk(), reasoning: 'PRIVATE_PROVIDER_TEXT' })],
+    ['completion_carrier_absent', () => ({
+      ...rawChunk(), choices: [{ index: 0, finish_reason: null, delta: { content: '' } }],
+    })],
+    ['completion_marker_invalid', () => rawChunk('', { ...completion, complete: false })],
+    ['completion_marker_valid', () => wrappedChunk('PRIVATE_PROVIDER_TEXT')],
+  ])('reports only the structural completion reason: %s', (reason, build) => {
+    const value = (build as () => unknown)();
+    const result = inspectProviderPublicPartCompletionState(value);
+    expect(result.reason).toBe(reason);
+    expect(result.completion).toEqual(inspectProviderPublicPartCompletion(value));
+    expect(result.reason).not.toContain('PRIVATE_PROVIDER_TEXT');
   });
   it.each(['', '<emphasis>Cobalt blue.</emphasis>'])(
     'keeps completion-only and complete text: %s',

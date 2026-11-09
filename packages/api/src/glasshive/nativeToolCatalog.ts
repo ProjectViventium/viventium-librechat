@@ -11,7 +11,7 @@ export interface NativeToolCatalog {
   expires_at: number;
   server_name: string;
   broker_url: string;
-  tools: Pick<Tool, 'name' | 'description' | 'inputSchema'>[];
+  tools: Pick<Tool, 'name' | 'description' | 'inputSchema' | '_meta'>[];
 }
 
 export function createNativeToolCatalog({
@@ -61,6 +61,7 @@ export function createNativeToolCatalog({
       name: tool.name,
       description: tool.description || '',
       inputSchema: tool.inputSchema,
+      ...(tool._meta ? { _meta: tool._meta } : {}),
     });
   }
   const catalog: NativeToolCatalog = {

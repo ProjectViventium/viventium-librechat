@@ -541,7 +541,9 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             storage = ScheduleStorage(StorageConfig(db_path=str(Path(tmpdir) / "schedules.db")))
             task = _seed_task(storage, "task-agent-external")
             engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
-            now = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            task["next_run_at"] = now.isoformat().replace("+00:00", "Z")
+            storage.update_task(task["user_id"], task["id"], {"next_run_at": task["next_run_at"]})
 
             with patch(
                 "scheduling_cortex.scheduler.dispatch_task",
@@ -954,7 +956,9 @@ class SchedulerDeliveryPersistenceTests(unittest.TestCase):
             storage.update_task("user-1", "task-glasshive", {"executor": "glasshive_host"})
             task = storage.get_task("user-1", "task-glasshive")
             engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
-            now = datetime(2026, 2, 13, 19, 0, tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            task["next_run_at"] = now.isoformat().replace("+00:00", "Z")
+            storage.update_task(task["user_id"], task["id"], {"next_run_at": task["next_run_at"]})
 
             def queued_result(dispatched):
                 run_id = dispatched["_scheduled_prompt_run_id"]
@@ -2359,3 +2363,28 @@ def test_terminal_cursor_does_not_project_onto_unrelated_pending_status(tmp_path
     repaired = storage.get_task(stale['user_id'], stale['id'])
     assert repaired['last_status'] == 'waiting'
     assert repaired['last_error'] == 'scheduler_gateway_unavailable'
+
+
+def test_recovered_attempt_carries_current_delivery_fence(tmp_path):
+    storage = ScheduleStorage(StorageConfig(db_path=str(tmp_path / 'recovered.db')))
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    due = now.isoformat().replace('+00:00', 'Z')
+    task = _seed_task(storage, 'recovered-fence', next_run_at=due)
+    first = storage.claim_scheduled_prompt_occurrence(task_id=task['id'], user_id=task['user_id'],
+        executor='viventium_agent', due_at=due, lease_owner='old-owner',
+        now=(now-timedelta(minutes=30)).isoformat(), lease_seconds=30)
+    engine = SchedulerEngine(storage, poll_interval_s=30, misfire_grace_s=900, retry_delay_s=300)
+    observed = []
+    def deliver(current):
+        observed.append((current['_scheduled_prompt_attempt'], current['_scheduled_prompt_run_lease_owner']))
+        claim = storage.claim_scheduled_prompt_delivery(run_id=current['_scheduled_prompt_run_id'],
+            occurrence_key=current['_scheduled_prompt_occurrence_key'], channel='telegram', part_index=0,
+            payload_hash='synthetic-result', lease_owner='delivery-owner', now=due, lease_seconds=30,
+            expected_run_lease_owner=current['_scheduled_prompt_run_lease_owner'],
+            expected_run_attempt=current['_scheduled_prompt_attempt'])
+        assert claim['claimed'] is True
+        return {'delivery': {'outcome': 'sent', 'channels': {'telegram': {'outcome': 'sent'}}}}
+    with patch('scheduling_cortex.scheduler.dispatch_task', side_effect=deliver):
+        engine._process_task(task, now)
+    assert observed == [(2, engine._lease_owner)]
+    assert storage.get_scheduled_prompt_run(first['run']['run_id'])['attempt'] == 2

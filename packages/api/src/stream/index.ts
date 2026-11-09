@@ -25,6 +25,7 @@ export type {
 } from './interfaces/IJobStore';
 
 export { createStreamServices } from './createStreamServices';
+export { startSseKeepAlive } from './sseKeepAlive';
 export type { StreamServicesConfig, StreamServices } from './createStreamServices';
 export { initializeStreamServicesBeforeTraffic } from './initializeStreamServicesBeforeTraffic';
 

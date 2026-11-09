@@ -14,6 +14,7 @@ const mockLog = jest.fn();
 const mockPublisher = jest.fn();
 const mockAccountRoute = jest.fn();
 const mockFollowUpBind = jest.fn();
+const mockNativePresentation = jest.fn();
 let mockSourceRows = [],
   mockSourceFiles = new Map();
 const mockReadSource = jest.fn();
@@ -77,6 +78,9 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 jest.mock('../nativeResponseService', () => ({
   resolveNativeResponseRoute: (...args) => mockRoute(...args),
+}));
+jest.mock('../NativeCoordinatorPresentationService', () => ({
+  resolve: (...args) => mockNativePresentation(...args),
 }));
 jest.mock('~/models/File', () => ({
   findFileById: (...args) => mockFind(...args),
@@ -146,6 +150,7 @@ const req = () => ({
 });
 beforeEach(() => {
   jest.clearAllMocks();
+  mockNativePresentation.mockReset().mockResolvedValue(null);
   mockCallbackRows = [];
   mockCallbackAccepted.mockResolvedValue(true);
   mockCallbackAcceptedBatch.mockReset().mockResolvedValue([]);
@@ -1147,6 +1152,15 @@ describe('retained owned native File references', () => {
         acceptedOperationGeneration: source.terminalCallbackEffectGeneration,
       },
     ]);
+    mockSourceRows = [
+      {
+        user: 'owner',
+        conversationId: 'conversation',
+        messageId: 'stale-native',
+        metadata: { viventium: { mainGenerationPresentation: { version: 2 } } },
+      },
+    ];
+    mockNativePresentation.mockRejectedValueOnce(new Error('Synthetic stale Native presentation'));
     await expect(loadRetainedNativeResultFileAccess('owner', 'conversation')).resolves.toEqual([
       {
         run_id: source.runId,
@@ -1346,4 +1360,85 @@ describe('retained owned native File references', () => {
     expect(result.imports).toHaveLength(0);
     expect(mockImport).not.toHaveBeenCalled();
   });
+});
+
+describe('retained Native presentation result file access', () => {
+  test.each(['goal', 'turn', 'foreign', 'invalid-publisher', 'missing', 'held', 'other-message'])(
+    'retained Native presentation result file access preserves exact authority: %s',
+    async (mode) => {
+      const publisher = {
+        owner_id: 'owner',
+        conversation_id: 'native-chat',
+        agent_id: 'coordinator',
+        request_id: 'request',
+        message_id: 'native-turn',
+        stream_id: 'native-turn',
+        run_id: 'run',
+      };
+      const envelope = {
+        version: 1,
+        ...publisher,
+        logical_turn_id: '',
+        logical_turn_revision: 1,
+        attempt_id: 'attempt',
+        invocation_id: '',
+        files: [
+          {
+            filename: 'result.png',
+            mime_type: 'image/png',
+            bytes: 64,
+            sha256: 'a'.repeat(64),
+            download_url: '/v1/conversation/requests/request/files/' + 'a'.repeat(64),
+          },
+        ],
+      };
+      const message = {
+        user: mode === 'foreign' ? 'other' : 'owner',
+        conversationId: 'conversation',
+        messageId: 'saved-native',
+        parentMessageId: 'parent',
+        agent_id: 'main',
+        metadata: {
+          viventium: {
+            mainGenerationPresentation: {
+              version: 2,
+              nativeCoordinatorResult: {
+                kind: mode === 'turn' ? 'native_coordinator_turn' : 'native_coordinator_goal',
+              },
+            },
+            cortexInsightDeliveryIds: ['accepted-delivery'],
+          },
+        },
+      };
+      mockSourceRows = [message];
+      const owned = {
+        eligible: mode !== 'held',
+        message: { messageId: mode === 'other-message' ? 'other' : message.messageId },
+        binding: { nativeConversationId: 'native-chat' },
+        data: { run_id: 'run' },
+        result: {
+          publisher,
+          output_files: {
+            ...envelope,
+            ...(mode === 'invalid-publisher' ? { owner_id: 'other' } : {}),
+          },
+        },
+      };
+      mockNativePresentation.mockResolvedValue(mode === 'missing' ? null : owned);
+      await expect(loadRetainedNativeResultFileAccess('owner', 'conversation')).resolves.toEqual(
+        ['goal', 'turn'].includes(mode)
+          ? [{ run_id: 'run', attempt_id: 'attempt', sha256: 'a'.repeat(64) }]
+          : [],
+      );
+      if (mode === 'foreign') expect(mockNativePresentation).not.toHaveBeenCalled();
+      else
+        expect(mockNativePresentation).toHaveBeenCalledWith({
+          ownerId: 'owner',
+          conversationId: 'conversation',
+          parentMessageId: 'parent',
+          deliveryIds: ['accepted-delivery'],
+        });
+      expect(mockImport).not.toHaveBeenCalled();
+    },
+  );
 });

@@ -507,11 +507,7 @@ class ModelEndHandler {
       context?.clientOptions?.[VIVENTIUM_DELIVERY_DISPOSITION_CAPABILITY_OWNER] ||
       context?.provider;
     const capability = this.req?.config?.endpoints?.agents?.providerCapabilities?.[owner];
-    if (
-      capability?.workspace_binding !== true ||
-      capability?.conversation_session !== true
-    )
-      return;
+    if (capability?.workspace_binding !== true || capability?.conversation_session !== true) return;
     let carrier;
     try {
       carrier = inspectNativeOutputFileCarrier(chunk);
@@ -641,7 +637,8 @@ class ModelEndHandler {
       if (errorMessage) {
         this.transferredOutputFileCaptures.delete(graph);
       } else if (
-        data?.output && currentOutput &&
+        data?.output &&
+        currentOutput &&
         (toolCalls?.length || !shouldEmitAgentOutput(metadata, agentContext.agentId))
       ) {
         let transfers = this.transferredOutputFileCaptures.get(graph);
@@ -666,7 +663,10 @@ class ModelEndHandler {
             agentContext.agentId,
             currentOutput.carrier.requestId || outputKey,
           ]);
-          transfers.set(identity, { carrier: currentOutput.carrier, agentId: agentContext.agentId });
+          transfers.set(identity, {
+            carrier: currentOutput.carrier,
+            agentId: agentContext.agentId,
+          });
         }
         // The original publisher remains the import authority. The existing consumer checks
         // the current logical turn, owner, run and attempt; a handoff cannot rebind a file.
@@ -1054,22 +1054,38 @@ function getDefaultHandlers({
     const identity = req?._viventiumNativeResponseIdentity;
     const interaction =
       require('~/server/services/viventium/interactionContext').getTrustedInteractionContext(req);
-    const identityRejection = !identity ? 'identity_missing'
-      : !streamId ? 'stream_missing'
-      : req?._viventiumHarnessExecutionEnabled !== true ? 'execution_disabled'
-      : !isAudioDeliveryRequested(req) ? 'audio_not_requested'
-      : interaction?.actor_kind !== 'external_user' ? 'actor_mismatch'
-      : interaction?.origin !== 'interactive' ? 'origin_mismatch'
-      : interaction.logical_turn_id !== identity.logicalTurnId ? 'logical_turn_mismatch'
-      : interaction.revision !== identity.revision ? 'revision_mismatch'
-      : req.user?.id !== identity.userId ? 'owner_mismatch'
-      : identity.streamId !== streamId ? 'identity_stream_mismatch'
-      : completion.stream_id !== streamId ? 'completion_stream_mismatch'
-      : completion.message_id !== identity.responseMessageId ? 'message_mismatch'
-      : metadata?.agentId !== identity.agentId ? 'agent_mismatch'
-      : !shouldEmitAgentOutput(metadata, identity.agentId) ? 'agent_not_visible'
-      : graph?.getAgentContext(metadata)?.currentTokenType !== ContentTypes.TEXT ? 'content_not_text'
-      : '';
+    const identityRejection = !identity
+      ? 'identity_missing'
+      : !streamId
+        ? 'stream_missing'
+        : req?._viventiumHarnessExecutionEnabled !== true
+          ? 'execution_disabled'
+          : !isAudioDeliveryRequested(req)
+            ? 'audio_not_requested'
+            : interaction?.actor_kind !== 'external_user'
+              ? 'actor_mismatch'
+              : interaction?.origin !== 'interactive'
+                ? 'origin_mismatch'
+                : interaction.logical_turn_id !== identity.logicalTurnId
+                  ? 'logical_turn_mismatch'
+                  : interaction.revision !== identity.revision
+                    ? 'revision_mismatch'
+                    : req.user?.id !== identity.userId
+                      ? 'owner_mismatch'
+                      : identity.streamId !== streamId
+                        ? 'identity_stream_mismatch'
+                        : completion.stream_id !== streamId
+                          ? 'completion_stream_mismatch'
+                          : completion.message_id !== identity.responseMessageId
+                            ? 'message_mismatch'
+                            : metadata?.agentId !== identity.agentId
+                              ? 'agent_mismatch'
+                              : !shouldEmitAgentOutput(metadata, identity.agentId)
+                                ? 'agent_not_visible'
+                                : graph?.getAgentContext(metadata)?.currentTokenType !==
+                                    ContentTypes.TEXT
+                                  ? 'content_not_text'
+                                  : '';
     if (identityRejection) {
       traceGate(identityRejection);
       return;
@@ -1090,14 +1106,22 @@ function getDefaultHandlers({
       return;
     }
     const job = await GenerationJobManager.getJobStore().getJob(streamId);
-    const jobRejection = !nativeJobMatches(job, identity) ? 'job_binding_mismatch'
-      : job.status !== 'running' ? 'job_not_running'
-      : job.generationCompleted === true ? 'generation_completed'
-      : job.nativeResponseCancelled === true ? 'native_response_cancelled'
-      : job.nativeResponse && job.nativeResponseSettled === true ? 'native_response_settled'
-      : job.nativeResponse && nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
-        ? 'native_response_binding_mismatch'
-        : completedPublicParts.has(key) ? 'duplicate_after_read' : '';
+    const jobRejection = !nativeJobMatches(job, identity)
+      ? 'job_binding_mismatch'
+      : job.status !== 'running'
+        ? 'job_not_running'
+        : job.generationCompleted === true
+          ? 'generation_completed'
+          : job.nativeResponseCancelled === true
+            ? 'native_response_cancelled'
+            : job.nativeResponse && job.nativeResponseSettled === true
+              ? 'native_response_settled'
+              : job.nativeResponse &&
+                  nativeIdentityJson(job.nativeResponse) !== nativeIdentityJson(identity)
+                ? 'native_response_binding_mismatch'
+                : completedPublicParts.has(key)
+                  ? 'duplicate_after_read'
+                  : '';
     if (jobRejection) {
       traceGate(jobRejection);
       return;

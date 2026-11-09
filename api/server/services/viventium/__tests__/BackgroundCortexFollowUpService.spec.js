@@ -17,10 +17,16 @@ jest.mock('~/models/Agent', () => ({
 }));
 jest.mock('@librechat/api', () => {
   const actual = jest.requireActual('@librechat/api');
-  return { ...actual, prepareMainAuthorContext: (...args) => {
-    const prepared = require('~/test/helpers/mainAuthorContext').mockMainAuthorContext(actual.prepareMainAuthorContext, ...args);
-    return mockMainAuthorPreparation(prepared) || prepared;
-  } };
+  return {
+    ...actual,
+    prepareMainAuthorContext: (...args) => {
+      const prepared = require('~/test/helpers/mainAuthorContext').mockMainAuthorContext(
+        actual.prepareMainAuthorContext,
+        ...args,
+      );
+      return mockMainAuthorPreparation(prepared) || prepared;
+    },
+  };
 });
 const os = require('node:os');
 const path = require('node:path');
@@ -1082,15 +1088,24 @@ describe('forced follow-up onto an empty primary answer', () => {
 
 describe('formatFollowUpPrompt', () => {
   test.each(['native_coordinator_result', 'native_coordinator_turn_result'])(
-    'preserves exact report and failure authority for %s evidence', (kind) => {
+    'preserves exact report and failure authority for %s evidence',
+    (kind) => {
       const insight = {
         cortexName: 'Native evidence',
         insight: '  Provider returned a partial explanation.\n  ',
-        authority: { kind, state: 'failed', failureClass: 'provider_unavailable',
-          runId: 'run', resultRevision: 2, resultDigest: `sha256:${'a'.repeat(64)}` },
+        authority: {
+          kind,
+          state: 'failed',
+          failureClass: 'provider_unavailable',
+          runId: 'run',
+          resultRevision: 2,
+          resultDigest: `sha256:${'a'.repeat(64)}`,
+        },
       };
       const prompt = formatFollowUpPrompt({ insights: [insight], surface: 'telegram' });
-      expect(prompt).toContain(JSON.stringify({ report: insight.insight, authority: insight.authority }));
+      expect(prompt).toContain(
+        JSON.stringify({ report: insight.insight, authority: insight.authority }),
+      );
       expect(prompt).not.toContain('"runInput"');
     },
   );
@@ -3403,11 +3418,17 @@ describe('authored no-response primary preparation', () => {
     ['web', '{NTA}', '{NTA}', false, ''],
     ['telegram', ' { nta } ', '{NTA}', false, ''],
     ['web', 'Nothing new to add.', '{NTA}', false, ''],
-    ['web', '{NTA}', 'The completed check found a new blocker.', false,
-      'The completed check found a new blocker.'],
+    [
+      'web',
+      '{NTA}',
+      'The completed check found a new blocker.',
+      false,
+      'The completed check found a new blocker.',
+    ],
     ['web', '', 'A recovered answer.', true, 'A recovered answer.'],
     ['web', 'Generation in progress.', 'A recovered answer.', true, 'A recovered answer.'],
-  ])('keeps authored silence distinct from blank recovery: %s / %s / %s',
+  ])(
+    'keeps authored silence distinct from blank recovery: %s / %s / %s',
     async (surface, recentResponse, generated, forced, expected) => {
       const processStream = jest.fn().mockResolvedValue(generated);
       const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
@@ -3416,11 +3437,14 @@ describe('authored no-response primary preparation', () => {
       try {
         const prepared = await prepareCortexFollowUpMessage({
           req: { body: { viventiumSurface: surface } },
-          conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent',
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
           agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
-          recentResponse, insightsData: { cortexCount: 1, insights: [
-            { cortexName: 'Synthetic evidence', insight: 'A verified finding.' },
-          ] },
+          recentResponse,
+          insightsData: {
+            cortexCount: 1,
+            insights: [{ cortexName: 'Synthetic evidence', insight: 'A verified finding.' }],
+          },
         });
         expect(prepared.shouldForceVisibleFollowUp).toBe(forced);
         expect(prepared.followUpDecisionRecord.forceVisibleFollowUp).toBe(forced);
@@ -3428,14 +3452,17 @@ describe('authored no-response primary preparation', () => {
         expect(prepared.followUpDecisionRecord.generationFailed).toBe(false);
         expect(processStream).toHaveBeenCalledTimes(1);
         if (recentResponse.trim() && !forced) {
-          expect(processStream.mock.calls[0][0].messages[0].content).toContain(recentResponse.trim());
+          expect(processStream.mock.calls[0][0].messages[0].content).toContain(
+            recentResponse.trim(),
+          );
         }
       } finally {
         if (priorKey == null) delete process.env.XAI_API_KEY;
         else process.env.XAI_API_KEY = priorKey;
         createRun.mockRestore();
       }
-    });
+    },
+  );
   test('failed optional synthesis after authored silence cannot expose raw specialist evidence', async () => {
     const processStream = jest.fn().mockRejectedValue(new Error('synthetic provider unavailable'));
     const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
@@ -3444,16 +3471,22 @@ describe('authored no-response primary preparation', () => {
     try {
       const prepared = await prepareCortexFollowUpMessage({
         req: { body: { viventiumSurface: 'telegram' } },
-        conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent',
+        conversationId: 'synthetic-conversation',
+        parentMessageId: 'synthetic-parent',
         agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
-        recentResponse: '{NTA}', insightsData: { cortexCount: 1, insights: [
-          { cortexName: 'Synthetic evidence', insight: 'Internal unfulfilled request only.' },
-        ] },
+        recentResponse: '{NTA}',
+        insightsData: {
+          cortexCount: 1,
+          insights: [
+            { cortexName: 'Synthetic evidence', insight: 'Internal unfulfilled request only.' },
+          ],
+        },
       });
       expect(prepared.shouldForceVisibleFollowUp).toBe(false);
       expect(prepared.text).toBe('');
       expect(prepared.followUpDecisionRecord).toMatchObject({
-        generationFailed: true, selectedStrategy: 'failed_optional_followup_suppressed',
+        generationFailed: true,
+        selectedStrategy: 'failed_optional_followup_suppressed',
       });
     } finally {
       if (priorKey == null) delete process.env.XAI_API_KEY;
@@ -3464,28 +3497,37 @@ describe('authored no-response primary preparation', () => {
 });
 /* VIVENTIUM END */
 
-
 describe('Main follow-up preserves full admitted context', () => {
-  test.each([false, true])('preserves complete requests and Cortex evidence in primary mode %s', (primaryResponseMode) => {
-    const userRequest = 'Original source. '.repeat(900) + ' END REQUEST RESTRICTION';
-    const insight = 'Actual evidence. '.repeat(1000) + ' END EVIDENCE';
-    const continuationContext = 'Newer original context. '.repeat(200) + ' END NEWER CORRECTION';
-    const prompt = formatFollowUpPrompt({
-      insights: [{ cortexName: 'Synthetic Cortex', insight, maxPromptChars: 1 }],
-      recentResponse: 'Accepted.', userRequest, continuationContext, primaryResponseMode,
-    });
-    expect(prompt).toContain(userRequest);
-    expect(prompt).toContain(insight);
-    expect(prompt).toContain(continuationContext);
-  });
+  test.each([false, true])(
+    'preserves complete requests and Cortex evidence in primary mode %s',
+    (primaryResponseMode) => {
+      const userRequest = 'Original source. '.repeat(900) + ' END REQUEST RESTRICTION';
+      const insight = 'Actual evidence. '.repeat(1000) + ' END EVIDENCE';
+      const continuationContext = 'Newer original context. '.repeat(200) + ' END NEWER CORRECTION';
+      const prompt = formatFollowUpPrompt({
+        insights: [{ cortexName: 'Synthetic Cortex', insight, maxPromptChars: 1 }],
+        recentResponse: 'Accepted.',
+        userRequest,
+        continuationContext,
+        primaryResponseMode,
+      });
+      expect(prompt).toContain(userRequest);
+      expect(prompt).toContain(insight);
+      expect(prompt).toContain(continuationContext);
+    },
+  );
 
   test('preserves every authorized descendant and long multi-line corrections', () => {
     const text = 'Keep this formatting.\n'.repeat(100) + ' END EXACT CORRECTION';
     const messages = [{ messageId: 'anchor', sender: 'AI', text: 'Working.' }];
-    for (let i = 0; i < 12; i++) messages.push({
-      messageId: `child-${i}`, parentMessageId: i ? `child-${i - 1}` : 'anchor',
-      sender: 'User', isCreatedByUser: true, text: i === 0 ? text : `Original follow-up ${i}`,
-    });
+    for (let i = 0; i < 12; i++)
+      messages.push({
+        messageId: `child-${i}`,
+        parentMessageId: i ? `child-${i - 1}` : 'anchor',
+        sender: 'User',
+        isCreatedByUser: true,
+        text: i === 0 ? text : `Original follow-up ${i}`,
+      });
     const result = resolveFollowUpContinuationContext(messages, 'anchor');
     expect(result.messageCount).toBe(12);
     expect(result.contextText).toContain(text);
@@ -3493,10 +3535,10 @@ describe('Main follow-up preserves full admitted context', () => {
   });
 });
 
-
 describe('prepared result event integrity', () => {
   test.each(['wrong_role', 'changed_text', 'attached_media'])(
-    'fails before generation instead of discarding an unexpected final event (%s)', async (shape) => {
+    'fails before generation instead of discarding an unexpected final event (%s)',
+    async (shape) => {
       const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
       const priorKey = process.env.XAI_API_KEY;
       process.env.XAI_API_KEY = 'synthetic-key';
@@ -3505,27 +3547,39 @@ describe('prepared result event integrity', () => {
       mockMainAuthorPreparation.mockImplementationOnce(async (promise) => {
         const prepared = await promise;
         const original = prepared.messages.at(-1).content;
-        prepared.messages[prepared.messages.length - 1] = shape === 'wrong_role'
-          ? new AIMessage(original)
-          : new HumanMessage(shape === 'changed_text' ? 'Changed evidence.'
-            : [{ type: 'text', text: original }, { type: 'image_url', image_url: 'synthetic' }]);
+        prepared.messages[prepared.messages.length - 1] =
+          shape === 'wrong_role'
+            ? new AIMessage(original)
+            : new HumanMessage(
+                shape === 'changed_text'
+                  ? 'Changed evidence.'
+                  : [
+                      { type: 'text', text: original },
+                      { type: 'image_url', image_url: 'synthetic' },
+                    ],
+              );
         return prepared;
       });
       try {
-        await expect(generateFollowUpText({
-          req: { user: { id: 'owner' }, body: {} },
-          agent: { id: 'main', provider: 'xai', model: 'synthetic', model_parameters: {} },
-          insightsData: { insights: [{ cortexName: 'Synthetic', insight: 'Verified evidence.' }] },
-        })).rejects.toThrow('main_author_event_context_mismatch');
+        await expect(
+          generateFollowUpText({
+            req: { user: { id: 'owner' }, body: {} },
+            agent: { id: 'main', provider: 'xai', model: 'synthetic', model_parameters: {} },
+            insightsData: {
+              insights: [{ cortexName: 'Synthetic', insight: 'Verified evidence.' }],
+            },
+          }),
+        ).rejects.toThrow('main_author_event_context_mismatch');
         expect(processStream).not.toHaveBeenCalled();
       } finally {
-        create.mockRestore(); mockMainAuthorPreparation.mockReset();
-        if (priorKey === undefined) delete process.env.XAI_API_KEY; else process.env.XAI_API_KEY = priorKey;
+        create.mockRestore();
+        mockMainAuthorPreparation.mockReset();
+        if (priorKey === undefined) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = priorKey;
       }
     },
   );
 });
-
 
 describe('typed durable synthesis failures', () => {
   test.each([
@@ -3538,14 +3592,18 @@ describe('typed durable synthesis failures', () => {
     [502, 'bad_gateway', true],
     [504, 'gateway_timeout', true],
   ])('preserves wrapped status %s and its recovery policy', async (status, code, retryable) => {
-    const processStream = jest.fn().mockRejectedValue(new Error('SDK wrapper', {
-      cause: Object.assign(new Error('Synthetic failure'), { status, code }),
-    }));
+    const processStream = jest.fn().mockRejectedValue(
+      new Error('SDK wrapper', {
+        cause: Object.assign(new Error('Synthetic failure'), { status, code }),
+      }),
+    );
     const create = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
     const prior = process.env.XAI_API_KEY;
     const history = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
     const parent = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
-    const current = jest.spyOn(require('../nativeResponseService'), 'offerMissionEvidenceToCurrentMain').mockResolvedValue(false);
+    const current = jest
+      .spyOn(require('../nativeResponseService'), 'offerMissionEvidenceToCurrentMain')
+      .mockResolvedValue(false);
     try {
       process.env.XAI_API_KEY = 'synthetic-key';
       const result = await prepareCortexFollowUpMessage({
@@ -3553,14 +3611,25 @@ describe('typed durable synthesis failures', () => {
         agent: { provider: 'xai', model: 'synthetic', model_parameters: {} },
         runId: 'synthetic-failure',
         recentResponse: 'Working.',
-        insightsData: { insights: [{ cortexName: 'Synthetic', insight: 'Retained result.',
-          authority: { kind: 'durable_terminal_callback' } }] },
+        insightsData: {
+          insights: [
+            {
+              cortexName: 'Synthetic',
+              insight: 'Retained result.',
+              authority: { kind: 'durable_terminal_callback' },
+            },
+          ],
+        },
       });
       expect(result.followUpDecisionRecord.generationFailure).toEqual({ status, code, retryable });
       expect(result.followUpDecisionRecord.generationFailed).toBe(true);
     } finally {
-      create.mockRestore(); history.mockRestore(); parent.mockRestore(); current.mockRestore();
-      if (prior == null) delete process.env.XAI_API_KEY; else process.env.XAI_API_KEY = prior;
+      create.mockRestore();
+      history.mockRestore();
+      parent.mockRestore();
+      current.mockRestore();
+      if (prior == null) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = prior;
     }
   });
 });

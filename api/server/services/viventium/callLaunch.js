@@ -72,12 +72,22 @@ function resolveTelegramPublicPlaygroundBaseUrl() {
   let publicUrl = process.env.VIVENTIUM_PUBLIC_PLAYGROUND_URL || '';
   if (process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE) {
     try {
-      const state = JSON.parse(fs.readFileSync(process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE, 'utf8'));
-      if (state.last_error || (state.lan_ip && (state.lan_runtime_ready !== true ||
-          !Object.values(os.networkInterfaces()).flat().some(address =>
-            address && !address.internal && address.address === state.lan_ip)))) return '';
+      const state = JSON.parse(
+        fs.readFileSync(process.env.VIVENTIUM_PUBLIC_NETWORK_STATE_FILE, 'utf8'),
+      );
+      if (
+        state.last_error ||
+        (state.lan_ip &&
+          (state.lan_runtime_ready !== true ||
+            !Object.values(os.networkInterfaces())
+              .flat()
+              .some((address) => address && !address.internal && address.address === state.lan_ip)))
+      )
+        return '';
       publicUrl = state.public_playground_url || '';
-    } catch { return ''; }
+    } catch {
+      return '';
+    }
   }
   const parsed = parseBaseUrl(publicUrl);
   if (!parsed) {
@@ -107,24 +117,34 @@ function resolveLocalPlaygroundBaseUrl() {
   }
   const parsed = parseBaseUrl(lanUrl);
   const parts = parsed?.hostname.split('.').map(Number) || [];
-  const privateAddress = isIP(parsed?.hostname || '') === 4 &&
-    (parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+  const privateAddress =
+    isIP(parsed?.hostname || '') === 4 &&
+    (parts[0] === 10 ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
       (parts[0] === 192 && parts[1] === 168));
-  const lanDomain = String(process.env.VIVENTIUM_LAN_DOMAIN || '').trim().toLowerCase();
+  const lanDomain = String(process.env.VIVENTIUM_LAN_DOMAIN || '')
+    .trim()
+    .toLowerCase();
   const configuredHostname = lanDomain && parsed?.hostname === `playground.${lanDomain}`;
   const boundAddress = configuredHostname ? lanIp : parsed?.hostname;
   if (
     !parsed ||
     parsed.protocol !== 'https:' ||
-    (!privateAddress && !configuredHostname) || !parsed.port ||
-    parsed.search || parsed.hash || parsed.pathname !== '/' ||
+    (!privateAddress && !configuredHostname) ||
+    !parsed.port ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.pathname !== '/' ||
     parsed.username ||
     parsed.password
   ) {
     return '';
   }
-  if (!Object.values(os.networkInterfaces()).flat().some((address) =>
-    address && !address.internal && address.address === boundAddress)) {
+  if (
+    !Object.values(os.networkInterfaces())
+      .flat()
+      .some((address) => address && !address.internal && address.address === boundAddress)
+  ) {
     return '';
   }
   return trimBaseUrl(parsed.toString());

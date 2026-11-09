@@ -82,8 +82,11 @@ jest.mock('@librechat/agents', () => ({
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
-  prepareMainAuthorContext: (...args) => require('~/test/helpers/mainAuthorContext')
-    .mockMainAuthorContext(jest.requireActual('@librechat/api').prepareMainAuthorContext, ...args),
+  prepareMainAuthorContext: (...args) =>
+    require('~/test/helpers/mainAuthorContext').mockMainAuthorContext(
+      jest.requireActual('@librechat/api').prepareMainAuthorContext,
+      ...args,
+    ),
   createViventiumPersonalAccountCleanupReceiptModel: jest.fn(() => ({})),
   createGlassHiveTerminalCallbackTransactionService: jest.fn(() => ({
     currentGlassHiveTerminalCallbackTransaction: jest.fn(() => null),
@@ -1835,9 +1838,7 @@ describe('BackgroundCortexFollowUpService', () => {
     expect(Run.create).toHaveBeenCalledWith(
       expect.objectContaining({
         graphConfig: expect.objectContaining({
-          instructions: expect.stringContaining(
-            'to complete the deferred answer',
-          ),
+          instructions: expect.stringContaining('to complete the deferred answer'),
           llmConfig: expect.objectContaining({
             maxTokens: 2000,
           }),

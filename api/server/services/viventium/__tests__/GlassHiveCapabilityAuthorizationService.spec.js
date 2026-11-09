@@ -162,121 +162,203 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
 
   function recallInput(mode = 'vector') {
     return {
-      user: { id: 'owner-1', role: 'USER' }, originRef: 'ghi_recall_unchanged_scope',
-      allowedServers: ['connected'], eagerServers: [], deferredServers: ['connected'],
-      allowedHostTools: ['file_search'], contentReadScope: true, executionMode: 'host',
+      user: { id: 'owner-1', role: 'USER' },
+      originRef: 'ghi_recall_unchanged_scope',
+      allowedServers: ['connected'],
+      eagerServers: [],
+      deferredServers: ['connected'],
+      allowedHostTools: ['file_search'],
+      contentReadScope: true,
+      executionMode: 'host',
       requestContext: {
-        conversation_id: 'conversation-1', parent_message_id: 'parent-1', message_id: 'message-1',
+        conversation_id: 'conversation-1',
+        parent_message_id: 'parent-1',
+        message_id: 'message-1',
       },
-      brokerUrl: 'http://127.0.0.1:3180/mcp', nowMs: 1_800_000_000_000,
-      hostToolResources: { file_search: { entity_id: 'agent-1', files: [
-        { file_id: 'recall-owner-1', context: 'conversation_recall', viventiumConversationRecallMode: mode,
-          viventiumConversationRecallAttachmentReason: mode === 'vector' ? 'vector_ready' : 'stale_corpus',
-          metadata: { conversationRecallCharCount: 1000, conversationRecallDigest: 'old',
-            conversationRecallSourceDigest: 'old', conversationRecallUploadedDigest: 'old',
-            conversationRecallTurnCount: 20 } },
-        ...Array.from({ length: 34 }, (_, index) => ({ file_id: `retained-file-${index}`, metadata: { revision: 1 } })),
-      ] } },
+      brokerUrl: 'http://127.0.0.1:3180/mcp',
+      nowMs: 1_800_000_000_000,
+      hostToolResources: {
+        file_search: {
+          entity_id: 'agent-1',
+          files: [
+            {
+              file_id: 'recall-owner-1',
+              context: 'conversation_recall',
+              viventiumConversationRecallMode: mode,
+              viventiumConversationRecallAttachmentReason:
+                mode === 'vector' ? 'vector_ready' : 'stale_corpus',
+              metadata: {
+                conversationRecallCharCount: 1000,
+                conversationRecallDigest: 'old',
+                conversationRecallSourceDigest: 'old',
+                conversationRecallUploadedDigest: 'old',
+                conversationRecallTurnCount: 20,
+              },
+            },
+            ...Array.from({ length: 34 }, (_, index) => ({
+              file_id: `retained-file-${index}`,
+              metadata: { revision: 1 },
+            })),
+          ],
+        },
+      },
     };
   }
   function refreshRecall(input) {
     const fresh = structuredClone(input);
     Object.assign(fresh.hostToolResources.file_search.files[0].metadata, {
-      conversationRecallCharCount: 1200, conversationRecallDigest: 'new',
-      conversationRecallSourceDigest: 'new', conversationRecallUploadedDigest: 'new',
+      conversationRecallCharCount: 1200,
+      conversationRecallDigest: 'new',
+      conversationRecallSourceDigest: 'new',
+      conversationRecallUploadedDigest: 'new',
     });
     return fresh;
   }
   function refreshRecallAvailability(input) {
     const fresh = refreshRecall(input);
     const file = fresh.hostToolResources.file_search.files[0];
-    file.viventiumConversationRecallMode = file.viventiumConversationRecallMode === 'vector'
-      ? 'source_only' : 'vector';
-    file.viventiumConversationRecallAttachmentReason = file.viventiumConversationRecallMode === 'vector'
-      ? 'vector_ready' : 'stale_corpus';
+    file.viventiumConversationRecallMode =
+      file.viventiumConversationRecallMode === 'vector' ? 'source_only' : 'vector';
+    file.viventiumConversationRecallAttachmentReason =
+      file.viventiumConversationRecallMode === 'vector' ? 'vector_ready' : 'stale_corpus';
     return fresh;
   }
-  test.each(['vector', 'source_only'])('unbound %s retrieval readiness can change without changing recall authority', async (mode) => {
-    const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
-    const input = recallInput(mode);
-    const original = await createCapabilityAuthorization(input);
-    const before = JSON.stringify([...authorizations.values()]);
-    await expect(createCapabilityAuthorization(refreshRecallAvailability(input))).resolves.toEqual(original);
-    expect(JSON.stringify([...authorizations.values()])).toBe(before);
-    expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
-    expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
-    expect(mockMintBrokerGrant).not.toHaveBeenCalled();
-  });
+  test.each(['vector', 'source_only'])(
+    'unbound %s retrieval readiness can change without changing recall authority',
+    async (mode) => {
+      const {
+        createCapabilityAuthorization,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const input = recallInput(mode);
+      const original = await createCapabilityAuthorization(input);
+      const before = JSON.stringify([...authorizations.values()]);
+      await expect(
+        createCapabilityAuthorization(refreshRecallAvailability(input)),
+      ).resolves.toEqual(original);
+      expect(JSON.stringify([...authorizations.values()])).toBe(before);
+      expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
+      expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
+      expect(mockMintBrokerGrant).not.toHaveBeenCalled();
+    },
+  );
   test('an unbound source-only readiness reason can change without changing recall authority', async () => {
     const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
     const input = recallInput('source_only');
     const original = await createCapabilityAuthorization(input);
     const fresh = structuredClone(input);
-    fresh.hostToolResources.file_search.files[0].viventiumConversationRecallAttachmentReason = 'runtime_timeout';
+    fresh.hostToolResources.file_search.files[0].viventiumConversationRecallAttachmentReason =
+      'runtime_timeout';
     await expect(createCapabilityAuthorization(fresh)).resolves.toEqual(original);
     expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
     expect(mockMintBrokerGrant).not.toHaveBeenCalled();
   });
-  test.each(['vector', 'source_only'])('unbound %s recall observation refresh preserves the immutable authority record', async (mode) => {
-    const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
-    const input = recallInput(mode);
-    const original = await createCapabilityAuthorization(input);
-    const before = JSON.stringify([...authorizations.values()]);
-    const repeated = await createCapabilityAuthorization(refreshRecall(input));
-    expect(repeated).toEqual(original);
-    expect(JSON.stringify([...authorizations.values()])).toBe(before);
-    expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
-    expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
-    expect(mockMintBrokerGrant).not.toHaveBeenCalled();
-  });
-  test.each(['vector', 'source_only'])('unbound %s turn-count refresh preserves original authority', async (mode) => {
-    const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
-    const input = recallInput(mode);
-    const original = await createCapabilityAuthorization(input);
-    const fresh = structuredClone(input);
-    fresh.hostToolResources.file_search.files[0].metadata.conversationRecallTurnCount += 1;
-    await expect(createCapabilityAuthorization(fresh)).resolves.toEqual(original);
-    expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
-    expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
-  });
-  test.each(['vector', 'source_only'])('unbound %s refresh of all owned corpus observations preserves authority', async (mode) => {
-    const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
-    const input = recallInput(mode);
-    Object.assign(input.hostToolResources.file_search.files[0].metadata, {
-      conversationRecallSourceTurnCount: 20,
-      conversationRecallSourceCharCount: 1000,
-      conversationRecallUsedReducedUploadWindow: false,
-    });
-    const original = await createCapabilityAuthorization(input);
-    const fresh = refreshRecall(input);
-    Object.assign(fresh.hostToolResources.file_search.files[0].metadata, {
-      conversationRecallTurnCount: 21,
-      conversationRecallSourceTurnCount: 22,
-      conversationRecallSourceCharCount: 1400,
-      conversationRecallUsedReducedUploadWindow: true,
-    });
-    await expect(createCapabilityAuthorization(fresh)).resolves.toEqual(original);
-    expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
-    expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
-    expect(mockMintBrokerGrant).not.toHaveBeenCalled();
-  });
+  test.each(['vector', 'source_only'])(
+    'unbound %s recall observation refresh preserves the immutable authority record',
+    async (mode) => {
+      const {
+        createCapabilityAuthorization,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const input = recallInput(mode);
+      const original = await createCapabilityAuthorization(input);
+      const before = JSON.stringify([...authorizations.values()]);
+      const repeated = await createCapabilityAuthorization(refreshRecall(input));
+      expect(repeated).toEqual(original);
+      expect(JSON.stringify([...authorizations.values()])).toBe(before);
+      expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
+      expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
+      expect(mockMintBrokerGrant).not.toHaveBeenCalled();
+    },
+  );
+  test.each(['vector', 'source_only'])(
+    'unbound %s turn-count refresh preserves original authority',
+    async (mode) => {
+      const {
+        createCapabilityAuthorization,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const input = recallInput(mode);
+      const original = await createCapabilityAuthorization(input);
+      const fresh = structuredClone(input);
+      fresh.hostToolResources.file_search.files[0].metadata.conversationRecallTurnCount += 1;
+      await expect(createCapabilityAuthorization(fresh)).resolves.toEqual(original);
+      expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
+      expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
+    },
+  );
+  test.each(['vector', 'source_only'])(
+    'unbound %s refresh of all owned corpus observations preserves authority',
+    async (mode) => {
+      const {
+        createCapabilityAuthorization,
+      } = require('../GlassHiveCapabilityAuthorizationService');
+      const input = recallInput(mode);
+      Object.assign(input.hostToolResources.file_search.files[0].metadata, {
+        conversationRecallSourceTurnCount: 20,
+        conversationRecallSourceCharCount: 1000,
+        conversationRecallUsedReducedUploadWindow: false,
+      });
+      const original = await createCapabilityAuthorization(input);
+      const fresh = refreshRecall(input);
+      Object.assign(fresh.hostToolResources.file_search.files[0].metadata, {
+        conversationRecallTurnCount: 21,
+        conversationRecallSourceTurnCount: 22,
+        conversationRecallSourceCharCount: 1400,
+        conversationRecallUsedReducedUploadWindow: true,
+      });
+      await expect(createCapabilityAuthorization(fresh)).resolves.toEqual(original);
+      expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
+      expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
+      expect(mockMintBrokerGrant).not.toHaveBeenCalled();
+    },
+  );
   test.each([
-    'file-id', 'entity', 'unknown-metadata', 'unknown-mode', 'unknown-context', 'other-host-tool', 'servers', 'tools',
-    'request', 'parent', 'conversation', 'turn', 'file-owner', 'namespace', 'actor', 'recall-scope',
-    'history-anchor', 'source-anchor', 'read-scope', 'execution-mode', 'broker', 'discovery-partition',
-    'expired', 'nan-clock', 'infinite-clock', 'revoked', 'bound-work', 'bound-worker', 'bound-run', 'bound-grant', 'bound-container', 'bound-host-lease', 'tampered-fingerprint',
+    'file-id',
+    'entity',
+    'unknown-metadata',
+    'unknown-mode',
+    'unknown-context',
+    'other-host-tool',
+    'servers',
+    'tools',
+    'request',
+    'parent',
+    'conversation',
+    'turn',
+    'file-owner',
+    'namespace',
+    'actor',
+    'recall-scope',
+    'history-anchor',
+    'source-anchor',
+    'read-scope',
+    'execution-mode',
+    'broker',
+    'discovery-partition',
+    'expired',
+    'nan-clock',
+    'infinite-clock',
+    'revoked',
+    'bound-work',
+    'bound-worker',
+    'bound-run',
+    'bound-grant',
+    'bound-container',
+    'bound-host-lease',
+    'tampered-fingerprint',
   ])('recall observation compatibility cannot change %s authority', async (change) => {
     const { createCapabilityAuthorization } = require('../GlassHiveCapabilityAuthorizationService');
     const input = recallInput();
     if (change === 'other-host-tool') {
       input.allowedHostTools.push('other_host_tool');
-      input.hostToolResources.other_host_tool = structuredClone(input.hostToolResources.file_search);
+      input.hostToolResources.other_host_tool = structuredClone(
+        input.hostToolResources.file_search,
+      );
     }
     const original = await createCapabilityAuthorization(input);
     const row = authorizations.get(original.authorizationRef);
     const fresh = refreshRecallAvailability(input);
     if (change === 'other-host-tool') {
-      fresh.hostToolResources.other_host_tool.files[0].metadata.conversationRecallDigest = 'different';
+      fresh.hostToolResources.other_host_tool.files[0].metadata.conversationRecallDigest =
+        'different';
     }
     const file = fresh.hostToolResources.file_search.files[0];
     if (change === 'file-id') file.file_id = 'foreign-file';
@@ -284,7 +366,10 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     if (change === 'unknown-metadata') file.metadata.accessScope = 'different';
     if (change === 'unknown-mode') file.viventiumConversationRecallMode = 'unknown';
     if (change === 'unknown-context') file.context = 'uploaded_file';
-    if (change === 'servers') { fresh.allowedServers = ['different']; fresh.deferredServers = ['different']; }
+    if (change === 'servers') {
+      fresh.allowedServers = ['different'];
+      fresh.deferredServers = ['different'];
+    }
     if (change === 'tools') fresh.allowedHostTools.push('web_search');
     if (change === 'request') fresh.requestContext.message_id = 'different-message';
     if (change === 'parent') fresh.requestContext.parent_message_id = 'different-parent';
@@ -300,7 +385,8 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     if (change === 'execution-mode') fresh.executionMode = 'docker';
     if (change === 'broker') fresh.brokerUrl = 'http://127.0.0.1:3181/mcp';
     if (change === 'discovery-partition') {
-      fresh.eagerServers = ['connected']; fresh.deferredServers = [];
+      fresh.eagerServers = ['connected'];
+      fresh.deferredServers = [];
     }
     if (change === 'expired') fresh.nowMs += 86400 * 1000;
     if (change === 'nan-clock') fresh.nowMs = NaN;
@@ -313,7 +399,9 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     if (change === 'bound-container') row.currentContainerGenerationId = 'a'.repeat(64);
     if (change === 'bound-host-lease') row.currentHostStartupLeaseId = 'host-lease-1';
     if (change === 'tampered-fingerprint') row.scopeFingerprint = 'tampered';
-    await expect(createCapabilityAuthorization(fresh)).rejects.toMatchObject({ code: 'capability_authorization_conflict' });
+    await expect(createCapabilityAuthorization(fresh)).rejects.toMatchObject({
+      code: 'capability_authorization_conflict',
+    });
     expect(mockAuthorizationCollection.insertOne).toHaveBeenCalledTimes(1);
     expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
   });
@@ -322,7 +410,9 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     const input = recallInput();
     const original = await createCapabilityAuthorization(input);
     const row = authorizations.get(original.authorizationRef);
-    row.workRef = 'work-1'; row.workerId = 'worker-1'; row.currentRunId = 'run-1';
+    row.workRef = 'work-1';
+    row.workerId = 'worker-1';
+    row.currentRunId = 'run-1';
     await expect(createCapabilityAuthorization(input)).resolves.toEqual(row);
     expect(mockAuthorizationCollection.updateOne).not.toHaveBeenCalled();
   });
@@ -664,7 +754,6 @@ describe('GlassHiveCapabilityAuthorizationService', () => {
     expect(authorization.hostToolResources).toEqual({
       file_search: { files: [{ file_id: 'file-1', text: 'x'.repeat(600000) }] },
     });
-
   });
 
   test('mints only at exact mission admission and binds the grant to worker and run', async () => {
@@ -1402,19 +1491,38 @@ describe('read-only capability descriptor for immutable native receipt recovery'
   );
 });
 
-
 describe('read-only original mission server ceiling', () => {
   test('uses exact existing owner/work identity without expiry renewal or grants', async () => {
-    const { readCapabilityAuthorizationServerScope } = require('../GlassHiveCapabilityAuthorizationService');
-    const record = { _id: 'scope-only', ownerId: 'scope-owner', workRef: 'actual-work', status: 'active',
-      allowedServers: ['existing-service'], maxExpiresAt: new Date(1), reauthorizationCount: 0 };
+    const {
+      readCapabilityAuthorizationServerScope,
+    } = require('../GlassHiveCapabilityAuthorizationService');
+    const record = {
+      _id: 'scope-only',
+      ownerId: 'scope-owner',
+      workRef: 'actual-work',
+      status: 'active',
+      allowedServers: ['existing-service'],
+      maxExpiresAt: new Date(1),
+      reauthorizationCount: 0,
+    };
     authorizations.set(record._id, record);
     mockMintBrokerGrant.mockClear();
     mockAuthorizationCollection.updateOne.mockClear();
-    expect(await readCapabilityAuthorizationServerScope({ ownerId: 'scope-owner', workRef: 'actual-work' }))
-      .toEqual(['existing-service']);
-    expect(await readCapabilityAuthorizationServerScope({ ownerId: 'foreign', workRef: 'actual-work' })).toBeNull();
-    expect(await readCapabilityAuthorizationServerScope({ ownerId: 'scope-owner', workRef: 'different-work' })).toBeNull();
+    expect(
+      await readCapabilityAuthorizationServerScope({
+        ownerId: 'scope-owner',
+        workRef: 'actual-work',
+      }),
+    ).toEqual(['existing-service']);
+    expect(
+      await readCapabilityAuthorizationServerScope({ ownerId: 'foreign', workRef: 'actual-work' }),
+    ).toBeNull();
+    expect(
+      await readCapabilityAuthorizationServerScope({
+        ownerId: 'scope-owner',
+        workRef: 'different-work',
+      }),
+    ).toBeNull();
     expect(record.maxExpiresAt.getTime()).toBe(1);
     expect(record.reauthorizationCount).toBe(0);
     expect(mockMintBrokerGrant).not.toHaveBeenCalled();

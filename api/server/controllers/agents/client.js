@@ -2888,8 +2888,7 @@ function createCompletionErrorContentPart(err) {
       'This turn needs a fresh connected-tool authorization. Retry the turn to continue.',
     conversation_session_authority_conflict:
       'This conversation was still finishing an earlier reply, so this request did not start.',
-    native_output_files_identity_unavailable:
-      'The selected file could not be attached.',
+    native_output_files_identity_unavailable: 'The selected file could not be attached.',
     source_context_unavailable:
       'The conversation context could not be preserved. Please retry this turn.',
     completion_error: 'Viventium could not complete this request. Please try again.',
@@ -2903,9 +2902,10 @@ function createCompletionErrorContentPart(err) {
           .trim()
           .toLowerCase() === 'host_capacity',
     );
-    const detail = capacityFailures.find((candidate) =>
-      candidate?.available || candidate?.required || candidate?.shortage,
-    ) || capacityFailures[0];
+    const detail =
+      capacityFailures.find(
+        (candidate) => candidate?.available || candidate?.required || candidate?.shortage,
+      ) || capacityFailures[0];
     const dimensions = ['childProcesses', 'threads', 'memoryBytes', 'diskBytes'];
     const capacity = {};
     for (const field of ['available', 'required', 'shortage']) {
@@ -2958,14 +2958,18 @@ function createCompletionErrorContentPart(err) {
   const capacityMetadata = hostCapacityMetadata();
   let publicMessage = publicMessageByClass[errorClass] || publicMessageByClass.completion_error;
   if (errorClass === 'host_capacity' && capacityMetadata.capacity_class === 'resource_pressure') {
-    const lacks = (dimension) => capacityMetadata.capacity_shortage?.[dimension] > 0 ||
+    const lacks = (dimension) =>
+      capacityMetadata.capacity_shortage?.[dimension] > 0 ||
       (Number.isSafeInteger(capacityMetadata.capacity_available?.[dimension]) &&
         Number.isSafeInteger(capacityMetadata.capacity_required?.[dimension]) &&
-        capacityMetadata.capacity_available[dimension] < capacityMetadata.capacity_required[dimension]);
+        capacityMetadata.capacity_available[dimension] <
+          capacityMetadata.capacity_required[dimension]);
     if (lacks('diskBytes')) {
-      publicMessage = 'The computer running Viventium is low on disk space and could not start this reply. Free some space, then retry.';
+      publicMessage =
+        'The computer running Viventium is low on disk space and could not start this reply. Free some space, then retry.';
     } else if (lacks('memoryBytes')) {
-      publicMessage = 'The computer running Viventium is low on memory and could not start this reply. Close unused apps, then retry.';
+      publicMessage =
+        'The computer running Viventium is low on memory and could not start this reply. Close unused apps, then retry.';
     }
   }
   return {
@@ -4273,7 +4277,8 @@ function buildViventiumMcpRequestBody({
     viventiumVoiceCallSessionId: req?.viventiumCallSession?.callSessionId,
     viventiumCallSessionId: req?.viventiumCallSession?.callSessionId,
     viventiumVoiceTaskId: req?.viventiumCallSession?.callSessionId
-      ? req?.body?.viventiumVoiceTaskId : undefined,
+      ? req?.body?.viventiumVoiceTaskId
+      : undefined,
     viventiumVoiceWorkAuthority: req?.viventiumVoiceWorkAuthority,
     viventiumVoiceStartAtMs: req?.viventiumVoiceStartAt,
     viventiumVoiceStartPerfMs: req?.viventiumVoicePerfStartAt,
@@ -4990,7 +4995,10 @@ class AgentClient extends BaseClient {
    * This prepares context only; generation, maintenance and delivery keep their existing owners.
    */
   async prepareMainRuntimeInstructions({
-    config = {}, abortController = new AbortController(), userMCPAuthMap, allowMemoryWriter = true,
+    config = {},
+    abortController = new AbortController(),
+    userMCPAuthMap,
+    allowMemoryWriter = true,
   } = {}) {
     const req = this.options.req;
     const voiceMode = this.options.req?.body?.voiceMode === true;
@@ -5040,9 +5048,7 @@ class AgentClient extends BaseClient {
     // Handle Voice Gateway insight delivery requests.
     const viventiumInsightInstructions = this.options.req?.body?.viventiumInsightInstructions;
     if (!replaysPinnedMainContext && viventiumInsightInstructions) {
-      logger.info(
-        '[AgentClient] Voice Gateway insight delivery - injecting insight instructions',
-      );
+      logger.info('[AgentClient] Voice Gateway insight delivery - injecting insight instructions');
       surfacePromptLayers.voice_gateway_insight_instructions = viventiumInsightInstructions;
       this.options.agent.instructions = [
         this.options.agent.instructions || '',
@@ -5057,10 +5063,7 @@ class AgentClient extends BaseClient {
       const voiceInstructions = buildVoiceModeInstructions(voiceProvider);
       if (voiceInstructions) {
         surfacePromptLayers.voice_mode = voiceInstructions;
-        this.options.agent.instructions = [
-          this.options.agent.instructions || '',
-          voiceInstructions,
-        ]
+        this.options.agent.instructions = [this.options.agent.instructions || '', voiceInstructions]
           .filter(Boolean)
           .join('\n\n');
       }
@@ -5141,7 +5144,8 @@ class AgentClient extends BaseClient {
       }
     }
     if (
-      !replaysPinnedMainContext && !voiceMode &&
+      !replaysPinnedMainContext &&
+      !voiceMode &&
       (isWorkbenchSurface || surface === 'web' || surface === '')
     ) {
       const scheduledCanonicalOutput = trustedInteractionContext?.origin === 'scheduler';
@@ -5216,10 +5220,7 @@ class AgentClient extends BaseClient {
       ? ''
       : getCurrentCallContext(this.options.req);
     /* === VIVENTIUM END === */
-    let selectedCarrierBytes = conversationProviderUsesInvocationLocalTime(
-      req,
-      this.options.agent,
-    )
+    let selectedCarrierBytes = conversationProviderUsesInvocationLocalTime(req, this.options.agent)
       ? NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
       : MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES;
     // Reuse the native whole-source estimator after history and attachments are prepared.
@@ -5270,7 +5271,8 @@ class AgentClient extends BaseClient {
             JSON.stringify({
               nativeBudgetBytes: replayBudget,
               nativeBudgetSource: req?._viventiumNativeHistoryBudgetV1
-                ? 'native_session_receipt' : 'discovery_floor',
+                ? 'native_session_receipt'
+                : 'discovery_floor',
               contextCapacityBytes: sizingReceipt.contextBudgetBytes ?? null,
               authorizedAttachmentBoundBytes: sizingReceipt.attachmentBoundBytes ?? null,
               selectedCarrierBytes,
@@ -5426,8 +5428,11 @@ class AgentClient extends BaseClient {
       config: { configurable: { requestBody: this.options.req.body } },
       allowMemoryWriter: false,
     });
-    const inherited = require('~/server/services/viventium/ViventiumMainContextService')
-      .prependInheritedConversationPayload(prompt, this.options.req._viventiumInheritedConversationContext);
+    const inherited =
+      require('~/server/services/viventium/ViventiumMainContextService').prependInheritedConversationPayload(
+        prompt,
+        this.options.req._viventiumInheritedConversationContext,
+      );
     const payload = normalizeTextPartsInPayload(stripInternalContentParts(inherited));
     const tools = new Set((this.options.agent.tools || []).map((tool) => tool?.name));
     const formatted = formatAgentMessages(payload, this.indexTokenCountMap, tools);
@@ -5637,22 +5642,30 @@ class AgentClient extends BaseClient {
     /* === VIVENTIUM START === Observe the native owner's current session budget before maintenance. === */
     const nativeHistoryBudget = conversationProviderUsesNativeBody(req, this.options.agent, {
       requireTransport: true,
-    }) ? await require('@librechat/api').readNativeConversationHistoryBudget({
-      ownerId: String(req?.user?.id || ''),
-      conversationId: String(this.conversationId || req?.body?.conversationId || ''),
-      agentId: String(this.options.agent?.id || ''),
-      contextEpoch: stableAuthorityDigest(this.options.agent),
-      modelId: String(this.options.agent?.model || this.options.agent?.model_parameters?.model || ''),
-      messages: orderedMessages,
-      signal: opts?.abortController?.signal,
-      readAdmission: async (ownerId, messageId) =>
-        (await require('~/models').getNativeResponse(ownerId, messageId))?.nativeResponse || null,
-      readResult: (identity) =>
-        require('~/server/services/viventium/nativeResponseService').getService()
-          .readResult(identity),
-    }) : null;
+    })
+      ? await require('@librechat/api').readNativeConversationHistoryBudget({
+          ownerId: String(req?.user?.id || ''),
+          conversationId: String(this.conversationId || req?.body?.conversationId || ''),
+          agentId: String(this.options.agent?.id || ''),
+          contextEpoch: stableAuthorityDigest(this.options.agent),
+          modelId: String(
+            this.options.agent?.model || this.options.agent?.model_parameters?.model || '',
+          ),
+          messages: orderedMessages,
+          signal: opts?.abortController?.signal,
+          readAdmission: async (ownerId, messageId) =>
+            (await require('~/models').getNativeResponse(ownerId, messageId))?.nativeResponse ||
+            null,
+          readResult: (identity) =>
+            require('~/server/services/viventium/nativeResponseService')
+              .getService()
+              .readResult(identity),
+        })
+      : null;
     Object.defineProperty(req, '_viventiumNativeHistoryBudgetV1', {
-      value: nativeHistoryBudget, configurable: true, enumerable: false,
+      value: nativeHistoryBudget,
+      configurable: true,
+      enumerable: false,
     });
     /* === VIVENTIUM END === */
     const nativeReplayBudget =
@@ -5709,9 +5722,10 @@ class AgentClient extends BaseClient {
           (capsule
             ? Buffer.byteLength(JSON.stringify(capsule), 'utf8') + TURN_CONTEXT_SEPARATOR_BYTES
             : 0);
-        const turnContextReserveBytes = nativeReplayBudget === null
-          ? actualReserveBytes
-          : Math.max(NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES, actualReserveBytes);
+        const turnContextReserveBytes =
+          nativeReplayBudget === null
+            ? actualReserveBytes
+            : Math.max(NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES, actualReserveBytes);
         const sizingReceipt = {};
         const fit = nativeWholeHistoryFits(
           req,
@@ -5734,7 +5748,8 @@ class AgentClient extends BaseClient {
             JSON.stringify({
               nativeBudgetKnown: nativeReplayBudget !== null,
               nativeBudgetSource: req?._viventiumNativeHistoryBudgetV1
-                ? 'native_session_receipt' : 'discovery_floor',
+                ? 'native_session_receipt'
+                : 'discovery_floor',
               fitOutcome: fit === null ? 'unknown' : fit ? 'fit' : 'over_bound',
               selectedHistoryCount: rows.length,
               nativeBudgetBytes: nativeReplayBudget,

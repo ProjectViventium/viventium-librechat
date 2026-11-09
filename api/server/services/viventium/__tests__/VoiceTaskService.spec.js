@@ -2661,41 +2661,107 @@ describe('Worker delivery presentation ownership', () => {
   );
   test('scheduled Main admission uses the same durable delivery discovery without a worker run', () => {
     const { buildMainGenerationPresentation } = require('@librechat/api');
-    const d = delivery({ status: 'pending', claimId: '', runId: '', event: 'main.followup',
-      text: 'Scheduled Main result.', callbackId: 'callback_sha256:' + 'a'.repeat(64),
-      voiceRequestId: 'schedule-stream', mainGenerationPresentation: buildMainGenerationPresentation(
-        { streamId: 'schedule-stream', admissionId: 'schedule-admission' }, 'worker-result', 'Scheduled Main result.') });
+    const d = delivery({
+      status: 'pending',
+      claimId: '',
+      runId: '',
+      event: 'main.followup',
+      text: 'Scheduled Main result.',
+      callbackId: 'callback_sha256:' + 'a'.repeat(64),
+      voiceRequestId: 'schedule-stream',
+      mainGenerationPresentation: buildMainGenerationPresentation(
+        { streamId: 'schedule-stream', admissionId: 'schedule-admission' },
+        'worker-result',
+        'Scheduled Main result.',
+      ),
+    });
     const task = registerVoiceTaskDeliveryPresentation(d, scope);
-    expect(task).toMatchObject({ state: 'completed', owner: { kind: 'glasshive_delivery', id: d.deliveryId } });
-    expect(snapshotEvent(task.taskId)).toMatchObject({ phase: 'follow_up', resultMessageId: d.callbackMessageId, source: { id: d.callbackId } });
+    expect(task).toMatchObject({
+      state: 'completed',
+      owner: { kind: 'glasshive_delivery', id: d.deliveryId },
+    });
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      phase: 'follow_up',
+      resultMessageId: d.callbackMessageId,
+      source: { id: d.callbackId },
+    });
     expect(registerVoiceTaskDeliveryPresentation(d, scope).taskId).toBe(task.taskId);
-    expect(registerVoiceTaskDeliveryPresentation({ ...d, userId: 'foreign-owner' }, scope)).toBeNull();
-    expect(registerVoiceTaskDeliveryPresentation({ ...d, deliveryId: 'other-delivery', event: 'run.completed' }, scope)).toBeNull();
+    expect(
+      registerVoiceTaskDeliveryPresentation({ ...d, userId: 'foreign-owner' }, scope),
+    ).toBeNull();
+    expect(
+      registerVoiceTaskDeliveryPresentation(
+        { ...d, deliveryId: 'other-delivery', event: 'run.completed' },
+        scope,
+      ),
+    ).toBeNull();
   });
   test('accepted Native result gets independent speech after foreground interruption and deduplicates its discovery', () => {
-    const { buildMainGenerationPresentation, nativeCoordinatorResultVoiceTurnId } = require('@librechat/api');
-    const foreground = createVoiceTask({ ...scope, conversationId: 'conversation-one', streamId: 'old-main-stream',
-      owner: { kind: 'remote_generation', id: 'old-main-stream' } });
+    const {
+      buildMainGenerationPresentation,
+      nativeCoordinatorResultVoiceTurnId,
+    } = require('@librechat/api');
+    const foreground = createVoiceTask({
+      ...scope,
+      conversationId: 'conversation-one',
+      streamId: 'old-main-stream',
+      owner: { kind: 'remote_generation', id: 'old-main-stream' },
+    });
     cancelVoiceTask(foreground.taskId, { userId: scope.userId });
     expect(isVoiceTaskSuppressed(foreground.taskId)).toBe(true);
-    expect(observeGenerationEvent(foreground.taskId, { event: 'on_cortex_followup',
-      data: { messageId: 'native-result', parentMessageId: 'old-main-result', conversationId: 'conversation-one' } })).toBeNull();
-    const source = { bindingRef: 'native-binding', nativeConversationId: 'native-conversation', goalId: 'native-goal',
-      runId: 'actual-native-run', resultRevision: 1, resultDigest: 'sha256:' + 'b'.repeat(64),
-      sourceTurnId: 'accepted-native-turn', sourceCallSessionId: scope.callSessionId };
+    expect(
+      observeGenerationEvent(foreground.taskId, {
+        event: 'on_cortex_followup',
+        data: {
+          messageId: 'native-result',
+          parentMessageId: 'old-main-result',
+          conversationId: 'conversation-one',
+        },
+      }),
+    ).toBeNull();
+    const source = {
+      bindingRef: 'native-binding',
+      nativeConversationId: 'native-conversation',
+      goalId: 'native-goal',
+      runId: 'actual-native-run',
+      resultRevision: 1,
+      resultDigest: 'sha256:' + 'b'.repeat(64),
+      sourceTurnId: 'accepted-native-turn',
+      sourceCallSessionId: scope.callSessionId,
+    };
     const text = 'Main has the independent result.';
-    const d = delivery({ status: 'pending', claimId: '', runId: source.runId, event: 'main.followup',
-      text, callbackMessageId: 'native-result', anchorMessageId: 'old-main-result',
+    const d = delivery({
+      status: 'pending',
+      claimId: '',
+      runId: source.runId,
+      event: 'main.followup',
+      text,
+      callbackMessageId: 'native-result',
+      anchorMessageId: 'old-main-result',
       callbackId: 'callback_sha256:' + 'a'.repeat(64),
       voiceRequestId: nativeCoordinatorResultVoiceTurnId(source, 'native-result'),
-      mainGenerationPresentation: buildMainGenerationPresentation({ nativeCoordinatorResult: source }, 'native-result', text) });
+      mainGenerationPresentation: buildMainGenerationPresentation(
+        { nativeCoordinatorResult: source },
+        'native-result',
+        text,
+      ),
+    });
     const task = registerVoiceTaskDeliveryPresentation(d, scope);
-    expect(task).toMatchObject({ state: 'completed', owner: { kind: 'glasshive_delivery', id: d.deliveryId } });
+    expect(task).toMatchObject({
+      state: 'completed',
+      owner: { kind: 'glasshive_delivery', id: d.deliveryId },
+    });
     expect(task.parentTaskId).not.toBe(foreground.taskId);
-    expect(snapshotEvent(task.taskId)).toMatchObject({ phase: 'follow_up', resultMessageId: 'native-result', source: { id: d.callbackId } });
+    expect(snapshotEvent(task.taskId)).toMatchObject({
+      phase: 'follow_up',
+      resultMessageId: 'native-result',
+      source: { id: d.callbackId },
+    });
     expect(registerVoiceTaskDeliveryPresentation(d, scope).taskId).toBe(task.taskId);
     expect(isVoiceTaskSuppressed(foreground.taskId)).toBe(true);
-    expect(registerVoiceTaskDeliveryPresentation({ ...d, userId: 'foreign-owner' }, scope)).toBeNull();
+    expect(
+      registerVoiceTaskDeliveryPresentation({ ...d, userId: 'foreign-owner' }, scope),
+    ).toBeNull();
   });
   test('pending Main delivery publishes one durable typed discovery snapshot before claim', () => {
     const d = pendingDelivery();

@@ -597,13 +597,15 @@ function retainedNativeMediaStore() {
             terminalCallbackResultDigest: 1,
             terminalCallbackEffectGeneration: 1,
           },
-        })
-;
+        });
       return cursor.toArray();
     },
-    readAccepted: (selector) => ResultModel.find(selector)
-      .select('_id ownerId originRef workRef runId attemptNumber callbackId resultRevision resultDigest acceptedOperationId acceptedOperationGeneration')
-      .lean(),
+    readAccepted: (selector) =>
+      ResultModel.find(selector)
+        .select(
+          '_id ownerId originRef workRef runId attemptNumber callbackId resultRevision resultDigest acceptedOperationId acceptedOperationGeneration',
+        )
+        .lean(),
     isAccepted: async (selector) => Boolean(await ResultModel.findOne(selector).lean()),
     fenceAccepted: (reference, session) =>
       fenceGlassHiveTerminalCallbackAcceptedOperation({
@@ -614,7 +616,10 @@ function retainedNativeMediaStore() {
   };
 }
 async function loadRetainedNativeResultFileAccess(ownerId, conversationId) {
-  return resolveGlassHiveRetainedResultFileAccess({ ownerId, conversationId }, retainedNativeMediaStore());
+  return resolveGlassHiveRetainedResultFileAccess(
+    { ownerId, conversationId },
+    retainedNativeMediaStore(),
+  );
 }
 async function prepareNativeResponseOutputFiles(req, response, identity, text) {
   const selected = await resolveGlassHiveNativeMediaMessageSelection(
@@ -622,7 +627,8 @@ async function prepareNativeResponseOutputFiles(req, response, identity, text) {
       text,
       ownerId: identity.userId,
       conversationId: identity.conversationId,
-      selectedFileSha256s: response.glasshive?.output_files?.files?.map((file) => file.sha256) || [],
+      selectedFileSha256s:
+        response.glasshive?.output_files?.files?.map((file) => file.sha256) || [],
     },
     retainedNativeMediaStore(),
   );

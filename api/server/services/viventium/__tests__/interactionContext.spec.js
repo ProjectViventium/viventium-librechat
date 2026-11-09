@@ -19,6 +19,7 @@ const {
 } = require('../interactionContext');
 const { getMcpOAuthWaitDecision, shouldSuppressMcpOAuthFlow } = require('../mcpOAuthPolicy');
 const { resolveViventiumSurface } = require('../surfacePrompts');
+const { createHash } = require('crypto');
 
 describe('trusted InteractionContext', () => {
   test.each([
@@ -450,8 +451,11 @@ describe('trusted InteractionContext', () => {
     expect(delivery.metadata.viventium.interactionContext).not.toHaveProperty('source_segments');
   });
 
-  test('bounds source segments by UTF-8 bytes without splitting a surrogate pair', () => {
+  test('preserves complete UTF-8 source bytes and its final condition beyond former preview limits', () => {
     const req = {};
+    const original = '🙂'.repeat(20_000) + '\nKeep this final condition unchanged.';
+    const originalBytes = Buffer.from(original, 'utf8');
+    const originalSha256 = createHash('sha256').update(originalBytes).digest('hex');
     setTrustedInteractionContext(
       req,
       createWebInteractionContext({
@@ -459,17 +463,25 @@ describe('trusted InteractionContext', () => {
         source_event_id: 'event-1',
       }),
     );
-    bindInteractionSourceSegments(req, '🙂'.repeat(20_000));
-    const [segment] = getTrustedInteractionContext(req).source_segments;
-    expect(Buffer.byteLength(segment.text, 'utf8')).toBeLessThanOrEqual(32 * 1024);
-    expect(segment.text.endsWith('🙂')).toBe(true);
-    expect(segment).toMatchObject({
-      truncated: true,
-      original_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    bindInteractionSourceSegments(req, original);
+    const context = getTrustedInteractionContext(req);
+    expect(context.source_segments).toHaveLength(1);
+    const [segment] = context.source_segments;
+    expect(segment).toEqual({
+      ordinal: 0,
+      source_event_id: 'event-1',
+      source_index: 0,
+      text: original,
     });
+    expect(Buffer.from(segment.text, 'utf8').equals(originalBytes)).toBe(true);
+    expect(Buffer.byteLength(segment.text, 'utf8')).toBe(originalBytes.length);
+    expect(createHash('sha256').update(segment.text, 'utf8').digest('hex')).toBe(originalSha256);
+    expect(segment).not.toHaveProperty('truncated');
+    expect(context.source_segments_overflow_count).toBeUndefined();
+    expect(Object.isFrozen(segment)).toBe(true);
   });
 
-  test('accepts a claimed logical turn that evicts only older large source segments', () => {
+  test('preserves a legacy claimed turn and its explicit source-overflow provenance', () => {
     const req = {};
     setTrustedInteractionContext(
       req,

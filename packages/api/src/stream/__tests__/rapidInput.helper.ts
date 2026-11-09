@@ -1,4 +1,5 @@
 /* eslint-disable jest/no-export -- Shared contract helper excluded from test discovery. */
+import { createHash } from 'crypto';
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
 import { prepareNativeSourceRecovery } from '../../glasshive/nativeSupersession';
@@ -514,15 +515,14 @@ export function rapidInputContract(createStore: () => IJobStore) {
       const first = await store.claimLogicalTurn('a-stream', 'owner', context('a'));
       await admitAndCommit('a-stream', first);
       const failed = await store.claimLogicalTurn('b-stream', 'owner', context('b'));
-      if (state) {
-        expect(
-          await store.acknowledgeDelivery({
+      const acknowledgement = state
+        ? await store.acknowledgeDelivery({
             logical_turn_id: first.interactionContext.logical_turn_id!,
             revision: first.interactionContext.revision,
             state,
-          }),
-        ).toMatchObject({ status: 'recorded' });
-      }
+          })
+        : undefined;
+      expect(acknowledgement?.status).toBe(state ? 'recorded' : undefined);
       expect(await store.rollbackLogicalTurnClaim('b-stream', failed.interactionContext)).toBe(
         true,
       );
@@ -556,16 +556,16 @@ export function rapidInputContract(createStore: () => IJobStore) {
       expect(await store.rollbackLogicalTurnClaim('b-stream', candidate.interactionContext)).toBe(
         !committed,
       );
+      let retrySources: string[] | null = null;
+      let authoredSources: string[] | null = null;
       if (!committed) {
         const retry = await store.claimLogicalTurn('c-stream', 'owner', context('c'));
-        expect(
-          retry.interactionContext.source_segments?.map((source) => source.source_event_id),
-        ).toEqual(['a', 'b', 'c']);
-        expect(owned(await admitAndCommit('c-stream', retry)).map((source) => source[1])).toEqual([
-          'b',
-          'c',
-        ]);
+        retrySources =
+          retry.interactionContext.source_segments?.map((source) => source.source_event_id) ?? [];
+        authoredSources = owned(await admitAndCommit('c-stream', retry)).map((source) => source[1]);
       }
+      expect(retrySources).toEqual(committed ? null : ['a', 'b', 'c']);
+      expect(authoredSources).toEqual(committed ? null : ['b', 'c']);
     },
   );
   /* === VIVENTIUM START ===
@@ -879,27 +879,115 @@ export function rapidInputContract(createStore: () => IJobStore) {
   test.each([
     [32, 10],
     [2, 24 * 1024],
+    [1, 40 * 1024],
   ])(
-    'input capacity (%i sources of %i bytes) fails before evicting an accepted reference',
+    'retains exact input beyond former courier thresholds (%i sources of %i bytes)',
     async (count, bytes) => {
-      const a = context('a');
+      const a = context('a', count);
       a.source_segments = Array.from({ length: count }, (_, index) => ({
         ordinal: index,
         source_event_id: `source-${index}`,
-        source_index: 0,
-        text: 'x'.repeat(bytes),
+        source_index: index % 3,
+        source_sequence: index + 1,
+        source_persisted: true,
+        source_message_id: `message-${index}`,
+        source_parent_message_id: `parent-${index}`,
+        text: `start-${index}\n${'🐝'.repeat(Math.ceil(bytes / 4))}\nend-${index}`,
+        ...(index === 0
+          ? {
+              source_files: Array.from({ length: 33 }, (_, fileIndex) => ({
+                file_id: `file-${fileIndex}`,
+                filename: `fixture-${fileIndex}.txt`,
+                type: 'text/plain',
+              })),
+            }
+          : {}),
       }));
+      const aBefore = JSON.parse(JSON.stringify(a));
       await store.retainLogicalTurnInput('owner', a);
-      const b = context('b');
-      b.source_segments = [{ ...b.source_segments![0], text: 'y'.repeat(bytes) }];
-      await expect(store.retainLogicalTurnInput('owner', b)).rejects.toMatchObject({
+      const first = await store.claimLogicalTurn('a-stream', 'owner', a);
+      expect(first.status).toBe('claimed');
+      const firstBefore = JSON.parse(JSON.stringify(first));
+      const expectedFirst = a.source_segments.map((segment) => ({
+        ...segment,
+        authoring_revision: first.interactionContext.revision,
+      }));
+      expect(first.interactionContext.source_segments).toEqual(expectedFirst);
+      const b = context('b', count + 1);
+      b.source_segments = [
+        { ...b.source_segments![0], text: `new-start\n${'y'.repeat(bytes)}\nnew-end` },
+      ];
+      const bBefore = JSON.parse(JSON.stringify(b));
+      await store.retainLogicalTurnInput('owner', b);
+      const next = await store.claimLogicalTurn('b-stream', 'owner', b);
+      expect(next.status).toBe('claimed');
+      expect(next.interactionContext.logical_turn_id).toBe(
+        first.interactionContext.logical_turn_id,
+      );
+      expect(next.interactionContext.revision).toBe(first.interactionContext.revision + 1);
+      const expected = [
+        ...expectedFirst,
+        {
+          ...b.source_segments[0],
+          ordinal: count,
+          authoring_revision: next.interactionContext.revision,
+        },
+      ];
+      expect(next.interactionContext.source_segments).toEqual(expected);
+      expect(
+        next.interactionContext.source_segments?.map((segment) =>
+          createHash('sha256').update(segment.text, 'utf8').digest('hex'),
+        ),
+      ).toEqual(
+        expected.map((segment) => createHash('sha256').update(segment.text, 'utf8').digest('hex')),
+      );
+      expect(next.interactionContext.source_segments_overflow_count ?? 0).toBe(0);
+      const earlier = await store.claimLogicalTurn('a-stream', 'owner', a);
+      expect(earlier.status).toBe('duplicate');
+      expect(earlier.interactionContext).toEqual(firstBefore.interactionContext);
+      expect(first).toEqual(firstBefore);
+      expect(a).toEqual(aBefore);
+      expect(b).toEqual(bBefore);
+    },
+  );
+  test.each(['declared overflow', 'empty source identity', 'empty source content'])(
+    'rejects %s without changing the accepted input or its claim',
+    async (invalidKind) => {
+      const a = context('a', 1);
+      await store.retainLogicalTurnInput('owner', a);
+      const first = await store.claimLogicalTurn('a-stream', 'owner', a);
+      expect(first.status).toBe('claimed');
+      const firstBefore = JSON.parse(JSON.stringify(first));
+      const invalid = context('invalid', 2);
+      if (invalidKind === 'declared overflow') invalid.source_segments_overflow_count = 1;
+      if (invalidKind === 'empty source identity') invalid.source_segments![0].source_event_id = '';
+      if (invalidKind === 'empty source content') invalid.source_segments![0].text = '';
+      const invalidBefore = JSON.parse(JSON.stringify(invalid));
+      await expect(store.retainLogicalTurnInput('owner', invalid)).rejects.toMatchObject({
         code: 'source_input_capacity',
       });
-      const original = await store.claimLogicalTurn('a-stream', 'owner', a);
-      expect(original.interactionContext.source_segments).toHaveLength(count);
-      expect(original.interactionContext.source_segments?.map((s) => s.source_event_id)).toEqual(
-        a.source_segments.map((s) => s.source_event_id),
+      const duplicate = await store.claimLogicalTurn('a-stream', 'owner', a);
+      expect(duplicate.status).toBe('duplicate');
+      expect(duplicate.interactionContext).toEqual(firstBefore.interactionContext);
+      const b = context('b', 2);
+      await store.retainLogicalTurnInput('owner', b);
+      const next = await store.claimLogicalTurn('b-stream', 'owner', b);
+      expect(next.status).toBe('claimed');
+      expect(next.interactionContext.logical_turn_id).toBe(
+        first.interactionContext.logical_turn_id,
       );
+      expect(next.interactionContext.revision).toBe(first.interactionContext.revision + 1);
+      expect(next.interactionContext.source_segments).toEqual([
+        ...firstBefore.interactionContext.source_segments,
+        {
+          ...b.source_segments![0],
+          ordinal: 1,
+          authoring_revision: next.interactionContext.revision,
+        },
+      ]);
+      expect(next.interactionContext.source_segments_overflow_count ?? 0).toBe(0);
+      expect(first).toEqual(firstBefore);
+      expect(invalid).toEqual(invalidBefore);
     },
   );
   test('different owner or conversation cannot import retained input', async () => {

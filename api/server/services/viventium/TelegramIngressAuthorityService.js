@@ -28,12 +28,14 @@ async function bindRetainedTelegramIngressAuthority({
     owner && source && stream
       ? await IngressModel.updateOne(
           { sourceEventId: source, libreChatUserId: owner, streamId: stream },
-          [{
-            $set: {
-              authorityBoundAt: { $ifNull: ['$authorityBoundAt', '$$NOW'] },
-              inputMode: { $ifNull: ['$inputMode', normalizeChannelInputMode(inputMode)] },
+          [
+            {
+              $set: {
+                authorityBoundAt: { $ifNull: ['$authorityBoundAt', '$$NOW'] },
+                inputMode: { $ifNull: ['$inputMode', normalizeChannelInputMode(inputMode)] },
+              },
             },
-          }],
+          ],
         )
       : null;
   if (result?.acknowledged === false || Number(result?.matchedCount ?? result?.n ?? 0) < 1) {
@@ -139,15 +141,21 @@ async function readRetainedTelegramTerminal({
   )
     return null;
   const hostFinal = await require('./nativeResponseService').readRetainedMainFinal({
-    userId: ownerId, streamId, surface: 'telegram', includeSettled,
+    userId: ownerId,
+    streamId,
+    surface: 'telegram',
+    includeSettled,
   });
-  if (hostFinal?.responseMessageId === binding.responseMessageId &&
+  if (
+    hostFinal?.responseMessageId === binding.responseMessageId &&
     hostFinal.conversationId === record.conversationId &&
     hostFinal.finalEvent?.requestMessage?.messageId === record.sourceMessageId &&
     hostFinal.interactionContext?.source_event_id === record.sourceEventId &&
     hostFinal.interactionContext?.logical_turn_id === binding.logicalTurnId &&
     hostFinal.interactionContext?.revision === binding.revision &&
-    await IngressModel.exists({ ...filter, responseBinding: binding })) return hostFinal;
+    (await IngressModel.exists({ ...filter, responseBinding: binding }))
+  )
+    return hostFinal;
   const messageQuery = MessageModel.findOne({
     user: ownerId,
     conversationId: record.conversationId,
@@ -161,7 +169,9 @@ async function readRetainedTelegramTerminal({
     'metadata.viventium.interactionContext.logical_turn_id': binding.logicalTurnId,
     'metadata.viventium.interactionContext.revision': binding.revision,
   });
-  const message = await (messageQuery.select ? messageQuery.select('+nativeResponse +hostFinal') : messageQuery).lean();
+  const message = await (
+    messageQuery.select ? messageQuery.select('+nativeResponse +hostFinal') : messageQuery
+  ).lean();
   const failures = Array.isArray(message?.content)
     ? message.content.filter(
         (part) =>
@@ -189,10 +199,15 @@ async function readRetainedTelegramTerminal({
     conversationId: record.conversationId,
     interactionContext: {
       ...message.metadata.viventium.interactionContext,
-      ...((message.nativeResponse?.sourceSequence || message.hostFinal?.sourceSequence) ? {
-        source_sequence: Math.max(Number(message.metadata.viventium.interactionContext.source_sequence) || 0,
-          Number(message.nativeResponse?.sourceSequence) || 0, Number(message.hostFinal?.sourceSequence) || 0),
-      } : {}),
+      ...(message.nativeResponse?.sourceSequence || message.hostFinal?.sourceSequence
+        ? {
+            source_sequence: Math.max(
+              Number(message.metadata.viventium.interactionContext.source_sequence) || 0,
+              Number(message.nativeResponse?.sourceSequence) || 0,
+              Number(message.hostFinal?.sourceSequence) || 0,
+            ),
+          }
+        : {}),
     },
     acknowledgement,
     ...(message.nativeResponse ? { nativeFailure: message.nativeResponse } : {}),
@@ -228,32 +243,40 @@ async function acknowledgeRetainedTelegramFailure(
       if (!terminal || terminal.responseMessageId !== record.responseBinding?.responseMessageId)
         return { status: 'not_found' };
       const job = await require('@librechat/api').GenerationJobManager.getJob(record.streamId);
-      if (job && (
-        !['complete', 'error', 'aborted', 'superseded'].includes(job.status) ||
-        job.metadata?.userId !== record.libreChatUserId ||
-        job.metadata?.conversationId !== record.conversationId ||
-        job.metadata?.responseMessageId !== terminal.responseMessageId ||
-        job.metadata?.interactionContext?.logical_turn_id !== acknowledgement.logical_turn_id ||
-        job.metadata?.interactionContext?.revision !== acknowledgement.revision
-      )) return { status: 'not_found' };
+      if (
+        job &&
+        (!['complete', 'error', 'aborted', 'superseded'].includes(job.status) ||
+          job.metadata?.userId !== record.libreChatUserId ||
+          job.metadata?.conversationId !== record.conversationId ||
+          job.metadata?.responseMessageId !== terminal.responseMessageId ||
+          job.metadata?.interactionContext?.logical_turn_id !== acknowledgement.logical_turn_id ||
+          job.metadata?.interactionContext?.revision !== acknowledgement.revision)
+      )
+        return { status: 'not_found' };
       const nativeFailure = terminal.nativeFailure;
       // The Native owner persists an unsupported graph interruption as a typed
       // terminal error without a replay snapshot. Acknowledge that exact failure
       // once; an active or unproved response still cannot settle its input.
-      const unsupportedTerminal = nativeFailure?.status === 'unsupported' &&
+      const unsupportedTerminal =
+        nativeFailure?.status === 'unsupported' &&
         terminal.error_class === 'native_response_unsupported';
-      if (nativeFailure && (
-        !(unsupportedTerminal || (['failed', 'cancelled'].includes(nativeFailure.status) &&
-          nativeFailure.finalReplayStoredAt > 0)) ||
-        nativeFailure.userId !== record.libreChatUserId ||
-        nativeFailure.conversationId !== record.conversationId ||
-        nativeFailure.streamId !== record.streamId ||
-        nativeFailure.responseMessageId !== terminal.responseMessageId ||
-        nativeFailure.source?.messageId !== record.sourceMessageId ||
-        nativeFailure.logicalTurnId !== acknowledgement.logical_turn_id ||
-        nativeFailure.revision !== acknowledgement.revision ||
-        !(await require('~/models').nativeResponseSourceMatches(nativeFailure))
-      )) return { status: 'not_found' };
+      if (
+        nativeFailure &&
+        (!(
+          unsupportedTerminal ||
+          (['failed', 'cancelled'].includes(nativeFailure.status) &&
+            nativeFailure.finalReplayStoredAt > 0)
+        ) ||
+          nativeFailure.userId !== record.libreChatUserId ||
+          nativeFailure.conversationId !== record.conversationId ||
+          nativeFailure.streamId !== record.streamId ||
+          nativeFailure.responseMessageId !== terminal.responseMessageId ||
+          nativeFailure.source?.messageId !== record.sourceMessageId ||
+          nativeFailure.logicalTurnId !== acknowledgement.logical_turn_id ||
+          nativeFailure.revision !== acknowledgement.revision ||
+          !(await require('~/models').nativeResponseSourceMatches(nativeFailure)))
+      )
+        return { status: 'not_found' };
       if (
         terminal.acknowledgement &&
         terminal.acknowledgement.state !== 'partial_removed' &&
@@ -306,8 +329,9 @@ async function acknowledgeRetainedTelegramFailure(
         throw Object.assign(new Error('Telegram terminal author changed'), {
           code: 'telegram_terminal_ack_conflict',
         });
-      const relatedSourceIds = new Set(Array.isArray(record.inputRelatedSourceEventIds)
-        ? record.inputRelatedSourceEventIds : []);
+      const relatedSourceIds = new Set(
+        Array.isArray(record.inputRelatedSourceEventIds) ? record.inputRelatedSourceEventIds : [],
+      );
       relatedSourceIds.delete(record.sourceEventId);
       for (const sourceEventId of relatedSourceIds) {
         const relatedFilter = {
@@ -320,12 +344,21 @@ async function acknowledgeRetainedTelegramFailure(
         };
         const related = await IngressModel.findOne(relatedFilter).lean();
         if (!related) continue;
-        const settledRelated = await IngressModel.updateOne({
-          ...relatedFilter, inputClaimToken: related.inputClaimToken,
-        }, { $set: {
-          inputState: 'failed', inputFailureCode: 'source_terminal_presented',
-          inputRetryAt: 0, inputLeaseUntil: 0, inputClaimToken: '',
-        } });
+        const settledRelated = await IngressModel.updateOne(
+          {
+            ...relatedFilter,
+            inputClaimToken: related.inputClaimToken,
+          },
+          {
+            $set: {
+              inputState: 'failed',
+              inputFailureCode: 'source_terminal_presented',
+              inputRetryAt: 0,
+              inputLeaseUntil: 0,
+              inputClaimToken: '',
+            },
+          },
+        );
         if (Number(settledRelated?.matchedCount ?? settledRelated?.n ?? 0) < 1)
           throw Object.assign(new Error('Telegram grouped terminal author changed'), {
             code: 'telegram_terminal_ack_conflict',

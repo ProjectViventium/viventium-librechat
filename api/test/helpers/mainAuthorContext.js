@@ -5,8 +5,8 @@ function mockMainAuthorContext(prepare, input, dependencies) {
   const source = input.request || {};
   return prepare(input, {
     ...dependencies,
-    readUser: async () => source.user || { id: input.ownerId, _id: input.ownerId,
-      email: 'qa@example.invalid' },
+    readUser: async () =>
+      source.user || { id: input.ownerId, _id: input.ownerId, email: 'qa@example.invalid' },
     readConfig: async () => source.config || {},
     createClient: async (req) => ({
       conversationId: '',

@@ -138,17 +138,20 @@ function buildCompactionPrompt(claim, correctionReason = '', candidate = null) {
         : {}),
     };
   }
-  const repairInput = candidate ? null : mainCompactionFieldRepairInput(
-    claim.previousSemanticCompaction, correctionReason, claim.outputContract);
+  const repairInput = candidate
+    ? null
+    : mainCompactionFieldRepairInput(
+        claim.previousSemanticCompaction,
+        correctionReason,
+        claim.outputContract,
+      );
   const payload = JSON.stringify({
     version: 1,
     sourceDigest: claim.sourceDigest,
     previousSemanticCompaction: claim.previousSemanticCompaction || null,
     acceptedOlderTurns: claim.sourceTurns || [],
     outputConstraints: claim.outputContract || mainCompactionOutputConstraints,
-    ...(repairInput
-      ? { fieldRepair: repairInput.contract }
-      : {}),
+    ...(repairInput ? { fieldRepair: repairInput.contract } : {}),
     ...(claim.legacyInputs?.length ? { legacyInputs: claim.legacyInputs } : {}),
     ...(candidate
       ? {
@@ -909,7 +912,10 @@ async function runAcceptedMainCompaction(input = {}) {
       if (repairingFidelity) fidelityRepairAttempts += 1;
       const decodedProposal = parseSemanticCompactionOutput(raw);
       const repairInput = mainCompactionFieldRepairInput(
-        claim.previousSemanticCompaction, correctionReason, claim.outputContract);
+        claim.previousSemanticCompaction,
+        correctionReason,
+        claim.outputContract,
+      );
       const proposal = applyMainCompactionFieldRepair(
         decodedProposal,
         repairInput?.candidate,
@@ -1201,11 +1207,15 @@ function loadAcceptedMainContextForAdmission(input = {}) {
         usePinned = false;
         context = pinned.context;
       } else context = await (input.loadContext || loadAcceptedMainContext)(input);
-      const rendered = renderAcceptedMainContextForCarrier(context, input.outputCarrier, { allowDegraded: true });
-      return rendered.continuityDegraded ? renderAcceptedMainContextForCarrier(context, input.outputCarrier, {
+      const rendered = renderAcceptedMainContextForCarrier(context, input.outputCarrier, {
         allowDegraded: true,
-        unavailableInstructions: getRequiredPromptText('main.continuity_availability'),
-      }) : rendered;
+      });
+      return rendered.continuityDegraded
+        ? renderAcceptedMainContextForCarrier(context, input.outputCarrier, {
+            allowDegraded: true,
+            unavailableInstructions: getRequiredPromptText('main.continuity_availability'),
+          })
+        : rendered;
     },
     defer: () =>
       scheduleMainContinuityMaintenance({

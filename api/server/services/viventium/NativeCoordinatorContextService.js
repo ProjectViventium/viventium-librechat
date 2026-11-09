@@ -42,7 +42,9 @@ const {
   maybeInjectGlassHiveCapabilityBroker,
 } = require('./GlassHiveCapabilityBootstrapService');
 const { BROKER_AUTHORITY_KINDS } = require('./GlassHiveCapabilityBrokerAuth');
-const { readCapabilityAuthorizationServerScope } = require('./GlassHiveCapabilityAuthorizationService');
+const {
+  readCapabilityAuthorizationServerScope,
+} = require('./GlassHiveCapabilityAuthorizationService');
 const {
   reconcileGlassHiveLaunchResult,
   resolveConfiguredGlassHiveDestinations,
@@ -54,14 +56,21 @@ const {
   claimPendingCortexInsightDeliveriesForParent,
 } = require('./CortexInsightDeliveryService');
 const { enqueueGlassHiveCallbackDelivery } = require('./GlassHiveCallbackDeliveryService');
-const { bindNativeResultAuthority, nativeResultSource, presentationParent } = require('./nativeCoordinatorPresentation');
+const {
+  bindNativeResultAuthority,
+  nativeResultSource,
+  presentationParent,
+} = require('./nativeCoordinatorPresentation');
 
 const bindings = () => mongoose.connection.collection('viventium_glasshive_callback_bindings');
 const failure = (code) => Object.assign(new Error(code), { code, status: 503 });
 
 async function prepareContext({ binding, source, eventId, purpose, workerWorkRef }) {
   const missionServerScope = workerWorkRef
-    ? await readCapabilityAuthorizationServerScope({ ownerId: binding.ownerId, workRef: workerWorkRef })
+    ? await readCapabilityAuthorizationServerScope({
+        ownerId: binding.ownerId,
+        workRef: workerWorkRef,
+      })
     : null;
   if (workerWorkRef && missionServerScope === null)
     throw failure('coordinator_worker_capabilities_unavailable');
@@ -197,8 +206,10 @@ async function prepareContext({ binding, source, eventId, purpose, workerWorkRef
     glasshive_capability_dependency: req._viventiumGlassHiveCapabilityDependency || {},
   };
   const declaredServerNames = declaredMcpServerNames(currentAgent, capability.excluded_mcp_servers);
-  const allowedServerNames = missionServerScope === null ? declaredServerNames
-    : declaredServerNames.filter((name) => missionServerScope.includes(name));
+  const allowedServerNames =
+    missionServerScope === null
+      ? declaredServerNames
+      : declaredServerNames.filter((name) => missionServerScope.includes(name));
   const bundle = await buildConversationProviderBootstrapBundle({
     user: req.user,
     requestBody: projectedBody,
@@ -250,7 +261,9 @@ async function prepareContext({ binding, source, eventId, purpose, workerWorkRef
 
 const presentationDependencies = {
   async readPresentation({ ownerId, conversationId, parentMessageId, deliveryIds }) {
-    let rows = (await getCortexInsightDeliveriesForParent({ ownerId, parentMessageId, deliveryIds })).filter(
+    let rows = (
+      await getCortexInsightDeliveriesForParent({ ownerId, parentMessageId, deliveryIds })
+    ).filter(
       (row) =>
         row.conversationId === conversationId &&
         row.parentMessageId === parentMessageId &&
@@ -260,8 +273,10 @@ const presentationDependencies = {
     if (
       rows.every(
         (row) =>
-          row.status === 'dropped' && row.dropReason !== 'delivery_attempts_exhausted' &&
-          typeof row.dropReason === 'string' && row.dropReason.trim(),
+          row.status === 'dropped' &&
+          row.dropReason !== 'delivery_attempts_exhausted' &&
+          typeof row.dropReason === 'string' &&
+          row.dropReason.trim(),
       )
     )
       return { presentationDisposition: 'dropped', dropReason: rows[0].dropReason };
@@ -273,9 +288,16 @@ const presentationDependencies = {
       if (!retained?.message) return null;
       await savedOwner.recover(scope);
       rows = await getCortexInsightDeliveriesForParent({ ownerId, parentMessageId, deliveryIds });
-      if (rows.length !== deliveryIds.length || rows.some((row) =>
-        row.conversationId !== conversationId || row.parentMessageId !== parentMessageId ||
-        !deliveryIds.includes(row.deliveryId) || !row.persistedMessageId))
+      if (
+        rows.length !== deliveryIds.length ||
+        rows.some(
+          (row) =>
+            row.conversationId !== conversationId ||
+            row.parentMessageId !== parentMessageId ||
+            !deliveryIds.includes(row.deliveryId) ||
+            !row.persistedMessageId,
+        )
+      )
         throw failure('coordinator_presentation_unconfirmed');
     }
     const ids = new Set(rows.map((row) => row.persistedMessageId));
@@ -307,11 +329,19 @@ const presentationDependencies = {
     publisher,
     data,
   }) => {
-    const candidates = buildCortexInsightDeliveryCandidates({ ownerId: binding.ownerId,
-      conversationId: binding.conversationId, parentMessageId,
-      surface: context.req.body?.viventiumSurface || 'web', insights });
-    const existing = await getCortexInsightDeliveriesForParent({ ownerId: binding.ownerId,
-      parentMessageId, deliveryIds: candidates.map((candidate) => candidate.deliveryId) }) || [];
+    const candidates = buildCortexInsightDeliveryCandidates({
+      ownerId: binding.ownerId,
+      conversationId: binding.conversationId,
+      parentMessageId,
+      surface: context.req.body?.viventiumSurface || 'web',
+      insights,
+    });
+    const existing =
+      (await getCortexInsightDeliveriesForParent({
+        ownerId: binding.ownerId,
+        parentMessageId,
+        deliveryIds: candidates.map((candidate) => candidate.deliveryId),
+      })) || [];
     const scopes = new Set(existing.map((row) => row.publicationId || ''));
     if (scopes.size > 1 || (existing.length && existing.length !== candidates.length))
       throw failure('coordinator_presentation_authority_conflict');
@@ -342,7 +372,7 @@ const presentationDependencies = {
         saveMessage: (req, message, options) =>
           db.saveMessage(req, bindNativeResultAuthority(message, binding, source, data), options),
         ...(outputFiles
-        ? {
+          ? {
               prepareAttachments: async (message) => {
                 const {
                   prepareNativeOutputFiles,
@@ -383,14 +413,18 @@ const presentationDependencies = {
                   ],
                 });
               },
-          }
-        : {}),
+            }
+          : {}),
       },
     });
   },
   async enqueue({ binding, source, eventId, message, data }) {
-    message = await require('./NativeCoordinatorPresentationService')
-      .persistAuthority(message, binding, source, data);
+    message = await require('./NativeCoordinatorPresentationService').persistAuthority(
+      message,
+      binding,
+      source,
+      data,
+    );
     const destinations = await resolveConfiguredGlassHiveDestinations({
       ownerId: binding.ownerId,
       requestBody: source.requestBody,
@@ -432,10 +466,12 @@ const presentationDependencies = {
       !linkedDestinations.some((destination) => ['telegram', 'voice'].includes(destination.surface))
     ) {
       const linkedWebCommitted = linkedDestinations.some((destination) =>
-        ['librechat', 'workbench'].includes(destination.surface));
+        ['librechat', 'workbench'].includes(destination.surface),
+      );
       if (linkedWebCommitted) {
         await require('./NativeCoordinatorPresentationService').settleLinkedWeb({
-          ownerId: binding.ownerId, conversationId: binding.conversationId,
+          ownerId: binding.ownerId,
+          conversationId: binding.conversationId,
           parentMessageId: presentationParent(message),
           deliveryIds: message.metadata?.viventium?.cortexInsightDeliveryIds,
         });
@@ -520,7 +556,15 @@ module.exports = createNativeCoordinatorContextAdapter({
       throw failure('coordinator_bootstrap_unavailable');
     return targetAgent.model_parameters.configuration.defaultHeaders;
   },
-  injectDelegation: ({ toolArguments, user, requestBody, workerContext, invocationId, route, preparationAuthority }) =>
+  injectDelegation: ({
+    toolArguments,
+    user,
+    requestBody,
+    workerContext,
+    invocationId,
+    route,
+    preparationAuthority,
+  }) =>
     maybeInjectGlassHiveCapabilityBroker({
       serverName:
         String(process.env.VIVENTIUM_GLASSHIVE_MCP_SERVER_NAMES || 'glasshive-workers-projects')
@@ -541,7 +585,9 @@ module.exports = createNativeCoordinatorContextAdapter({
           user,
           requestBody,
           glasshive_launch_authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
-          ...(preparationAuthority ? { glasshive_launch_preparation_authority: preparationAuthority } : {}),
+          ...(preparationAuthority
+            ? { glasshive_launch_preparation_authority: preparationAuthority }
+            : {}),
           glasshive_worker_route: resolveBackgroundWorkerRoute(
             { profile: route.profile, effort: route.effort },
             {

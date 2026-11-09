@@ -19,8 +19,10 @@ const {
 } = require('./GlassHiveTerminalCallbackTransaction');
 
 module.exports = createGlassHiveTerminalCallbackOutboxService({
-  readScheduleAdmission: (filter) => mongoose.connection
-    .collection('viventium_scheduler_dispatch_intents').findOne(filter, { maxTimeMS: 5000 }),
+  readScheduleAdmission: (filter) =>
+    mongoose.connection
+      .collection('viventium_scheduler_dispatch_intents')
+      .findOne(filter, { maxTimeMS: 5000 }),
   ResultModel: GlassHiveTerminalCallbackResult,
   OutboxModel: ViventiumGlassHiveCallbackEffectOutbox,
   fenceAcceptedOperation: fenceGlassHiveTerminalCallbackAcceptedOperation,

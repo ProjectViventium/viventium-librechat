@@ -265,7 +265,6 @@ describe('Viventium orchestration data hooks', () => {
     ).toBe(30_000);
   });
 
-
   test('keeps terminal-only refresh slow even when old worker runtime counts remain', () => {
     expect(
       activeWorkRefetchInterval({

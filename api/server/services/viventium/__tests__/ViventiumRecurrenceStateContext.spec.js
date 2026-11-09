@@ -1,5 +1,10 @@
 'use strict';
 
+// Only persisted continuity is synthetic. Main preparation and compiled prompt readers stay real.
+jest.mock('~/server/services/viventium/ViventiumMainContinuityService', () => ({
+  loadAcceptedMainContext: jest.fn(async () => ({ status: 'empty', capsule: '', turns: [] })),
+}));
+
 const { buildRecurrenceStateCapsule } = require('../ViventiumRecurrenceStateContext');
 const {
   createSchedulerInteractionContext,
@@ -46,31 +51,36 @@ describe('ViventiumRecurrenceStateContext', () => {
 describe('Main runtime recurrence context wiring', () => {
   const fs = require('fs');
   const path = require('path');
-  const vm = require('vm');
+  const os = require('os');
+  const AgentClient = require('../../../controllers/agents/client');
   const {
-    NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-    getCurrentCallContext,
-    mainContinuityOutputCarrier,
-  } = require('@librechat/api');
-  const { applyTimeContextDelivery } = require('../surfacePrompts');
+    buildPromptBundleFixture,
+  } = require('../../../../../scripts/test-support/promptBundle.cjs');
   const {
-    mainContinuityCarrierPeerParts,
-    combineTurnContextInstructions,
-  } = require('../../../controllers/agents/client');
-  const { mainAttemptFactsAuthorityReserveBytes } = require('../ViventiumMainContextService');
-  const {
-    conversationProviderUsesInvocationLocalTime,
-    conversationProviderUsesNativeBody,
-  } = require('../GlassHiveConversationProviderService');
-  const source = fs.readFileSync(
-    path.join(__dirname, '../../../controllers/agents/client.js'),
-    'utf8',
-  );
-  const carrierLimitDeclaration = source.match(
-    /^const MAX_CONVERSATION_PROVIDER_TURN_CONTEXT_BYTES = [^;]+;/m,
-  )?.[0];
-  const start = source.indexOf('      const timeContextInstructions = replaysPinnedMainContext');
-  const end = source.indexOf('      /* === VIVENTIUM NOTE END === */', start);
+    buildScheduledCanonicalOutputInstructions,
+    buildWebTextInstructions,
+    buildTimeContextInstructions,
+  } = require('../surfacePrompts');
+  let promptDirectory;
+  const previousBundle = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  beforeAll(() => {
+    promptDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'recurrence-main-context-'));
+    const bundle = path.join(promptDirectory, 'bundle.json');
+    fs.writeFileSync(
+      bundle,
+      JSON.stringify(
+        buildPromptBundleFixture(
+          path.resolve(__dirname, '../../../../../viventium/source_of_truth/prompts'),
+        ),
+      ),
+    );
+    process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundle;
+  });
+  afterAll(() => {
+    if (previousBundle === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+    else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousBundle;
+    fs.rmSync(promptDirectory, { recursive: true, force: true });
+  });
   const state = {
     version: 1,
     outcome: 'sent',
@@ -81,47 +91,36 @@ describe('Main runtime recurrence context wiring', () => {
   };
 
   async function assemble(req, native) {
-    const owner = { options: { req, agent: { instructions: 'Existing Main authority.' } } };
+    req.user = { id: 'owner-a', role: 'USER' };
+    req.body.clientTimestamp = '2026-08-19T13:00:00Z';
+    req.body.clientTimezone = 'UTC';
+    req._viventiumContinuityActiveWorkContext = '';
     const requestBody = {};
-    const surfacePromptLayers = {};
     if (native) req.viventiumTimeContextDelivery = 'per_turn_header';
-    const context = {
-      owner,
+    const client = new AgentClient({
       req,
+      agent: {
+        id: 'main',
+        provider: 'openAI',
+        instructions: 'Existing Main authority.',
+        model_parameters: { model: 'gpt-4' },
+        tools: [],
+      },
+      maxContextTokens: 128000,
+    });
+    client.chatCompletion = jest.fn();
+    client.startDeferredMemoryWriter = jest.fn();
+    const result = await client.prepareMainRuntimeInstructions({
       config: { configurable: { requestBody } },
-      surfacePromptLayers,
-      voiceMode: false,
-      replaysPinnedMainContext: false,
-      telegramReplyContext: '',
-      buildTimeContextInstructions: () => '',
-      resolveActiveWorkTurnContext: async () => '',
-      sourceSelectionTurnContext: () => '',
-      stableAuthorityDigest: () => '',
-      loadAcceptedMainContextForAdmission: async () => ({ capsule: '' }),
-      abortController: undefined,
-      mainAttemptFactsAuthorityReserveBytes,
-      mainContinuityOutputCarrier,
-      mainContinuityCarrierPeerParts,
-      conversationProviderUsesNativeBody,
-      evalIsolationForRequest: () => ({ savedMemory: false }),
-      isCancelledVoiceTask: () => false,
-      shouldSkipAutomaticMemoryWriter: () => false,
-      buildSavedMemoryWriterTurnContext: () => '',
-      combineTurnContextInstructions,
-      buildRecurrenceStateCapsule,
-      NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-      getCurrentCallContext,
-      conversationProviderUsesInvocationLocalTime,
-      applyTimeContextDelivery,
+      allowMemoryWriter: false,
+    });
+    expect(client.chatCompletion).not.toHaveBeenCalled();
+    expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
+    return {
+      instructions: client.options.agent.instructions,
+      requestBody,
+      surfacePromptLayers: result.surfacePromptLayers,
     };
-    expect(carrierLimitDeclaration).toBeDefined();
-    expect(start).toBeGreaterThan(0);
-    expect(end).toBeGreaterThan(start);
-    await vm.runInNewContext(
-      `${carrierLimitDeclaration} (async function() {${source.slice(start, end)}}).call(owner)`,
-      context,
-    );
-    return { instructions: owner.options.agent.instructions, requestBody, surfacePromptLayers };
   }
 
   test.each([false, true])(
@@ -147,7 +146,9 @@ describe('Main runtime recurrence context wiring', () => {
       expect(actual.split('<viventium_recurrence_state_v1>').length - 1).toBe(1);
       expect(result.surfacePromptLayers.recurrence_state).toBe(expected);
       if (native) {
-        expect(result.instructions).toBe('Existing Main authority.');
+        expect(result.instructions).toBe(
+          ['Existing Main authority.', buildScheduledCanonicalOutputInstructions()].join('\n\n'),
+        );
         expect(req.body.viventiumGlassHiveTurnContextB64).toBe(
           result.requestBody.viventiumGlassHiveTurnContextB64,
         );
@@ -163,8 +164,17 @@ describe('Main runtime recurrence context wiring', () => {
       },
     };
     const result = await assemble(req, true);
-    expect(result.instructions).toBe('Existing Main authority.');
-    expect(result.requestBody.viventiumGlassHiveTurnContextB64).toBeUndefined();
+    expect(result.instructions).toBe(
+      ['Existing Main authority.', buildWebTextInstructions()].join('\n\n'),
+    );
+    const turnContext = Buffer.from(
+      result.requestBody.viventiumGlassHiveTurnContextB64 || '',
+      'base64',
+    ).toString('utf8');
+    expect(turnContext).toBe(buildTimeContextInstructions(req));
+    expect(turnContext).not.toContain('<viventium_recurrence_state_v1>');
+    expect(turnContext).not.toContain(state.result_sha256);
+    expect(turnContext).not.toContain(state.result_excerpt);
     expect(result.surfacePromptLayers.recurrence_state).toBeUndefined();
   });
 });

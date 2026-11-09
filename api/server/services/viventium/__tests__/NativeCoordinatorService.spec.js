@@ -18,15 +18,28 @@ test('a signed malformed notification cannot echo its supplied type into diagnos
   const eventId = 'event-synthetic-invalid';
   const timestamp = String(Math.floor(now / 1000));
   const marker = 'SYNTHETIC_UNTRUSTED_NOTIFICATION_TEXT';
-  const rawBody = Buffer.from(JSON.stringify({ type: marker, event_id: eventId,
-    principal: { owner_id: 'synthetic-owner', tenant_id: 'local' },
-    created_at: new Date(now).toISOString(), expires_at: new Date(now + 60000).toISOString(),
-    data: { conversation_id: 'synthetic-native', request_ref: 'synthetic-binding' },
-  }));
-  const signature = 'v1,' + crypto.createHmac('sha256', Buffer.from(secret, 'base64'))
-    .update(`${eventId}.${timestamp}.`).update(rawBody).digest('base64');
-  const headers = { 'webhook-id': eventId, 'webhook-timestamp': timestamp,
-    'webhook-signature': signature };
+  const rawBody = Buffer.from(
+    JSON.stringify({
+      type: marker,
+      event_id: eventId,
+      principal: { owner_id: 'synthetic-owner', tenant_id: 'local' },
+      created_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 60000).toISOString(),
+      data: { conversation_id: 'synthetic-native', request_ref: 'synthetic-binding' },
+    }),
+  );
+  const signature =
+    'v1,' +
+    crypto
+      .createHmac('sha256', Buffer.from(secret, 'base64'))
+      .update(`${eventId}.${timestamp}.`)
+      .update(rawBody)
+      .digest('base64');
+  const headers = {
+    'webhook-id': eventId,
+    'webhook-timestamp': timestamp,
+    'webhook-signature': signature,
+  };
   const response = { status: jest.fn().mockReturnThis(), json: jest.fn() };
   try {
     await receive({ viventiumScheduleDueRawBody: rawBody, get: (name) => headers[name] }, response);

@@ -690,7 +690,8 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
   }, 15000);
 
   test.each(['prepared', 'permanent failure', 'temporary failure'])(
-    'a real reclaimed claim prevents stale %s draft, delivery and settlement', async (mode) => {
+    'a real reclaimed claim prevents stale %s draft, delivery and settlement',
+    async (mode) => {
       const proof = await authoredDeliveryProof(`reclaimed-${mode.replaceAll(' ', '-')}`);
       const evidence = mongoose.connection.collection(MISSION_EVIDENCE_COLLECTION);
       proof.prepare.mockImplementationOnce(async () => {
@@ -701,14 +702,17 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
           { $set: { processingClaimId: 'replacement-claim' } },
         );
         expect(changed.matchedCount).toBe(1);
-        if (mode !== 'prepared') throw Object.assign(new Error('Synthetic stale author'), {
-          code: 'synthetic_stale_author', retryable: mode === 'temporary failure',
-        });
+        if (mode !== 'prepared')
+          throw Object.assign(new Error('Synthetic stale author'), {
+            code: 'synthetic_stale_author',
+            retryable: mode === 'temporary failure',
+          });
         return { text: proof.preparedText };
       });
       await proof.service.flushGlassHiveMissionAdjudications({ ownerId: proof.result.ownerId });
       expect(await evidence.findOne({ _id: proof.evidence._id })).toMatchObject({
-        state: 'processing', processingClaimId: 'replacement-claim',
+        state: 'processing',
+        processingClaimId: 'replacement-claim',
       });
       expect(await Message.countDocuments({ messageId: proof.authoredId })).toBe(0);
       expect(proof.persist).not.toHaveBeenCalled();

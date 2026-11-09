@@ -69,16 +69,35 @@ const {
 } = require('../staleCortexMessageRecovery');
 
 test.each(['owned', 'unavailable', 'generic'])(
-  'keeps %s saved-presentation recovery with its existing owner', async (state) => {
-    const parent = { ownerId: 'owner-a', conversationId: 'conversation-a', parentMessageId: 'parent-a', surface: 'telegram' };
-    const recoverOwnedPresentation = state === 'unavailable'
-      ? jest.fn().mockRejectedValue(Object.assign(new Error('owner unavailable'), { code: 'owner_unavailable' }))
-      : jest.fn().mockResolvedValue(state === 'owned');
+  'keeps %s saved-presentation recovery with its existing owner',
+  async (state) => {
+    const parent = {
+      ownerId: 'owner-a',
+      conversationId: 'conversation-a',
+      parentMessageId: 'parent-a',
+      surface: 'telegram',
+    };
+    const recoverOwnedPresentation =
+      state === 'unavailable'
+        ? jest
+            .fn()
+            .mockRejectedValue(
+              Object.assign(new Error('owner unavailable'), { code: 'owner_unavailable' }),
+            )
+        : jest.fn().mockResolvedValue(state === 'owned');
     const loadParentState = jest.fn().mockResolvedValue({ unfinished: true });
-    const deliveryService = { listRecoverableParents: jest.fn().mockResolvedValue([parent]),
-      claimPendingByParent: jest.fn(), deferRecoverableParent: jest.fn() };
-    await recoverPendingCortexInsightDeliveries({ deliveryService, recoverOwnedPresentation,
-      loadParentState, replayMessageFallbacks: async () => ({}), replayOutbox: async () => ({}) });
+    const deliveryService = {
+      listRecoverableParents: jest.fn().mockResolvedValue([parent]),
+      claimPendingByParent: jest.fn(),
+      deferRecoverableParent: jest.fn(),
+    };
+    await recoverPendingCortexInsightDeliveries({
+      deliveryService,
+      recoverOwnedPresentation,
+      loadParentState,
+      replayMessageFallbacks: async () => ({}),
+      replayOutbox: async () => ({}),
+    });
     expect(recoverOwnedPresentation).toHaveBeenCalledWith(parent);
     expect(deliveryService.claimPendingByParent).not.toHaveBeenCalled();
     if (state === 'generic') expect(loadParentState).toHaveBeenCalledWith(parent);
@@ -1188,8 +1207,11 @@ describe('staleCortexMessageRecovery', () => {
 
     // Orphan settlement uses the pass's own cutoff: older than the stale window and this process.
     const [[options]] = recoverInsightDeliveries.mock.calls;
-    expect(options).toEqual({ limit: 100, orphanedBefore: expect.any(Date),
-      recoverOwnedPresentation: expect.any(Function) });
+    expect(options).toEqual({
+      limit: 100,
+      orphanedBefore: expect.any(Date),
+      recoverOwnedPresentation: expect.any(Function),
+    });
     expect(options.orphanedBefore.getTime()).toBeLessThanOrEqual(
       new Date('2026-05-06T12:00:00.000Z').getTime() - result.timeoutMs,
     );

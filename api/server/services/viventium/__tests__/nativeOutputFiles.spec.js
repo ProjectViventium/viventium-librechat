@@ -567,7 +567,8 @@ test.each([true, false])(
   'mission merge prefers only verified Main import: available=%s',
   async (available) => {
     const mainGrant = 'https://artifacts.example.test/v1/link-refs/ghr_' + 'main1234567890abcdef';
-    const workerGrant = 'https://artifacts.example.test/v1/link-refs/ghr_' + 'worker1234567890abcdef';
+    const workerGrant =
+      'https://artifacts.example.test/v1/link-refs/ghr_' + 'worker1234567890abcdef';
     const file = {
       filename: 'shape.svg',
       mime_type: 'image/svg+xml',
@@ -1131,22 +1132,33 @@ describe('retained owned native File references', () => {
   test('retained inventory performs one exact owner/result-key lookup without per-row acceptance reads', async () => {
     const fixture = setupRetainedCallback();
     const source = fixture.source;
-    mockCallbackAcceptedBatch.mockResolvedValue([{
-      _id: source.terminalCallbackResultKey, ownerId: source.ownerId,
-      originRef: source.originRef, workRef: source.workRef, runId: source.runId,
-      attemptNumber: source.attemptNumber, callbackId: source.terminalCallbackId,
-      resultRevision: source.terminalCallbackResultRevision,
-      resultDigest: source.terminalCallbackResultDigest,
-      acceptedOperationId: source.terminalCallbackAcceptedOperationId,
-      acceptedOperationGeneration: source.terminalCallbackEffectGeneration,
-    }]);
-    await expect(loadRetainedNativeResultFileAccess('owner', 'conversation')).resolves.toEqual([{
-      run_id: source.runId, attempt_id: source.attemptId, sha256: fixture.file.sha256,
-    }]);
+    mockCallbackAcceptedBatch.mockResolvedValue([
+      {
+        _id: source.terminalCallbackResultKey,
+        ownerId: source.ownerId,
+        originRef: source.originRef,
+        workRef: source.workRef,
+        runId: source.runId,
+        attemptNumber: source.attemptNumber,
+        callbackId: source.terminalCallbackId,
+        resultRevision: source.terminalCallbackResultRevision,
+        resultDigest: source.terminalCallbackResultDigest,
+        acceptedOperationId: source.terminalCallbackAcceptedOperationId,
+        acceptedOperationGeneration: source.terminalCallbackEffectGeneration,
+      },
+    ]);
+    await expect(loadRetainedNativeResultFileAccess('owner', 'conversation')).resolves.toEqual([
+      {
+        run_id: source.runId,
+        attempt_id: source.attemptId,
+        sha256: fixture.file.sha256,
+      },
+    ]);
     expect(mockCallbackAcceptedBatch).toHaveBeenCalledTimes(1);
-    expect(mockCallbackAcceptedBatch).toHaveBeenCalledWith({ ownerId: 'owner',
-      _id: { $in: [source.terminalCallbackResultKey] } },
-    '_id ownerId originRef workRef runId attemptNumber callbackId resultRevision resultDigest acceptedOperationId acceptedOperationGeneration');
+    expect(mockCallbackAcceptedBatch).toHaveBeenCalledWith(
+      { ownerId: 'owner', _id: { $in: [source.terminalCallbackResultKey] } },
+      '_id ownerId originRef workRef runId attemptNumber callbackId resultRevision resultDigest acceptedOperationId acceptedOperationGeneration',
+    );
     expect(mockCallbackAccepted).not.toHaveBeenCalled();
   });
   test('reuses accepted callback File bytes without a native response, public fetch or new worker', async () => {

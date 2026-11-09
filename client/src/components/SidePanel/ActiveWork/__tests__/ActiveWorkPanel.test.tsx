@@ -129,21 +129,35 @@ describe('Active work Control Panel', () => {
     (useToastContext as jest.Mock).mockReturnValue({ showToast: jest.fn() });
   });
 
-
-
-
   test('shows a rejected unlaunched dispatch truthfully and sends its exact Native Retry control', () => {
-    setWork({ work: [{ workRef: 'xpc_synthetic_pending', managementKind: 'native_coordinator',
-      nativeGoalId: 'synthetic-goal', nativeConversationId: 'synthetic-native',
-      title: 'Original background request', state: 'blocked', actions: ['retry', 'stop'],
-      attention: { kind: 'failure', code: 'application_delivery_rejected', summary: 'Background work cannot start yet.' } }] });
+    setWork({
+      work: [
+        {
+          workRef: 'xpc_synthetic_pending',
+          managementKind: 'native_coordinator',
+          nativeGoalId: 'synthetic-goal',
+          nativeConversationId: 'synthetic-native',
+          title: 'Original background request',
+          state: 'blocked',
+          actions: ['retry', 'stop'],
+          attention: {
+            kind: 'failure',
+            code: 'application_delivery_rejected',
+            summary: 'Background work cannot start yet.',
+          },
+        },
+      ],
+    });
     render(<ActiveWorkPanel />);
     expect(screen.getByText('Could not start')).toBeVisible();
     expect(screen.getByText('Background work cannot start yet.')).toBeVisible();
     expect(screen.queryByText('Needs your input')).not.toBeInTheDocument();
     expect(screen.queryByText('application_delivery_rejected')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'com_ui_parallel_work_action_retry' }));
-    expect(actionMutation.mutate.mock.calls[0][0]).toMatchObject({ workRef: 'xpc_synthetic_pending', action: 'retry' });
+    expect(actionMutation.mutate.mock.calls[0][0]).toMatchObject({
+      workRef: 'xpc_synthetic_pending',
+      action: 'retry',
+    });
     expect(actionMutation.mutate.mock.calls[0][0]).not.toHaveProperty('instruction');
   });
 

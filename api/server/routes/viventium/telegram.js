@@ -1013,7 +1013,8 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const requestedTarget = incoming.launchTarget === 'lan' ? 'local' : incoming.launchTarget ?? 'auto';
+    const requestedTarget =
+      incoming.launchTarget === 'lan' ? 'local' : (incoming.launchTarget ?? 'auto');
     if (!['auto', 'public', 'local'].includes(requestedTarget)) {
       return res.status(400).json({ error: 'launchTarget must be auto, public or local' });
     }
@@ -1042,9 +1043,8 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
      * === VIVENTIUM END === */
     const telegramPlaygroundBase = resolveTelegramPublicPlaygroundBaseUrl();
     const localPlaygroundBase = resolveLocalPlaygroundBaseUrl();
-    const launchTarget = requestedTarget === 'auto'
-      ? (telegramPlaygroundBase ? 'public' : 'local')
-      : requestedTarget;
+    const launchTarget =
+      requestedTarget === 'auto' ? (telegramPlaygroundBase ? 'public' : 'local') : requestedTarget;
     if (launchTarget === 'public' && !telegramPlaygroundBase) {
       return res.status(409).json({
         error: TELEGRAM_PUBLIC_PLAYGROUND_REQUIRED_ERROR,
@@ -1054,7 +1054,8 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
 
     if (launchTarget === 'local' && !localPlaygroundBase) {
       return res.status(409).json({
-        error: 'Same-Wi-Fi calling is not ready. Keep the Viventium computer awake and connected to Wi-Fi, then try again.',
+        error:
+          'Same-Wi-Fi calling is not ready. Keep the Viventium computer awake and connected to Wi-Fi, then try again.',
         localPlaygroundRequired: true,
       });
     }
@@ -1081,9 +1082,14 @@ router.post('/call-link', telegramAuth, configMiddleware, async (req, res) => {
             launchCapability: launch.capability,
           });
     return res.json({
-      ...selectedLaunch, launchTarget, localCallUrl: localLaunch?.callUrl || '',
+      ...selectedLaunch,
+      launchTarget,
+      localCallUrl: localLaunch?.callUrl || '',
       publicCallUrl: telegramPlaygroundBase
-        ? buildCallLaunchResponse(session, { baseUrl: telegramPlaygroundBase, launchCapability: launch.capability }).callUrl
+        ? buildCallLaunchResponse(session, {
+            baseUrl: telegramPlaygroundBase,
+            launchCapability: launch.capability,
+          }).callUrl
         : '',
     });
   } catch (err) {
@@ -1175,12 +1181,16 @@ router.post('/source-order', telegramAuth, async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'input')) {
       const input = req.body.input;
       if (
-        !input || typeof input !== 'object' || Array.isArray(input) ||
+        !input ||
+        typeof input !== 'object' ||
+        Array.isArray(input) ||
         !/^[a-f0-9]{64}$/.test(String(input.conversationGeneration || '')) ||
         !/^[a-f0-9-]{36}$/.test(String(input.preparationId || '')) ||
         typeof input.text !== 'string' ||
-        !input.preparation || typeof input.preparation !== 'object' ||
-        Array.isArray(input.preparation) || input.preparation.version !== 1 ||
+        !input.preparation ||
+        typeof input.preparation !== 'object' ||
+        Array.isArray(input.preparation) ||
+        input.preparation.version !== 1 ||
         Number(input.preparation.message?.message_id) !== sourceSequence ||
         Buffer.byteLength(JSON.stringify(input.preparation), 'utf8') > 64 * 1024
       ) {
@@ -1317,7 +1327,12 @@ router.post('/source-order', telegramAuth, async (req, res) => {
         });
         if (deferred.state === 'preparing' && deferred.leaseUntil === 0) {
           const { claimToken, ...retainedReceipt } = inputReceipt;
-          inputReceipt = { ...retainedReceipt, state: deferred.state, claimed: false, leaseUntil: 0 };
+          inputReceipt = {
+            ...retainedReceipt,
+            state: deferred.state,
+            claimed: false,
+            leaseUntil: 0,
+          };
         }
       } catch (deferError) {
         // Preserve the original unavailable result; its owned lease remains recoverable.
@@ -2390,9 +2405,9 @@ router.post('/preferences', telegramAuth, async (req, res) => {
   );
 
   if (alwaysVoiceResponse == null && replyVoiceWithVoice == null && voiceResponsesEnabled == null) {
-    return res
-      .status(400)
-      .json({ error: 'alwaysVoiceResponse, replyVoiceWithVoice or voiceResponsesEnabled is required' });
+    return res.status(400).json({
+      error: 'alwaysVoiceResponse, replyVoiceWithVoice or voiceResponsesEnabled is required',
+    });
   }
 
   try {

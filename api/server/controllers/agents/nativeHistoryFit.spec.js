@@ -6,24 +6,36 @@ const ts = require('typescript');
 // Exercise the real buildMessages callback at its native estimator and Core-store boundaries.
 function fitOwner({ peerBytes = 90000, capacity = 145000, nativeBudget = 237500 } = {}) {
   const file = path.join(__dirname, 'client.js');
-  const ast = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+  const ast = ts.createSourceFile(
+    file,
+    fs.readFileSync(file, 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+  );
   let callback;
   const visit = (node) => {
-    if (ts.isPropertyAssignment(node) && node.name.getText(ast) === 'canCarryWholeHistory') callback = node.initializer;
+    if (ts.isPropertyAssignment(node) && node.name.getText(ast) === 'canCarryWholeHistory')
+      callback = node.initializer;
     ts.forEachChild(node, visit);
   };
   visit(ast);
   if (!callback) throw new Error('Native history fit owner not found');
-  const resolveLegacyOutputCarrier = jest.fn(async () => peerBytes == null ? null : { reservedContextUtf8Bytes: peerBytes });
+  const resolveLegacyOutputCarrier = jest.fn(async () =>
+    peerBytes == null ? null : { reservedContextUtf8Bytes: peerBytes },
+  );
   const nativeWholeHistoryFits = jest.fn((_req, _agent, _rows, reserved) => reserved <= capacity);
   const scope = {
-    module: { exports: {} }, Buffer,
-    req: {}, nativeUploadRequestBody: {}, nativeReplayBudget: nativeBudget,
+    module: { exports: {} },
+    Buffer,
+    req: {},
+    nativeUploadRequestBody: {},
+    nativeReplayBudget: nativeBudget,
     NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES: 128 * 1024,
     TURN_CONTEXT_SEPARATOR_BYTES: 2,
     conversationProviderUsesNativeBody: () => true,
     resolveConversationProviderUploadedFiles: async () => [],
-    resolveLegacyOutputCarrier, nativeWholeHistoryFits,
+    resolveLegacyOutputCarrier,
+    nativeWholeHistoryFits,
     isAgentsEndpoint: () => true,
     logger: { info: jest.fn() },
   };
@@ -57,5 +69,7 @@ test('retains actual peer pricing for the unknown native-budget path', async () 
   const owner = fitOwner({ peerBytes: 20000, nativeBudget: null });
   const capsule = 'Quoted "evidence"\nwith a new line.';
   expect(await owner.run([], capsule)).toBe(true);
-  expect(owner.nativeWholeHistoryFits.mock.calls[0][3]).toBe(20000 + Buffer.byteLength(JSON.stringify(capsule)) + 2);
+  expect(owner.nativeWholeHistoryFits.mock.calls[0][3]).toBe(
+    20000 + Buffer.byteLength(JSON.stringify(capsule)) + 2,
+  );
 });

@@ -183,26 +183,52 @@ test.each(['owned', 'foreign', 'sibling', 'deselected'])(
     const earlier = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
     const fileId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
     const text = 'item: sample\nquantity: 2\nunit_price: 4';
-    const file = { file_id: fileId, filename: 'retained-table.csv', type: 'text/csv',
-      source: 'text', context: 'message_attachment', bytes: Buffer.byteLength(text), text };
+    const file = {
+      file_id: fileId,
+      filename: 'retained-table.csv',
+      type: 'text/csv',
+      source: 'text',
+      context: 'message_attachment',
+      bytes: Buffer.byteLength(text),
+      text,
+    };
     const reads = {
-      getMessages: jest.fn(async (filter) => filter.user === 'owner' ? [
-        { messageId: parent, ...(visibility !== 'sibling' ? { parentMessageId: earlier } : {}) },
-        { messageId: earlier, files: [{ file_id: fileId }] },
-      ] : []),
-      getFiles: jest.fn(async (filter) => filter.user === 'owner' && visibility !== 'foreign' &&
-        filter.file_id.$in.includes(fileId) ? [file] : []),
+      getMessages: jest.fn(async (filter) =>
+        filter.user === 'owner'
+          ? [
+              {
+                messageId: parent,
+                ...(visibility !== 'sibling' ? { parentMessageId: earlier } : {}),
+              },
+              { messageId: earlier, files: [{ file_id: fileId }] },
+            ]
+          : [],
+      ),
+      getFiles: jest.fn(async (filter) =>
+        filter.user === 'owner' && visibility !== 'foreign' && filter.file_id.$in.includes(fileId)
+          ? [file]
+          : [],
+      ),
     };
     resolveConversationProviderUploadedFiles.mockImplementationOnce(async (req, body, options) => {
       expect(options).toEqual({ includeHistory: true });
-      return trustedUploadedFilesFromRequestBody({ files: await resolveSelectedHistoryAttachments({
-        userId: req.user.id, conversationId: body.conversationId, parentMessageId: body.parentMessageId,
-      }, reads, visibility === 'deselected' ? [] : undefined) });
+      return trustedUploadedFilesFromRequestBody({
+        files: await resolveSelectedHistoryAttachments(
+          {
+            userId: req.user.id,
+            conversationId: body.conversationId,
+            parentMessageId: body.parentMessageId,
+          },
+          reads,
+          visibility === 'deselected' ? [] : undefined,
+        ),
+      });
     });
     const context = await service.prepareContext({
       binding: { ...binding, conversationId },
       source: { requestBody: { ...original, conversationId, parentMessageId: parent, files: [] } },
-      eventId: 'native-history-turn', purpose: 'worker',
+      eventId: 'native-history-turn',
+      purpose: 'worker',
     });
     const expected = visibility === 'owned' ? [{ ...file, media_group_index: 0 }] : [];
     expect(context.workerContext.glasshive_uploaded_files).toEqual(expected);
@@ -210,18 +236,30 @@ test.each(['owned', 'foreign', 'sibling', 'deselected'])(
     const actionBundle = await service.prepareActionBundle(context);
     expect(actionBundle.glasshive_upload_context?.tool_uploaded_files || []).toEqual(expected);
     expect(context.requestBody.files).toEqual([]);
-    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
-    await service.injectDelegation({ toolArguments: { goal: 'Use the selected source.' },
-      user: context.user, requestBody: context.requestBody, workerContext: context.workerContext,
-      invocationId: 'native-chat:historical-goal', route: {
-        profile: 'codex-cli', model: 'codex-cli:synthetic-configured-model', effort: 'high',
-      } });
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
+    await service.injectDelegation({
+      toolArguments: { goal: 'Use the selected source.' },
+      user: context.user,
+      requestBody: context.requestBody,
+      workerContext: context.workerContext,
+      invocationId: 'native-chat:historical-goal',
+      route: {
+        profile: 'codex-cli',
+        model: 'codex-cli:synthetic-configured-model',
+        effort: 'high',
+      },
+    });
     const transported = maybeInjectGlassHiveCapabilityBroker.mock.calls.at(-1)[0].toolArguments;
     expect(transported.uploaded_files || []).toEqual(expected);
     expect(JSON.stringify(transported)).not.toContain('filepath');
     if (visibility === 'owned') {
-      expect(reads.getFiles).toHaveBeenCalledWith(expect.objectContaining({ user: 'owner' }), null,
-        'file_id filename type bytes source context text messageId');
+      expect(reads.getFiles).toHaveBeenCalledWith(
+        expect.objectContaining({ user: 'owner' }),
+        null,
+        'file_id filename type bytes source context text messageId',
+      );
       expect(transported.uploaded_files[0].text).toBe(text);
     }
   },
@@ -235,22 +273,41 @@ test('uses the declared Native endpoint capability after initializeClient remaps
     return result;
   });
   const capability = { workspace_binding: true, native_tools: true };
-  getAppConfig.mockResolvedValue({ endpoints: { agents: { providerCapabilities: {
-    'glasshive-harness': capability, openAI: { native_tools: false },
-  } } } });
-  const context = await service.prepareContext({ binding, source: { requestBody: original },
-    eventId: 'native-turn', purpose: 'worker' });
+  getAppConfig.mockResolvedValue({
+    endpoints: {
+      agents: {
+        providerCapabilities: {
+          'glasshive-harness': capability,
+          openAI: { native_tools: false },
+        },
+      },
+    },
+  });
+  const context = await service.prepareContext({
+    binding,
+    source: { requestBody: original },
+    eventId: 'native-turn',
+    purpose: 'worker',
+  });
   expect(context.bundle.glasshive_capability_broker).toBeDefined();
-  expect(resolveHostToolCapabilityState).toHaveBeenCalledWith(expect.objectContaining({ capability,
-    targetAgent: expect.objectContaining({ provider: 'openAI', endpoint: 'glasshive-harness' }),
-  }));
+  expect(resolveHostToolCapabilityState).toHaveBeenCalledWith(
+    expect.objectContaining({
+      capability,
+      targetAgent: expect.objectContaining({ provider: 'openAI', endpoint: 'glasshive-harness' }),
+    }),
+  );
 });
 
 test('fails before preparing a broker when the declared Native endpoint has no workspace capability', async () => {
   getAppConfig.mockResolvedValue({ endpoints: { agents: { providerCapabilities: {} } } });
-  await expect(service.prepareContext({ binding, source: { requestBody: original },
-    eventId: 'native-turn', purpose: 'worker' }))
-    .rejects.toMatchObject({ code: 'coordinator_capabilities_unavailable' });
+  await expect(
+    service.prepareContext({
+      binding,
+      source: { requestBody: original },
+      eventId: 'native-turn',
+      purpose: 'worker',
+    }),
+  ).rejects.toMatchObject({ code: 'coordinator_capabilities_unavailable' });
   expect(resolveHostToolCapabilityState).not.toHaveBeenCalled();
   expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
 });
@@ -292,34 +349,64 @@ test.each([undefined, 'ask', 'full', 'unrecognized'])(
       const result = await initialize(input);
       result.client.options.agent = {
         ...agent,
-        glasshive_options: { orchestration: {
-          worker_profile: 'claude-code', worker_model: 'configured-other-route',
-          worker_reasoning_effort: 'high', worker_access: access,
-        } },
+        glasshive_options: {
+          orchestration: {
+            worker_profile: 'claude-code',
+            worker_model: 'configured-other-route',
+            worker_reasoning_effort: 'high',
+            worker_access: access,
+          },
+        },
       };
       return result;
     });
     const context = await service.prepareContext({
-      binding, source: { requestBody: original }, eventId: 'native-turn', purpose: 'worker',
+      binding,
+      source: { requestBody: original },
+      eventId: 'native-turn',
+      purpose: 'worker',
     });
-    const route = { profile: 'codex-cli', model: 'codex-cli:synthetic-configured-model', effort: 'high' };
-    const preparationAuthority = { kind: 'native_coordinator_dispatch', generation: 2,
-      notificationRef: 'current-native-notification', expiresAt: '2026-08-22T13:00:00.000Z' };
-    const { maybeInjectGlassHiveCapabilityBroker } = require('../GlassHiveCapabilityBootstrapService');
+    const route = {
+      profile: 'codex-cli',
+      model: 'codex-cli:synthetic-configured-model',
+      effort: 'high',
+    };
+    const preparationAuthority = {
+      kind: 'native_coordinator_dispatch',
+      generation: 2,
+      notificationRef: 'current-native-notification',
+      expiresAt: '2026-08-22T13:00:00.000Z',
+    };
+    const {
+      maybeInjectGlassHiveCapabilityBroker,
+    } = require('../GlassHiveCapabilityBootstrapService');
     await service.injectDelegation({
       toolArguments: { goal: 'Original work.', worker_access: 'full' },
-      user: context.user, requestBody: context.requestBody, workerContext: context.workerContext,
-      invocationId: 'native-chat:goal', route, preparationAuthority,
+      user: context.user,
+      requestBody: context.requestBody,
+      workerContext: context.workerContext,
+      invocationId: 'native-chat:goal',
+      route,
+      preparationAuthority,
     });
     const injected = maybeInjectGlassHiveCapabilityBroker.mock.calls.at(-1)[0];
-    expect(injected.config.configurable.glasshive_launch_authority_kind).toBe('conversation_orchestrator');
-    expect(injected.config.configurable.glasshive_launch_preparation_authority).toBe(preparationAuthority);
+    expect(injected.config.configurable.glasshive_launch_authority_kind).toBe(
+      'conversation_orchestrator',
+    );
+    expect(injected.config.configurable.glasshive_launch_preparation_authority).toBe(
+      preparationAuthority,
+    );
     expect(injected.config.configurable.glasshive_worker_route).toEqual({
-      worker_model: route.model, worker_reasoning_effort: route.effort,
+      worker_model: route.model,
+      worker_reasoning_effort: route.effort,
       ...(['ask', 'full'].includes(access) ? { worker_access: access } : {}),
     });
-    expect(injected.config.configurable.glasshive_worker_route).not.toHaveProperty('worker_profile');
-    expect(injected.config.configurable.glasshive_worker_route).not.toHaveProperty('execution_mode');
+    expect(injected.config.configurable.glasshive_worker_route).not.toHaveProperty(
+      'worker_profile',
+    );
+    expect(injected.config.configurable.glasshive_worker_route).not.toHaveProperty(
+      'execution_mode',
+    );
   },
 );
 
@@ -687,16 +774,19 @@ test('refreshes continuation memory and scoped Feelings through the existing lau
 test('recognizes only exact owner/conversation/candidate terminal dropped receipts', async () => {
   const { getCortexInsightDeliveriesForParent } = require('../CortexInsightDeliveryService');
   const read = service.presentResult.readPresentation;
-  getCortexInsightDeliveriesForParent.mockImplementation(async ({ownerId,parentMessageId}) =>
-    ownerId === 'owner' && parentMessageId === 'parent' ? [
-    {
-      conversationId: 'core-chat',
-      parentMessageId: 'parent',
-      deliveryId: 'delivery',
-      status: 'dropped',
-      dropReason: 'no_response',
-    },
-  ] : []);
+  getCortexInsightDeliveriesForParent.mockImplementation(async ({ ownerId, parentMessageId }) =>
+    ownerId === 'owner' && parentMessageId === 'parent'
+      ? [
+          {
+            conversationId: 'core-chat',
+            parentMessageId: 'parent',
+            deliveryId: 'delivery',
+            status: 'dropped',
+            dropReason: 'no_response',
+          },
+        ]
+      : [],
+  );
   await expect(
     read({
       ownerId: 'owner',
@@ -732,124 +822,299 @@ test('recognizes only exact owner/conversation/candidate terminal dropped receip
 });
 
 test('recognizes a persisted Main result through the actual owner-scoped public delivery shape', async () => {
-  const {getCortexInsightDeliveriesForParent}=require('../CortexInsightDeliveryService');
-  const input={ownerId:'owner',conversationId:'core-chat',parentMessageId:'parent',deliveryIds:['delivery']};
-  const row={conversationId:'core-chat',parentMessageId:'parent',deliveryId:'delivery',status:'claimed',persistenceStatus:'persisted',persistedMessageId:'same-main-message'};
-  const message={messageId:'same-main-message',user:'owner',conversationId:'core-chat',parentMessageId:'parent',text:'The existing Main result.',metadata:{viventium:{cortexInsightDeliveryIds:['delivery']}}};
-  getCortexInsightDeliveriesForParent.mockImplementation(async ({ownerId,parentMessageId})=>
-    ownerId==='owner' && parentMessageId==='parent' ? [row] : []);
+  const { getCortexInsightDeliveriesForParent } = require('../CortexInsightDeliveryService');
+  const input = {
+    ownerId: 'owner',
+    conversationId: 'core-chat',
+    parentMessageId: 'parent',
+    deliveryIds: ['delivery'],
+  };
+  const row = {
+    conversationId: 'core-chat',
+    parentMessageId: 'parent',
+    deliveryId: 'delivery',
+    status: 'claimed',
+    persistenceStatus: 'persisted',
+    persistedMessageId: 'same-main-message',
+  };
+  const message = {
+    messageId: 'same-main-message',
+    user: 'owner',
+    conversationId: 'core-chat',
+    parentMessageId: 'parent',
+    text: 'The existing Main result.',
+    metadata: { viventium: { cortexInsightDeliveryIds: ['delivery'] } },
+  };
+  getCortexInsightDeliveriesForParent.mockImplementation(async ({ ownerId, parentMessageId }) =>
+    ownerId === 'owner' && parentMessageId === 'parent' ? [row] : [],
+  );
   db.getMessages.mockResolvedValue([message]);
-  const read=service.presentResult.readPresentation;
+  const read = service.presentResult.readPresentation;
   await expect(read(input)).resolves.toBe(message);
   await expect(read(input)).resolves.toBe(message);
-  expect(getCortexInsightDeliveriesForParent).toHaveBeenCalledWith({ownerId:'owner',parentMessageId:'parent',deliveryIds:['delivery']});
-  expect(db.getMessages).toHaveBeenLastCalledWith({user:'owner',conversationId:'core-chat',messageId:'same-main-message',isCreatedByUser:false});
+  expect(getCortexInsightDeliveriesForParent).toHaveBeenCalledWith({
+    ownerId: 'owner',
+    parentMessageId: 'parent',
+    deliveryIds: ['delivery'],
+  });
+  expect(db.getMessages).toHaveBeenLastCalledWith({
+    user: 'owner',
+    conversationId: 'core-chat',
+    messageId: 'same-main-message',
+    isCreatedByUser: false,
+  });
   expect(row).not.toHaveProperty('userId');
-  await expect(read({...input,ownerId:'foreign'})).resolves.toBeNull();
-  await expect(read({...input,parentMessageId:'foreign-parent'})).resolves.toBeNull();
-  await expect(read({...input,conversationId:'foreign-conversation'})).resolves.toBeNull();
-  await expect(read({...input,deliveryIds:['delivery','missing']})).resolves.toBeNull();
-  db.getMessages.mockResolvedValue([{...message,user:'foreign'}]);
+  await expect(read({ ...input, ownerId: 'foreign' })).resolves.toBeNull();
+  await expect(read({ ...input, parentMessageId: 'foreign-parent' })).resolves.toBeNull();
+  await expect(read({ ...input, conversationId: 'foreign-conversation' })).resolves.toBeNull();
+  await expect(read({ ...input, deliveryIds: ['delivery', 'missing'] })).resolves.toBeNull();
+  db.getMessages.mockResolvedValue([{ ...message, user: 'foreign' }]);
   await expect(read(input)).rejects.toThrow('coordinator_presentation_unavailable');
-  db.getMessages.mockResolvedValue([{...message,parentMessageId:'foreign-parent'}]);
+  db.getMessages.mockResolvedValue([{ ...message, parentMessageId: 'foreign-parent' }]);
   await expect(read(input)).rejects.toThrow('coordinator_presentation_unavailable');
-  db.getMessages.mockResolvedValue([{...message,metadata:{viventium:{cortexInsightDeliveryIds:['different']}}}]);
+  db.getMessages.mockResolvedValue([
+    { ...message, metadata: { viventium: { cortexInsightDeliveryIds: ['different'] } } },
+  ]);
   await expect(read(input)).rejects.toThrow('coordinator_presentation_unavailable');
 });
 
 test('keeps a transport-exhausted persisted message recoverable instead of treating it as silence', async () => {
   const { getCortexInsightDeliveriesForParent } = require('../CortexInsightDeliveryService');
-  getCortexInsightDeliveriesForParent.mockResolvedValue([{ conversationId: 'core-chat', parentMessageId: 'parent',
-    deliveryId: 'delivery', status: 'dropped', dropReason: 'delivery_attempts_exhausted',
-    persistedMessageId: 'saved-main' }]);
-  const message = { user: 'owner', conversationId: 'core-chat', parentMessageId: 'later-leaf',
-    messageId: 'saved-main', text: 'The same saved result.', metadata: { viventium: {
-      cortexInsightDeliveryIds: ['delivery'], cortexPresentationParentMessageId: 'parent' } } };
+  getCortexInsightDeliveriesForParent.mockResolvedValue([
+    {
+      conversationId: 'core-chat',
+      parentMessageId: 'parent',
+      deliveryId: 'delivery',
+      status: 'dropped',
+      dropReason: 'delivery_attempts_exhausted',
+      persistedMessageId: 'saved-main',
+    },
+  ]);
+  const message = {
+    user: 'owner',
+    conversationId: 'core-chat',
+    parentMessageId: 'later-leaf',
+    messageId: 'saved-main',
+    text: 'The same saved result.',
+    metadata: {
+      viventium: {
+        cortexInsightDeliveryIds: ['delivery'],
+        cortexPresentationParentMessageId: 'parent',
+      },
+    },
+  };
   db.getMessages.mockResolvedValue([message]);
-  await expect(service.presentResult.readPresentation({ ownerId: 'owner', conversationId: 'core-chat',
-    parentMessageId: 'parent', deliveryIds: ['delivery'] })).resolves.toBe(message);
+  await expect(
+    service.presentResult.readPresentation({
+      ownerId: 'owner',
+      conversationId: 'core-chat',
+      parentMessageId: 'parent',
+      deliveryIds: ['delivery'],
+    }),
+  ).resolves.toBe(message);
 });
 
 test('binds the existing Native v2 source before saving a no-file Main reply', async () => {
   const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
-  require('../CortexInsightDeliveryService').getCortexInsightDeliveriesForParent.mockResolvedValue([]);
+  require('../CortexInsightDeliveryService').getCortexInsightDeliveriesForParent.mockResolvedValue(
+    [],
+  );
   db.saveMessage = jest.fn(async (_req, value) => value);
   const source = { turnId: 'original-native-turn', requestBody: original };
-  const data = { goal_id: 'goal', run_id: 'run', result_revision: 1, result_digest: `sha256:${'a'.repeat(64)}` };
-  await service.presentResult.createFollowUp({ context: { req: { user: { id: 'owner' } }, agent: {} },
-    binding, source, parentMessageId: original.messageId, eventId: 'native-result', insights: [], data });
+  const data = {
+    goal_id: 'goal',
+    run_id: 'run',
+    result_revision: 1,
+    result_digest: `sha256:${'a'.repeat(64)}`,
+  };
+  await service.presentResult.createFollowUp({
+    context: { req: { user: { id: 'owner' } }, agent: {} },
+    binding,
+    source,
+    parentMessageId: original.messageId,
+    eventId: 'native-result',
+    insights: [],
+    data,
+  });
   const [{ dependencies }] = createCortexFollowUpMessage.mock.calls.at(-1);
-  await dependencies.saveMessage({}, { messageId: 'saved-main', text: 'Main reply.', metadata: {} }, {});
-  expect(db.saveMessage.mock.calls[0][1].metadata.viventium.mainGenerationPresentation).toMatchObject({
-    version: 2, responseMessageId: 'saved-main', nativeCoordinatorResult: {
-      sourceTurnId: 'original-native-turn', goalId: 'goal', runId: 'run' } });
+  await dependencies.saveMessage(
+    {},
+    { messageId: 'saved-main', text: 'Main reply.', metadata: {} },
+    {},
+  );
+  expect(
+    db.saveMessage.mock.calls[0][1].metadata.viventium.mainGenerationPresentation,
+  ).toMatchObject({
+    version: 2,
+    responseMessageId: 'saved-main',
+    nativeCoordinatorResult: {
+      sourceTurnId: 'original-native-turn',
+      goalId: 'goal',
+      runId: 'run',
+    },
+  });
 });
 
-test.each(['retained-publication', ''])('same-event author replay preserves accepted admission scope %s and fresh cognition', async (publicationId) => {
-  const { getCortexInsightDeliveriesForParent, claimPendingCortexInsightDeliveriesForParent } = require('../CortexInsightDeliveryService');
-  const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
-  const insights = [{ cortexId: 'native-event', status: 'completed', insight: 'The exact accepted result.',
-    authority: { kind: 'native_coordinator_result', goalId: 'goal' } }];
-  const candidates = require('@librechat/api').buildCortexInsightDeliveryCandidates({ ownerId: binding.ownerId,
-    conversationId: binding.conversationId, parentMessageId: original.messageId, surface: 'web', insights });
-  getCortexInsightDeliveriesForParent.mockResolvedValue(candidates.map(row => ({ ...row, publicationId })));
-  const accepted = { claimed: candidates.map(row => ({ ...row, claimToken: 'accepted-claim', claimGeneration: 2 })),
-    deliveries: candidates, recoveryContext: { feelingSnapshot: { version: 1, capsule: 'Original admission.' } } };
-  claimPendingCortexInsightDeliveriesForParent.mockResolvedValue(accepted);
-  const req = { user: { id: 'owner' }, body: { viventiumSurface: 'web' },
-    _viventiumFeelingSnapshot: { version: 2, capsule: 'Current author cognition.' } };
-  await service.presentResult.createFollowUp({ context: { req, agent: {} }, binding,
-    source: { turnId: 'source', requestBody: original }, parentMessageId: original.messageId,
-    eventId: 'native-event', insights, data: nativeResultData });
-  expect(claimPendingCortexInsightDeliveriesForParent).toHaveBeenCalledWith({ ownerId: 'owner',
-    parentMessageId: original.messageId, deliveryIds: candidates.map(row => row.deliveryId), surface: 'web' });
-  expect(createCortexFollowUpMessage).toHaveBeenCalledWith(expect.objectContaining({ req,
-    claimedDeliveryBatch: accepted, publicationId, insightsData: expect.objectContaining({ insights }) }));
-  expect(req._viventiumFeelingSnapshot.version).toBe(2);
-  expect(accepted.recoveryContext.feelingSnapshot.version).toBe(1);
-});
+test.each(['retained-publication', ''])(
+  'same-event author replay preserves accepted admission scope %s and fresh cognition',
+  async (publicationId) => {
+    const {
+      getCortexInsightDeliveriesForParent,
+      claimPendingCortexInsightDeliveriesForParent,
+    } = require('../CortexInsightDeliveryService');
+    const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+    const insights = [
+      {
+        cortexId: 'native-event',
+        status: 'completed',
+        insight: 'The exact accepted result.',
+        authority: { kind: 'native_coordinator_result', goalId: 'goal' },
+      },
+    ];
+    const candidates = require('@librechat/api').buildCortexInsightDeliveryCandidates({
+      ownerId: binding.ownerId,
+      conversationId: binding.conversationId,
+      parentMessageId: original.messageId,
+      surface: 'web',
+      insights,
+    });
+    getCortexInsightDeliveriesForParent.mockResolvedValue(
+      candidates.map((row) => ({ ...row, publicationId })),
+    );
+    const accepted = {
+      claimed: candidates.map((row) => ({
+        ...row,
+        claimToken: 'accepted-claim',
+        claimGeneration: 2,
+      })),
+      deliveries: candidates,
+      recoveryContext: { feelingSnapshot: { version: 1, capsule: 'Original admission.' } },
+    };
+    claimPendingCortexInsightDeliveriesForParent.mockResolvedValue(accepted);
+    const req = {
+      user: { id: 'owner' },
+      body: { viventiumSurface: 'web' },
+      _viventiumFeelingSnapshot: { version: 2, capsule: 'Current author cognition.' },
+    };
+    await service.presentResult.createFollowUp({
+      context: { req, agent: {} },
+      binding,
+      source: { turnId: 'source', requestBody: original },
+      parentMessageId: original.messageId,
+      eventId: 'native-event',
+      insights,
+      data: nativeResultData,
+    });
+    expect(claimPendingCortexInsightDeliveriesForParent).toHaveBeenCalledWith({
+      ownerId: 'owner',
+      parentMessageId: original.messageId,
+      deliveryIds: candidates.map((row) => row.deliveryId),
+      surface: 'web',
+    });
+    expect(createCortexFollowUpMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req,
+        claimedDeliveryBatch: accepted,
+        publicationId,
+        insightsData: expect.objectContaining({ insights }),
+      }),
+    );
+    expect(req._viventiumFeelingSnapshot.version).toBe(2);
+    expect(accepted.recoveryContext.feelingSnapshot.version).toBe(1);
+  },
+);
 
 test('an active exact Native author claim does not start another author or readmit fresh Feelings', async () => {
-  const { getCortexInsightDeliveriesForParent, claimPendingCortexInsightDeliveriesForParent } = require('../CortexInsightDeliveryService');
+  const {
+    getCortexInsightDeliveriesForParent,
+    claimPendingCortexInsightDeliveriesForParent,
+  } = require('../CortexInsightDeliveryService');
   const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
-  const insights = [{ cortexId: 'native-event', status: 'completed', insight: 'Exact accepted result.' }];
-  const candidates = require('@librechat/api').buildCortexInsightDeliveryCandidates({ ownerId: 'owner',
-    conversationId: binding.conversationId, parentMessageId: original.messageId, surface: 'web', insights });
+  const insights = [
+    { cortexId: 'native-event', status: 'completed', insight: 'Exact accepted result.' },
+  ];
+  const candidates = require('@librechat/api').buildCortexInsightDeliveryCandidates({
+    ownerId: 'owner',
+    conversationId: binding.conversationId,
+    parentMessageId: original.messageId,
+    surface: 'web',
+    insights,
+  });
   getCortexInsightDeliveriesForParent.mockResolvedValue(candidates);
-  claimPendingCortexInsightDeliveriesForParent.mockResolvedValue({ claimed: [], deliveries: candidates });
-  await expect(service.presentResult.createFollowUp({ context: { req: { user: { id: 'owner' }, body: {} }, agent: {} },
-    binding, source: { turnId: 'source', requestBody: original }, parentMessageId: original.messageId,
-    eventId: 'native-event', insights, data: nativeResultData })).resolves.toBeNull();
+  claimPendingCortexInsightDeliveriesForParent.mockResolvedValue({
+    claimed: [],
+    deliveries: candidates,
+  });
+  await expect(
+    service.presentResult.createFollowUp({
+      context: { req: { user: { id: 'owner' }, body: {} }, agent: {} },
+      binding,
+      source: { turnId: 'source', requestBody: original },
+      parentMessageId: original.messageId,
+      eventId: 'native-event',
+      insights,
+      data: nativeResultData,
+    }),
+  ).resolves.toBeNull();
   expect(createCortexFollowUpMessage).not.toHaveBeenCalled();
 });
 
-
 test.each([
-  { scope: ['authorized-server'], expected: ['authorized-server'], name: 'old mission excludes new Chrome' },
-  { scope: ['authorized-server', 'chrome-devtools'], expected: ['authorized-server', 'chrome-devtools'], name: 'authorized mission retains Core Chrome' },
+  {
+    scope: ['authorized-server'],
+    expected: ['authorized-server'],
+    name: 'old mission excludes new Chrome',
+  },
+  {
+    scope: ['authorized-server', 'chrome-devtools'],
+    expected: ['authorized-server', 'chrome-devtools'],
+    name: 'authorized mission retains Core Chrome',
+  },
   { scope: [], expected: [], name: 'empty original mission scope stays empty' },
-])('fresh Worker continuation uses original mission server ceiling: $name', async ({ scope, expected }) => {
-  const { readCapabilityAuthorizationServerScope } = require('../GlassHiveCapabilityAuthorizationService');
-  readCapabilityAuthorizationServerScope.mockResolvedValueOnce(scope);
-  declaredMcpServerNames.mockReturnValueOnce(['authorized-server', 'chrome-devtools', 'new-unrelated']);
-  await service.prepareContext({
-    binding, source: { requestBody: original }, eventId: 'continuation', purpose: 'worker',
-    workerWorkRef: 'actual-native-work',
-  });
-  expect(readCapabilityAuthorizationServerScope).toHaveBeenCalledWith({
-    ownerId: 'owner', workRef: 'actual-native-work',
-  });
-  expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith(expect.objectContaining({
-    allowedServerNames: expected,
-  }));
-});
+])(
+  'fresh Worker continuation uses original mission server ceiling: $name',
+  async ({ scope, expected }) => {
+    const {
+      readCapabilityAuthorizationServerScope,
+    } = require('../GlassHiveCapabilityAuthorizationService');
+    readCapabilityAuthorizationServerScope.mockResolvedValueOnce(scope);
+    declaredMcpServerNames.mockReturnValueOnce([
+      'authorized-server',
+      'chrome-devtools',
+      'new-unrelated',
+    ]);
+    await service.prepareContext({
+      binding,
+      source: { requestBody: original },
+      eventId: 'continuation',
+      purpose: 'worker',
+      workerWorkRef: 'actual-native-work',
+    });
+    expect(readCapabilityAuthorizationServerScope).toHaveBeenCalledWith({
+      ownerId: 'owner',
+      workRef: 'actual-native-work',
+    });
+    expect(buildConversationProviderBootstrapBundle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowedServerNames: expected,
+      }),
+    );
+  },
+);
 
 test('missing original mission scope cannot mint a fresh broader Core grant or Native mask', async () => {
-  const { readCapabilityAuthorizationServerScope } = require('../GlassHiveCapabilityAuthorizationService');
+  const {
+    readCapabilityAuthorizationServerScope,
+  } = require('../GlassHiveCapabilityAuthorizationService');
   readCapabilityAuthorizationServerScope.mockResolvedValueOnce(null);
-  await expect(service.prepareContext({
-    binding, source: { requestBody: original }, eventId: 'continuation', purpose: 'worker',
-    workerWorkRef: 'actual-native-work',
-  })).rejects.toMatchObject({ code: 'coordinator_worker_capabilities_unavailable' });
+  await expect(
+    service.prepareContext({
+      binding,
+      source: { requestBody: original },
+      eventId: 'continuation',
+      purpose: 'worker',
+      workerWorkRef: 'actual-native-work',
+    }),
+  ).rejects.toMatchObject({ code: 'coordinator_worker_capabilities_unavailable' });
   expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
 });

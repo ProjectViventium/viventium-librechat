@@ -2055,7 +2055,8 @@ async function attachConversationProviderCapabilityBundle({
   const workerRoute = configuredConversationOrchestrationWorkerRoute(mcpCapabilitySource);
   const coordinationPolicy =
     mcpCapabilitySource?.glasshive_options?.orchestration?.tool_mode === 'coordination';
-  const nativeActionTools = capability?.native_tools === true || capability?.worker_native_tools === true;
+  const nativeActionTools =
+    capability?.native_tools === true || capability?.worker_native_tools === true;
   const inheritedConversation = coordinationPolicy
     ? suppliedInheritedConversation ||
       require('./ViventiumMainContextService').getMainContextAttemptState(req)
@@ -2089,7 +2090,9 @@ async function attachConversationProviderCapabilityBundle({
       user: req?.user,
       requestBody: trustedRequestBody,
       allowedServerNames,
-      ...(coordinationPolicy ? { conversationToolMode: 'coordination', inheritedConversation } : {}),
+      ...(coordinationPolicy
+        ? { conversationToolMode: 'coordination', inheritedConversation }
+        : {}),
       allowedHostTools: hostToolCapabilityState.authorizedHostTools,
       hostToolResources: hostToolCapabilityState.hostToolResources,
       ...(allowedConversationOrchestrationTools.length > 0
@@ -2160,9 +2163,12 @@ async function attachConversationProviderCapabilityBundle({
       provider_capabilities: {
         ...bundle.provider_capabilities,
         native_tools: false,
-        ...(mcpCapabilitySource?.glasshive_options?.orchestration?.conversation_process_reuse === true &&
-        capability?.models?.find((model) => model.id === targetAgent?.model)?.harnessProfile === 'claude-code' &&
-        (declaredAgent?.viventiumProviderSessionMode || targetAgent?.viventiumProviderSessionMode) !== 'stateless' &&
+        ...(mcpCapabilitySource?.glasshive_options?.orchestration?.conversation_process_reuse ===
+          true &&
+        capability?.models?.find((model) => model.id === targetAgent?.model)?.harnessProfile ===
+          'claude-code' &&
+        (declaredAgent?.viventiumProviderSessionMode ||
+          targetAgent?.viventiumProviderSessionMode) !== 'stateless' &&
         configuration.defaultHeaders?.['X-GlassHive-Provider-Session-Mode'] !== 'stateless'
           ? { conversation_process_reuse: true }
           : {}),
@@ -2189,8 +2195,10 @@ async function attachConversationProviderCapabilityBundle({
             ? req?.viventiumSchedulerDueAdmissionId
             : undefined,
         viventiumStreamId:
-          req?.viventiumSchedulerDueStreamId || req?._resumableStreamId ||
-          req?.body?.streamId || trustedRequestBody.viventiumStreamId,
+          req?.viventiumSchedulerDueStreamId ||
+          req?._resumableStreamId ||
+          req?.body?.streamId ||
+          trustedRequestBody.viventiumStreamId,
       },
     });
   }
@@ -2222,7 +2230,9 @@ async function attachConversationProviderCapabilityBundle({
   // File inventory is independent of connected-tool availability and grants no new paths.
   try {
     const access = await require('./nativeOutputFiles').loadRetainedNativeResultFileAccess(
-      String(req?.user?.id || req?.user?._id || ''), String(trustedRequestBody.conversationId || ''));
+      String(req?.user?.id || req?.user?._id || ''),
+      String(trustedRequestBody.conversationId || ''),
+    );
     if (access.length) bundle.authorized_result_files = access;
   } catch (error) {
     logger.warn('[VIVENTIUM][native-result-files] Current source scope unavailable', {

@@ -1003,10 +1003,14 @@ function projectWorkerFeelingBundle({ bundle, workerFeelings, workerFeelingsScop
     if (capsule && typeof bundle[field] === 'string')
       bundle[field] = bundle[field].split(capsule).join('').trim();
   }
-  if (enabled) bundle.agents_md = pinFeelingCapsuleLast({ instructions: bundle.agents_md, capsule });
+  if (enabled)
+    bundle.agents_md = pinFeelingCapsuleLast({ instructions: bundle.agents_md, capsule });
   if (opaque) return bundle;
   bundle.viventium_feelings_projection = {
-    version: 1, enabled, scope: workerFeelingsScope, canonical_instruction_field: 'agents_md',
+    version: 1,
+    enabled,
+    scope: workerFeelingsScope,
+    canonical_instruction_field: 'agents_md',
     snapshot_sha256: enabled ? crypto.createHash('sha256').update(capsule).digest('hex') : '',
     expected_capsule_count: enabled ? 1 : 0,
   };
@@ -1296,10 +1300,7 @@ function applyContextBrief(
     args.context = appendText(args.context, brief);
   } else if (toolName === 'workspace_continue') {
     args.additional_instructions = appendText(args.additional_instructions, brief);
-  } else if (
-    toolName === 'worker_run' ||
-    toolName === 'worker_schedule'
-  ) {
+  } else if (toolName === 'worker_run' || toolName === 'worker_schedule') {
     args.instruction = appendText(args.instruction, brief);
   }
 }
@@ -1310,10 +1311,7 @@ function applyUnavailableContextBrief(args, toolName, reason) {
     args.context = appendText(args.context, brief);
   } else if (toolName === 'workspace_continue') {
     args.additional_instructions = appendText(args.additional_instructions, brief);
-  } else if (
-    toolName === 'worker_run' ||
-    toolName === 'worker_schedule'
-  ) {
+  } else if (toolName === 'worker_run' || toolName === 'worker_schedule') {
     args.instruction = appendText(args.instruction, brief);
   }
 }
@@ -1324,12 +1322,15 @@ async function assertCurrentGlassHiveResultAuthor({ userId, requestBody, signal 
   signal?.throwIfAborted();
   if (!binding || typeof binding.scope !== 'string' || typeof binding.messageId !== 'string') {
     throw Object.assign(new Error('source_authority_binding_incomplete'), {
-      code: 'source_authority_binding_incomplete', retryable: false,
+      code: 'source_authority_binding_incomplete',
+      retryable: false,
     });
   }
   await require('./GlassHiveMissionAdjudicationService').assertCurrentGlassHiveMissionAuthor({
-    ownerId: userId, conversationId: requestBody.conversationId,
-    scope: binding.scope, messageId: binding.messageId,
+    ownerId: userId,
+    conversationId: requestBody.conversationId,
+    scope: binding.scope,
+    messageId: binding.messageId,
   });
 }
 
@@ -1376,7 +1377,8 @@ async function maybeInjectGlassHiveCapabilityBroker({
     const userId = String(config?.configurable?.user?.id || config?.configurable?.user?._id || '');
     const requestBody = config?.configurable?.requestBody;
     await assertCurrentGlassHiveSourceAuthor({
-      userId, requestBody,
+      userId,
+      requestBody,
       getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
     });
     await assertCurrentGlassHiveResultAuthor({ userId, requestBody, signal: config?.signal });
@@ -1405,7 +1407,8 @@ async function maybeInjectGlassHiveCapabilityBroker({
       requestBody: config?.configurable?.requestBody,
       bundle,
       feelingBlock: enabled ? capsule : '',
-      snapshotHash: bundle.viventium_feelings_projection?.snapshot_sha256 ||
+      snapshotHash:
+        bundle.viventium_feelings_projection?.snapshot_sha256 ||
         (enabled ? crypto.createHash('sha256').update(capsule).digest('hex') : ''),
       scope: workerFeelingsScope,
       ...workerFeelingRangeTelemetry,
@@ -1437,7 +1440,10 @@ async function maybeInjectGlassHiveCapabilityBroker({
           ...(bundle.claude_project_mcp || {}),
           viventium_media: server,
         };
-        bundle.codex_config_append = appendText(bundle.codex_config_append, media.codex_config_append);
+        bundle.codex_config_append = appendText(
+          bundle.codex_config_append,
+          media.codex_config_append,
+        );
       }
     }
     /* === VIVENTIUM END === */
@@ -1681,9 +1687,12 @@ async function buildConversationProviderBootstrapBundle({
   const orchestrationRequestBody = { ...requestBody };
   delete orchestrationRequestBody.tool_resources;
   if (conversationToolMode === 'coordination') {
-    if (inheritedConversation?.version !== 1 ||
-        inheritedConversation.conversation_id !== requestBody.conversationId ||
-        !Array.isArray(inheritedConversation.sources)) throw new Error('coordination_context_unavailable');
+    if (
+      inheritedConversation?.version !== 1 ||
+      inheritedConversation.conversation_id !== requestBody.conversationId ||
+      !Array.isArray(inheritedConversation.sources)
+    )
+      throw new Error('coordination_context_unavailable');
   }
   const delegationResources = normalizedConversationOrchestrationTools.includes(
     DELEGATION_TOOL_NAME,
@@ -1733,7 +1742,8 @@ async function buildConversationProviderBootstrapBundle({
     : {};
   const orchestrationResources = {
     ...delegationResources,
-    ...(conversationToolMode === 'coordination' && normalizedConversationOrchestrationTools.includes('active_work_list')
+    ...(conversationToolMode === 'coordination' &&
+    normalizedConversationOrchestrationTools.includes('active_work_list')
       ? { active_work_list: { version: 1, request_body_ref: 'conversation_request_body' } }
       : {}),
     ...(normalizedConversationOrchestrationTools.includes('active_work_action')
@@ -1794,9 +1804,14 @@ async function buildConversationProviderBootstrapBundle({
     return declaredServers.has(serverName) || declaredDeferredServers.has(serverName);
   });
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
-  const eagerServers = conversationToolMode === 'coordination' ? [] : allowedServers.filter((serverName) => declaredServers.has(serverName));
+  const eagerServers =
+    conversationToolMode === 'coordination'
+      ? []
+      : allowedServers.filter((serverName) => declaredServers.has(serverName));
   const deferredServers = allowedServers.filter(
-    (serverName) => conversationToolMode === 'coordination' || (!declaredServers.has(serverName) && declaredDeferredServers.has(serverName)),
+    (serverName) =>
+      conversationToolMode === 'coordination' ||
+      (!declaredServers.has(serverName) && declaredDeferredServers.has(serverName)),
   );
   if (allowedServers.length === 0 && allProviderHostTools.length === 0) {
     return degradedConversationCapabilityBundle('no_reviewed_capabilities');
@@ -1853,11 +1868,16 @@ async function buildConversationProviderBootstrapBundle({
     logger.info(
       JSON.stringify({
         event: 'glasshive_broker_grant_created',
-        ...(conversationToolMode === 'coordination' ? {
-          conversationToolMode,
-          inheritedContextSourceCount: inheritedConversation.sources.length,
-          inheritedContextSha256: crypto.createHash('sha256').update(JSON.stringify(inheritedConversation)).digest('hex'),
-        } : {}),
+        ...(conversationToolMode === 'coordination'
+          ? {
+              conversationToolMode,
+              inheritedContextSourceCount: inheritedConversation.sources.length,
+              inheritedContextSha256: crypto
+                .createHash('sha256')
+                .update(JSON.stringify(inheritedConversation))
+                .digest('hex'),
+            }
+          : {}),
         grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
         message_id_sha256: scopeHash(mintedGrant.payload.message_id),
         conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
@@ -1903,9 +1923,13 @@ async function buildConversationProviderBootstrapBundle({
     if (toolCatalog) {
       const describedBundle =
         conversationToolMode === 'coordination'
-          ? mergeBrokerBundle({ ...bundleOptions, nativeToolCatalog: {
-              ...toolCatalog, tools: catalog.hostTools.map((item) => item.definition),
-            } })
+          ? mergeBrokerBundle({
+              ...bundleOptions,
+              nativeToolCatalog: {
+                ...toolCatalog,
+                tools: catalog.hostTools.map((item) => item.definition),
+              },
+            })
           : bundle;
       if (nativeToolCatalogFitsBootstrap(describedBundle, toolCatalog)) {
         bundle = describedBundle;

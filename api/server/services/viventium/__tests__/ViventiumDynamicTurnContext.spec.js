@@ -1387,23 +1387,44 @@ describe('readiness capsule facts: requested preference and capability truth', (
   });
 });
 
-
 test('coordination roster advertises the projected name while full keeps the native name', () => {
   const input = { snapshot: { snapshot: 'fresh', work: [] } };
-  expect(buildActiveWorkCapsule({ ...input, coordinationOnly: true })).toContain('"fullRosterTool":"list_workers"');
+  expect(buildActiveWorkCapsule({ ...input, coordinationOnly: true })).toContain(
+    '"fullRosterTool":"list_workers"',
+  );
   expect(buildActiveWorkCapsule(input)).toContain('"fullRosterTool":"active_work_list"');
 });
 
-test.each(['codex-cli', 'claude-code', 'direct-xai'].flatMap((profile) =>
-  ['coordination', 'full'].map((mode) => [profile, mode])))('%s %s roster follows the saved role', async (profile, mode) => {
+test.each(
+  ['codex-cli', 'claude-code', 'direct-xai'].flatMap((profile) =>
+    ['coordination', 'full'].map((mode) => [profile, mode]),
+  ),
+)('%s %s roster follows the saved role', async (profile, mode) => {
   const capsule = await loadActiveWorkTurnContext({
-    userId: 'synthetic-owner', user: { personalization: { orchestration_mode: 'parallel', parallel_work_known: true } },
-    available: true, agent: { model: 'synthetic-model', provider: 'synthetic',
-      glasshive_options: { orchestration: { tool_mode: mode } } },
-    request: { config: { endpoints: { agents: { providerCapabilities: { synthetic: {
-      models: [{ id: 'synthetic-model', harnessProfile: profile }],
-    } } } } } },
+    userId: 'synthetic-owner',
+    user: { personalization: { orchestration_mode: 'parallel', parallel_work_known: true } },
+    available: true,
+    agent: {
+      model: 'synthetic-model',
+      provider: 'synthetic',
+      glasshive_options: { orchestration: { tool_mode: mode } },
+    },
+    request: {
+      config: {
+        endpoints: {
+          agents: {
+            providerCapabilities: {
+              synthetic: {
+                models: [{ id: 'synthetic-model', harnessProfile: profile }],
+              },
+            },
+          },
+        },
+      },
+    },
     getActiveWorkSnapshotImpl: async () => ({ snapshot: 'fresh', work: [], overflowCount: 0 }),
   });
-  expect(capsule).toContain(`"fullRosterTool":"${mode === 'coordination' ? 'list_workers' : 'active_work_list'}"`);
+  expect(capsule).toContain(
+    `"fullRosterTool":"${mode === 'coordination' ? 'list_workers' : 'active_work_list'}"`,
+  );
 });

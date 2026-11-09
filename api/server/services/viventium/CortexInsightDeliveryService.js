@@ -51,8 +51,11 @@ function createFollowUpTerminalOutcomeRecorder({ service, MessageModel }) {
     const parent = String(parentMessageId || '').trim();
     if (!userId || !parent || !MessageModel) return 0;
     const byMessage = new Map();
-    for (const row of await service.listByParent({ ownerId: userId, parentMessageId: parent,
-      ...(publicationId ? { publicationId } : {}) })) {
+    for (const row of await service.listByParent({
+      ownerId: userId,
+      parentMessageId: parent,
+      ...(publicationId ? { publicationId } : {}),
+    })) {
       const persistedMessageId = String(row?.persistedMessageId || '').trim();
       if (!persistedMessageId) continue;
       byMessage.set(persistedMessageId, [...(byMessage.get(persistedMessageId) || []), row]);
@@ -96,7 +99,9 @@ function withFollowUpTerminalOutcome(service, { MessageModel } = {}) {
             TERMINAL_DELIVERY_STATUSES.has(row?.status) &&
             String(row?.persistedMessageId || '').trim(),
         )
-        .map((row) => JSON.stringify([String(row?.parentMessageId || '').trim(), row?.publicationId || '']))
+        .map((row) =>
+          JSON.stringify([String(row?.parentMessageId || '').trim(), row?.publicationId || '']),
+        )
         .filter((key) => JSON.parse(key)[0]),
     );
     for (const key of parents) {
@@ -153,12 +158,18 @@ async function reconcileFollowUpTerminalOutcomes({
     status: { $in: [...TERMINAL_DELIVERY_STATUSES] },
     $or: [
       { persistedMessageId: { $nin: ['', null] } },
-      { status: 'dropped', dropReason: 'delivery_attempts_exhausted',
-        persistenceStatus: 'pending', persistedMessageId: { $in: ['', null] } },
+      {
+        status: 'dropped',
+        dropReason: 'delivery_attempts_exhausted',
+        persistenceStatus: 'pending',
+        persistedMessageId: { $in: ['', null] },
+      },
     ],
     ...(cursor ? { _id: { $gt: cursor } } : {}),
   })
-    .select('_id userId conversationId parentMessageId persistedMessageId persistenceStatus status dropReason publicationId')
+    .select(
+      '_id userId conversationId parentMessageId persistedMessageId persistenceStatus status dropReason publicationId',
+    )
     .sort({ _id: 1 })
     .limit(batchSize)
     .lean();
@@ -171,16 +182,29 @@ async function reconcileFollowUpTerminalOutcomes({
     const persistedMessageId = String(row?.persistedMessageId || '').trim();
     const parentMessageId = String(row?.parentMessageId || '').trim();
     if (!userId || !parentMessageId) continue;
-    if (recoverOwnedPresentation && row.status === 'dropped' &&
-      row.dropReason === 'delivery_attempts_exhausted') {
+    if (
+      recoverOwnedPresentation &&
+      row.status === 'dropped' &&
+      row.dropReason === 'delivery_attempts_exhausted'
+    ) {
       try {
-        if (await recoverOwnedPresentation({ ownerId: userId,
-          conversationId: row.conversationId, parentMessageId, persistedMessageId,
-          publicationId: row.publicationId || '' })) continue;
+        if (
+          await recoverOwnedPresentation({
+            ownerId: userId,
+            conversationId: row.conversationId,
+            parentMessageId,
+            persistedMessageId,
+            publicationId: row.publicationId || '',
+          })
+        )
+          continue;
       } catch (error) {
-        logger.warn('[VIVENTIUM][cortex-insight-delivery] Owned saved publication remains pending', {
-          code: String(error?.code || error?.name || 'owned_presentation_unavailable'),
-        });
+        logger.warn(
+          '[VIVENTIUM][cortex-insight-delivery] Owned saved publication remains pending',
+          {
+            code: String(error?.code || error?.name || 'owned_presentation_unavailable'),
+          },
+        );
         continue;
       }
     }
@@ -210,7 +234,8 @@ async function reconcileFollowUpTerminalOutcomes({
     const group =
       followUps.get(`${user}\u0000${message?.messageId}`) ||
       parents.get(`${user}\u0000${message?.messageId}\u0000${persistedMessageId}`);
-    const parentKey = group && `${group.userId}\u0000${group.parentMessageId}\u0000${group.publicationId}`;
+    const parentKey =
+      group && `${group.userId}\u0000${group.parentMessageId}\u0000${group.publicationId}`;
     if (!group || reflectedParents.has(parentKey)) continue;
     reflectedParents.add(parentKey);
     try {
@@ -239,7 +264,8 @@ async function readAcceptedVoiceDispatch(row) {
     deletedAt: null,
   }).lean();
   return resolveAcceptedVoiceCortexDispatch(message, {
-    ownerId: String(row.userId), parentMessageId: row.parentMessageId,
+    ownerId: String(row.userId),
+    parentMessageId: row.parentMessageId,
   });
 }
 
@@ -283,8 +309,8 @@ const voicePresentationDependencies = {
         'metadata.viventium.cortexPresentationParentMessageId': receipt.parentMessageId,
         'metadata.viventium.cortexInsightDeliveryIds':
           message.metadata.viventium.cortexInsightDeliveryIds,
-        'metadata.viventium.deliveryAcknowledgement.cortexPresentation':
-          message.metadata?.viventium?.deliveryAcknowledgement?.cortexPresentation || { $exists: false },
+        'metadata.viventium.deliveryAcknowledgement.cortexPresentation': message.metadata?.viventium
+          ?.deliveryAcknowledgement?.cortexPresentation || { $exists: false },
       },
       { $set: { 'metadata.viventium.deliveryAcknowledgement.cortexPresentation': receipt } },
     );

@@ -1150,7 +1150,12 @@ const RECOVERY_ATTEMPT_LIMIT =
   Number(ViventiumCortexInsightDelivery?.schema?.path?.('recoveryAttemptNumber')?.options?.max) ||
   16;
 
-async function loadCortexRecoveryParentDeliveries({ deliveryModel, ownerId, parentMessageId, publicationId = '' }) {
+async function loadCortexRecoveryParentDeliveries({
+  deliveryModel,
+  ownerId,
+  parentMessageId,
+  publicationId = '',
+}) {
   if (typeof deliveryModel?.find !== 'function') return [];
   const query = deliveryModel.find({
     userId: String(ownerId || '').trim(),
@@ -1420,7 +1425,7 @@ async function recoverPendingCortexInsightDeliveries({
           await deliveryService.listByParent({
             ownerId: parent.ownerId,
             parentMessageId: parent.parentMessageId,
-        ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
+            ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
           })
         ).filter((row) => !['sent', 'dropped'].includes(row.status));
         if (!rows.length) continue;
@@ -1470,7 +1475,7 @@ async function recoverPendingCortexInsightDeliveries({
               voiceTaskId: authority.taskId,
               conversationId: parent.conversationId,
               parentMessageId: parent.parentMessageId,
-        ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
+              ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
               messageId: rows[0].persistedMessageId,
             });
           } catch (error) {
@@ -1587,7 +1592,7 @@ async function recoverPendingCortexInsightDeliveries({
           ownerId: parent.ownerId,
           conversationId: parent.conversationId,
           parentMessageId: parent.parentMessageId,
-        ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
+          ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
           messageId: persistedMessageIds[0],
         });
         if (!message) {
@@ -1608,7 +1613,7 @@ async function recoverPendingCortexInsightDeliveries({
         const rows = await deliveryService.listByParent({
           ownerId: parent.ownerId,
           parentMessageId: parent.parentMessageId,
-        ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
+          ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
         });
         const terminal = rows.filter((row) =>
           batch.claimed.some((claim) => claim.deliveryId === row.deliveryId),
@@ -1700,7 +1705,7 @@ async function recoverPendingCortexInsightDeliveries({
           claims: batch.claimed,
           surface,
           parentMessageId: parent.parentMessageId,
-        ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
+          ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
           persistedMessageId: message.messageId,
           messageRevision: revision,
         });
@@ -1728,7 +1733,7 @@ async function recoverPendingCortexInsightDeliveries({
               claims: presentationFence.claims,
               surface,
               parentMessageId: parent.parentMessageId,
-        ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
+              ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
               persistedMessageId: message.messageId,
               messageRevision: revision,
             });
@@ -1797,7 +1802,7 @@ async function recoverPendingCortexInsightDeliveries({
             const terminalBatch = await deliveryService.claimPendingByParent({
               ownerId: parent.ownerId,
               parentMessageId: parent.parentMessageId,
-        ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
+              ...(parent.publicationId ? { publicationId: parent.publicationId } : {}),
               surface: parent.surface,
               terminalSettlement: true,
             });

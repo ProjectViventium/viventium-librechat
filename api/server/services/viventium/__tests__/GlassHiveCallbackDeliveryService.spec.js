@@ -1154,31 +1154,53 @@ describe('GlassHiveCallbackDeliveryService', () => {
     },
   );
 
-  test.each(['voice_note', 'text', undefined])('durable callback projects original inputMode %s', async (inputMode) => {
-    mockFindOneAndUpdate.mockImplementation((_filter, update) => leanResult({ ...update.$setOnInsert }));
-    const result = await enqueueGlassHiveCallbackDelivery({
-      body: { callback_id: 'callback-mode', event: 'main.followup', inputMode: 'voice_call' },
-      message: { messageId: 'main-message', text: 'The result.' }, text: 'The result.',
-      deliveryContext: { ownerId: 'owner', conversationId: 'conversation', originRef: 'origin', inputMode,
-        destinations: [{ surface: 'telegram', telegramChatId: 'chat', telegramUserId: 'telegram-user' }] },
-    });
-    expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.inputMode).toBe(inputMode);
-    expect(result.deliveries[0].inputMode).toBe(inputMode);
-  });
+  test.each(['voice_note', 'text', undefined])(
+    'durable callback projects original inputMode %s',
+    async (inputMode) => {
+      mockFindOneAndUpdate.mockImplementation((_filter, update) =>
+        leanResult({ ...update.$setOnInsert }),
+      );
+      const result = await enqueueGlassHiveCallbackDelivery({
+        body: { callback_id: 'callback-mode', event: 'main.followup', inputMode: 'voice_call' },
+        message: { messageId: 'main-message', text: 'The result.' },
+        text: 'The result.',
+        deliveryContext: {
+          ownerId: 'owner',
+          conversationId: 'conversation',
+          originRef: 'origin',
+          inputMode,
+          destinations: [
+            { surface: 'telegram', telegramChatId: 'chat', telegramUserId: 'telegram-user' },
+          ],
+        },
+      });
+      expect(mockFindOneAndUpdate.mock.calls[0][1].$setOnInsert.inputMode).toBe(inputMode);
+      expect(result.deliveries[0].inputMode).toBe(inputMode);
+    },
+  );
 
   test('scheduled Main carries byte-exact canonical text for its proof and gateway digest', async () => {
-    mockFindOneAndUpdate.mockImplementation((_filter, update) => leanResult({ ...update.$setOnInsert }));
+    mockFindOneAndUpdate.mockImplementation((_filter, update) =>
+      leanResult({ ...update.$setOnInsert }),
+    );
     const text = '  Actual Main reply.\n';
     const result = await enqueueGlassHiveCallbackDelivery({
       body: { callback_id: 'schedule-main-whitespace', event: 'main.followup' },
-      message: { messageId: 'message-main', text }, text,
-      deliveryContext: { ownerId: 'owner-main', conversationId: 'conversation-main', originRef: 'binding-main',
+      message: { messageId: 'message-main', text },
+      text,
+      deliveryContext: {
+        ownerId: 'owner-main',
+        conversationId: 'conversation-main',
+        originRef: 'binding-main',
         mainGenerationPresentation: { streamId: 'stream-main', admissionId: 'admission-main' },
-        destinations: [{ surface: 'telegram', telegramChatId: 'chat-main' }] },
+        destinations: [{ surface: 'telegram', telegramChatId: 'chat-main' }],
+      },
     });
     expect(result.deliveries[0].fullText).toBe(text);
     expect(result.deliveries[0].text).toBe(text.trim());
-    expect(result.deliveries[0].mainGenerationPresentation.responseDigest).toBe('sha256:' + require('crypto').createHash('sha256').update(text).digest('hex'));
+    expect(result.deliveries[0].mainGenerationPresentation.responseDigest).toBe(
+      'sha256:' + require('crypto').createHash('sha256').update(text).digest('hex'),
+    );
   });
   test('Main presentation identity excludes raw callback rows and cannot rewrite a sent receipt', async () => {
     const rows = new Map();
@@ -2853,28 +2875,53 @@ describe('GlassHiveCallbackDeliveryService', () => {
   test('unlinked bounded prefix defers so a later linked owner can progress', async () => {
     const matches = require('sift').default;
     const rows = Array.from({ length: 25 }, (_, i) => ({
-      deliveryId: `unlinked-${i}`, userId: `owner-unlinked-${i}`, surface: 'telegram',
-      status: 'unresolved', createdAt: new Date(i), nextAttemptAt: null,
-    })).concat({ deliveryId: 'linked-last', userId: 'owner-linked', surface: 'telegram',
-      status: 'unresolved', createdAt: new Date(30), nextAttemptAt: null });
+      deliveryId: `unlinked-${i}`,
+      userId: `owner-unlinked-${i}`,
+      surface: 'telegram',
+      status: 'unresolved',
+      createdAt: new Date(i),
+      nextAttemptAt: null,
+    })).concat({
+      deliveryId: 'linked-last',
+      userId: 'owner-linked',
+      surface: 'telegram',
+      status: 'unresolved',
+      createdAt: new Date(30),
+      nextAttemptAt: null,
+    });
     mockFindDeliveries.mockImplementation((filter) => {
       let limit = Infinity;
-      const q = { sort: () => q, limit: (n) => { limit = n; return q; },
-        lean: async () => rows.filter(matches(filter)).slice(0, limit) };
+      const q = {
+        sort: () => q,
+        limit: (n) => {
+          limit = n;
+          return q;
+        },
+        lean: async () => rows.filter(matches(filter)).slice(0, limit),
+      };
       return q;
     });
     mockResolveTelegramMappingByUserId.mockImplementation(async ({ libreChatUserId }) =>
-      libreChatUserId === 'owner-linked' ? { telegramUserId: '77', telegramChatId: '77' } : null);
+      libreChatUserId === 'owner-linked' ? { telegramUserId: '77', telegramChatId: '77' } : null,
+    );
     mockUpdateOne.mockImplementation(async (filter, update) => {
-      const row = rows.find(matches(filter)); if (row) Object.assign(row, update.$set);
+      const row = rows.find(matches(filter));
+      if (row) Object.assign(row, update.$set);
       return { matchedCount: row ? 1 : 0 };
     });
     mockFindOneAndUpdate.mockImplementation((filter, update) => {
-      const row = rows.find(matches(filter)); if (row) Object.assign(row, update.$set);
+      const row = rows.find(matches(filter));
+      if (row) Object.assign(row, update.$set);
       return leanResult(row || null);
     });
-    expect(await reconcileUnresolvedGlassHiveCallbackDeliveries({ limit: 25 })).toMatchObject({ scanned: 25, pending: 25 });
-    expect(await reconcileUnresolvedGlassHiveCallbackDeliveries({ limit: 25 })).toMatchObject({ scanned: 1, repaired: 1 });
+    expect(await reconcileUnresolvedGlassHiveCallbackDeliveries({ limit: 25 })).toMatchObject({
+      scanned: 25,
+      pending: 25,
+    });
+    expect(await reconcileUnresolvedGlassHiveCallbackDeliveries({ limit: 25 })).toMatchObject({
+      scanned: 1,
+      repaired: 1,
+    });
     expect(rows.at(-1)).toMatchObject({ status: 'pending', telegramUserId: '77' });
     expect(rows[0].status).toBe('unresolved');
   });

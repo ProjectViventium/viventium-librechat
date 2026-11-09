@@ -21,9 +21,8 @@ module.exports = createNativeCoordinatorResultSourceVerifier({
         { session },
       ),
   readGoal: (ownerId, conversationId, goalId) =>
-    readNativeCoordinatorGoalSnapshot(
-      { ownerId, conversationId, goalId },
-      (ownerId, path) => requestAccountApi({ ownerId, path }),
+    readNativeCoordinatorGoalSnapshot({ ownerId, conversationId, goalId }, (ownerId, path) =>
+      requestAccountApi({ ownerId, path }),
     ),
   readResult: (ownerId, cid, gid, runId) =>
     requestAccountApi({

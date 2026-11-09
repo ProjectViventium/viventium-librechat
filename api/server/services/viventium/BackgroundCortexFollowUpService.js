@@ -65,7 +65,12 @@ const {
 } = require('./CortexInsightDeliveryService');
 const { settleOwnedCompletedCortexInsights } = require('./CortexInsightOutboxService');
 
-const { getTrustedInteractionContext, getTrustedDeliveryPolicy, getTrustedAdapterCapabilities, setTrustedInteractionContext } = require('./interactionContext');
+const {
+  getTrustedInteractionContext,
+  getTrustedDeliveryPolicy,
+  getTrustedAdapterCapabilities,
+  setTrustedInteractionContext,
+} = require('./interactionContext');
 const { getCortexFollowupGraceMs } = require('./cortexFollowupGrace');
 
 /* === VIVENTIUM START ===
@@ -297,7 +302,9 @@ function getFollowUpErrorStatus(error) {
 function getFollowUpErrorCode(error) {
   for (const current of followUpErrorChain(error)) {
     for (const candidate of [current.code, current.lc_error_code, current.error?.code]) {
-      const code = String(candidate || '').trim().toUpperCase();
+      const code = String(candidate || '')
+        .trim()
+        .toUpperCase();
       if (code) return code;
     }
   }
@@ -308,9 +315,12 @@ function isRetryableFollowUpTransportError(error) {
   if (getFollowUpErrorCode(error) === 'NATIVE_OUTPUT_FILES_IDENTITY_UNAVAILABLE') return false;
   const status = getFollowUpErrorStatus(error);
   if (status != null) return [408, 425, 429, 502, 503, 504].includes(status);
-  return followUpErrorChain(error).some((current) =>
-    RETRYABLE_FOLLOW_UP_TRANSPORT_CODES.has(getFollowUpErrorCode(current)) ||
-    current.name === 'APIConnectionError' || current.name === 'FetchError');
+  return followUpErrorChain(error).some(
+    (current) =>
+      RETRYABLE_FOLLOW_UP_TRANSPORT_CODES.has(getFollowUpErrorCode(current)) ||
+      current.name === 'APIConnectionError' ||
+      current.name === 'FetchError',
+  );
 }
 
 function hasDurableFollowUpReattachContract(providerCapability, llmConfig) {
@@ -1802,8 +1812,11 @@ async function resolveDurableMissionUserSources({ req, insightsData, conversatio
       const source = insight.authority.userSource;
       const message =
         source?.messageId && source?.conversationId ? sources.get(sourceKey(source)) : null;
-      const text = message ? (typeof message.text === 'string' ? message.text
-        : extractTextFromMessageContent(message.content)) : '';
+      const text = message
+        ? typeof message.text === 'string'
+          ? message.text
+          : extractTextFromMessageContent(message.content)
+        : '';
       const sourceFiles = normalizeInteractionSourceFiles(message?.files || message?.attachments);
       return {
         ...insight,
@@ -1933,8 +1946,13 @@ async function resolveFollowUpLLMConfig({
     // Match this Run's actual execution contract without changing the saved Main participant.
     resolvedAgent = {
       ...JSON.parse(JSON.stringify(resolvedAgent)),
-      tools: [], toolDefinitions: [], toolRegistry: new Map(), declaredToolNames: [],
-      mcp: [], agent_ids: [], edges: [],
+      tools: [],
+      toolDefinitions: [],
+      toolRegistry: new Map(),
+      declaredToolNames: [],
+      mcp: [],
+      agent_ids: [],
+      edges: [],
     };
   }
 
@@ -2067,19 +2085,25 @@ async function resolveFollowUpLLMConfig({
     // A follow-up owns its capability. Never inherit Main's signed grant when the fresh
     // builder has no eligible resources or cannot authorize this invocation.
     clearConversationProviderCapabilityBundle(resolvedAgent);
-    const coordinationOnly = resolvedAgent.glasshive_options?.orchestration?.tool_mode === 'coordination';
+    const coordinationOnly =
+      resolvedAgent.glasshive_options?.orchestration?.tool_mode === 'coordination';
     let inheritedConversation;
     if (coordinationOnly) {
       if (!inheritedContext?.prompt) throw new Error('coordination_context_unavailable');
-      const { buildInheritedConversationContext, prependInheritedConversationPayload } =
-        require('./ViventiumMainContextService');
+      const {
+        buildInheritedConversationContext,
+        prependInheritedConversationPayload,
+      } = require('./ViventiumMainContextService');
       inheritedConversation = buildInheritedConversationContext({
         conversationId: conversationId || req.body?.conversationId || '',
         messages: prependInheritedConversationPayload(
-          inheritedContext.messages || [], req._viventiumInheritedConversationContext,
+          inheritedContext.messages || [],
+          req._viventiumInheritedConversationContext,
         ),
-        sections: { conversationContinuity: inheritedContext.continuationContext,
-          resultEvidence: JSON.stringify(inheritedContext.evidence) },
+        sections: {
+          conversationContinuity: inheritedContext.continuationContext,
+          resultEvidence: JSON.stringify(inheritedContext.evidence),
+        },
       });
     }
     await attachConversationProviderCapabilityBundle({
@@ -2104,16 +2128,19 @@ async function resolveFollowUpLLMConfig({
         {};
       let runtimeHeaders = withoutMainTurnCarrierHeaders(existingHeaders);
       if (inheritedContext?.turnContextB64) {
-        if (!Number.isSafeInteger(inheritedContext.selectedCarrierBytes) ||
-            inheritedContext.selectedCarrierBytes <= 0) {
+        if (
+          !Number.isSafeInteger(inheritedContext.selectedCarrierBytes) ||
+          inheritedContext.selectedCarrierBytes <= 0
+        ) {
           throw Object.assign(new Error('Native context allocation is unavailable'), {
-            code: 'source_context_unavailable', status: 413,
+            code: 'source_context_unavailable',
+            status: 413,
           });
         }
-        runtimeHeaders['X-GlassHive-Turn-Context-B64'] =
-          inheritedContext.turnContextB64;
-        runtimeHeaders['X-Viventium-Turn-Context-Max-Bytes'] =
-          String(inheritedContext.selectedCarrierBytes);
+        runtimeHeaders['X-GlassHive-Turn-Context-B64'] = inheritedContext.turnContextB64;
+        runtimeHeaders['X-Viventium-Turn-Context-Max-Bytes'] = String(
+          inheritedContext.selectedCarrierBytes,
+        );
       }
       if (followUpCapability?.workspace_binding === true) {
         const providerDefaultAccess =
@@ -2486,7 +2513,11 @@ function formatFollowUpPrompt({
         i?.authority?.kind,
       );
       const text =
-        typeof i.insight === 'string' ? (mission || nativeResult ? i.insight : i.insight.trim()) : '';
+        typeof i.insight === 'string'
+          ? mission || nativeResult
+            ? i.insight
+            : i.insight.trim()
+          : '';
       if (!text) {
         return null;
       }
@@ -2558,9 +2589,7 @@ function formatFollowUpPrompt({
   const recentBlock = cleanRecent || '(short acknowledgment)';
   const currentUserRequest =
     primaryResponseMode && cleanContinuation
-      ? [cleanUserRequest, cleanContinuation]
-          .filter(Boolean)
-          .join('\n\n')
+      ? [cleanUserRequest, cleanContinuation].filter(Boolean).join('\n\n')
       : cleanUserRequest;
   const userRequestBlock = currentUserRequest
     ? currentUserRequest
@@ -3086,105 +3115,172 @@ async function generateFollowUpText({
     );
   }
   const sourceReq = req;
-  const eventId = nativeAuthor?.messageId || buildHarnessIdempotencyKey(
-    'phase_b_context', runId || parentMessageId, runtimeAgent.id,
-  );
+  const eventId =
+    nativeAuthor?.messageId ||
+    buildHarnessIdempotencyKey('phase_b_context', runId || parentMessageId, runtimeAgent.id);
   const leaf = resolveConversationLeafMessageId(conversationMessages, parentMessageId);
   const sourceInteraction = getTrustedInteractionContext(sourceReq);
   // The accepted source stays the task; the rendered result prompt is evidence for Main only.
   const durableSources = insights.filter(isDurableMissionInsight).flatMap(({ authority }) => {
     const source = authority.userSource;
     return source?.status === 'available' && typeof source.text === 'string'
-      ? [{ source_event_id: source.messageId, source_message_id: source.messageId,
-          source_persisted: true, source_index: 0, text: source.text,
-          ...(source.source_files?.length ? { source_files: source.source_files } : {}) }]
+      ? [
+          {
+            source_event_id: source.messageId,
+            source_message_id: source.messageId,
+            source_persisted: true,
+            source_index: 0,
+            text: source.text,
+            ...(source.source_files?.length ? { source_files: source.source_files } : {}),
+          },
+        ]
       : [];
   });
-  const sourceMessages = new Map((conversationMessages || []).map((message) => [message.messageId, message]));
+  const sourceMessages = new Map(
+    (conversationMessages || []).map((message) => [message.messageId, message]),
+  );
   const parentSource = sourceMessages.get(parentMessageId);
-  const candidateSource = parentSource?.isCreatedByUser === true ? parentSource
-    : sourceMessages.get(parentSource?.parentMessageId);
+  const candidateSource =
+    parentSource?.isCreatedByUser === true
+      ? parentSource
+      : sourceMessages.get(parentSource?.parentMessageId);
   const original = candidateSource?.isCreatedByUser === true ? candidateSource : undefined;
   const sourceSegments = normalizeInteractionSourceSegments(
-    sourceInteraction?.source_segments?.length ? sourceInteraction.source_segments
-      : durableSources.length ? durableSources
-      : userRequest ? [{ source_event_id: original?.messageId || sourceInteraction?.source_event_id
-          || sourceReq.body?.messageId || eventId, source_index: 0,
-          ...(original?.messageId ? { source_message_id: original.messageId } : {}),
-          text: original?.isCreatedByUser === true && typeof original.text === 'string'
-            ? original.text : userRequest }] : [],
+    sourceInteraction?.source_segments?.length
+      ? sourceInteraction.source_segments
+      : durableSources.length
+        ? durableSources
+        : userRequest
+          ? [
+              {
+                source_event_id:
+                  original?.messageId ||
+                  sourceInteraction?.source_event_id ||
+                  sourceReq.body?.messageId ||
+                  eventId,
+                source_index: 0,
+                ...(original?.messageId ? { source_message_id: original.messageId } : {}),
+                text:
+                  original?.isCreatedByUser === true && typeof original.text === 'string'
+                    ? original.text
+                    : userRequest,
+              },
+            ]
+          : [],
   ).segments;
-  const sourceEventId = sourceInteraction?.source_event_id
-    || sourceSegments.at(-1)?.source_event_id || eventId;
+  const sourceEventId =
+    sourceInteraction?.source_event_id || sourceSegments.at(-1)?.source_event_id || eventId;
   const sourceBody = require('~/server/controllers/agents/client').buildViventiumMcpRequestBody({
-    req: sourceReq, agentId: runtimeAgent.id, conversationId,
+    req: sourceReq,
+    agentId: runtimeAgent.id,
+    conversationId,
     messageId: nativeAuthor?.messageId || parentMessageId,
   });
-  const authorContext = await prepareMainAuthorContext({
-    ownerId: String(req.user?.id || ''),
-    agent: { ...runtimeAgent, provider: providerName, model: effectiveModel,
-      model_parameters: { ...runtimeAgent.model_parameters, model: effectiveModel } },
-    conversationId, parentMessageId: leaf, messageId: eventId, text: prompt, sourceEventId, sourceSegments,
-    messages: Array.isArray(conversationMessages) ? conversationMessages : [],
-    request: { ...req, body: { ...req.body, ...sourceBody } },
-  }, {
-    readUser: (ownerId) => db.getUserById(ownerId, '-password -__v -totpSecret -backupCodes'),
-    readConfig: (role) => require('~/server/services/Config').getAppConfig({ role }),
-    bindRequest: (authorReq) => {
-      if (nativeAuthor?.scope && nativeAuthor?.messageId) {
-        authorReq.body.viventiumResultAuthor = {
-          scope: nativeAuthor.scope, messageId: nativeAuthor.messageId,
-        };
-      } else {
-        // An in-process continuation keeps its real source job; never invent a foreground job.
-        if (sourceBody.viventiumStreamId) {
-          for (const field of ['viventiumStreamId', 'viventiumLogicalTurnId',
-            'viventiumLogicalTurnRevision', 'viventiumAuthoringSourceEventId', 'viventiumAuthoringSourceRevision'])
-            authorReq.body[field] = sourceBody[field];
-        } else authorReq.body.viventiumResultAuthor = null;
-      }
-      const interaction = getTrustedInteractionContext(sourceReq);
-      if (interaction?.origin === 'scheduler') {
-        authorReq.viventiumSchedulerDueAdmissionId = sourceReq.viventiumSchedulerDueAdmissionId;
-        authorReq.viventiumSchedulerDueStreamId = sourceReq._resumableStreamId || sourceReq.body?.streamId;
-      }
-      setTrustedInteractionContext(authorReq, {
-        actor_kind: 'system',
-        origin: interaction?.origin === 'scheduler' ? 'scheduler' : 'callback',
-        surface: interaction?.surface || (sourceReq._viventiumTelegram === true ? 'telegram'
-          : sourceReq.viventiumCallSession ? 'voice' : 'web'),
-        source_event_id: sourceEventId, conversation_id: conversationId,
-        source_segments: authorReq.body.viventiumTriggeringSourceSegments,
-        ...(interaction?.schedule_id ? { schedule_id: interaction.schedule_id } : {}),
-        ...(interaction?.schedule_run_id ? { schedule_run_id: interaction.schedule_run_id } : {}),
-      }, getTrustedAdapterCapabilities(sourceReq) || undefined,
-      getTrustedDeliveryPolicy(sourceReq) || undefined);
-      if (interaction?.origin === 'callback' &&
-          Object.prototype.hasOwnProperty.call(sourceReq, '_viventiumFeelingReadFailureClass')) {
-        authorReq._viventiumFeelingSnapshotPromise = Promise.resolve(sourceReq._viventiumFeelingSnapshot);
-        authorReq._viventiumFeelingReadFailureClass = sourceReq._viventiumFeelingReadFailureClass;
-      }
-      if (sourceReq[ownedVoiceCortexRecovery])
-        authorReq[ownedVoiceCortexRecovery] = sourceReq[ownedVoiceCortexRecovery];
-      if (sourceReq._viventiumInheritedConversationContext)
-        Object.defineProperty(authorReq, '_viventiumInheritedConversationContext', {
-          value: sourceReq._viventiumInheritedConversationContext,
+  const authorContext = await prepareMainAuthorContext(
+    {
+      ownerId: String(req.user?.id || ''),
+      agent: {
+        ...runtimeAgent,
+        provider: providerName,
+        model: effectiveModel,
+        model_parameters: { ...runtimeAgent.model_parameters, model: effectiveModel },
+      },
+      conversationId,
+      parentMessageId: leaf,
+      messageId: eventId,
+      text: prompt,
+      sourceEventId,
+      sourceSegments,
+      messages: Array.isArray(conversationMessages) ? conversationMessages : [],
+      request: { ...req, body: { ...req.body, ...sourceBody } },
+    },
+    {
+      readUser: (ownerId) => db.getUserById(ownerId, '-password -__v -totpSecret -backupCodes'),
+      readConfig: (role) => require('~/server/services/Config').getAppConfig({ role }),
+      bindRequest: (authorReq) => {
+        if (nativeAuthor?.scope && nativeAuthor?.messageId) {
+          authorReq.body.viventiumResultAuthor = {
+            scope: nativeAuthor.scope,
+            messageId: nativeAuthor.messageId,
+          };
+        } else {
+          // An in-process continuation keeps its real source job; never invent a foreground job.
+          if (sourceBody.viventiumStreamId) {
+            for (const field of [
+              'viventiumStreamId',
+              'viventiumLogicalTurnId',
+              'viventiumLogicalTurnRevision',
+              'viventiumAuthoringSourceEventId',
+              'viventiumAuthoringSourceRevision',
+            ])
+              authorReq.body[field] = sourceBody[field];
+          } else authorReq.body.viventiumResultAuthor = null;
+        }
+        const interaction = getTrustedInteractionContext(sourceReq);
+        if (interaction?.origin === 'scheduler') {
+          authorReq.viventiumSchedulerDueAdmissionId = sourceReq.viventiumSchedulerDueAdmissionId;
+          authorReq.viventiumSchedulerDueStreamId =
+            sourceReq._resumableStreamId || sourceReq.body?.streamId;
+        }
+        setTrustedInteractionContext(
+          authorReq,
+          {
+            actor_kind: 'system',
+            origin: interaction?.origin === 'scheduler' ? 'scheduler' : 'callback',
+            surface:
+              interaction?.surface ||
+              (sourceReq._viventiumTelegram === true
+                ? 'telegram'
+                : sourceReq.viventiumCallSession
+                  ? 'voice'
+                  : 'web'),
+            source_event_id: sourceEventId,
+            conversation_id: conversationId,
+            source_segments: authorReq.body.viventiumTriggeringSourceSegments,
+            ...(interaction?.schedule_id ? { schedule_id: interaction.schedule_id } : {}),
+            ...(interaction?.schedule_run_id
+              ? { schedule_run_id: interaction.schedule_run_id }
+              : {}),
+          },
+          getTrustedAdapterCapabilities(sourceReq) || undefined,
+          getTrustedDeliveryPolicy(sourceReq) || undefined,
+        );
+        if (
+          interaction?.origin === 'callback' &&
+          Object.prototype.hasOwnProperty.call(sourceReq, '_viventiumFeelingReadFailureClass')
+        ) {
+          authorReq._viventiumFeelingSnapshotPromise = Promise.resolve(
+            sourceReq._viventiumFeelingSnapshot,
+          );
+          authorReq._viventiumFeelingReadFailureClass = sourceReq._viventiumFeelingReadFailureClass;
+        }
+        if (sourceReq[ownedVoiceCortexRecovery])
+          authorReq[ownedVoiceCortexRecovery] = sourceReq[ownedVoiceCortexRecovery];
+        if (sourceReq._viventiumInheritedConversationContext)
+          Object.defineProperty(authorReq, '_viventiumInheritedConversationContext', {
+            value: sourceReq._viventiumInheritedConversationContext,
+          });
+        if (sourceReq.viventiumCallSession)
+          authorReq.viventiumCallSession = sourceReq.viventiumCallSession;
+        if (sourceReq._viventiumTelegram === true) authorReq._viventiumTelegram = true;
+        inheritCurrentCallContext(sourceReq, authorReq);
+      },
+      createClient: async (authorReq, authorAgent) => {
+        const { initializeClient } = require('~/server/services/Endpoints/agents/initialize');
+        const { client } = await initializeClient({
+          req: authorReq,
+          res: { locals: {} },
+          signal: new AbortController().signal,
+          endpointOption: {
+            endpoint: EModelEndpoint.agents,
+            agent: Promise.resolve(authorAgent),
+            model_parameters: authorAgent.model_parameters,
+          },
         });
-      if (sourceReq.viventiumCallSession)
-        authorReq.viventiumCallSession = sourceReq.viventiumCallSession;
-      if (sourceReq._viventiumTelegram === true) authorReq._viventiumTelegram = true;
-      inheritCurrentCallContext(sourceReq, authorReq);
+        return client;
+      },
     },
-    createClient: async (authorReq, authorAgent) => {
-      const { initializeClient } = require('~/server/services/Endpoints/agents/initialize');
-      const { client } = await initializeClient({
-        req: authorReq, res: { locals: {} }, signal: new AbortController().signal,
-        endpointOption: { endpoint: EModelEndpoint.agents,
-          agent: Promise.resolve(authorAgent), model_parameters: authorAgent.model_parameters },
-      });
-      return client;
-    },
-  });
+  );
   req = authorContext.req;
   const tools = [];
   const llmConfig = await resolveFollowUpLLMConfig({
@@ -3198,9 +3294,14 @@ async function generateFollowUpText({
     conversationId,
     parentMessageId,
     responseMessageId: nativeAuthor?.messageId,
-    inheritedContext: { prompt, evidence: insights, messages: conversationMessages, continuationContext,
+    inheritedContext: {
+      prompt,
+      evidence: insights,
+      messages: conversationMessages,
+      continuationContext,
       turnContextB64: req.body?.viventiumGlassHiveTurnContextB64,
-      selectedCarrierBytes: authorContext.selectedCarrierBytes },
+      selectedCarrierBytes: authorContext.selectedCarrierBytes,
+    },
     tools,
   });
   if (!llmConfig?.provider) {
@@ -3276,7 +3377,8 @@ async function generateFollowUpText({
   bindConversationProviderDeveloperInstructionTail({
     targetAgent: followUpAuthority,
     tail: buildViventiumDynamicTail({
-      memory: authorContext.memoryContext, capsule: phaseBFeelingInjection.capsule,
+      memory: authorContext.memoryContext,
+      capsule: phaseBFeelingInjection.capsule,
     }),
   });
   llmConfig.configuration = followUpAuthority.model_parameters.configuration;
@@ -3441,11 +3543,15 @@ async function generateFollowUpText({
     ownerId: String(req?.user?.id || ''),
   });
   const preparedEvent = authorContext.messages.at(-1);
-  const preparedEventText = typeof preparedEvent?.content === 'string'
-    ? preparedEvent.content
-    : Array.isArray(preparedEvent?.content) && preparedEvent.content.every(
-      (part) => part.type === 'text' && typeof part.text === 'string',
-    ) ? preparedEvent.content.map((part) => part.text).join('') : null;
+  const preparedEventText =
+    typeof preparedEvent?.content === 'string'
+      ? preparedEvent.content
+      : Array.isArray(preparedEvent?.content) &&
+          preparedEvent.content.every(
+            (part) => part.type === 'text' && typeof part.text === 'string',
+          )
+        ? preparedEvent.content.map((part) => part.text).join('')
+        : null;
   if (preparedEvent?._getType() !== 'human' || preparedEventText !== prompt) {
     throw new Error('main_author_event_context_mismatch');
   }
@@ -3461,10 +3567,7 @@ async function generateFollowUpText({
   const content = await processFollowUpWithDurableReattach({
     run,
     input: {
-      messages: [
-        ...authorContext.messages.slice(0, -1),
-        new HumanMessage(modelContent),
-      ],
+      messages: [...authorContext.messages.slice(0, -1), new HumanMessage(modelContent)],
     },
     config,
     providerCapability: followUpProviderCapability,

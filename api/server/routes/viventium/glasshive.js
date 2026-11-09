@@ -1176,19 +1176,20 @@ async function handleGlassHiveCallback(req, res) {
           workRef: deliveryContext.workRef,
         },
       });
-    const terminalResultGate = isGlassHiveWorkTerminalCallback(callbackBody) || runOnlyCompletion
-      ? await runGlassHiveTerminalCallbackTransaction(
-          async (effectSession) => {
-            await fenceGlassHiveCallbackRunState({
-              binding: deliveryContext,
-              body: callbackBody,
-              effectSession,
-            });
-            return receiveTerminalResult();
-          },
-          { retry: 'native' },
-        )
-      : await receiveTerminalResult();
+    const terminalResultGate =
+      isGlassHiveWorkTerminalCallback(callbackBody) || runOnlyCompletion
+        ? await runGlassHiveTerminalCallbackTransaction(
+            async (effectSession) => {
+              await fenceGlassHiveCallbackRunState({
+                binding: deliveryContext,
+                body: callbackBody,
+                effectSession,
+              });
+              return receiveTerminalResult();
+            },
+            { retry: 'native' },
+          )
+        : await receiveTerminalResult();
     if (terminalResultGate.applies && 'error' in terminalResultGate) {
       return res.status(terminalResultGate.httpStatus).json({ error: terminalResultGate.error });
     }
@@ -1363,13 +1364,24 @@ async function handleGlassHiveCallback(req, res) {
     String(deliveryContext.conversationId || '').trim(),
   );
   if (runOnlyCompletion) {
-    await runTerminalEffect((effectFence, effectSession) => enqueueGlassHiveMissionAdjudication({
-      binding: deliveryContext, body: callbackBody, effectFence, effectSession,
-    }), { retry: 'native' });
-    return res.status(202).json(withTerminalResultReceipt(
-      httpAcceptedPayload({ deliverySummary: { deferredToMain: true } }),
-      terminalResultReceipt,
-    ));
+    await runTerminalEffect(
+      (effectFence, effectSession) =>
+        enqueueGlassHiveMissionAdjudication({
+          binding: deliveryContext,
+          body: callbackBody,
+          effectFence,
+          effectSession,
+        }),
+      { retry: 'native' },
+    );
+    return res
+      .status(202)
+      .json(
+        withTerminalResultReceipt(
+          httpAcceptedPayload({ deliverySummary: { deferredToMain: true } }),
+          terminalResultReceipt,
+        ),
+      );
   }
   if (!conversation) {
     // A valid owner-scoped association remains authoritative after the origin conversation is

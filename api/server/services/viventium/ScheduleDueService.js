@@ -70,15 +70,22 @@ const store = {
     if (!current) return;
     await admissions().updateOne(filter, {
       $unset: { leaseUntil: '', claimToken: '' },
-      $set: { nextAttemptAt: current.dueState === 'unknown' && current.nextAttemptAt
-        ? current.nextAttemptAt : new Date(Date.now() + 2_000), updatedAt: new Date() },
+      $set: {
+        nextAttemptAt:
+          current.dueState === 'unknown' && current.nextAttemptAt
+            ? current.nextAttemptAt
+            : new Date(Date.now() + 2_000),
+        updatedAt: new Date(),
+      },
     });
   },
   wakeStream: (streamId) =>
     admissions().updateOne(
       { kind: 'schedule_due', streamId },
-      { $set: { nextAttemptAt: new Date(), resultRecoveryAttempts: 0 },
-        $unset: { resultRecoveryExhaustedAt: '', resultRecoveryDiagnostic: '' } },
+      {
+        $set: { nextAttemptAt: new Date(), resultRecoveryAttempts: 0 },
+        $unset: { resultRecoveryExhaustedAt: '', resultRecoveryDiagnostic: '' },
+      },
     ),
 };
 const service = createScheduleDueHost({
@@ -187,18 +194,28 @@ const service = createScheduleDueHost({
   readResume: (streamId) => GenerationJobManager.getResumeState(streamId),
   readRetainedResult: async (admission) => {
     const retained = await require('./nativeResponseService').readRetainedMainFinal({
-      userId: admission.userId, streamId: admission.streamId,
-      conversationId: admission.conversationId, includeSettled: true,
+      userId: admission.userId,
+      streamId: admission.streamId,
+      conversationId: admission.conversationId,
+      includeSettled: true,
     });
     const context = retained?.interactionContext;
-    if (retained && context?.origin === 'scheduler' && context.source_event_id === admission.eventId &&
+    if (
+      retained &&
+      context?.origin === 'scheduler' &&
+      context.source_event_id === admission.eventId &&
       context.schedule_id === admission.envelope.schedule_id &&
-      context.schedule_run_id === admission.envelope.occurrence_id) {
+      context.schedule_run_id === admission.envelope.occurrence_id
+    ) {
       return { state: 'complete', messageId: retained.responseMessageId };
     }
     const filter = {
-      user: admission.userId, conversationId: admission.conversationId,
-      deletedAt: null, isCreatedByUser: false, unfinished: false, error: true,
+      user: admission.userId,
+      conversationId: admission.conversationId,
+      deletedAt: null,
+      isCreatedByUser: false,
+      unfinished: false,
+      error: true,
       'nativeResponse.streamId': admission.streamId,
       'nativeResponse.status': { $in: ['failed', 'cancelled'] },
       'metadata.viventium.interactionContext.origin': 'scheduler',
@@ -208,9 +225,12 @@ const service = createScheduleDueHost({
     };
     const failures = await Message.find(filter).select('+nativeResponse').limit(2).lean();
     const failed = failures.length === 1 ? failures[0] : null;
-    if (!failed?.nativeResponse ||
+    if (
+      !failed?.nativeResponse ||
       !(await require('~/models').nativeResponseSourceMatches(failed.nativeResponse)) ||
-      !(await Message.exists({ ...filter, nativeResponse: failed.nativeResponse }))) return null;
+      !(await Message.exists({ ...filter, nativeResponse: failed.nativeResponse }))
+    )
+      return null;
     return { state: 'failed', failureCode: 'scheduled_execution_failed' };
   },
   subscribe: (streamId, onDone) =>
@@ -291,17 +311,28 @@ async function applyConversationScheduleAccess({ bundle, user, requestBody }) {
 }
 async function wakeScheduleDueResult(scope) {
   const final = await require('./nativeResponseService').readRetainedMainFinal({
-    ...scope, includeSettled: true,
+    ...scope,
+    includeSettled: true,
   });
   const context = final?.interactionContext;
   if (!final || context?.origin !== 'scheduler') return;
-  const result = await admissions().updateOne({
-    kind: 'schedule_due', status: 'accepted', dueState: 'unknown',
-    userId: scope.userId, streamId: scope.streamId, conversationId: final.conversationId,
-    eventId: context.source_event_id, 'envelope.schedule_id': context.schedule_id,
-    'envelope.occurrence_id': context.schedule_run_id,
-  }, { $set: { resultMessageId: final.responseMessageId, nextAttemptAt: new Date() },
-    $unset: { resultRecoveryExhaustedAt: '', resultRecoveryDiagnostic: '' } });
+  const result = await admissions().updateOne(
+    {
+      kind: 'schedule_due',
+      status: 'accepted',
+      dueState: 'unknown',
+      userId: scope.userId,
+      streamId: scope.streamId,
+      conversationId: final.conversationId,
+      eventId: context.source_event_id,
+      'envelope.schedule_id': context.schedule_id,
+      'envelope.occurrence_id': context.schedule_run_id,
+    },
+    {
+      $set: { resultMessageId: final.responseMessageId, nextAttemptAt: new Date() },
+      $unset: { resultRecoveryExhaustedAt: '', resultRecoveryDiagnostic: '' },
+    },
+  );
   if (result.modifiedCount) await service.reconcile();
 }
 module.exports = {

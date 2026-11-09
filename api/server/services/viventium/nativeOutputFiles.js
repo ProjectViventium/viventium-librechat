@@ -670,7 +670,7 @@ async function loadRetainedNativeResultFileAccess(ownerId, conversationId) {
           userId: ownerId,
           conversationId,
           responseMessageId: message.messageId,
-          agentId: message.agent_id,
+          agentId: owned.binding.agentId,
         },
       );
       grants.push(

@@ -1397,7 +1397,6 @@ describe('retained Native presentation result file access', () => {
         conversationId: 'conversation',
         messageId: 'saved-native',
         parentMessageId: 'parent',
-        agent_id: 'main',
         metadata: {
           viventium: {
             mainGenerationPresentation: {
@@ -1414,7 +1413,7 @@ describe('retained Native presentation result file access', () => {
       const owned = {
         eligible: mode !== 'held',
         message: { messageId: mode === 'other-message' ? 'other' : message.messageId },
-        binding: { nativeConversationId: 'native-chat' },
+        binding: { nativeConversationId: 'native-chat', agentId: 'main' },
         data: { run_id: 'run' },
         result: {
           publisher,

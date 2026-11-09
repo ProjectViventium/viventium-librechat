@@ -14,6 +14,7 @@ describe('common native interaction scope', () => {
     { actor_kind: 'external_user' as const, origin: 'interactive' as const },
     { actor_kind: 'system' as const, origin: 'scheduler' as const },
     { actor_kind: 'worker' as const, origin: 'callback' as const },
+    { actor_kind: 'system' as const, origin: 'worker' as const },
   ])(
     'binds trusted native authoring scope through the installed SDK: $origin',
     async (interactionContext) => {

@@ -216,7 +216,7 @@ describe('Viventium orchestration data hooks', () => {
         ],
       }),
     ).toBe(5_000);
-    for (const state of ['paused', 'needs_input'] as const) {
+    for (const state of ['paused', 'needs_input', 'blocked'] as const) {
       expect(
         activeWorkRefetchInterval({
           pages: [
@@ -264,6 +264,7 @@ describe('Viventium orchestration data hooks', () => {
       }),
     ).toBe(30_000);
   });
+
 
   test('keeps terminal-only refresh slow even when old worker runtime counts remain', () => {
     expect(

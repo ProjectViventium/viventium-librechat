@@ -46,6 +46,7 @@ function getPolicy(serverConfig = {}) {
     writePolicy: policy.writePolicy || 'deny',
     riskClass: String(policy.riskClass || 'unspecified'),
     reexportNativeTools: policy.reexportNativeTools !== false,
+    nativeServerIds: Array.isArray(policy.nativeServerIds) ? policy.nativeServerIds : [],
     toolPolicies: policy.toolPolicies || {},
     allowUserConfigured: policy.allowUserConfigured === true,
   };

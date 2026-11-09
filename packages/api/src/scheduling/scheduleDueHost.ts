@@ -112,9 +112,7 @@ interface DueHostDependencies {
     request: ScheduledMainRequest,
   ): Promise<{ streamId: string; conversationId: string; deferred?: boolean }>;
   readJob(streamId: string): Promise<{ status: string } | null>;
-  readRetainedResult?(
-    admission: ScheduleDueAdmission,
-  ): Promise<
+  readRetainedResult?(admission: ScheduleDueAdmission): Promise<
     { state: 'complete'; messageId: string } | { state: 'failed'; failureCode: string } | null
   >;
   readResume(streamId: string): Promise<{
@@ -666,6 +664,6 @@ export function createScheduleDueHost(deps: DueHostDependencies) {
     await dispatcher.reconcile();
     if (recoverRequested) requestRecovery();
   }
-  return { receive, ensureTarget, ensureTargets, reconcile };
+  return { receive, ensureTarget, ensureTargets, ensureDestination, reconcile };
 }
 /* === VIVENTIUM END === */

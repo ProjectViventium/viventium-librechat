@@ -82,6 +82,8 @@ jest.mock('@librechat/agents', () => ({
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  prepareMainAuthorContext: (...args) => require('~/test/helpers/mainAuthorContext')
+    .mockMainAuthorContext(jest.requireActual('@librechat/api').prepareMainAuthorContext, ...args),
   createViventiumPersonalAccountCleanupReceiptModel: jest.fn(() => ({})),
   createGlassHiveTerminalCallbackTransactionService: jest.fn(() => ({
     currentGlassHiveTerminalCallbackTransaction: jest.fn(() => null),
@@ -805,7 +807,7 @@ describe('BackgroundCortexFollowUpService', () => {
     let capturedPrompt = '';
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async ({ messages }) => {
-        capturedPrompt = messages[0].content;
+        capturedPrompt = messages.at(-1).content;
         return '{NTA}';
       }),
     });
@@ -1035,7 +1037,7 @@ describe('BackgroundCortexFollowUpService', () => {
     let capturedPrompt = '';
     Run.create.mockResolvedValueOnce({
       processStream: jest.fn(async ({ messages }) => {
-        capturedPrompt = messages[0].content;
+        capturedPrompt = messages.at(-1).content;
         return 'One new missing detail.';
       }),
     });
@@ -1774,7 +1776,7 @@ describe('BackgroundCortexFollowUpService', () => {
   });
 
   // === VIVENTIUM NOTE ===
-  test('generateFollowUpText injects voice rules when voiceMode is true', async () => {
+  test('generateFollowUpText leaves voice rules to ordinary Main preparation', async () => {
     const req = { user: { id: 'u1' }, body: { voiceMode: true } };
     await generateFollowUpText({
       req,
@@ -1796,8 +1798,8 @@ describe('BackgroundCortexFollowUpService', () => {
     const runInstance = await runPromise;
     const callArgs = runInstance.processStream.mock.calls[0][0];
     const prompt = callArgs.messages[0].content;
-    expect(prompt).toContain('For spoken audio, use short sentences');
-    expect(prompt).toContain('Include requested URLs and email addresses in the written reply');
+    expect(prompt).not.toContain('For spoken audio, use short sentences');
+    expect(prompt).not.toContain('Include requested URLs and email addresses in the written reply');
   });
   // === VIVENTIUM NOTE ===
 
@@ -1834,7 +1836,7 @@ describe('BackgroundCortexFollowUpService', () => {
       expect.objectContaining({
         graphConfig: expect.objectContaining({
           instructions: expect.stringContaining(
-            'completing a deferred response after a short holding acknowledgement',
+            'to complete the deferred answer',
           ),
           llmConfig: expect.objectContaining({
             maxTokens: 2000,
@@ -1864,7 +1866,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
     expect(initializeOpenAI).toHaveBeenCalledWith(
       expect.objectContaining({
-        req,
+        req: expect.objectContaining({ user: expect.objectContaining({ id: req.user.id }) }),
         endpoint: EModelEndpoint.openAI,
         db,
       }),
@@ -2545,7 +2547,7 @@ describe('BackgroundCortexFollowUpService', () => {
 
     expect(initializeAnthropic).toHaveBeenCalledWith(
       expect.objectContaining({
-        req,
+        req: expect.objectContaining({ user: expect.objectContaining({ id: req.user.id }) }),
         endpoint: EModelEndpoint.anthropic,
         db,
       }),
@@ -2786,7 +2788,7 @@ describe('BackgroundCortexFollowUpService', () => {
     });
   });
 
-  test('generateFollowUpText uses minimal system prompt without agent personality', async () => {
+  test('generateFollowUpText retains prepared Main personality with the registered result tail', async () => {
     const req = { user: { id: 'u1' }, body: {} };
     await generateFollowUpText({
       req,
@@ -2804,9 +2806,8 @@ describe('BackgroundCortexFollowUpService', () => {
 
     const runConfig = Run.create.mock.calls[0][0];
     const systemPrompt = runConfig.graphConfig.instructions;
-    expect(systemPrompt).not.toContain('Eve');
-    expect(systemPrompt).not.toContain('deeply personal');
-    expect(systemPrompt).toContain('conversational AI assistant');
+    expect(systemPrompt).toContain('You are Eve, a deeply personal companion AI.');
+    expect(systemPrompt).toContain('Continue as the same Main');
     expect(systemPrompt).toContain('{NTA}');
   });
 

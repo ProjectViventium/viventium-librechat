@@ -689,6 +689,34 @@ describe('GlassHive terminal callback all-destination transaction fence', () => 
     await replicaSet?.stop({ doCleanup: true, force: true });
   }, 15000);
 
+  test.each(['prepared', 'permanent failure', 'temporary failure'])(
+    'a real reclaimed claim prevents stale %s draft, delivery and settlement', async (mode) => {
+      const proof = await authoredDeliveryProof(`reclaimed-${mode.replaceAll(' ', '-')}`);
+      const evidence = mongoose.connection.collection(MISSION_EVIDENCE_COLLECTION);
+      proof.prepare.mockImplementationOnce(async () => {
+        // Retain the accepted callback, source, attempt count and timestamp. Only the
+        // processing claim changes, as on a same-millisecond release/reclaim.
+        const changed = await evidence.updateOne(
+          { _id: proof.evidence._id, state: 'processing' },
+          { $set: { processingClaimId: 'replacement-claim' } },
+        );
+        expect(changed.matchedCount).toBe(1);
+        if (mode !== 'prepared') throw Object.assign(new Error('Synthetic stale author'), {
+          code: 'synthetic_stale_author', retryable: mode === 'temporary failure',
+        });
+        return { text: proof.preparedText };
+      });
+      await proof.service.flushGlassHiveMissionAdjudications({ ownerId: proof.result.ownerId });
+      expect(await evidence.findOne({ _id: proof.evidence._id })).toMatchObject({
+        state: 'processing', processingClaimId: 'replacement-claim',
+      });
+      expect(await Message.countDocuments({ messageId: proof.authoredId })).toBe(0);
+      expect(proof.persist).not.toHaveBeenCalled();
+      expect(proof.delivery).not.toHaveBeenCalled();
+      expect(await proof.receipts.countDocuments({})).toBe(0);
+    },
+  );
+
   test.each(['current', 'newer-child', 'member-fence-race'])(
     'legacy sent aggregate status recovery commits all current members atomically: %s',
     async (scenario) => {

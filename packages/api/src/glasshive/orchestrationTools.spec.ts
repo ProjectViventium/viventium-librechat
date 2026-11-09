@@ -194,7 +194,6 @@ describe('GlassHive Main orchestration tools', () => {
       ['duplicate', 'duplicate'],
       [42],
       ['x'.repeat(257)],
-      Array.from({ length: 65 }, (_, i) => String(i)),
     ]) {
       expect(delegation.schema.safeParse({ ...args, fileIds }).success).toBe(false);
     }
@@ -207,6 +206,14 @@ describe('GlassHive Main orchestration tools', () => {
       expect.objectContaining({
         args: expect.objectContaining({ fileIds: args.fileIds }),
       }),
+    );
+    const fileIds = Array.from({ length: 65 }, (_, index) => `synthetic-file-${index}`);
+    expect(delegation.schema.safeParse({ ...args, fileIds }).success).toBe(true);
+    await delegation.invoke({ ...args, fileIds }, {
+      configurable: { requestBody: { conversationId: 'conversation-1', messageId: 'message-1' } },
+    });
+    expect(executeMainDelegation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ args: expect.objectContaining({ fileIds }) }),
     );
   });
 

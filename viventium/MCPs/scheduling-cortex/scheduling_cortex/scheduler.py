@@ -1036,6 +1036,7 @@ class SchedulerEngine:
         try:
             scheduled_task = dict(task)
             scheduled_task["next_run_at"] = to_utc_iso(next_run_dt)
+            scheduled_task["_scheduled_prompt_run_lease_owner"] = self._lease_owner
             scheduled_task["_scheduled_prompt_trigger_kind"] = "scheduled"
             scheduled_task["_scheduled_prompt_trigger_source"] = "scheduler_loop"
             scheduled_task["_scheduled_prompt_attempted_at"] = to_utc_iso(now)

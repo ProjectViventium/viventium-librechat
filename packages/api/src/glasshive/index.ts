@@ -24,6 +24,7 @@ export * from './nativeMedia';
 export * from './callbackSanitizer';
 export * from './terminalCallbackTransaction';
 export * from './nativeResponse';
+export * from './nativeHistoryBudget';
 export * from './foregroundAttention';
 export * from './nativeOutputFiles';
 export * from './nativeToolEvidence';
@@ -45,3 +46,12 @@ export { prepareNativeSourceRecovery } from './nativeSupersession';
 
 export * from './mainGenerationPresentation';
 export * from './retainedMainFinal';
+
+export * from './nativeCoordinator';
+export * from './nativeCoordinatorWork';
+export * from './nativeCoordinatorContext';
+export * from './nativeCoordinatorVoicePresentation';
+
+export * from './brokerNativeMcpSelection';
+export * from './nativeConversationInstructions';
+export * from './nativeCoordinatorResultDelivery';

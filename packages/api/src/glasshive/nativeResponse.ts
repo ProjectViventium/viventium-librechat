@@ -16,6 +16,7 @@ import {
 } from './nativeToolEvidence';
 import { convertHarnessActivityParts } from '../utils/content';
 import type { MainContinuityFetch } from '../continuity/mainContinuity';
+import type { NativeHistoryBudgetReceipt } from './nativeHistoryBudget';
 import type {
   NativeResponseIdentity,
   NativeResponseAdmission,
@@ -67,6 +68,7 @@ export type NativeResult = {
   conversation_id: string;
   request_id: string;
   run_id: string;
+  native_history_budget_v1?: NativeHistoryBudgetReceipt;
   graph_tool_evidence?: unknown;
   failure_class?: string;
   foreground_attention_control?: {
@@ -243,6 +245,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
   async function readResult(
     identity: NativeResponseIdentity,
     includeToolEvidence = false,
+    signal?: AbortSignal,
   ): Promise<NativeResult | null> {
     const route = await currentRoute(identity);
     const base = route.baseURL.replace(/\/$/, '');
@@ -256,7 +259,7 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
     const response = await (deps.fetch || fetch)(url, {
       method: 'GET',
       headers: route.headers,
-      signal: AbortSignal.timeout(10_000),
+      signal: signal || AbortSignal.timeout(10_000),
     });
     if (response.status === 404) return null;
     if (!response.ok) throw new Error(`native_response_lookup_${response.status}`);

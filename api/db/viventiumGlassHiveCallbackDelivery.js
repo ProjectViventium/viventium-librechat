@@ -20,78 +20,16 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
       runId: { type: String, required: true, immutable: true },
       callbackRef: { type: String, required: true, immutable: true },
       kind: { type: String, enum: ['nonterminal_attention'], immutable: true },
-      event: {
-        type: String,
-        enum: ['run.needs_input'],
-        required: function () {
-          return this.kind === 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      workTerminal: {
-        type: Boolean,
-        required: function () {
-          return this.kind === 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      evidenceId: {
-        type: String,
-        match: /^ghe_[a-f0-9]{32}$/,
-        required: function () {
-          return this.kind === 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      attemptNumber: {
-        type: Number,
-        required: function () {
-          return this.kind !== 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      resultKey: {
-        type: String,
-        required: function () {
-          return this.kind !== 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      acceptedOperationId: {
-        type: String,
-        required: function () {
-          return this.kind !== 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      terminalCallbackId: {
-        type: String,
-        required: function () {
-          return this.kind !== 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      resultDigest: {
-        type: String,
-        required: function () {
-          return this.kind !== 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      resultRevision: {
-        type: Number,
-        required: function () {
-          return this.kind !== 'nonterminal_attention';
-        },
-        immutable: true,
-      },
-      effectGeneration: {
-        type: Number,
-        required: function () {
-          return this.kind !== 'nonterminal_attention';
-        },
-        immutable: true,
-      },
+      event: { type: String, enum: ['run.needs_input'], required: function () { return this.kind === 'nonterminal_attention'; }, immutable: true },
+      workTerminal: { type: Boolean, required: function () { return this.kind === 'nonterminal_attention'; }, immutable: true },
+      evidenceId: { type: String, match: /^ghe_[a-f0-9]{32}$/, required: function () { return this.kind === 'nonterminal_attention'; }, immutable: true },
+      attemptNumber: { type: Number, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
+      resultKey: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
+      acceptedOperationId: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
+      terminalCallbackId: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
+      resultDigest: { type: String, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
+      resultRevision: { type: Number, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
+      effectGeneration: { type: Number, required: function () { return this.kind !== 'nonterminal_attention'; }, immutable: true },
     },
     { _id: false, strict: 'throw' },
   );
@@ -99,19 +37,10 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
   workerCompletionBindingSchema.pre('validate', function (next) {
     const attention = this.kind === 'nonterminal_attention';
     const forbidden = attention
-      ? [
-          'attemptNumber',
-          'resultKey',
-          'acceptedOperationId',
-          'terminalCallbackId',
-          'resultDigest',
-          'resultRevision',
-          'effectGeneration',
-        ]
+      ? ['attemptNumber', 'resultKey', 'acceptedOperationId', 'terminalCallbackId', 'resultDigest', 'resultRevision', 'effectGeneration']
       : ['event', 'workTerminal', 'evidenceId'];
-    for (const field of forbidden)
-      if (this[field] !== undefined)
-        this.invalidate(field, 'voice_worker_presentation_binding_invalid');
+    for (const field of forbidden) if (this[field] !== undefined)
+      this.invalidate(field, 'voice_worker_presentation_binding_invalid');
     if (attention && this.workTerminal !== false)
       this.invalidate('workTerminal', 'voice_worker_presentation_binding_invalid');
     next();
@@ -163,21 +92,45 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
     { _id: false, strict: 'throw' },
   );
 
-  const mainGenerationPresentationSchema = new mongoose.Schema(
+  const nativeCoordinatorResultSchema = new mongoose.Schema(
     {
-      version: { type: Number, enum: [1], required: true, immutable: true },
-      streamId: { type: String, required: true, maxlength: 512, immutable: true },
-      admissionId: { type: String, required: true, maxlength: 512, immutable: true },
-      responseMessageId: { type: String, required: true, maxlength: 512, immutable: true },
-      responseDigest: {
-        type: String,
-        required: true,
-        match: /^sha256:[a-f0-9]{64}$/,
-        immutable: true,
-      },
+      kind: { type: String, enum: ['native_coordinator_goal', 'native_coordinator_turn'], required: true, immutable: true },
+      bindingRef: { type: String, required: true, maxlength: 512, immutable: true },
+      nativeConversationId: { type: String, required: true, maxlength: 512, immutable: true },
+      goalId: { type: String, required: function () { return this.kind === 'native_coordinator_goal'; }, maxlength: 512, immutable: true },
+      turnId: { type: String, required: function () { return this.kind === 'native_coordinator_turn'; }, maxlength: 512, immutable: true },
+      requestId: { type: String, required: function () { return this.kind === 'native_coordinator_turn'; }, maxlength: 512, immutable: true },
+      runId: { type: String, required: true, maxlength: 512, immutable: true },
+      resultRevision: { type: Number, required: true, min: 1, immutable: true },
+      resultDigest: { type: String, required: true, match: /^sha256:[a-f0-9]{64}$/, immutable: true },
+      sourceTurnId: { type: String, required: true, maxlength: 512, immutable: true },
+      sourceCallSessionId: { type: String, default: '', maxlength: 512, immutable: true },
     },
     { _id: false, strict: 'throw' },
   );
+  nativeCoordinatorResultSchema.pre('validate', function (next) {
+    const forbidden = this.kind === 'native_coordinator_turn' ? ['goalId'] : ['turnId', 'requestId'];
+    for (const field of forbidden) if (this[field] !== undefined)
+      this.invalidate(field, 'native_coordinator_result_source_variant_invalid');
+    next();
+  });
+  const mainGenerationPresentationSchema = new mongoose.Schema(
+    {
+      version: { type: Number, enum: [1, 2], required: true, immutable: true },
+      streamId: { type: String, required: function () { return this.version === 1; }, maxlength: 512, immutable: true },
+      admissionId: { type: String, required: function () { return this.version === 1; }, maxlength: 512, immutable: true },
+      nativeCoordinatorResult: { type: nativeCoordinatorResultSchema, required: function () { return this.version === 2; }, immutable: true },
+      responseMessageId: { type: String, required: true, maxlength: 512, immutable: true },
+      responseDigest: { type: String, required: true, match: /^sha256:[a-f0-9]{64}$/, immutable: true },
+    },
+    { _id: false, strict: 'throw' },
+  );
+  mainGenerationPresentationSchema.pre('validate', function (next) {
+    const invalid = this.version === 1 ? this.nativeCoordinatorResult !== undefined :
+      this.streamId !== undefined || this.admissionId !== undefined;
+    if (invalid) this.invalidate('version', 'main_generation_source_variant_invalid');
+    next();
+  });
 
   const attachmentSchema = new mongoose.Schema(
     {
@@ -195,24 +148,9 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
           {
             version: { type: Number, enum: [1], required: true },
             status: { type: String, enum: ['available', 'unavailable'], required: true },
-            code: {
-              type: String,
-              required() {
-                return this.status === 'unavailable';
-              },
-            },
-            messageId: {
-              type: String,
-              required() {
-                return this.status === 'available';
-              },
-            },
-            downloadUrl: {
-              type: String,
-              required() {
-                return this.status === 'available';
-              },
-            },
+            code: { type: String, required() { return this.status === 'unavailable'; } },
+            messageId: { type: String, required() { return this.status === 'available'; } },
+            downloadUrl: { type: String, required() { return this.status === 'available'; } },
           },
           { _id: false, strict: 'throw' },
         ),
@@ -313,16 +251,8 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
         default: null,
         immutable: true,
       },
-      mainGenerationPresentation: {
-        type: mainGenerationPresentationSchema,
-        default: null,
-        immutable: true,
-      },
-      workerCompletionBindings: {
-        type: [workerCompletionBindingSchema],
-        default: [],
-        immutable: true,
-      },
+      mainGenerationPresentation: { type: mainGenerationPresentationSchema, default: null, immutable: true },
+      workerCompletionBindings: { type: [workerCompletionBindingSchema], default: [], immutable: true },
       workerCompletionProjectionAppliedAt: { type: Date, default: null },
       workerCompletionEffectLeases: {
         type: [workerCompletionEffectLeaseSchema],

@@ -81,8 +81,8 @@ function accountRequestTimeoutMs({
   if (Number.isInteger(explicitTimeoutMs) && explicitTimeoutMs > 0) return explicitTimeoutMs;
   if (
     String(method || 'GET').toUpperCase() === 'POST' &&
-    String(path || '').startsWith('/v1/work/') &&
-    String(path || '').endsWith('/actions')
+    ((String(path || '').startsWith('/v1/work/') && String(path || '').endsWith('/actions')) ||
+      /^\/v1\/coordinator\/conversations\/[^/?]+\/goals\/[^/?]+\/actions(?:\?[^#]*)?$/.test(String(path || '')))
   ) {
     return positiveIntEnv('VIVENTIUM_ACTIVE_WORK_ACTION_TIMEOUT_MS', DEFAULT_ACTION_TIMEOUT_MS);
   }
@@ -189,6 +189,7 @@ export async function requestAccountApi({
   method = 'GET',
   body,
   ownerNativeInput,
+  maxResponseBytes = MAX_RESPONSE_BYTES,
   fetchImpl = globalThis.fetch,
   timeoutMs,
 }: {
@@ -197,6 +198,8 @@ export async function requestAccountApi({
   method?: string;
   body?: unknown;
   ownerNativeInput?: NativeWorkInputResponse;
+  /** null delegates complete-context response capacity to the Native endpoint. */
+  maxResponseBytes?: number | null;
   fetchImpl?: AccountFetch;
   timeoutMs?: number;
 }): Promise<unknown> {
@@ -239,17 +242,20 @@ export async function requestAccountApi({
     ...(serializedBody != null ? { body: serializedBody } : {}),
     ...(signal ? { signal } : {}),
   }).catch(transportFailure);
+  const responseLimit = maxResponseBytes === null ? Number.POSITIVE_INFINITY
+    : Number.isSafeInteger(maxResponseBytes) && maxResponseBytes > 0
+      ? maxResponseBytes : MAX_RESPONSE_BYTES;
   const contentType = String(response.headers.get('content-type') || '').toLowerCase();
   const contentLength = Number(response.headers.get('content-length'));
   if (
     !contentType.startsWith('application/json') ||
-    (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES)
+    (Number.isFinite(contentLength) && contentLength > responseLimit)
   ) {
     throw new Error('glasshive_account_response_invalid');
   }
 
   const raw = await response.text().catch(transportFailure);
-  if (Buffer.byteLength(raw, 'utf8') > MAX_RESPONSE_BYTES) {
+  if (Buffer.byteLength(raw, 'utf8') > responseLimit) {
     throw new Error('glasshive_account_response_oversized');
   }
 
@@ -272,8 +278,9 @@ export async function requestAccountApi({
       code,
       status: Number(response.status) || 502,
       body: parsed,
-      ...(method.toUpperCase() === 'POST' && path.startsWith('/v1/work/') &&
-          path.endsWith('/actions/receipt') &&
+      ...(method.toUpperCase() === 'POST' &&
+          ((path.startsWith('/v1/work/') && path.endsWith('/actions/receipt')) ||
+            /^\/v1\/coordinator\/conversations\/[^/?]+\/goals\/[^/?]+\/actions\/receipt(?:\?[^#]*)?$/.test(path)) &&
           response.headers.get('x-xperfect-action-receipt') === 'failed-v1'
         ? { actionReceipt: 'immutable_failure' } : {}),
       userMessage: typeof structuredRecord.message === 'string' ? structuredRecord.message : '',

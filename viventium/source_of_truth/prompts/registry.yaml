@@ -36,6 +36,7 @@ related_config:
       - worker.compiled_bootstrap
       - worker.native_composition
       - worker.native_schedule_tools
+      - worker.native_conversation_inventory
     worker.grok_mcp_tool_access:
       - worker.compiled_bootstrap
       - worker.native_tool_access
@@ -164,6 +165,12 @@ related_config:
       summary: Existing harness, project and run instruction producers consume the same resolved completion and capability text.
       path: viventium_v0_4/xPerfect/runtime_phase1/src/workers_projects_runtime/profile_runtime.py
       selector: _instruction_with_completion_contract
+      source: worker.compiled_prompt_contract
+    worker.native_conversation_inventory:
+      title: Action-Capable Native Conversation Instructions
+      summary: Full Native conversations inherit the unchanged compiled capability inventory; coordination and tool-less presentation retain their existing scope.
+      path: viventium_v0_4/LibreChat/packages/api/src/glasshive/nativeConversationInstructions.ts
+      selector: inheritNativeConversationCapabilityInventory
       source: worker.compiled_prompt_contract
     feelings.numeric_kernel:
       title: Feeling State And Capsule Structure

@@ -15,6 +15,7 @@ describe('openAIReasoningParams', () => {
     expect(isOpenAIReasoningModelWithoutSampling('gpt-5')).toBe(true);
     expect(isOpenAIReasoningModelWithoutSampling('gpt-5-pro')).toBe(true);
     expect(isOpenAIReasoningModelWithoutSampling('gpt-5.4')).toBe(true);
+    expect(isOpenAIReasoningModelWithoutSampling('gpt-6-sol')).toBe(true);
   });
 
   test('does not generalize the gpt-5.4 runtime evidence to every dotted gpt-5 version', () => {
@@ -28,6 +29,10 @@ describe('openAIReasoningParams', () => {
     const guarded = { model: 'gpt-5.4', temperature: 1, topP: 0.8, max_output_tokens: 2000 };
     expect(sanitizeOpenAIReasoningSamplingParams(guarded)).toEqual(['temperature', 'topP']);
     expect(guarded).toEqual({ model: 'gpt-5.4', max_output_tokens: 2000 });
+
+    const sol = { model: 'gpt-6-sol', temperature: 1, top_p: 0.8, reasoning_effort: 'high' };
+    expect(sanitizeOpenAIReasoningSamplingParams(sol)).toEqual(['temperature', 'top_p']);
+    expect(sol).toEqual({ model: 'gpt-6-sol', reasoning_effort: 'high' });
 
     const samplingCapable = { model: 'gpt-5.2', temperature: 0.4, topP: 0.9 };
     expect(sanitizeOpenAIReasoningSamplingParams(samplingCapable)).toEqual([]);

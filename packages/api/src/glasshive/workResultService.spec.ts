@@ -38,6 +38,15 @@ describe('retained work result read', () => {
     );
     expect(externalWork.findOne).not.toHaveBeenCalled();
   });
+  it('retains complete accepted continuation input beyond old courier bounds', async () => {
+    const text = 'x'.repeat(140000) + '\nKeep the final condition.';
+    const guidance = Array.from({ length: 130 }, (_, n) => `${n}: ${text}`);
+    const runInput = { ...row.runInput, instruction: text,
+      continuation_context: { version: 1, base_instruction: text, guidance } };
+    missionEvidence.findOne.mockResolvedValue({ ...row, runInput });
+    const result = await service.getGlassHiveWorkResult({ ownerId: 'owner-a', runId: 'run-a' });
+    expect(result.runInput).toEqual(runInput);
+  });
   it('labels the retained terminal result when corrected work is now running', async () => {
     externalWork.findOne.mockResolvedValue({
       ownerId: 'owner-a',
@@ -153,6 +162,9 @@ describe('retained work result read', () => {
     });
     const result = await service.getGlassHiveWorkResult({ ownerId: 'owner-a', runId: 'run-a' });
     expect(result.outputFiles).toEqual(outputFiles);
+    expect(result.attachmentDelivery).not.toHaveProperty('supported');
+    expect(result.attachmentDelivery).toEqual({ scope: 'origin_conversation',
+      sourceReference: 'download_url', publicNetworkRequired: false });
     expect(result.deliveryScope).toEqual({
       originConversationId: 'old-chat',
       destinations: ['telegram', 'librechat'],

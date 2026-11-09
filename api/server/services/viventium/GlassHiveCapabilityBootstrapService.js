@@ -1,6 +1,9 @@
 const { VOICE_TASK_TOOL_NAME } = require('./VoiceTaskManagementTool');
 const {
   backgroundWorkerResources,
+  brokerOwnedNativeServerIds,
+  composeBrokerNativeMcpConfig,
+  stripModelBrokerAuthority,
   createNativeToolCatalog,
   NATIVE_TOOL_CATALOG_MAX_BYTES,
   NATIVE_TOOL_CATALOG_MAX_TOOLS,
@@ -902,7 +905,7 @@ function brokerContextBrief(
       ? encode({ ...discovery, host_tool_descriptions: descriptions })
       : '';
     return [
-      'Declared conversation tools: hand_off_to, list_workers. Their contracts own action work and current worker state. Other authorized capabilities belong to the configured workers.',
+      'Declared conversation tools: hand_off_to accepts new original input; active_work_action controls existing work; list_workers reads current work. Other authorized capabilities belong to the configured workers.',
       described && Buffer.byteLength(described, 'utf8') <= NATIVE_TOOL_CATALOG_MAX_BYTES
         ? described
         : encode(discovery),
@@ -987,6 +990,26 @@ function pinWorkerFeelingBlockLast(bundle, feelingBlock) {
       capsule: feelingBlock,
     });
   }
+  return bundle;
+}
+
+function projectWorkerFeelingBundle({ bundle, workerFeelings, workerFeelingsScope }) {
+  const opaque = bundle.application_context_format === 'opaque_v1';
+  if (opaque && Object.prototype.hasOwnProperty.call(bundle, 'viventium_feelings_projection'))
+    throw new Error('opaque_context_legacy_projection_conflict');
+  const capsule = workerFeelingBlock(workerFeelings);
+  const enabled = workerFeelingsScope === 'all_agents' && Boolean(capsule);
+  for (const field of WORKER_INSTRUCTION_FIELDS) {
+    if (capsule && typeof bundle[field] === 'string')
+      bundle[field] = bundle[field].split(capsule).join('').trim();
+  }
+  if (enabled) bundle.agents_md = pinFeelingCapsuleLast({ instructions: bundle.agents_md, capsule });
+  if (opaque) return bundle;
+  bundle.viventium_feelings_projection = {
+    version: 1, enabled, scope: workerFeelingsScope, canonical_instruction_field: 'agents_md',
+    snapshot_sha256: enabled ? crypto.createHash('sha256').update(capsule).digest('hex') : '',
+    expected_capsule_count: enabled ? 1 : 0,
+  };
   return bundle;
 }
 
@@ -1103,6 +1126,7 @@ function mergeBrokerBundle({
   grantToken,
   grantPayload,
   allowedServers,
+  nativeServerIds = [],
   eagerServers = allowedServers,
   deferredServers = [],
   allowedHostTools = [],
@@ -1147,12 +1171,13 @@ function mergeBrokerBundle({
     'glasshive-user-capabilities': serverConfig,
   };
   applyHostReadPermissionRules(bundle, allowedHostTools);
-  const codexBlock = [
-    '[mcp_servers.glasshive-user-capabilities]',
-    `url = ${tomlString(brokerUrl)}`,
-    `bearer_token_env_var = ${tomlString(codexTokenEnvVar)}`,
-  ].join('\n');
-  bundle.codex_config_append = appendText(bundle.codex_config_append, codexBlock);
+  bundle.codex_config_append = composeBrokerNativeMcpConfig({
+    configAppend: bundle.codex_config_append,
+    brokerServerName: 'glasshive-user-capabilities',
+    brokerUrl,
+    bearerTokenEnvVar: codexTokenEnvVar,
+    nativeServerIds,
+  });
   bundle.env = {
     ...(bundle.env || {}),
     [codexTokenEnvVar]: grantToken,
@@ -1175,6 +1200,7 @@ function mergePendingBrokerAuthorizationBundle({
   authorization,
   brokerUrl,
   allowedServers,
+  nativeServerIds = [],
   allowedHostTools = [],
   contentReadScope = false,
   workerMemory = '',
@@ -1235,12 +1261,13 @@ function mergePendingBrokerAuthorizationBundle({
     'glasshive-user-capabilities': serverConfig,
   };
   applyHostReadPermissionRules(bundle, allowedHostTools);
-  const codexBlock = [
-    '[mcp_servers.glasshive-user-capabilities]',
-    `url = ${tomlString(brokerUrl)}`,
-    `bearer_token_env_var = ${tomlString(tokenEnvVar)}`,
-  ].join('\n');
-  bundle.codex_config_append = appendText(bundle.codex_config_append, codexBlock);
+  bundle.codex_config_append = composeBrokerNativeMcpConfig({
+    configAppend: bundle.codex_config_append,
+    brokerServerName: 'glasshive-user-capabilities',
+    brokerUrl,
+    bearerTokenEnvVar: tokenEnvVar,
+    nativeServerIds,
+  });
   bundle.env = { ...(bundle.env || {}) };
   delete bundle.env[tokenEnvVar];
   const instruction = brokerContextBrief(allowedServers, {
@@ -1270,7 +1297,6 @@ function applyContextBrief(
   } else if (toolName === 'workspace_continue') {
     args.additional_instructions = appendText(args.additional_instructions, brief);
   } else if (
-    toolName === 'worker_delegate_once' ||
     toolName === 'worker_run' ||
     toolName === 'worker_schedule'
   ) {
@@ -1285,12 +1311,26 @@ function applyUnavailableContextBrief(args, toolName, reason) {
   } else if (toolName === 'workspace_continue') {
     args.additional_instructions = appendText(args.additional_instructions, brief);
   } else if (
-    toolName === 'worker_delegate_once' ||
     toolName === 'worker_run' ||
     toolName === 'worker_schedule'
   ) {
     args.instruction = appendText(args.instruction, brief);
   }
+}
+
+async function assertCurrentGlassHiveResultAuthor({ userId, requestBody, signal } = {}) {
+  const binding = requestBody?.viventiumResultAuthor;
+  if (binding === undefined) return;
+  signal?.throwIfAborted();
+  if (!binding || typeof binding.scope !== 'string' || typeof binding.messageId !== 'string') {
+    throw Object.assign(new Error('source_authority_binding_incomplete'), {
+      code: 'source_authority_binding_incomplete', retryable: false,
+    });
+  }
+  await require('./GlassHiveMissionAdjudicationService').assertCurrentGlassHiveMissionAuthor({
+    ownerId: userId, conversationId: requestBody.conversationId,
+    scope: binding.scope, messageId: binding.messageId,
+  });
 }
 
 async function maybeInjectGlassHiveCapabilityBroker({
@@ -1306,6 +1346,15 @@ async function maybeInjectGlassHiveCapabilityBroker({
   if (!args) {
     return toolArguments;
   }
+  /* === VIVENTIUM START === Model arguments cannot supply Core-owned broker authority. === */
+  args.bootstrap_bundle_json = stripModelBrokerAuthority(
+    normalizeBootstrapBundle(args.bootstrap_bundle_json),
+    {
+      brokerServerName: 'glasshive-user-capabilities',
+      bearerTokenEnvVar: 'GLASSHIVE_CAPABILITY_BROKER_TOKEN',
+    },
+  );
+  /* === VIVENTIUM END === */
   const launchAuthorityKind = String(
     config?.configurable?.glasshive_launch_authority_kind || '',
   ).trim();
@@ -1323,12 +1372,15 @@ async function maybeInjectGlassHiveCapabilityBroker({
   }
   // VIVENTIUM START: Superseded authoring cannot create a new launch intent.
   config?.signal?.throwIfAborted();
-  const assertAuthor = () =>
-    assertCurrentGlassHiveSourceAuthor({
-      userId: String(config?.configurable?.user?.id || config?.configurable?.user?._id || ''),
-      requestBody: config?.configurable?.requestBody,
+  const assertAuthor = async () => {
+    const userId = String(config?.configurable?.user?.id || config?.configurable?.user?._id || '');
+    const requestBody = config?.configurable?.requestBody;
+    await assertCurrentGlassHiveSourceAuthor({
+      userId, requestBody,
       getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
     });
+    await assertCurrentGlassHiveResultAuthor({ userId, requestBody, signal: config?.signal });
+  };
   await assertAuthor();
   // VIVENTIUM END
   const launchContext = await registerGlassHiveLaunchContext({
@@ -1338,6 +1390,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
     toolName,
     toolArguments: args,
     toolCall: config?.toolCall || {},
+    preparationAuthority: config?.configurable?.glasshive_launch_preparation_authority,
   });
   if (!launchContext?.originRef || !launchContext?.delegationIdentity) {
     throw new Error('glasshive_launch_origin_not_bound');
@@ -1347,27 +1400,13 @@ async function maybeInjectGlassHiveCapabilityBroker({
     const capsule = workerFeelingBlock(workerFeelings);
     const enabled = workerFeelingsScope === 'all_agents' && Boolean(capsule);
     const bundle = args.bootstrap_bundle_json;
-    for (const field of WORKER_INSTRUCTION_FIELDS) {
-      if (capsule && typeof bundle[field] === 'string') {
-        bundle[field] = bundle[field].split(capsule).join('').trim();
-      }
-    }
-    if (enabled) {
-      bundle.agents_md = pinFeelingCapsuleLast({ instructions: bundle.agents_md, capsule });
-    }
-    bundle.viventium_feelings_projection = {
-      version: 1,
-      enabled,
-      scope: workerFeelingsScope,
-      canonical_instruction_field: 'agents_md',
-      snapshot_sha256: enabled ? crypto.createHash('sha256').update(capsule).digest('hex') : '',
-      expected_capsule_count: enabled ? 1 : 0,
-    };
+    projectWorkerFeelingBundle({ bundle, workerFeelings, workerFeelingsScope });
     logWorkerFeelingPlacement({
       requestBody: config?.configurable?.requestBody,
       bundle,
       feelingBlock: enabled ? capsule : '',
-      snapshotHash: bundle.viventium_feelings_projection.snapshot_sha256,
+      snapshotHash: bundle.viventium_feelings_projection?.snapshot_sha256 ||
+        (enabled ? crypto.createHash('sha256').update(capsule).digest('hex') : ''),
       scope: workerFeelingsScope,
       ...workerFeelingRangeTelemetry,
       reason,
@@ -1383,6 +1422,23 @@ async function maybeInjectGlassHiveCapabilityBroker({
         user: config?.configurable?.user,
         requestBody: config?.configurable?.requestBody,
       });
+    }
+    /* === VIVENTIUM END === */
+    /* === VIVENTIUM START === Project operator-configured local media only into delegated host workers. === */
+    if (
+      toolName === 'worker_delegate_once' &&
+      launchAuthorityKind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR &&
+      executionModeForBroker(args) === 'host'
+    ) {
+      const media = normalizeBootstrapBundle(process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP);
+      const server = media.claude_project_mcp?.mcpServers?.viventium_media;
+      if (server && typeof media.codex_config_append === 'string') {
+        bundle.claude_project_mcp = {
+          ...(bundle.claude_project_mcp || {}),
+          viventium_media: server,
+        };
+        bundle.codex_config_append = appendText(bundle.codex_config_append, media.codex_config_append);
+      }
     }
     /* === VIVENTIUM END === */
     const trustedLaunchArgs = attachGlassHiveTrustedLaunchMetadata(
@@ -1528,6 +1584,7 @@ async function maybeInjectGlassHiveCapabilityBroker({
     authorization,
     brokerUrl,
     allowedServers,
+    nativeServerIds: brokerOwnedNativeServerIds(allowedServerEntries, allowedServers),
     allowedHostTools,
     contentReadScope,
     workerMemory,
@@ -1624,12 +1681,9 @@ async function buildConversationProviderBootstrapBundle({
   const orchestrationRequestBody = { ...requestBody };
   delete orchestrationRequestBody.tool_resources;
   if (conversationToolMode === 'coordination') {
-    if (
-      inheritedConversation?.version !== 1 ||
-      inheritedConversation.conversation_id !== requestBody.conversationId ||
-      !Array.isArray(inheritedConversation.sources)
-    )
-      throw new Error('coordination_context_unavailable');
+    if (inheritedConversation?.version !== 1 ||
+        inheritedConversation.conversation_id !== requestBody.conversationId ||
+        !Array.isArray(inheritedConversation.sources)) throw new Error('coordination_context_unavailable');
   }
   const delegationResources = normalizedConversationOrchestrationTools.includes(
     DELEGATION_TOOL_NAME,
@@ -1679,6 +1733,9 @@ async function buildConversationProviderBootstrapBundle({
     : {};
   const orchestrationResources = {
     ...delegationResources,
+    ...(conversationToolMode === 'coordination' && normalizedConversationOrchestrationTools.includes('active_work_list')
+      ? { active_work_list: { version: 1, request_body_ref: 'conversation_request_body' } }
+      : {}),
     ...(normalizedConversationOrchestrationTools.includes('active_work_action')
       ? { active_work_action: { version: 1, request_body_ref: 'conversation_request_body' } }
       : {}),
@@ -1715,8 +1772,12 @@ async function buildConversationProviderBootstrapBundle({
       );
       return null;
     });
-    if (!mcpConfig) {
+    if (!mcpConfig && allProviderHostTools.length === 0) {
       return degradedConversationCapabilityBundle('registry_unavailable');
+    }
+    if (!mcpConfig) {
+      capabilityResolutionStatus ||= 'registry_unavailable';
+      mcpConfig = {};
     }
   }
   const executionMode = 'host';
@@ -1733,14 +1794,9 @@ async function buildConversationProviderBootstrapBundle({
     return declaredServers.has(serverName) || declaredDeferredServers.has(serverName);
   });
   const allowedServers = allowedServerEntries.map(({ serverName }) => serverName);
-  const eagerServers =
-    conversationToolMode === 'coordination'
-      ? []
-      : allowedServers.filter((serverName) => declaredServers.has(serverName));
+  const eagerServers = conversationToolMode === 'coordination' ? [] : allowedServers.filter((serverName) => declaredServers.has(serverName));
   const deferredServers = allowedServers.filter(
-    (serverName) =>
-      conversationToolMode === 'coordination' ||
-      (!declaredServers.has(serverName) && declaredDeferredServers.has(serverName)),
+    (serverName) => conversationToolMode === 'coordination' || (!declaredServers.has(serverName) && declaredDeferredServers.has(serverName)),
   );
   if (allowedServers.length === 0 && allProviderHostTools.length === 0) {
     return degradedConversationCapabilityBundle('no_reviewed_capabilities');
@@ -1755,7 +1811,7 @@ async function buildConversationProviderBootstrapBundle({
       deferredServers,
       allowedHostTools: allProviderHostTools,
       hostToolResources: allProviderHostToolResources,
-      ...(Object.keys(orchestrationResources).length > 0
+      ...(normalizedConversationOrchestrationTools.length > 0
         ? { conversationRequestBody: orchestrationRequestBody }
         : {}),
       ...(conversationToolMode === 'coordination' ? { inheritedConversation } : {}),
@@ -1797,16 +1853,11 @@ async function buildConversationProviderBootstrapBundle({
     logger.info(
       JSON.stringify({
         event: 'glasshive_broker_grant_created',
-        ...(conversationToolMode === 'coordination'
-          ? {
-              conversationToolMode,
-              inheritedContextSourceCount: inheritedConversation.sources.length,
-              inheritedContextSha256: crypto
-                .createHash('sha256')
-                .update(JSON.stringify(inheritedConversation))
-                .digest('hex'),
-            }
-          : {}),
+        ...(conversationToolMode === 'coordination' ? {
+          conversationToolMode,
+          inheritedContextSourceCount: inheritedConversation.sources.length,
+          inheritedContextSha256: crypto.createHash('sha256').update(JSON.stringify(inheritedConversation)).digest('hex'),
+        } : {}),
         grant_id_sha256: scopeHash(mintedGrant.payload.grant_id),
         message_id_sha256: scopeHash(mintedGrant.payload.message_id),
         conversation_id_sha256: scopeHash(mintedGrant.payload.conversation_id),
@@ -1821,6 +1872,7 @@ async function buildConversationProviderBootstrapBundle({
     grantToken: mintedGrant.token,
     grantPayload: mintedGrant.payload,
     allowedServers,
+    nativeServerIds: brokerOwnedNativeServerIds(allowedServerEntries, allowedServers),
     eagerServers,
     deferredServers,
     allowedHostTools: allProviderHostTools,
@@ -1851,7 +1903,9 @@ async function buildConversationProviderBootstrapBundle({
     if (toolCatalog) {
       const describedBundle =
         conversationToolMode === 'coordination'
-          ? mergeBrokerBundle({ ...bundleOptions, nativeToolCatalog: toolCatalog })
+          ? mergeBrokerBundle({ ...bundleOptions, nativeToolCatalog: {
+              ...toolCatalog, tools: catalog.hostTools.map((item) => item.definition),
+            } })
           : bundle;
       if (nativeToolCatalogFitsBootstrap(describedBundle, toolCatalog)) {
         bundle = describedBundle;
@@ -1898,6 +1952,7 @@ async function buildConversationProviderBootstrapBundle({
 
 /* === VIVENTIUM START === Capability-bootstrap public export contract. === */
 module.exports = {
+  assertCurrentGlassHiveResultAuthor,
   DirectGlassHiveCapabilityError,
   GLASSHIVE_LAUNCH_TOOLS,
   ScheduledGlassHiveCapabilityError,
@@ -1914,6 +1969,7 @@ module.exports = {
   maybeInjectGlassHiveCapabilityBroker,
   mergeBrokerBundle,
   mergeWorkerContextBundle,
+  projectWorkerFeelingBundle,
   providerProjectionBoundary,
   isGlassHiveLaunchTool,
   executionModeForBroker,

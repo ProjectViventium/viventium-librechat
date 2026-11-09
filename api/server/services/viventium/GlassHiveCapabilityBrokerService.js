@@ -10,6 +10,7 @@ const {
   mainDelegationJsonSchema,
   resolveSelectedDelegationAttachments,
   resolveSelectedHistoryAttachments,
+  refreshConversationRecallExecutionFiles,
 } = require('@librechat/api');
 /* === VIVENTIUM START ===
  * Feature: GlassHive capability broker service
@@ -26,6 +27,7 @@ const {
   GenerationJobManager,
   executeManagedSourceMutation,
   isManagedSourceMutation,
+  nativeCoordinatorHandoffTurnId,
 } = require('@librechat/api');
 const durableEffects = require('./InteractionDurableEffectService');
 const {
@@ -33,7 +35,7 @@ const {
   transcribeAttachedAudio,
   transcriptionAttachmentReferences,
 } = require('@librechat/api');
-const { getFiles, getMessages } = require('~/models');
+const { getFiles, getMessages, getLatestRecallEligibleMessageCreatedAt } = require('~/models');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { CacheKeys, PermissionTypes, Permissions } = require('librechat-data-provider');
 const { getMCPManager, getMCPServersRegistry, getFlowStateManager } = require('~/config');
@@ -93,7 +95,7 @@ const {
   getActiveWorkHistoryPage,
   invalidateActiveWorkSnapshot,
 } = require('./GlassHiveAccountService');
-const { readActiveWork } = require('@librechat/api');
+const { readActiveWork, coordinationToolDefinitions, coordinationToolCall } = require('@librechat/api');
 const { getGlassHiveWorkResult } = require('./GlassHiveWorkResultService');
 const { executeGlassHiveWorkAction } = require('./GlassHiveWorkActionService');
 const {
@@ -101,7 +103,7 @@ const {
   markGlassHiveLaunchDispatchRejected,
   reconcileGlassHiveLaunchResult,
 } = require('./GlassHiveCallbackBindingService');
-const { maybeInjectGlassHiveCapabilityBroker } = require('./GlassHiveCapabilityBootstrapService');
+const { maybeInjectGlassHiveCapabilityBroker, assertCurrentGlassHiveResultAuthor } = require('./GlassHiveCapabilityBootstrapService');
 const {
   selectTrustedLaunchRequestBody,
   selectTrustedSourceInstruction,
@@ -548,15 +550,9 @@ async function buildCapabilityCatalog({
             ),
           }
         : declaredDefinition;
-    if (
-      baseDefinition &&
-      resources?.request_body?.viventiumInheritedConversation?.version === 1 &&
-      isConversationOrchestrationMutationTool(toolName)
-    ) {
-      baseDefinition = {
-        ...baseDefinition,
-        inputSchema: inheritedWorkSchema(baseDefinition.inputSchema, resources.request_body),
-      };
+    if (baseDefinition && resources?.request_body?.viventiumInheritedConversation?.version === 1 &&
+        isConversationOrchestrationMutationTool(toolName)) {
+      baseDefinition = { ...baseDefinition, inputSchema: inheritedWorkSchema(baseDefinition.inputSchema, resources.request_body) };
     }
     const definition =
       baseDefinition &&
@@ -722,6 +718,7 @@ async function buildCapabilityCatalog({
 
   return {
     user,
+    coordination: isInheritedCoordinationGrant(grant),
     authorityKind:
       grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
         ? BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
@@ -740,6 +737,9 @@ async function buildCapabilityCatalog({
 }
 
 function toolDefinitionsForMcp(catalog) {
+  if (catalog.coordination) {
+    return coordinationToolDefinitions(catalog.hostTools.map((item) => item.definition));
+  }
   return [
     ...catalog.helperTools.map((tool) => ({
       name: tool.name,
@@ -778,6 +778,12 @@ function publicCatalog(catalog) {
 
 function findHostTool(catalog, toolName) {
   return catalog.hostTools.find((item) => item.toolName === toolName);
+}
+
+function isInheritedCoordinationGrant(grant) {
+  return grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR &&
+    Object.values(grant.host_tool_resources || {}).some((resource) =>
+      resource?.request_body?.viventiumInheritedConversation?.version === 1);
 }
 
 function cleanBoundedString(value, maxLength) {
@@ -949,10 +955,15 @@ async function invokeConversationDelegation({
   invocationId,
   trustedToolCall,
   signal,
+  inheritedArgumentsResolved = false,
 }) {
   let canonicalArgs;
   try {
-    if (args.inheritContext === true) args = inheritedWorkArguments(hostTool.resources, args, true);
+    // The conversation broker already resolved and signed these exact arguments.
+    // A direct Core invocation resolves the original assignment here instead.
+    if (args.inheritContext === true && !inheritedArgumentsResolved) {
+      args = inheritedWorkArguments(hostTool.resources, args, true);
+    }
     canonicalArgs = canonicalConversationOrchestrationArguments(DELEGATION_TOOL_NAME, args);
   } catch (error) {
     const selectionFailure = inheritedSelectionFailure(error, hostTool.toolName);
@@ -1040,6 +1051,36 @@ async function invokeConversationDelegation({
   if (trustedUploadedFiles.length > 0) {
     toolArguments.uploaded_files = trustedUploadedFiles;
   }
+  /* === VIVENTIUM START === Admit originals before background assignment planning. === */
+  if (isInheritedCoordinationGrant(grant)) {
+    if (requestBody.viventiumVoiceCallSessionId) {
+      await require('./VoiceWorkAuthorityService').assertVoiceWorkAuthority(
+        requestBody.viventiumVoiceWorkAuthority, catalog.user.id,
+      );
+    }
+    const sourceFlagId = nativeCoordinatorHandoffTurnId(requestBody, canonicalArgs.instruction);
+    return executeManagedSourceMutation({
+      userId: catalog.user.id, requestBody,
+      adapterId: 'xperfect.coordinator.accept.v1', routeId: 'native-coordinator',
+      operation: 'accept_turn', effectKind: 'durable_work_accepted',
+      occurrenceId: sourceFlagId,
+      providerIdempotencyKey: sourceFlagId,
+      providerIdempotencyMode: 'native_key',
+      canonicalArgs: args, service: durableEffects,
+      getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId), signal,
+      recordReceipt: (row) => recordManagedDurableReceipt(row, requestBody.viventiumStreamId),
+      dispatch: async () => {
+        const receipt = await require('./NativeCoordinatorService').accept({
+          ownerId: String(catalog.user.id), resources,
+          requestBody: { ...requestBody, files: trustedUploadedFiles },
+          instruction: canonicalArgs.instruction, invocationId: stableInvocationId,
+        });
+        invalidateActiveWorkSnapshot({ ownerId: catalog.user.id });
+        return { receiptRef: receipt.handoffRef, result: { ...receipt, tool: hostTool.toolName } };
+      },
+    });
+  }
+  /* === VIVENTIUM END === */
   const config = {
     signal,
     toolCall: {
@@ -1051,13 +1092,10 @@ async function invokeConversationDelegation({
     configurable: {
       user: catalog.user,
       requestBody,
-      glasshive_inherited_conversation:
-        require('./ViventiumMainContextService').assignInheritedConversationContext(
-          baseRequestBody.viventiumInheritedConversation,
-          selection.sourceOrdinals,
-        ),
-      glasshive_worker_memory: cleanBoundedString(resources.worker_memory, 200000),
-      glasshive_worker_feelings: cleanBoundedString(resources.worker_feelings, 200000),
+      glasshive_inherited_conversation: require('./ViventiumMainContextService').assignInheritedConversationContext(
+        baseRequestBody.viventiumInheritedConversation, selection.sourceOrdinals),
+      glasshive_worker_memory: String(resources.worker_memory || ''),
+      glasshive_worker_feelings: String(resources.worker_feelings || ''),
       glasshive_worker_feelings_enabled: resources.worker_feelings_enabled === true,
       glasshive_worker_feelings_hash: cleanBoundedString(resources.worker_feelings_hash, 256),
       glasshive_worker_feelings_scope: cleanBoundedString(resources.worker_feelings_scope, 64),
@@ -1136,6 +1174,8 @@ async function invokeConversationDelegation({
       rejectDispatch: (error) => markGlassHiveLaunchDispatchRejected(effectiveToolArguments, error),
       recordReceipt: (row) => recordManagedDurableReceipt(row, requestBody.viventiumStreamId),
       dispatch: async () => {
+        if (requestBody?.viventiumResultAuthor !== undefined)
+          await assertCurrentGlassHiveResultAuthor({ userId: catalog.user.id, requestBody, signal });
         dispatchStage = 'mcp_transport';
         const rawResult = await mcpManager.callTool({
           serverName,
@@ -1278,7 +1318,13 @@ async function executeMainDelegation({
     };
   }
   return invokeConversationDelegation({
-    grant: { grant_id: `core_main_${cleanBoundedString(invocationId, 192)}` },
+    grant: {
+      grant_id: `core_main_${cleanBoundedString(invocationId, 192)}`,
+      ...(args?.inheritContext === true && requestBody?.viventiumInheritedConversation?.version === 1
+        ? { authority_kind: BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR,
+            host_tool_resources: { [DELEGATION_TOOL_NAME]: { request_body: requestBody } } }
+        : {}),
+    },
     catalog: { user: { ...user, id: ownerId } },
     hostTool: {
       toolName: DELEGATION_TOOL_NAME,
@@ -1331,6 +1377,7 @@ async function invokeConversationOrchestrationTool({
       args,
       invocationId,
       signal,
+      inheritedArgumentsResolved: true,
     });
   }
   if (hostTool.toolName === 'active_work_list') {
@@ -1357,14 +1404,13 @@ async function invokeConversationOrchestrationTool({
     }
     try {
       const requestBody = hostTool.resources.request_body;
-      const inheritedConversation =
-        args.inheritContext === true &&
+      const inheritedConversation = args.inheritContext === true &&
         ['queue', 'message', 'steer', 'retry'].includes(input.action)
-          ? require('./ViventiumMainContextService').assignInheritedConversationContext(
-              requestBody.viventiumInheritedConversation,
-              selectTrustedLaunchRequestBody(requestBody, args.sourceOrdinals).sourceOrdinals,
-            )
-          : undefined;
+        ? require('./ViventiumMainContextService').assignInheritedConversationContext(
+            requestBody.viventiumInheritedConversation,
+            selectTrustedLaunchRequestBody(requestBody, args.sourceOrdinals).sourceOrdinals,
+          )
+        : undefined;
       return await executeManagedSourceMutation({
         userId: catalog.user.id,
         requestBody,
@@ -1387,14 +1433,13 @@ async function invokeConversationOrchestrationTool({
         signal,
         recordReceipt: (row) => recordManagedDurableReceipt(row, requestBody?.viventiumStreamId),
         dispatch: async () => {
+        if (requestBody?.viventiumResultAuthor !== undefined)
+          await assertCurrentGlassHiveResultAuthor({ userId: catalog.user.id, requestBody, signal });
           const result = await executeGlassHiveWorkAction({
             ownerId: catalog.user.id,
             ...input,
             ...(inheritedConversation ? { inheritedConversation } : {}),
-            ...(['queue', 'message', 'steer', 'retry', 'resume'].includes(input.action) ||
-            input.nativeInput
-              ? { requestBody }
-              : {}),
+            ...(['queue', 'message', 'steer', 'retry', 'resume'].includes(input.action) || input.nativeInput ? { requestBody } : {}),
             operationId: stableInvocationId,
             ...(isManagedSourceMutation(requestBody)
               ? {
@@ -1446,86 +1491,42 @@ function inheritedWorkSchema(schema, requestBody) {
   const selection = mainDelegationJsonSchema(requestBody);
   return {
     ...schema,
-    properties: {
-      ...schema.properties,
-      inheritContext: { type: 'boolean', enum: [true] },
+    properties: { ...schema.properties, inheritContext: { type: 'boolean', enum: [true] },
       sourceOrdinals: selection.properties.sourceOrdinals,
-      instruction: {
-        ...schema.properties.instruction,
-        description: MAIN_DELEGATION_JSON_SCHEMA.properties.instruction.description,
-      },
-    },
-    required: (schema.required || []).filter(
-      (name) => !['title', 'instruction', 'resourceClass'].includes(name),
-    ),
+      instruction: { ...schema.properties.instruction,
+        description: MAIN_DELEGATION_JSON_SCHEMA.properties.instruction.description } },
+    required: (schema.required || []).filter((name) => !['title', 'instruction', 'resourceClass'].includes(name)),
     anyOf: [{ required: ['inheritContext'] }, { required: schema.required || [] }],
   };
 }
 
 function inheritedWorkArguments(resources, args, start = false) {
   const body = resources?.request_body;
-  if (body?.viventiumInheritedConversation?.version !== 1)
-    throw Object.assign(new Error('inherited_context_unavailable'), {
-      code: 'inherited_context_unavailable',
-    });
-  const selection = selectTrustedLaunchRequestBody(body, args.sourceOrdinals);
+  if (body?.viventiumInheritedConversation?.version !== 1) throw Object.assign(new Error('inherited_context_unavailable'), { code: 'inherited_context_unavailable' });
+  const sourceOrdinals = args.sourceOrdinals === undefined && Array.isArray(body.viventiumTriggeringSourceSegments)
+    ? body.viventiumTriggeringSourceSegments.map((_segment, index) => index + 1)
+    : args.sourceOrdinals;
+  const selection = selectTrustedLaunchRequestBody(body, sourceOrdinals);
   if (selection.error) throw Object.assign(new Error(selection.error), { code: selection.error });
   const selected = selection.requestBody;
   const segments = selected.viventiumTriggeringSourceSegments;
   const texts = Array.isArray(segments)
-    ? segments
-        .map((segment) => (typeof segment.text === 'string' ? segment.text : ''))
-        .filter(Boolean)
+    ? segments.map((segment) => typeof segment.text === 'string' ? segment.text : '').filter(Boolean)
     : [];
   const suppliedInstruction = selectTrustedSourceInstruction(
-    texts.length ? texts : typeof selected.text === 'string' ? [selected.text] : [],
-    args.instruction,
-  );
-  const instruction =
-    suppliedInstruction ??
-    (texts.length
-      ? texts.join('\n\n')
-      : String(selected.text || '') ||
-        (trustedUploadedFilesFromRequestBody(selected).length
-          ? JSON.stringify({
-              source_segments: segments || [],
-              files: trustedUploadedFilesFromRequestBody(selected),
-            })
-          : ''));
-  if (!instruction)
-    throw Object.assign(new Error('current_task_source_unavailable'), {
-      code: 'current_task_source_unavailable',
-    });
-  return {
-    ...args,
-    instruction,
-    ...(start ? { title: instruction, resourceClass: 'standard' } : {}),
-  };
+    texts.length ? texts : typeof selected.text === 'string' ? [selected.text] : [], args.instruction);
+  const instruction = suppliedInstruction ?? (texts.length ? texts.join('\n\n') : String(selected.text || '') ||
+    (trustedUploadedFilesFromRequestBody(selected).length ? JSON.stringify({ source_segments: segments || [], files: trustedUploadedFilesFromRequestBody(selected) }) : ''));
+  if (!instruction) throw Object.assign(new Error('current_task_source_unavailable'), { code: 'current_task_source_unavailable' });
+  return { ...args, instruction, sourceOrdinals: selection.sourceOrdinals,
+    ...(start ? { title: instruction, resourceClass: 'standard', fileIds: args.fileIds ?? [] } : {}) };
 }
 
 function inheritedSelectionFailure(error, tool) {
   const code = error?.code;
-  if (
-    ![
-      'source_selection_required',
-      'invalid_source_selection',
-      'invalid_source_instruction_selection',
-      'inherited_context_unavailable',
-      'current_task_source_unavailable',
-    ].includes(code)
-  )
-    return null;
-  return {
-    status: 'blocked',
-    reason: code,
-    tool,
-    retryable: [
-      'source_selection_required',
-      'invalid_source_selection',
-      'invalid_source_instruction_selection',
-    ].includes(code),
-    needsInput: false,
-  };
+  if (!['source_selection_required', 'invalid_source_selection', 'invalid_source_instruction_selection', 'inherited_context_unavailable', 'current_task_source_unavailable'].includes(code)) return null;
+  return { status: 'blocked', reason: code, tool,
+    retryable: ['source_selection_required', 'invalid_source_selection', 'invalid_source_instruction_selection'].includes(code), needsInput: false };
 }
 
 async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationId, signal } = {}) {
@@ -1577,9 +1578,19 @@ async function invokeHostTool({ grant, catalog, hostTool, args = {}, invocationI
     let artifact;
     let resourceCount;
     if (hostTool.toolName === 'file_search') {
+      const files = await refreshConversationRecallExecutionFiles({
+        ownerId: catalog.user.id,
+        agentId: String(hostTool.resources.entity_id || '').trim() || undefined,
+        activeMessageId: String(grant?.message_id || '').trim() || undefined,
+        files: hostTool.resources.files,
+      }, {
+        readFiles: (filter) => getFiles(filter, null, { text: 0 }),
+        readLatestMessageCreatedAt: getLatestRecallEligibleMessageCreatedAt,
+      });
+      if (!files.length) return { status: 'blocked', reason: 'file_search_scope_unavailable', tool: hostTool.toolName };
       const fileSearchTool = await createFileSearchTool({
         userId: catalog.user.id,
-        files: hostTool.resources.files,
+        files,
         entity_id: String(hostTool.resources.entity_id || '').trim() || undefined,
         conversationId: String(grant?.conversation_id || '').trim() || undefined,
         activeMessageId: String(grant?.message_id || '').trim() || undefined,
@@ -1773,10 +1784,11 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
     policyDecision.toolPolicy?.access === 'write' &&
     grant?.authority_kind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
       ? Object.values(grant.host_tool_resources || {}).find(
-          (resource) => resource?.request_body?.viventiumStreamId,
+          (resource) => resource?.request_body?.viventiumStreamId || resource?.request_body?.viventiumResultAuthor !== undefined,
         )?.request_body
       : undefined;
   const managedWrite = isManagedSourceMutation(sourceRequestBody);
+  const resultAuthorBound = sourceRequestBody?.viventiumResultAuthor !== undefined;
   /* === VIVENTIUM END === */
   const replay = managedWrite
     ? { accepted: true }
@@ -1845,6 +1857,8 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
       getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
       signal,
       dispatch: async () => {
+        if (sourceRequestBody?.viventiumResultAuthor !== undefined)
+          await assertCurrentGlassHiveResultAuthor({ userId: catalog.user.id, requestBody: sourceRequestBody, signal });
         const returned = await Promise.race([
           mcpManager.callTool({
             serverName: nativeTool.serverName,
@@ -1888,9 +1902,10 @@ async function invokeUnderlyingTool({ grant, catalog, nativeTool, args = {}, sig
     });
   } catch (error) {
     if (
-      managedWrite &&
+      (managedWrite || resultAuthorBound) &&
       (String(error?.code || '').startsWith('source_') ||
-        String(error?.code || '').startsWith('durable_effect_'))
+        String(error?.code || '').startsWith('durable_effect_') ||
+        error?.code === 'mission_main_author_superseded')
     ) {
       return {
         status: 'blocked',
@@ -1959,6 +1974,25 @@ async function handleToolCall({
   signal,
   appConfig,
 } = {}) {
+  if (toolName === 'hand_off_to' || toolName === 'list_workers' ||
+      (isInheritedCoordinationGrant(grant) && toolName === 'active_work_action')) {
+    if (!isInheritedCoordinationGrant(grant)) return { status: 'blocked', reason: 'orchestration_authority_required', tool: toolName };
+    try {
+      ({ toolName, args } = coordinationToolCall(toolName, args));
+    } catch (error) {
+      return { status: 'blocked', reason: 'invalid_arguments', tool: toolName,
+        message: error.message };
+    }
+  }
+  if (isInheritedCoordinationGrant(grant)) {
+    if (!isConversationOrchestrationTool(toolName)) {
+      return { status: 'blocked', reason: 'coordination_action_unavailable', tool: toolName };
+    }
+    if (toolName === DELEGATION_TOOL_NAME ||
+        (toolName === 'active_work_action' && ['queue', 'message', 'steer', 'retry'].includes(args.action))) {
+      args = { ...args, inheritContext: true };
+    }
+  }
   if (toolName === 'capabilities_list') {
     const catalog = await buildCapabilityCatalog({ grant, signal, appConfig });
     return publicCatalog(catalog);
@@ -2046,11 +2080,7 @@ async function handleToolCall({
       let canonicalMutationArgs;
       try {
         if (args.inheritContext === true) {
-          args = inheritedWorkArguments(
-            hostTool.resources,
-            args,
-            toolName === DELEGATION_TOOL_NAME,
-          );
+          args = inheritedWorkArguments(hostTool.resources, args, toolName === DELEGATION_TOOL_NAME);
         }
         canonicalMutationArgs = canonicalConversationOrchestrationArguments(toolName, args);
       } catch (error) {

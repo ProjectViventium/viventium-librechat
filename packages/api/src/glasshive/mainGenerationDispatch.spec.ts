@@ -141,3 +141,39 @@ test('Main cannot borrow a missing verifier or a stale canonical message/claim p
     await denied.authorizeGlassHiveCallbackDeliveryDispatch({ ...f.input, claimId: 'newer-claim' }),
   ).toBeNull();
 });
+
+test('Native Main result v2 uses existing speech permit and rechecks its own source before renewal', async () => {
+  const f = fixture();
+  const source = {
+    bindingRef: 'native-binding',
+    nativeConversationId: 'native-conversation',
+    goalId: 'goal-one',
+    runId: 'native-run',
+    resultRevision: 1,
+    resultDigest: 'sha256:' + 'a'.repeat(64),
+    sourceTurnId: 'source-turn',
+    sourceCallSessionId: 'call-one',
+  };
+  f.change({
+    surface: 'voice',
+    voiceCallSessionId: 'call-one',
+    originRef: 'native-binding',
+    mainGenerationPresentation: buildMainGenerationPresentation(
+      { nativeCoordinatorResult: source },
+      'message-a',
+      'Actual Main reply',
+    ),
+  });
+  const input = { ...f.input, voiceCallSessionId: 'call-one' };
+  const permit = await f.service.authorizeGlassHiveCallbackDeliveryDispatch(input);
+  expect(permit).toMatchObject({
+    surface: 'voice',
+    resultDigest: f.read().mainGenerationPresentation!.responseDigest,
+  });
+  (f.deps.mainPresentationCurrent as jest.Mock).mockResolvedValue(false);
+  expect(
+    await f.service.renewGlassHiveCallbackDeliveryDispatch({ ...input, dispatchPermit: permit! }),
+  ).toBeNull();
+  expect(f.deps.acquireEffectLease).not.toHaveBeenCalled();
+  expect(f.deps.resultExists).not.toHaveBeenCalled();
+});

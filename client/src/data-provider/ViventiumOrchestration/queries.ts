@@ -29,6 +29,7 @@ export type WorkState =
   | 'running'
   | 'settling'
   | 'paused'
+  | 'blocked'
   | 'needs_input'
   | 'stopping'
   | 'completed'
@@ -100,7 +101,7 @@ const LIVE_WORK_STATES = new Set<WorkState>([
   'stopping',
 ]);
 
-const ATTENTION_WORK_STATES = new Set<WorkState>(['paused', 'needs_input']);
+const ATTENTION_WORK_STATES = new Set<WorkState>(['paused', 'needs_input', 'blocked']);
 
 export const activeWorkRefetchInterval = (data?: { pages?: ActiveWorkSnapshot[] }): number => {
   const pages = data?.pages ?? [];

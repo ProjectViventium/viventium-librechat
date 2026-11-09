@@ -21,7 +21,6 @@ const {
   ownedInteractionSources,
   prepareMainContinuityCarrier,
   NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
   MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER,
   visibleMessageChain: buildMainContinuityMessageChain,
 } = require('@librechat/api');
@@ -1066,13 +1065,7 @@ function mainHistoryFitsNativeBody(
   }
 }
 
-function buildInheritedConversationContext({
-  conversationId,
-  messages = [],
-  sections = {},
-  messageChain = [],
-  sourceSegments = [],
-}) {
+function buildInheritedConversationContext({ conversationId, messages = [], sections = {}, messageChain = [], sourceSegments = [] }) {
   const chain = new Map(messageChain.map((row) => [String(row.id), row]));
   const sourceFactsFor = (id) => {
     const ordinals = [];
@@ -1082,11 +1075,8 @@ function buildInheritedConversationContext({
       if (String(source.source_message_id || '') !== id) return;
       ordinals.push(index + 1);
       const receipt = source.source_received_at;
-      if (
-        !Number.isSafeInteger(receipt) ||
-        receipt <= 0 ||
-        (receivedAt !== undefined && receivedAt !== receipt)
-      ) {
+      if (!Number.isSafeInteger(receipt) || receipt <= 0 ||
+          (receivedAt !== undefined && receivedAt !== receipt)) {
         receiptConsistent = false;
       } else {
         receivedAt = receipt;
@@ -1094,49 +1084,27 @@ function buildInheritedConversationContext({
     });
     return { ordinals, receivedAt: receiptConsistent ? receivedAt : undefined };
   };
-  return {
-    version: 1,
-    conversation_id: conversationId,
-    sources: [
-      ...(Array.isArray(messages) ? messages : []).map((message, index) => {
-        const id = String(message.id || message.messageId || index);
-        const row = chain.get(id);
-        const sourceFacts = sourceFactsFor(id);
-        const sourceOrdinals = Array.isArray(row?.source_ordinals)
-          ? row.source_ordinals
-          : sourceFacts.ordinals;
-        return {
-          id: `message:${id}`,
-          role: String(
-            message.role ||
-              message._getType?.() ||
-              (message.isCreatedByUser === false ? 'assistant' : 'user'),
-          ),
-          text: messageContentText(message, true),
-          current_input: row?.current_input === true || sourceOrdinals.length > 0,
-          source_ordinals: sourceOrdinals,
-          ...(sourceFacts.receivedAt !== undefined
-            ? { source_received_at: sourceFacts.receivedAt }
-            : {}),
-          ...(message.tool_calls?.length ? { tool_calls: canonical(message.tool_calls) } : {}),
-          ...(message.tool_call_id ? { tool_call_id: String(message.tool_call_id) } : {}),
-        };
-      }),
-      ...Object.entries(sections).flatMap(([key, value]) =>
-        typeof value === 'string' && value
-          ? [
-              {
-                id: `context:${key}`,
-                role: 'context',
-                text: value,
-                current_input: key === 'currentFollowUp',
-                source_ordinals: key === 'currentFollowUp' ? [1] : [],
-              },
-            ]
-          : [],
-      ),
-    ],
-  };
+  return { version: 1, conversation_id: conversationId, sources: [
+    ...(Array.isArray(messages) ? messages : []).map((message, index) => {
+      const id = String(message.id || message.messageId || index);
+      const row = chain.get(id);
+      const sourceFacts = sourceFactsFor(id);
+      const sourceOrdinals = Array.isArray(row?.source_ordinals) ? row.source_ordinals : sourceFacts.ordinals;
+      return {
+        id: `message:${id}`,
+        role: String(message.role || message._getType?.() || (message.isCreatedByUser === false ? 'assistant' : 'user')),
+        text: messageContentText(message, true),
+        current_input: row?.current_input === true || sourceOrdinals.length > 0,
+        source_ordinals: sourceOrdinals,
+        ...(sourceFacts.receivedAt !== undefined ? { source_received_at: sourceFacts.receivedAt } : {}),
+        ...(message.tool_calls?.length ? { tool_calls: canonical(message.tool_calls) } : {}),
+        ...(message.tool_call_id ? { tool_call_id: String(message.tool_call_id) } : {}),
+      };
+    }),
+    ...Object.entries(sections).flatMap(([key, value]) => typeof value === 'string' && value
+      ? [{ id: `context:${key}`, role: 'context', text: value,
+          current_input: key === 'currentFollowUp', source_ordinals: key === 'currentFollowUp' ? [1] : [] }] : []),
+  ] };
 }
 
 // Main and worker consumers share this raw carrier; no model-authored summary is introduced.
@@ -1146,8 +1114,8 @@ function prependInheritedConversationPayload(payload, context) {
     role: source.role === 'context' ? 'system' : source.role,
     content: source.text,
     messageId: `inherited:${context.conversation_id}:${source.id}`,
-    ...(source.tool_calls?.length ? { tool_calls: source.tool_calls } : {}),
-    ...(source.tool_call_id ? { tool_call_id: source.tool_call_id } : {}),
+    ...(source.tool_calls?.length ? {tool_calls:source.tool_calls} : {}),
+    ...(source.tool_call_id ? {tool_call_id:source.tool_call_id} : {}),
   }));
   return [...inherited, ...payload];
 }
@@ -1155,17 +1123,11 @@ function prependInheritedConversationPayload(payload, context) {
 function assignInheritedConversationContext(context, sourceOrdinals = []) {
   if (!context || context.version !== 1 || !Array.isArray(context.sources)) return context;
   const selected = new Set(sourceOrdinals);
-  return {
-    ...context,
-    assigned_source_ordinals: [...selected],
-    sources: context.sources.map((source) => ({
-      ...source,
-      assigned_input:
-        source.current_input === true &&
-        Array.isArray(source.source_ordinals) &&
-        source.source_ordinals.some((ordinal) => selected.has(ordinal)),
-    })),
-  };
+  return { ...context, assigned_source_ordinals: [...selected], sources: context.sources.map((source) => ({
+    ...source,
+    assigned_input: source.current_input === true && Array.isArray(source.source_ordinals) &&
+      source.source_ordinals.some((ordinal) => selected.has(ordinal)),
+  })) };
 }
 
 function captureMainContextSnapshot(
@@ -1350,12 +1312,7 @@ function captureMainContextSnapshot(
     ...body,
     snapshotSha256: digest(body),
   };
-  const configuredModel = req.config?.endpoints?.agents?.providerCapabilities?.[
-    agent?.endpoint || agent?.provider
-  ]?.models?.find((model) => model.id === (agent?.model || agent?.model_parameters?.model));
-  const inheritConversation =
-    agent?.glasshive_options?.orchestration?.tool_mode === 'coordination' &&
-    ['direct-openai', 'direct-anthropic', 'direct-xai'].includes(configuredModel?.harnessProfile);
+  const inheritConversation = agent?.glasshive_options?.orchestration?.tool_mode === 'coordination';
   /* === VIVENTIUM START ===
    * Feature: Exact local attempt replay.
    * Purpose: The public/provider contract carries only digests, while fallback and retry inside
@@ -1363,25 +1320,13 @@ function captureMainContextSnapshot(
    * never serialized into provider headers or an enumerable request field.
    * === VIVENTIUM END === */
   Object.defineProperty(snapshot, LOCAL_ATTEMPT_STATE, {
-    value: Object.freeze(
-      canonical({
-        ...attemptState,
-        ...(inheritConversation
-          ? {
-              inheritedConversation: buildInheritedConversationContext({
-                conversationId,
-                messages: selectedMessages,
-                messageChain: chain,
-                sourceSegments: interaction.source_segments || [],
-                sections: {
-                  mainContinuity: sections.mainContinuity,
-                  conversationContinuity: sections.conversationContinuity,
-                },
-              }),
-            }
-          : {}),
-      }),
-    ),
+    value: Object.freeze(canonical({
+      ...attemptState,
+      ...(inheritConversation ? { inheritedConversation: buildInheritedConversationContext({
+        conversationId, messages: selectedMessages, messageChain: chain, sourceSegments: interaction.source_segments || [],
+        sections: { mainContinuity: sections.mainContinuity, conversationContinuity: sections.conversationContinuity },
+      }) } : {}),
+    })),
     configurable: false,
     enumerable: false,
     writable: false,
@@ -1703,13 +1648,9 @@ function applyMainContextAttempt({
         trustedAttemptAuthority,
         snapshot,
         maximumBytes: usesNativeBody
-          ? Math.min(
-              NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
-              Number.isSafeInteger(local.turnContextMaximumBytes) &&
-                local.turnContextMaximumBytes > 0
-                ? local.turnContextMaximumBytes
-                : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-            )
+          ? Number.isSafeInteger(local.turnContextMaximumBytes) && local.turnContextMaximumBytes > 0
+            ? local.turnContextMaximumBytes
+            : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES
           : TURN_CONTEXT_MAX_DECODED_BYTES,
         onStateBlocks: (value) => {
           stateBlocks = value;
@@ -1781,13 +1722,10 @@ function bindMainContextCarrier(targetAgent, snapshot) {
         ...(headers['X-GlassHive-Agent-Id']
           ? {
               [MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER]: String(
-                Math.min(
-                  NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES,
-                  Number.isSafeInteger(snapshot[LOCAL_ATTEMPT_STATE]?.turnContextMaximumBytes) &&
-                    snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes > 0
-                    ? snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes
-                    : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
-                ),
+                Number.isSafeInteger(snapshot[LOCAL_ATTEMPT_STATE]?.turnContextMaximumBytes) &&
+                  snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes > 0
+                  ? snapshot[LOCAL_ATTEMPT_STATE].turnContextMaximumBytes
+                  : NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES,
               ),
             }
           : {}),

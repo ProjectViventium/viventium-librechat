@@ -279,10 +279,16 @@ export function discardDeferredMainCompaction(domainKey: string): void {
 export function deferAcceptedMainCompactionForIdle(input: {
   ownerId: string; domainKey: string; schedule: () => Promise<unknown>;
   shouldYield: () => boolean; onError: (error: unknown) => void; signal?: AbortSignal;
+  preservePending?: boolean;
 }): boolean {
   if (!input.ownerId || !input.domainKey || input.signal?.aborted) return false;
   const delayMs = 30000;
   pruneCallCompactionSchedules(Date.now());
+  const existing = deferredCallCompactions.get(input.domainKey);
+  if (input.preservePending && existing?.ownerId === input.ownerId) {
+    if (!existing.callSessionId) existing.schedule = input.schedule;
+    return true;
+  }
   discardDeferredMainCompaction(input.domainKey);
   const entry = { ownerId: input.ownerId, callSessionId: '',
     expiresAt: Date.now() + mainCompactionAcceptanceRetention.ttlMs,
@@ -626,87 +632,33 @@ export function resetMainCompactionSchedulingForTests(): void {
 
 /** Later legal reference growth uses the existing runner once, with the full stored source. */
 export async function recoverMainContinuityCarrierForAdmission<
-  T extends { readonly status?: string },
+  T extends { readonly status?: string; readonly continuityDegraded?: boolean },
 >(input: {
   request?: { _viventiumAcceptedMainCarrierRecovery?: Set<string> };
   identityKey: string;
   load: () => Promise<T>;
-  ensure: () => Promise<object | void>;
+  defer: () => void;
   signal?: AbortSignal;
-  getActiveCompactions?: () => readonly Promise<void>[];
 }): Promise<T> {
   const checkStopped = () => {
     if (input.signal?.aborted)
       throw Object.assign(new Error('Main context admission cancelled.'), { name: 'AbortError' });
   };
-  let context = await input.load();
-  if (context.status !== 'context_budget') return context;
-  const joinActive = async (current: T): Promise<{ context: T; waited: boolean }> => {
-    let waited = false;
-    while (current.status === 'context_budget') {
-      checkStopped();
-      const active = input.getActiveCompactions?.() || [];
-      if (!active.length) return { context: current, waited };
-      waited = true;
-      await new Promise<void>((resolve, reject) => {
-        const stop = () => {
-          input.signal?.removeEventListener('abort', stop);
-          reject(
-            Object.assign(new Error('Main context admission cancelled.'), { name: 'AbortError' }),
-          );
-        };
-        input.signal?.addEventListener('abort', stop, { once: true });
-        Promise.all(active).then(
-          () => {
-            input.signal?.removeEventListener('abort', stop);
-            resolve();
-          },
-          (error) => {
-            input.signal?.removeEventListener('abort', stop);
-            reject(error);
-          },
-        );
-        if (input.signal?.aborted) stop();
-      });
-      // The existing finite idle batch may admit its next claim at this same boundary.
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      checkStopped();
-      current = await input.load();
-      checkStopped();
-    }
-    return { context: current, waited };
-  };
-  context = (await joinActive(context)).context;
-  if (context.status === 'available') return context;
   checkStopped();
-  const attempts = input.request
+  const context = await input.load();
+  checkStopped();
+  if (context.status === 'context_budget')
+    throw Object.assign(new Error('Main continuity disclosure cannot fit its selected carrier.'), {
+      code: 'source_context_unavailable', status: 413,
+    });
+  if (!context.continuityDegraded) return context;
+  const scheduled = input.request
     ? (input.request._viventiumAcceptedMainCarrierRecovery ||= new Set<string>())
     : new Set<string>();
-  if (!attempts.has(input.identityKey)) {
-    let retryUnclaimedBusy: boolean;
-    do {
-      checkStopped();
-      attempts.add(input.identityKey);
-      const outcome = await input.ensure();
-      context = await input.load();
-      const joined = await joinActive(context);
-      context = joined.context;
-      // A pre-claim race did not spend a producer attempt; completed CAS contention did.
-      retryUnclaimedBusy =
-        context.status === 'context_budget' &&
-        joined.waited &&
-        !!outcome &&
-        'status' in outcome &&
-        outcome.status === 'busy' &&
-        !('attempts' in outcome);
-      if (retryUnclaimedBusy) attempts.delete(input.identityKey);
-    } while (retryUnclaimedBusy);
+  if (!scheduled.has(input.identityKey)) {
+    scheduled.add(input.identityKey);
+    input.defer();
   }
-  if (context.status !== 'available')
-    throw Object.assign(new Error('Prior accepted Main history cannot be carried intact.'), {
-      code: 'source_context_unavailable',
-      status: 413,
-    });
   return context;
 }
 

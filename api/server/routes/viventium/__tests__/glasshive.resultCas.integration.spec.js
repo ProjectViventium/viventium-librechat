@@ -689,6 +689,30 @@ describe('GlassHive callback terminal-result receiver CAS integration', () => {
     }
   }, 25000);
 
+  test('accepts a completed run as evidence while its queued successor owns the work', async () => {
+    const result = terminalBody(1, 'a', 'First result', {
+      work_state: 'running',
+      work_terminal: false,
+    });
+
+    const accepted = await callbackRequest(app, result);
+    expect(accepted.status).toBe(202);
+    expect(accepted.body).toEqual(expect.objectContaining(receiptFor(result, 'accepted', result)));
+    expect(mockEnqueueGlassHiveMissionAdjudication).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ run_id: result.run_id, work_terminal: false }),
+        effectFence: expect.objectContaining({ callbackId: result.callback_id }),
+      }),
+    );
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockRecordGlassHiveCallbackExternalState).not.toHaveBeenCalled();
+    const replay = await callbackRequest(app, result);
+    expect(replay.body).toEqual(expect.objectContaining(receiptFor(result, 'idempotent', result)));
+    await expect(
+      mongoose.connection.db.collection(CALLBACK_RESULTS_COLLECTION).countDocuments({}),
+    ).resolves.toBe(1);
+  }, 15000);
+
   test('requires exact sender headers and performs no side effect for malformed identity', async () => {
     const resultA = terminalBody(1, 'a', 'Malformed identity must not persist.');
     const response = await callbackRequest(app, resultA, {

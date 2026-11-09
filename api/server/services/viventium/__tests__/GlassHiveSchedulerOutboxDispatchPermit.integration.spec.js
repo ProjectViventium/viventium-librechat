@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
+const { schedulerDispatchDocumentId } = require('@librechat/api');
 const {
   compareAndSetGlassHiveTerminalCallbackResult,
   fenceGlassHiveTerminalCallbackAcceptedOperationTransaction,
@@ -19,6 +20,7 @@ const {
 const {
   dispatchGlassHiveSchedulerCallbackOutbox,
   enqueueGlassHiveSchedulerCallbackOutbox,
+  reconcileGlassHiveSchedulerCallbackOutbox,
 } = require('../GlassHiveTerminalCallbackOutboxService');
 const {
   runGlassHiveTerminalCallbackTransaction,
@@ -148,6 +150,150 @@ describe('GlassHive scheduler outbox final dispatch permit', () => {
     if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
     await replicaSet?.stop({ doCleanup: true, force: true });
   }, 15000);
+
+  async function enqueueOwnershipCase(occurrenceKey = 'opaque-occurrence') {
+    const result = identity(1, 'a');
+    const accepted = await compareAndSetGlassHiveTerminalCallbackResult({
+      ResultModel: GlassHiveTerminalCallbackResult, incoming: result,
+    });
+    const durable = await GlassHiveTerminalCallbackResult.findOne({}).lean();
+    return enqueueGlassHiveSchedulerCallbackOutbox({
+      binding: { ownerId: result.ownerId, scheduleOccurrenceKey: occurrenceKey },
+      summary: { requiredTotal: 1, requiredTerminal: 1, requiredFailed: 0,
+        allRequiredTerminal: true, state: 'completed' },
+      effectFence: { resultKey: String(durable._id), acceptedOperationId: accepted.acceptedOperationId,
+        callbackId: result.callbackId, resultDigest: result.resultDigest, resultRevision: 1, generation: 1 },
+    });
+  }
+
+  async function insertAdmission(row) {
+    return mongoose.connection.collection('viventium_scheduler_dispatch_intents').insertOne({
+      _id: schedulerDispatchDocumentId(row.userId, row.idempotencyKey), ...row,
+    });
+  }
+
+  test.each([
+    ['schedule_due', 'owner-scheduler-permit', true],
+    ['schedule_due', 'another-owner', false],
+    ['legacy', 'owner-scheduler-permit', false],
+  ])('routes opaque occurrence by saved %s owner %s', async (kind, userId, applicationOwned) => {
+    await insertAdmission({
+      kind, userId, idempotencyKey: 'opaque-occurrence',
+    });
+    const outbox = await enqueueOwnershipCase();
+    if (applicationOwned) {
+      expect(outbox).toBeNull();
+      expect(await ViventiumGlassHiveCallbackEffectOutbox.countDocuments({})).toBe(0);
+    } else {
+      const fetchImpl = jest.fn(async () => ({ ok: true, status: 200 }));
+      expect(await dispatchGlassHiveSchedulerCallbackOutbox({ outboxId: outbox.outboxId, fetchImpl }))
+        .toMatchObject({ status: 'sent' });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  test('retained application-owned callback is superseded without sending to legacy scheduler', async () => {
+    const outbox = await enqueueOwnershipCase();
+    await insertAdmission({
+      kind: 'schedule_due', userId: 'owner-scheduler-permit', idempotencyKey: 'opaque-occurrence',
+    });
+    const fetchImpl = jest.fn();
+    expect(await dispatchGlassHiveSchedulerCallbackOutbox({ outboxId: outbox.outboxId, fetchImpl }))
+      .toMatchObject({ status: 'superseded' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(await ViventiumGlassHiveCallbackEffectOutbox.findOne({ outboxId: outbox.outboxId }).lean())
+      .toMatchObject({ status: 'superseded', nextAttemptAt: null,
+        lastError: 'scheduler_occurrence_owned_by_application' });
+    expect(await GlassHiveTerminalCallbackResult.countDocuments({})).toBe(1);
+  });
+
+  test('keeps a durable callback when ownership lookup fails, then resolves the owner before sending', async () => {
+    const admissions = mongoose.connection.collection('viventium_scheduler_dispatch_intents');
+    const lookup = jest.spyOn(admissions, 'findOne').mockRejectedValueOnce(new Error('lookup_unavailable'));
+    let outbox;
+    try {
+      outbox = await enqueueOwnershipCase();
+    } finally {
+      lookup.mockRestore();
+    }
+    expect(outbox.status).toBe('pending');
+    await insertAdmission({ kind: 'schedule_due', userId: 'owner-scheduler-permit',
+      idempotencyKey: 'opaque-occurrence' });
+    const fetchImpl = jest.fn();
+    expect(await dispatchGlassHiveSchedulerCallbackOutbox({ outboxId: outbox.outboxId, fetchImpl }))
+      .toMatchObject({ status: 'superseded' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  test.each([false, true])('does not send when ownership lookup is unavailable during dispatch (expired=%s)', async (expired) => {
+    const outbox = await enqueueOwnershipCase();
+    const lookup = jest.spyOn(mongoose.connection.collection('viventium_scheduler_dispatch_intents'),
+      'findOne').mockImplementationOnce(async () => {
+        // Model a lookup that outlasts the claim, without faking Mongo's timers.
+        if (expired) await ViventiumGlassHiveCallbackEffectOutbox.updateOne({ outboxId: outbox.outboxId },
+          { $set: { claimExpiresAt: new Date(0) } });
+        throw new Error('lookup_unavailable');
+      });
+    const fetchImpl = jest.fn(async () => ({ ok: true }));
+    try {
+      await expect(dispatchGlassHiveSchedulerCallbackOutbox({ outboxId: outbox.outboxId, fetchImpl }))
+        .rejects.toThrow('lookup_unavailable');
+    } finally { lookup.mockRestore(); }
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const deferred = await ViventiumGlassHiveCallbackEffectOutbox.findOne({ outboxId: outbox.outboxId }).lean();
+    expect(deferred).toMatchObject({ status: 'failed', claimId: '', claimExpiresAt: null,
+      lastError: 'scheduler_ownership_lookup_unavailable' });
+    expect(deferred.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+    // The normal retry remains available after the delay, with no abandoned claim.
+    await ViventiumGlassHiveCallbackEffectOutbox.updateOne({ outboxId: outbox.outboxId },
+      { $set: { nextAttemptAt: new Date(0) } });
+    expect(await dispatchGlassHiveSchedulerCallbackOutbox({ outboxId: outbox.outboxId, fetchImpl }))
+      .toMatchObject({ status: 'sent' });
+  });
+
+  test('lookup failure cannot settle a claim acquired by another dispatcher', async () => {
+    const outbox = await enqueueOwnershipCase();
+    const lookup = jest.spyOn(mongoose.connection.collection('viventium_scheduler_dispatch_intents'),
+      'findOne').mockImplementationOnce(async () => {
+        await ViventiumGlassHiveCallbackEffectOutbox.updateOne({ outboxId: outbox.outboxId },
+          { $set: { claimId: 'new-dispatcher-claim', claimExpiresAt: new Date(Date.now() + 30000) } });
+        throw new Error('lookup_unavailable');
+      });
+    const fetchImpl = jest.fn();
+    try {
+      await expect(dispatchGlassHiveSchedulerCallbackOutbox({ outboxId: outbox.outboxId, fetchImpl }))
+        .rejects.toThrow('lookup_unavailable');
+    } finally { lookup.mockRestore(); }
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(await ViventiumGlassHiveCallbackEffectOutbox.findOne({ outboxId: outbox.outboxId }).lean())
+      .toMatchObject({ status: 'claimed', claimId: 'new-dispatcher-claim' });
+  });
+
+  test('a failed callback does not prevent a later callback in the same batch', async () => {
+    const bad = await enqueueOwnershipCase('bad-occurrence');
+    await enqueueOwnershipCase('good-occurrence');
+    const fetchImpl = jest.fn(async (_url, options) => {
+      const badOccurrence = JSON.parse(options.body).occurrence_key === 'bad-occurrence';
+      return { ok: !badOccurrence, status: badOccurrence ? 404 : 200 };
+    });
+    expect(await reconcileGlassHiveSchedulerCallbackOutbox({ limit: 2, fetchImpl }))
+      .toMatchObject({ failed: 1, sent: 1 });
+    expect(await ViventiumGlassHiveCallbackEffectOutbox.findOne({ outboxId: bad.outboxId }).lean())
+      .toMatchObject({ status: 'failed', lastError: 'scheduler_external_work_callback_http_404' });
+  });
+
+  test('an older retry does not jump ahead of callbacks eligible for longer', async () => {
+    const bad = await enqueueOwnershipCase('old-retry');
+    const good = await enqueueOwnershipCase('waiting-callback');
+    await ViventiumGlassHiveCallbackEffectOutbox.updateOne({ outboxId: bad.outboxId },
+      { $set: { status: 'failed', createdAt: new Date(0), nextAttemptAt: new Date(Date.now() - 1000) } });
+    await ViventiumGlassHiveCallbackEffectOutbox.updateOne({ outboxId: good.outboxId },
+      { $set: { nextAttemptAt: new Date(Date.now() - 2000) } });
+    const fetchImpl = jest.fn(async () => ({ ok: true, status: 200 }));
+    expect(await dispatchGlassHiveSchedulerCallbackOutbox({ fetchImpl }))
+      .toMatchObject({ status: 'sent', outboxId: good.outboxId });
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body).occurrence_key).toBe('waiting-callback');
+  });
 
   test('blocks B while receiver accepts A, then accepts B after A settles', async () => {
     const resultA = identity(1, 'a');

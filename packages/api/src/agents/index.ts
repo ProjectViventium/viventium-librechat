@@ -5,8 +5,10 @@ export * from './chain';
  * Added: 2026-02-19
  */
 export * from './conversationRecall';
+export { refreshConversationRecallExecutionFiles } from './conversationRecallAvailability';
 /* === VIVENTIUM END === */
 export * from './context';
+export * from '../cortex/mainAuthorContext';
 export * from './edges';
 export * from './handlers';
 export * from './initialize';

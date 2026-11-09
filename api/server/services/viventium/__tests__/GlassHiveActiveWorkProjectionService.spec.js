@@ -5,6 +5,13 @@ let mockFindOneAndUpdate;
 let mockUpdateOne;
 let mockMissionFind;
 
+jest.mock('../NativeCoordinatorService', () => ({
+  enrich: jest.fn(async (_ownerId, snapshot) => snapshot),
+}));
+jest.mock('../NativeCoordinatorWorkService', () => ({
+  resolveNativeCoordinatorWorkIdentity: jest.fn(async () => null),
+}));
+
 jest.mock('mongoose', () => {
   const actual = jest.requireActual('mongoose');
   return {
@@ -949,4 +956,56 @@ describe('GlassHiveActiveWorkProjectionService', () => {
     expect(mockUpdateOne).not.toHaveBeenCalled();
     expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
   });
+
+  test.each(['delivered', 'pending', 'new-run', 'foreign-receipt', 'invalid-alias'])(
+    'Native retained goal delivery survives raw roster omission: %s',
+    async (scenario) => {
+      const { mergeHostedAndNativeRoster, nativeCoordinatorWorkRef } = require('@librechat/api');
+      const { row, evidence } = currentResultFixture(scenario === 'pending' ? 'processing' : 'completed');
+      row.ownerId = scenario === 'foreign-receipt' ? 'other-owner' : 'owner-1';
+      const cursor = (values) => ({ toArray: async () => values,
+        sort() { return this; }, limit() { return this; } });
+      mockFind.mockImplementation((query) => cursor(
+        query.ownerId === row.ownerId && query.workRef?.$in?.includes(row.workRef) ? [row] : [],
+      ));
+      mockMissionFind.mockReturnValue(cursor([evidence]));
+      const binding = { ownerId: 'owner-1', tenantId: 'tenant-1', conversationId: 'origin-chat',
+        nativeConversationId: 'native-chat', active: true };
+      const viewRef = 'https://runtime.example.test/w/owned-read-only-result';
+      const goal = { goal_id: 'retained-goal', text: 'Synthetic retained result', state: 'completed',
+        work_ref: row.workRef, run_id: scenario === 'new-run' ? 'later-native-run' : 'run-current',
+        actions: ['message', 'queue', 'dismiss'], view_ref: viewRef };
+      const native = require('../NativeCoordinatorService');
+      const merge = async (_ownerId, snapshot) => {
+        const merged = mergeHostedAndNativeRoster({ ownerId: 'owner-1', tenantId: 'tenant-1',
+          hosted: snapshot, native: { snapshot: 'fresh', snapshots: [{ binding,
+            snapshot: { conversation_id: 'native-chat', goals: [goal] } }] }, scope: 'active' });
+        if (scenario === 'invalid-alias') merged.work[1].workRef = 'unverified-alias';
+        return merged;
+      };
+      native.enrich.mockImplementationOnce(merge).mockImplementationOnce(merge);
+      const newer = { workRef: 'newer-terminal-work', state: 'completed', actions: [] };
+      const input = { ownerId: 'owner-1', includeCoreOnly: true,
+        snapshot: { snapshot: 'fresh', cursor: 'preserved-cursor', overflowCount: 7, work: [newer] } };
+      const result = await enrichActiveWorkSnapshot(input);
+      const repeated = await enrichActiveWorkSnapshot(input);
+      expect(result).toEqual(repeated);
+      expect(result.cursor).toBe('preserved-cursor');
+      expect(result.overflowCount).toBe(7);
+      expect(result.work).toHaveLength(2);
+      expect(result.work[0]).toMatchObject(newer);
+      const retained = result.work[1];
+      expect(retained).toMatchObject({ nativeWorkRef: row.workRef, viewRef });
+      expect(retained.workRef).toBe(scenario === 'invalid-alias' ? 'unverified-alias'
+        : nativeCoordinatorWorkRef('native-chat', 'retained-goal'));
+      const expected = scenario === 'delivered' ? 'delivered' : scenario === 'pending' ? 'pending' : 'unknown';
+      expect(retained.delivery.state).toBe(expected);
+      expect(retained.actions).toEqual(expected === 'delivered'
+        ? ['message', 'queue', 'dismiss'] : ['message', 'queue']);
+      expect(mockUpdateOne).not.toHaveBeenCalled();
+      expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+      expect(input.snapshot.work).toEqual([newer]);
+    },
+  );
+
 });

@@ -70,10 +70,8 @@ jest.mock('@librechat/api', () => ({
   isAcceptedMainProjectionComplete: (...args) => mockProjectionComplete(...args),
   prepareNativeSourceRecovery: (...args) =>
     jest.requireActual('@librechat/api').prepareNativeSourceRecovery(...args),
-  readRetainedNativeMainFinal: (...args) =>
-    jest.requireActual('@librechat/api').readRetainedNativeMainFinal(...args),
-  inspectRetainedMainFinalState: (...args) =>
-    jest.requireActual('@librechat/api').inspectRetainedMainFinalState(...args),
+  readRetainedNativeMainFinal: (...args) => jest.requireActual('@librechat/api').readRetainedNativeMainFinal(...args),
+  inspectRetainedMainFinalState: (...args) => jest.requireActual('@librechat/api').inspectRetainedMainFinalState(...args),
   GenerationJobManager: mockJobs,
   nativeIdentityJson: (...args) => jest.requireActual('@librechat/api').nativeIdentityJson(...args),
   nativeJobMatches: (...args) => jest.requireActual('@librechat/api').nativeJobMatches(...args),
@@ -872,10 +870,7 @@ describe('native graph participant file identity', () => {
     mockPrepareInvocation.mockClear();
     mockPrepareInvocation.mockResolvedValue(false);
     mockCreateNativeResponseFetch.mockReturnValueOnce(baseFetch);
-    req.body = {
-      ...req.body,
-      _viventiumNativeResponseIdentity: { invocationId: 'untrusted-body' },
-    };
+    req.body = { ...req.body, _viventiumNativeResponseIdentity: { invocationId: 'untrusted-body' } };
     wrapNativeResponseFetch(req, 'specialist', baseFetch, route);
     const callbacks = mockCreateNativeResponseFetch.mock.calls.at(-1);
     const next = { invocationId: 'next' };
@@ -1711,6 +1706,16 @@ describe('terminal mission current Native Main courier', () => {
       .mockResolvedValue({ status: 'queued', deliveryId: 'd'.repeat(64) });
   });
   afterEach(() => offer.mockRestore());
+  test('offers Telegram evidence only to Main in the accepted source order scope', async () => {
+    expect(await native.offerMissionEvidenceToCurrentMain({
+      ...input, expectedSourceOrderScope: 'different-topic',
+    })).toBe(false);
+    expect(offer).not.toHaveBeenCalled();
+    expect(await native.offerMissionEvidenceToCurrentMain({
+      ...input, expectedSourceOrderScope: identity.sourceOrderScope,
+    })).toBe(true);
+    expect(offer).toHaveBeenCalledTimes(1);
+  });
   test('offers exact evidence through Native and defers without claiming consumption', async () => {
     expect(await native.offerMissionEvidenceToCurrentMain(input)).toBe(true);
     expect(offer).toHaveBeenCalledWith(

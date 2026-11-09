@@ -8,6 +8,7 @@ let mockMessageFindOne;
 let mockMessageFind;
 let mockConversationFindOne;
 let mockStoredMessages;
+let mockClaimedRows;
 let mockFindOneAndUpdate;
 let mockFindOne;
 let mockFind;
@@ -54,9 +55,38 @@ jest.mock('mongoose', () => {
             : name === 'conversations'
               ? { findOne: (...args) => mockConversationFindOne(...args) }
               : {
-                  updateOne: (...args) => mockUpdateOne(...args),
-                  findOneAndUpdate: (...args) => mockFindOneAndUpdate(...args),
-                  findOne: (...args) => mockFindOne(...args),
+                  updateOne: async (filter, update, ...rest) => {
+                    const current = mockClaimedRows.get(filter._id);
+                    if (filter.processingClaimId && !require('sift').default(filter)(current || {})) {
+                      return { acknowledged: true, matchedCount: 0 };
+                    }
+                    const before = Object.fromEntries(Object.keys(update.$inc || {}).map((key) => [key, current?.[key]]));
+                    const result = await mockUpdateOne(filter, update, ...rest);
+                    if (current && result?.matchedCount !== 0) {
+                      Object.assign(current, update.$set);
+                      for (const key of Object.keys(update.$unset || {})) delete current[key];
+                      for (const [key, amount] of Object.entries(update.$inc || {})) {
+                        if (current[key] === before[key]) current[key] = (current[key] || 0) + amount;
+                      }
+                    }
+                    return result;
+                  },
+                  findOneAndUpdate: async (filter, update, ...rest) => {
+                    const result = await mockFindOneAndUpdate(filter, update, ...rest);
+                    const current = result?.value || result;
+                    if (current?._id && update.$set?.processingClaimId) {
+                      // Mongo's returnDocument:after includes the token this claim wrote.
+                      current.state = update.$set.state;
+                      current.processingAt ||= update.$set.processingAt;
+                      current.processingClaimId = update.$set.processingClaimId;
+                      mockClaimedRows.set(current._id, current);
+                    }
+                    return result;
+                  },
+                  findOne: (filter, ...rest) => filter.processingClaimId
+                    ? Promise.resolve(require('sift').default(filter)(mockClaimedRows.get(filter._id) || {})
+                      ? { ...mockClaimedRows.get(filter._id) } : null)
+                    : mockFindOne(filter, ...rest),
                   find: (...args) => mockFind(...args),
                 },
     },
@@ -236,69 +266,172 @@ afterAll(() => {
 });
 
 describe('GlassHiveMissionAdjudicationService', () => {
+  test.each(['prepared', 'permanent failure', 'temporary failure'])(
+    'a reclaimed evidence claim rejects its stale author before %s mutations', async (mode) => {
+      const matches = require('sift').default;
+      let current = row();
+      mockFind.mockReturnValueOnce(cursor([current]));
+      mockFindOneAndUpdate.mockImplementationOnce(async (filter, update) => {
+        if (!matches(filter)(current)) return null;
+        current = { ...current, ...update.$set, attempts: current.attempts + 1 };
+        return { ...current };
+      });
+      mockFindOne.mockImplementation(async (filter) => matches(filter)(current) ? { ...current } : null);
+      mockUpdateOne.mockImplementation(async (filter, update) => {
+        if (!matches(filter)(current)) return { acknowledged: true, matchedCount: 0 };
+        Object.assign(current, update.$set);
+        for (const [field, amount] of Object.entries(update.$inc || {})) current[field] = (current[field] || 0) + amount;
+        for (const field of Object.keys(update.$unset || {})) delete current[field];
+        return { acknowledged: true, matchedCount: 1 };
+      });
+      mockPrepareCortexFollowUpMessage.mockImplementationOnce(async () => {
+        // A retryable attempt can be released and reclaimed in the same millisecond.
+        // Its counter and time can match; its durable claim identity cannot.
+        current = { ...current, processingClaimId: 'replacement-claim' };
+        mockClaimedRows.set(current._id, current);
+        if (mode !== 'prepared') throw Object.assign(new Error('Synthetic author failure'), {
+          code: 'synthetic_author_failure', retryable: mode === 'temporary failure',
+        });
+        return { prepared: true };
+      });
+      await flushGlassHiveMissionAdjudications({ ownerId: current.ownerId });
+      expect(current).toMatchObject({ state: 'processing', processingClaimId: 'replacement-claim' });
+      expect(current.followUpMessageId).toBeUndefined();
+      expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+      expect(mockEnqueueDelivery).not.toHaveBeenCalled();
+      expect(mockRecordOutcome).not.toHaveBeenCalled();
+    },
+  );
+
+  test('retained callback with an omitted agent ID uses its freshly resolved Main owner', async () => {
+    const before = process.env.VIVENTIUM_MAIN_AGENT_ID;
+    process.env.VIVENTIUM_MAIN_AGENT_ID = 'main-agent';
+    const claimed = row({ mainAgentId: '', state: 'processing', attempts: 1, processingAt: new Date() });
+    mockFind.mockReturnValueOnce(cursor([row({ mainAgentId: '' })]));
+    mockFindOneAndUpdate.mockResolvedValueOnce(claimed);
+    mockFindOne.mockImplementation(async (filter) => Object.entries(filter).every(([key, value]) => claimed[key] === value) ? claimed : null);
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async ({ nativeAuthor: author, agent }) => {
+      expect(agent.id).toBe('main-agent');
+      const fetch = jest.fn().mockResolvedValue(new Response('{}'));
+      await expect(author.wrapFetch(fetch, 'native')('http://native.test/v1/chat/completions', {
+        method: 'POST', body: JSON.stringify({ model: 'synthetic', messages: [] }),
+        headers: { 'X-Viventium-User-Id': 'user-1', 'X-Viventium-Conversation-Id': 'conversation-1',
+          'X-Viventium-Message-Id': author.messageId, 'X-GlassHive-Agent-Id': 'main-agent:phase_b:followup',
+          'X-Viventium-Stream-Id': 'callback-stream', 'X-GlassHive-Idempotency-Key': 'callback-stream' },
+      })).resolves.toBeInstanceOf(Response);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      return { text: 'Saved result recovered.' };
+    });
+    try {
+      await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ visible: 1, failed: 0 });
+    } finally {
+      if (before === undefined) delete process.env.VIVENTIUM_MAIN_AGENT_ID; else process.env.VIVENTIUM_MAIN_AGENT_ID = before;
+    }
+  });
+
+  test('callback action authority uses its live claim and rejects foreign, closed or superseded authors', async () => {
+    const service = require('../GlassHiveMissionAdjudicationService');
+    const claimed = row({ state: 'processing', attempts: 1, processingAt: new Date() });
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    mockFindOneAndUpdate.mockResolvedValueOnce(claimed);
+    mockFindOne.mockImplementation(async (filter) => Object.entries(filter).every(([key, value]) => claimed[key] === value) ? claimed : null);
+    let binding;
+    mockPrepareCortexFollowUpMessage.mockImplementationOnce(async ({ nativeAuthor: author }) => {
+      binding = { ownerId: claimed.ownerId, conversationId: claimed.conversationId,
+        scope: author.scope, messageId: author.messageId };
+      await expect(service.assertCurrentGlassHiveMissionAuthor(binding)).resolves.toBeUndefined();
+      for (const change of [{ ownerId: 'foreign' }, { conversationId: 'foreign' }, { messageId: 'foreign' }, { scope: 'foreign' }])
+        await expect(service.assertCurrentGlassHiveMissionAuthor({ ...binding, ...change })).rejects.toBeDefined();
+      mockClaimedRows.get(claimed._id).processingClaimId = 'superseded-claim';
+      await expect(service.assertCurrentGlassHiveMissionAuthor(binding)).rejects.toBeDefined();
+      return { text: 'Useful current result.' };
+    });
+    await flushGlassHiveMissionAdjudications({ ownerId: claimed.ownerId });
+    await expect(service.assertCurrentGlassHiveMissionAuthor(binding)).rejects.toBeDefined();
+  });
+
+  test('a lost native response after tool effects recovers without repeating either effect', async () => {
+    let current = row({ state: 'processing', attempts: 1, processingAt: new Date() });
+    mockFindOne.mockImplementation(async (filter) => Object.entries(filter).every(([key, value]) => current[key] === value) ? current : null);
+    mockUpdateOne.mockImplementation(async (_filter, change) => {
+      if (change.$set) Object.assign(current, change.$set);
+      if (change.$inc?.attempts) current.attempts += change.$inc.attempts;
+      return { acknowledged: true, matchedCount: 1 };
+    });
+    let launches = 0, writes = 0, posts = 0, lookups = 0;
+    mockPrepareCortexFollowUpMessage.mockImplementation(async ({ nativeAuthor: author }) => {
+      const native = async (_url, init) => {
+        if (init.method !== 'GET') {
+          posts += 1; launches += 1; writes += 1;
+          throw Object.assign(new Error('Reply lost after execution'), { status: 503, code: 'upstream_unavailable', retryable: true });
+        }
+        lookups += 1;
+        const identity = current.nativeSynthesisIdentity;
+        return new Response(JSON.stringify({
+          object: 'glasshive.request.result', version: 1, state: 'completed',
+          invocation_id: identity.invocationId, body_sha256: identity.bodySha256,
+          authority_sha256: 'c'.repeat(64), stream_id: 'stable-callback-stream',
+          message_id: author.messageId, agent_id: 'main-agent:phase_b:followup',
+          conversation_id: 'conversation-1', request_id: 'retained-request', run_id: 'retained-run',
+          response: { id: 'retained-request', object: 'chat.completion', created: 1, model: 'synthetic',
+            choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'Accepted effects retained.' } }] },
+        }));
+      };
+      const response = await author.wrapFetch(native, 'native')('http://native.test/v1/chat/completions', {
+        method: 'POST', body: JSON.stringify({ model: 'synthetic', stream: false, messages: [{ role: 'user', content: 'Keep the accepted outcome.' }] }),
+        headers: { 'X-Viventium-User-Id': 'user-1', 'X-Viventium-Conversation-Id': 'conversation-1',
+          'X-Viventium-Message-Id': author.messageId, 'X-GlassHive-Agent-Id': 'main-agent:phase_b:followup',
+          'X-Viventium-Stream-Id': 'stable-callback-stream', 'X-GlassHive-Idempotency-Key': 'stable-callback-stream' },
+      });
+      expect(await response.text()).toContain('Accepted effects retained.');
+      return { prepared: true };
+    });
+    mockFind.mockReturnValueOnce(cursor([row()]));
+    mockFindOneAndUpdate.mockImplementationOnce(async () => current);
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ failed: 1, visible: 0 });
+    expect(current.state).toBe('failed');
+    expect(current.nativeSynthesisIdentity).toBeDefined();
+    const pending = { ...current, state: 'pending' };
+    mockFind.mockReturnValueOnce(cursor([pending]));
+    mockFindOneAndUpdate.mockImplementationOnce(async () => {
+      current = { ...pending, state: 'processing', attempts: pending.attempts + 1, processingAt: new Date() };
+      return current;
+    });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ failed: 0, visible: 1 });
+    expect({ launches, writes, posts, lookups }).toEqual({ launches: 1, writes: 1, posts: 1, lookups: 1 });
+    expect(mockPersistPreparedCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+  });
+
   test('does not reclaim a slow active native synthesis after five minutes', async () => {
     jest.useFakeTimers();
     const service = require('../GlassHiveMissionAdjudicationService');
-    const claimed = row({
-      state: 'processing',
-      attempts: 1,
-      processingAt: new Date(Date.now() - 360000),
-    });
+    const claimed = row({ state: 'processing', attempts: 1, processingAt: new Date(Date.now() - 360000) });
     let release;
-    const held = new Promise((resolve) => {
-      release = resolve;
-    });
+    const held = new Promise((resolve) => { release = resolve; });
     mockFind.mockReturnValueOnce(cursor([row()])).mockReturnValue(cursor([]));
     mockFindOneAndUpdate.mockResolvedValueOnce(claimed);
     mockPrepareCortexFollowUpMessage.mockImplementationOnce(() => held);
-    service.wakeGlassHiveMissionAdjudications({
-      ownerId: 'user-1',
-      conversationId: 'conversation-1',
-    });
+    service.wakeGlassHiveMissionAdjudications({ ownerId: 'user-1', conversationId: 'conversation-1' });
     await jest.advanceTimersByTimeAsync(0);
     const before = mockUpdateOne.mock.calls.length;
     mockFind.mockReturnValue(cursor([claimed]));
     await service.reconcilePendingGlassHiveMissionAdjudications();
-    expect(
-      mockUpdateOne.mock.calls
-        .slice(before)
-        .filter(
-          ([filter, change]) => filter._id === claimed._id && change.$set?.state === 'pending',
-        ),
-    ).toHaveLength(0);
+    expect(mockUpdateOne.mock.calls.slice(before).filter(([filter, change]) =>
+      filter._id === claimed._id && change.$set?.state === 'pending')).toHaveLength(0);
     mockFind.mockReturnValue(cursor([]));
     release({ prepared: true });
     await jest.advanceTimersByTimeAsync(0);
   });
 
-  test.each([
-    'complete',
-    'consumer',
-    'pending',
-    'foreign',
-    'first',
-    'missing',
-    'unavailable',
-    'cancelled',
-    'queue',
-    'message',
-  ])('retains exact native synthesis across retry: %s', async (mode) => {
-    const first = row({
-      state: 'processing',
-      attempts: mode === 'first' ? 1 : 2,
-      processingAt: new Date(),
-    });
+  test.each(['complete', 'consumer', 'pending', 'foreign', 'first', 'missing', 'unavailable', 'cancelled', 'queue', 'message'])('retains exact native synthesis across retry: %s', async (mode) => {
+    const first = row({ state: 'processing', attempts: mode === 'first' ? 1 : 2, processingAt: new Date() });
     mockFind.mockReturnValueOnce(cursor([row({ attempts: mode === 'first' ? 0 : 1 })]));
-    if (['queue', 'message'].includes(mode))
-      mockExternalWorkFindOne.mockResolvedValue({
-        _id: first.originRef,
-        runId: 'later-run',
-        acceptedAction: mode,
-      });
+    if (['queue', 'message'].includes(mode)) mockExternalWorkFindOne.mockResolvedValue({
+      _id: first.originRef, runId: 'later-run', acceptedAction: mode,
+    });
     mockFindOneAndUpdate.mockResolvedValueOnce(first);
     mockFindOne.mockImplementation(async (filter) =>
-      Object.entries(filter).every(([key, value]) => first[key] === value) ? first : null,
-    );
+      Object.entries(filter).every(([key, value]) => first[key] === value) ? first : null);
     mockUpdateOne.mockImplementation(async (filter, change) => {
       if (change.$set) Object.assign(first, change.$set);
       return { acknowledged: true, matchedCount: 1 };
@@ -318,75 +451,26 @@ describe('GlassHiveMissionAdjudicationService', () => {
         const scope = new URL(String(url));
         expect(scope.searchParams.get('agent_id')).toBe('main-agent:phase_b:followup');
         const result = {
-          object: 'glasshive.request.result',
-          version: 1,
-          state:
-            mode === 'cancelled'
-              ? 'cancelled'
-              : mode === 'pending' && lookups === 1
-                ? 'running'
-                : 'completed',
-          invocation_id: 'a'.repeat(64),
-          body_sha256: 'b'.repeat(64),
-          authority_sha256: 'c'.repeat(64),
-          stream_id: 'phase-b-stream',
-          message_id: author.messageId,
-          agent_id: 'main-agent:phase_b:followup',
-          conversation_id: mode === 'foreign' ? 'foreign' : 'conversation-1',
-          request_id: 'saved-response',
-          run_id: 'saved-run',
-          response: {
-            id: 'saved-response',
-            object: 'chat.completion',
-            created: 1,
-            model: 'configured-model',
-            choices: [
-              {
-                index: 0,
-                finish_reason: 'stop',
-                message: {
-                  role: 'assistant',
-                  content: 'Original Main answer',
-                  reasoning_content: 'Private reasoning must not replay',
-                  provider_specific_fields: {
-                    viventium: {
-                      delivery_disposition: { version: 1, audio: 'skip' },
-                      deliveryDispositionRanges: [
-                        { text_start: 0, text_end: 20, disposition: { audio: 'skip' } },
-                      ],
-                    },
-                  },
-                },
-              },
-            ],
-            usage: { prompt_tokens: 4, completion_tokens: 6, total_tokens: 10 },
-            glasshive: { output_files: { version: 1, files: [{ file_id: 'original-file' }] } },
-          },
+          object: 'glasshive.request.result', version: 1,
+          state: mode === 'cancelled' ? 'cancelled' : mode === 'pending' && lookups === 1 ? 'running' : 'completed',
+          invocation_id: 'a'.repeat(64), body_sha256: 'b'.repeat(64), authority_sha256: 'c'.repeat(64),
+          stream_id: 'phase-b-stream', message_id: author.messageId,
+          agent_id: 'main-agent:phase_b:followup', conversation_id: mode === 'foreign' ? 'foreign' : 'conversation-1',
+          request_id: 'saved-response', run_id: 'saved-run',
+          response: { id: 'saved-response', object: 'chat.completion', created: 1, model: 'configured-model',
+            choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'Original Main answer', reasoning_content: 'Private reasoning must not replay',
+              provider_specific_fields: { viventium: { delivery_disposition: { version: 1, audio: 'skip' }, deliveryDispositionRanges: [{ text_start: 0, text_end: 20, disposition: { audio: 'skip' } }] } } } }],
+            usage: { prompt_tokens: 4, completion_tokens: 6, total_tokens: 10 }, glasshive: { output_files: { version: 1, files: [{ file_id: 'original-file' }] } } },
         };
         return new Response(JSON.stringify(result));
       };
       const bound = author.wrapFetch(send, 'native');
       const reply = await bound('http://native.test/v1/chat/completions', {
-        method: 'POST',
-        body: JSON.stringify({
-          model: 'configured-model',
-          stream: true,
-          messages: [
-            {
-              role: 'system',
-              content: 'New Feelings and clock do not replace the accepted answer',
-            },
-          ],
-        }),
-        headers: {
-          Authorization: 'Bearer synthetic',
-          'X-Viventium-User-Id': 'user-1',
-          'X-Viventium-Conversation-Id': 'conversation-1',
-          'X-Viventium-Message-Id': author.messageId,
+        method: 'POST', body: JSON.stringify({ model: 'configured-model', stream: true, messages: [{ role: 'system', content: 'New Feelings and clock do not replace the accepted answer' }] }),
+        headers: { Authorization: 'Bearer synthetic', 'X-Viventium-User-Id': 'user-1',
+          'X-Viventium-Conversation-Id': 'conversation-1', 'X-Viventium-Message-Id': author.messageId,
           'X-GlassHive-Agent-Id': 'main-agent:phase_b:followup',
-          'X-Viventium-Stream-Id': 'phase-b-stream',
-          'X-GlassHive-Idempotency-Key': 'phase-b-stream',
-        },
+          'X-Viventium-Stream-Id': 'phase-b-stream', 'X-GlassHive-Idempotency-Key': 'phase-b-stream' },
       });
       if (['complete', 'consumer', 'pending', 'queue', 'message'].includes(mode)) {
         expect(author.identity).toBeUndefined();
@@ -396,16 +480,10 @@ describe('GlassHiveMissionAdjudicationService', () => {
         const { getChatModelClass, Providers } = require('@librechat/agents');
         const ChatModel = getChatModelClass(Providers.OPENAI);
         const replay = reply.clone();
-        const model = new ChatModel({
-          model: 'configured-model',
-          apiKey: 'synthetic',
-          streaming: true,
-          streamUsage: true,
-          configuration: {
-            baseURL: 'http://native.test/v1',
-            fetch: async () => replay.clone(),
-          },
-        });
+        const model = new ChatModel({ model: 'configured-model', apiKey: 'synthetic',
+          streaming: true, streamUsage: true, configuration: {
+            baseURL: 'http://native.test/v1', fetch: async () => replay.clone(),
+          } });
         let combined;
         for await (const chunk of await model.stream('Synthetic consumer check'))
           combined = combined ? combined.concat(chunk) : chunk;
@@ -429,40 +507,29 @@ describe('GlassHiveMissionAdjudicationService', () => {
     });
     const outcome = await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
     expect(outcome.failed).toBe(['foreign', 'unavailable', 'cancelled'].includes(mode) ? 1 : 0);
-    expect(sends.filter((method) => method === 'POST')).toHaveLength(
-      ['first', 'missing'].includes(mode) ? 1 : 0,
-    );
+    expect(sends.filter((method) => method === 'POST')).toHaveLength(['first', 'missing'].includes(mode) ? 1 : 0);
     if (mode === 'pending') expect(lookups).toBe(2);
-    if (['foreign', 'unavailable', 'cancelled'].includes(mode))
-      expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
+    if (['foreign', 'unavailable', 'cancelled'].includes(mode)) expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
   });
 
   test('does not revive exhausted image results or implicitly publish old deadletters', async () => {
-    const exhausted = ['completed', 'failed', 'cancelled'].map((state, index) =>
-      row({
-        _id: `ghe_${String(index + 1).repeat(32)}`,
-        state: 'deadletter',
-        attempts: 10,
-        errorCode: 'mission_adjudication_retry_exhausted',
-        followUpMessageId: '',
-        adjudicationGroupId: `ghag_${String(index + 1).repeat(32)}`,
-        adjudicationGroupMemberIds: [`ghe_${String(index + 1).repeat(32)}`],
-        deliveryLedgerParentMessageId: 'assistant-anchor',
-        evidence: `Retained ${state} image task result`,
-      }),
-    );
+    const exhausted = ['completed', 'failed', 'cancelled'].map((state, index) => row({
+      _id: `ghe_${String(index + 1).repeat(32)}`,
+      state: 'deadletter', attempts: 10, errorCode: 'mission_adjudication_retry_exhausted',
+      followUpMessageId: '', adjudicationGroupId: `ghag_${String(index + 1).repeat(32)}`,
+      adjudicationGroupMemberIds: [`ghe_${String(index + 1).repeat(32)}`],
+      deliveryLedgerParentMessageId: 'assistant-anchor',
+      evidence: `Retained ${state} image task result`,
+    }));
     mockFind.mockImplementation((filter) => cursor(filter.state === 'deadletter' ? exhausted : []));
     const service = require('../GlassHiveMissionAdjudicationService');
     await service.reconcilePendingGlassHiveMissionAdjudications();
     expect(mockPrepareCortexFollowUpMessage).not.toHaveBeenCalled();
     expect(mockEnqueueDelivery).not.toHaveBeenCalled();
-    expect(
-      mockUpdateOne.mock.calls.some(([filter]) => exhausted.some((row) => row._id === filter._id)),
-    ).toBe(false);
+    expect(mockUpdateOne.mock.calls.some(([filter]) => exhausted.some((row) => row._id === filter._id))).toBe(false);
     expect(exhausted.every((row) => row.state === 'deadletter' && row.attempts === 10)).toBe(true);
     const recoveryScan = mockFind.mock.calls.find(([filter]) =>
-      filter.$or?.some((entry) => entry.state === 'pending'),
-    )[0];
+      filter.$or?.some((entry) => entry.state === 'pending'))[0];
     expect(recoveryScan.$or.filter((entry) => entry.state === 'deadletter')).toEqual([
       expect.objectContaining({ followUpMessageId: { $type: 'string', $ne: '' } }),
     ]);
@@ -482,7 +549,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       failed: 0,
     });
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-1', state: 'processing', attempts: 1, processingAt },
+      { _id: 'cb-1', state: 'processing', attempts: 1, processingAt, ownerId: 'user-1', processingClaimId: expect.any(String) },
       {
         $set: { state: 'pending', updatedAt: expect.any(Date) },
         $unset: { processingAt: '' },
@@ -628,9 +695,10 @@ describe('GlassHiveMissionAdjudicationService', () => {
 
   beforeEach(() => {
     clearAdjudicationTimersForTests();
-    mockUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true });
+    mockUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockMessageUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockStoredMessages = [];
+    mockClaimedRows = new Map();
     const originMessages = ['conversation-1', 'conversation-a', 'conversation-b'].flatMap(
       (conversationId) =>
         ['assistant-anchor', 'anchor-1', 'anchor-2', 'assistant-anchor-newer'].map((messageId) => ({
@@ -664,6 +732,10 @@ describe('GlassHiveMissionAdjudicationService', () => {
     mockNewestAttentionEvidence = { _id: 'cb-1' };
     mockAttentionEvidenceRows = null;
     mockFindOne = jest.fn(async (filter, options) => {
+      if (filter.processingClaimId) {
+        const current = mockClaimedRows.get(filter._id);
+        return require('sift').default(filter)(current || {}) ? { ...current } : null;
+      }
       if (filter.event !== 'run.needs_input' || filter.workTerminal !== false) return null;
       if (!mockAttentionEvidenceRows) return mockNewestAttentionEvidence;
       return (
@@ -1503,22 +1575,15 @@ describe('GlassHiveMissionAdjudicationService', () => {
     },
   );
 
-  test.each(['voice_note', 'text'])(
-    'Main follow-up keeps its original %s input from durable evidence',
-    async (inputMode) => {
-      const evidence = row({ inputMode });
-      mockFind.mockReturnValueOnce(cursor([evidence]));
-      mockFindOneAndUpdate.mockResolvedValueOnce({ ...evidence, state: 'processing' });
-      await expect(
-        flushGlassHiveMissionAdjudications({ ownerId: 'user-1' }),
-      ).resolves.toMatchObject({ visible: 1, failed: 0 });
-      expect(mockEnqueueDelivery).toHaveBeenCalledWith(
-        expect.objectContaining({
-          deliveryContext: expect.objectContaining({ inputMode }),
-        }),
-      );
-    },
-  );
+  test.each(['voice_note', 'text'])('Main follow-up keeps its original %s input from durable evidence', async (inputMode) => {
+    const evidence = row({ inputMode });
+    mockFind.mockReturnValueOnce(cursor([evidence]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...evidence, state: 'processing' });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toMatchObject({ visible: 1, failed: 0 });
+    expect(mockEnqueueDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      deliveryContext: expect.objectContaining({ inputMode }),
+    }));
+  });
 
   test('persists exact terminal evidence idempotently before scheduling synthesis', async () => {
     await enqueueGlassHiveMissionAdjudication({
@@ -1564,12 +1629,9 @@ describe('GlassHiveMissionAdjudicationService', () => {
           inputMode: 'voice_note',
           callbackRef: canonicalCallbackRef('cb-1'),
           attemptNumber: 1,
-          destinations: [
-            expect.objectContaining({
-              surface: 'telegram',
-              telegramMessageThreadId: '42',
-            }),
-          ],
+          destinations: [expect.objectContaining({
+            surface: 'telegram', telegramMessageThreadId: '42',
+          })],
           state: 'pending',
         }),
       },
@@ -2135,7 +2197,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
         }
         if (boundary === 'final') author.finish();
         if (boundary === 'abort') controller.abort();
-        if (boundary === 'stale_claim') first.attempts += 1;
+        if (boundary === 'stale_claim') mockClaimedRows.get(first._id).processingClaimId = 'superseded-claim';
         if (boundary === 'surface') fresh.destinations = [{ surface: 'web' }];
         if (boundary === 'feelings') fresh.feelingsIsolated = true;
         await enqueueGlassHiveMissionAdjudication({
@@ -2668,6 +2730,10 @@ describe('GlassHiveMissionAdjudicationService', () => {
       failed: 0,
     });
     expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+    const authorReq = mockCreateCortexFollowUpMessage.mock.calls[0][0].req;
+    expect(require('../interactionContext').getTrustedInteractionContext(authorReq)).toMatchObject({
+      actor_kind: 'system', origin: 'callback', surface: rows[0].surface,
+    });
     expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         agent: expect.objectContaining({ id: 'main-agent' }),
@@ -2680,7 +2746,6 @@ describe('GlassHiveMissionAdjudicationService', () => {
               cortexName: 'Mission evidence',
               insight: 'Verified synthetic result.',
               nativeMedia: media,
-              maxPromptChars: 12_000,
               authority: {
                 kind: 'durable_terminal_callback',
                 userSource: { messageId: 'original-user-a', conversationId: 'conversation-1' },
@@ -2693,7 +2758,6 @@ describe('GlassHiveMissionAdjudicationService', () => {
               cortexId: 'cb-2',
               cortexName: 'Mission evidence',
               insight: 'Second result.',
-              maxPromptChars: 12_000,
               authority: {
                 kind: 'durable_terminal_callback',
                 userSource: { messageId: 'original-user-b', conversationId: 'conversation-1' },
@@ -2837,7 +2901,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-first', state: 'processing' },
+      { _id: 'cb-first', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           deliveryLedgerParentMessageId: 'assistant-anchor',
@@ -2845,7 +2909,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-second', state: 'processing' },
+      { _id: 'cb-second', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           deliveryLedgerParentMessageId: 'follow-up-first',
@@ -3034,7 +3098,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
           { followUpMessageId: '' },
           { followUpMessageId: null },
         ],
-      },
+       ownerId: second.ownerId, processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           followUpMessageId: first.followUpMessageId,
@@ -3411,7 +3475,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       if (filter?._id === first._id && update?.$set?.followUpMessageId) {
         firstFollowUpMessageId = update.$set.followUpMessageId;
       }
-      return { acknowledged: true };
+      return { acknowledged: true, matchedCount: 1 };
     });
     mockFindOne.mockImplementation(async (filter) => {
       const excludedGroupIds = Array.isArray(filter?.adjudicationGroupId?.$nin)
@@ -3552,7 +3616,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: second._id, state: 'processing' },
+      { _id: second._id, state: 'processing' , ownerId: second.ownerId, processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           accountContinuationConversationId: continuationConversationId,
@@ -3599,7 +3663,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: later._id, state: 'processing' },
+      { _id: later._id, state: 'processing' , ownerId: later.ownerId, processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           deliveryLedgerParentMessageId: 'follow-up-deleted-prior-legacy-pin',
@@ -4871,7 +4935,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-1', state: 'processing' },
+      { _id: 'cb-1', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           accountContinuationConversationId: phaseBInput.conversationId,
@@ -4909,7 +4973,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       expect.objectContaining({ failed: 1 }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-1', state: 'processing' },
+      { _id: 'cb-1', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({ state: 'failed', errorCode: 'provider_unavailable' }),
       }),
@@ -4924,7 +4988,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       owners: 1,
     });
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-1', state: 'failed' },
+      { _id: 'cb-1', ownerId: 'user-1', state: 'failed' },
       expect.objectContaining({ $set: expect.objectContaining({ state: 'pending' }) }),
     );
 
@@ -5040,7 +5104,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       expect.objectContaining({ failed: 1 }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-1', state: 'processing' },
+      { _id: 'cb-1', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           state: 'failed',
@@ -5048,6 +5112,30 @@ describe('GlassHiveMissionAdjudicationService', () => {
         }),
       }),
     );
+  });
+
+  test.each([10, 30, 100])('keeps a typed temporary outage recoverable at attempt %s', async (attempts) => {
+    const evidence = row({ attempts: attempts - 1 });
+    mockFind.mockReturnValueOnce(cursor([evidence]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...evidence, state: 'processing', attempts });
+    mockPrepareCortexFollowUpMessage.mockResolvedValueOnce({
+      followUpDecisionRecord: { generationFailed: true, generationFailure: {
+        status: 503, code: 'host_capacity_unavailable', retryable: true,
+      } },
+    });
+    await expect(flushGlassHiveMissionAdjudications({ ownerId: 'user-1' })).resolves.toEqual(
+      expect.objectContaining({ failed: 1 }),
+    );
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      { _id: evidence._id, ownerId: evidence.ownerId, state: 'processing', processingClaimId: expect.any(String), attempts, processingAt: expect.any(Date) },
+      expect.objectContaining({
+        $set: expect.objectContaining({ state: 'failed', errorCode: 'host_capacity_unavailable',
+          failureStage: 'prepare_synthesis', failureCode: 'host_capacity_unavailable', nextAttemptAt: expect.any(Date) }),
+        $inc: { attempts: -1 },
+      }),
+    );
+    expect(mockUpdateOne.mock.calls.some(([, update]) => update?.$set?.state === 'deadletter')).toBe(false);
+    expect(mockPersistPreparedCortexFollowUpMessage).not.toHaveBeenCalled();
   });
 
   test('dead-letters a permanently failing adjudication after the bounded retry budget', async () => {
@@ -5070,6 +5158,8 @@ describe('GlassHiveMissionAdjudicationService', () => {
     expect(terminalUpdate[1].$set).toMatchObject({
       state: 'deadletter',
       errorCode: 'mission_adjudication_retry_exhausted',
+      failureStage: 'persist_prepared_synthesis',
+      failureCode: 'mission_adjudication_persist_prepared_synthesis_failed',
     });
     expect(terminalUpdate[1].$set).not.toHaveProperty('nextAttemptAt');
   });
@@ -5085,7 +5175,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
     );
     expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-1', state: 'processing' },
+      { _id: 'cb-1', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           state: 'delivery_pending',
@@ -5124,34 +5214,20 @@ describe('GlassHiveMissionAdjudicationService', () => {
   test.each([
     ['glasshive_callback_effect_fenced', 1, 'superseded', 'terminal_callback_revision_superseded'],
     ['mission_surface_delivery_unresolved', 10, 'deadletter', 'mission_delivery_retry_exhausted'],
-  ])(
-    'settles authored delivery %s at attempt %i without regenerating',
-    async (code, attempts, state, errorCode) => {
-      const retained = row({
-        state: 'delivery_pending',
-        attempts,
-        followUpMessageId: 'retained-result',
-        followUpText: 'Retained Main-authored result.',
-      });
-      retainAuthoredFollowUp(retained);
-      mockFind.mockReturnValueOnce(cursor([retained]));
-      mockFindOneAndUpdate.mockResolvedValueOnce({ ...retained, state: 'processing', attempts });
-      mockEnqueueDelivery.mockRejectedValueOnce(Object.assign(new Error(code), { code }));
-      await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
-      expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
-      expect(mockUpdateOne).toHaveBeenCalledWith(
-        { _id: 'cb-1', state: 'processing' },
-        expect.objectContaining({ $set: expect.objectContaining({ state, errorCode }) }),
-      );
-      if (state === 'deadletter')
-        expect(mockUpdateOne).toHaveBeenCalledWith(
-          { _id: 'cb-1', state: 'processing' },
-          expect.objectContaining({
-            $set: expect.objectContaining({ followUpMessageId: 'retained-result' }),
-          }),
-        );
-    },
-  );
+  ])('settles authored delivery %s at attempt %i without regenerating', async (code, attempts, state, errorCode) => {
+    const retained = row({ state: 'delivery_pending', attempts,
+      followUpMessageId: 'retained-result', followUpText: 'Retained Main-authored result.' });
+    retainAuthoredFollowUp(retained);
+    mockFind.mockReturnValueOnce(cursor([retained]));
+    mockFindOneAndUpdate.mockResolvedValueOnce({ ...retained, state: 'processing', attempts });
+    mockEnqueueDelivery.mockRejectedValueOnce(Object.assign(new Error(code), { code }));
+    await flushGlassHiveMissionAdjudications({ ownerId: 'user-1' });
+    expect(mockCreateCortexFollowUpMessage).not.toHaveBeenCalled();
+    expect(mockUpdateOne).toHaveBeenCalledWith({ _id: 'cb-1', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
+      expect.objectContaining({ $set: expect.objectContaining({ state, errorCode }) }));
+    if (state === 'deadletter') expect(mockUpdateOne).toHaveBeenCalledWith(
+      { _id: 'cb-1', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) }, expect.objectContaining({ $set: expect.objectContaining({ followUpMessageId: 'retained-result' }) }));
+  });
 
   test('keeps a zero-target Main continuation durably unresolved and retryable', async () => {
     mockFind.mockReturnValueOnce(cursor([row()]));
@@ -5172,7 +5248,7 @@ describe('GlassHiveMissionAdjudicationService', () => {
       }),
     );
     expect(mockUpdateOne).toHaveBeenCalledWith(
-      { _id: 'cb-1', state: 'processing' },
+      { _id: 'cb-1', state: 'processing' , ownerId: 'user-1', processingClaimId: expect.any(String), attempts: expect.any(Number), processingAt: expect.any(Date) },
       expect.objectContaining({
         $set: expect.objectContaining({
           state: 'delivery_pending',

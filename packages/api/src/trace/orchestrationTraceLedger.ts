@@ -408,6 +408,7 @@ const FIRST_OBSERVATION_REPLAY_STAGES = new Set<TraceStage>([
   'prompt.layers.invalid',
   'launch.prepared',
   'launch.accepted',
+  'launch.failed',
   'callback.accepted',
 ]);
 const CORTEX_STATUSES: ReadonlySet<string> = new Set(ORCHESTRATION_TRACE_CORTEX_STATUSES);

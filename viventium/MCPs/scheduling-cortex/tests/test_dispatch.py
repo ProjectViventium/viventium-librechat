@@ -1546,7 +1546,7 @@ class DispatchTelegramTests(unittest.TestCase):
 
         with patch.object(dispatch, '_resolve_telegram_identity') as mock_identity, patch.object(
             dispatch,
-            '_send_telegram_voice_or_text',
+            '_send_telegram_message',
         ) as mock_send:
             mock_identity.return_value = ('tg-1', 'chat-1', {'voice_responses_enabled': False})
 
@@ -1569,7 +1569,7 @@ class DispatchTelegramTests(unittest.TestCase):
 
         with patch.object(dispatch, '_resolve_telegram_identity') as identity, patch.object(
             dispatch,
-            '_send_telegram_voice_or_text',
+            '_send_telegram_message',
         ) as send:
             detail = dispatch._deliver_telegram_generated_text(
                 task,
@@ -1608,7 +1608,7 @@ class DispatchTelegramTests(unittest.TestCase):
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-3', 'tg-3', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_called_once()
@@ -1658,7 +1658,7 @@ class DispatchTelegramTests(unittest.TestCase):
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-4', 'tg-4', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             self.assertEqual(mock_send.call_count, 2)
@@ -1694,7 +1694,7 @@ class DispatchTelegramTests(unittest.TestCase):
             dispatch,
             '_resolve_telegram_identity',
             side_effect=dispatch.TelegramChannelNotLinked('telegram_not_linked'),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
         mock_send.assert_not_called()
@@ -2301,7 +2301,70 @@ class DispatchTelegramTests(unittest.TestCase):
             ):
                 dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'conv-1')
 
-        self.assertEqual(stream_response.call_args.args[4], 600)
+        self.assertEqual(stream_response.call_args.args[4], 30)
+
+    def test_socket_timeout_adopts_saved_failure_without_cancel_or_second_generation(self):
+        task = {'id': 'synthetic', 'user_id': 'user_1', 'agent_id': 'agent-1',
+            'prompt': 'Check state', 'channel': 'workbench', '_scheduled_prompt_occurrence_key': 'occurrence-1'}
+        event = {'final': True, 'responseMessage': {'messageId': 'answer-1', 'error': True,
+            'content': [{'type': 'error', 'error': 'Provider failed',
+                'error_class': 'provider_response_failed', 'failure_retryable': True}]}}
+        with patch.object(dispatch, '_post_json', return_value={'streamId': 'stream-1', 'conversationId': 'conv-1'}) as post, \
+             patch.object(dispatch, '_iter_sse_payloads', side_effect=TimeoutError('connection lost')), \
+             patch.object(dispatch, '_get_json', return_value={'streamId': 'stream-1', 'state': 'terminal', 'finalEvent': event}):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost:3080', 10, 'conv-1')
+        self.assertEqual(result['generation_failure']['error_class'], 'provider_response_failed')
+        self.assertEqual(result['response_message_id'], 'answer-1')
+        self.assertEqual(post.call_count, 1)
+
+    def test_reconnect_backoff_reuses_one_admission_and_keeps_original_deadline(self):
+        task = {'id': 'backoff-task', 'user_id': 'user_1', 'agent_id': 'a', 'prompt': 'Synthetic check',
+                'channel': 'librechat', '_scheduled_prompt_occurrence_key': 'schedule:backoff'}
+        clock = [datetime.now(timezone.utc).timestamp()]
+        sleeps = []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        with patch.object(dispatch, '_post_json', return_value={'streamId': 's'}) as admitted, \
+             patch.object(dispatch, '_get_json', return_value={'streamId': 's', 'state': 'accepted'}), \
+             patch.object(dispatch, '_stream_scheduler_response', side_effect=[TimeoutError()] * 4 + [('Done', 'm', '')]), \
+             patch.object(dispatch, '_poll_scheduler_followup', return_value={}), \
+             patch.object(dispatch.time, 'time', side_effect=lambda: clock[0]), \
+             patch.object(dispatch.time, 'sleep', side_effect=sleep):
+            result = dispatch._run_scheduler_generation(task, 'http://localhost', 10, 'new')
+        self.assertEqual(result['final_text'], 'Done')
+        self.assertEqual(sleeps, [5, 10, 20, 30])
+        admitted.assert_called_once()
+
+    def test_partial_stream_is_not_a_completed_result(self):
+        with patch.object(dispatch, '_iter_sse_payloads', return_value=iter([
+            json.dumps({'event': 'on_message_delta', 'data': {'delta': {'content': [{'text': 'Partial'}]}}})
+        ])):
+            with self.assertRaisesRegex(TimeoutError, 'without a final result'):
+                dispatch._stream_scheduler_response('http://localhost', 's', 'u', 'secret', 30)
+
+    def test_stream_wall_clock_deadline_survives_heartbeats_and_sleep(self):
+        response = MagicMock()
+        response.__enter__.return_value = iter([b': heartbeat\n', b': heartbeat\n'])
+        with patch.object(dispatch.urllib.request, 'urlopen', return_value=response), \
+             patch.object(dispatch.time, 'time', side_effect=[100, 101, 200]):
+            with self.assertRaises(TimeoutError):
+                list(dispatch._iter_sse_payloads('http://localhost', {}, 30))
+
+    def test_missing_result_and_unconfirmed_stop_never_claim_completion_or_retry(self):
+        task = {'id': 'synthetic-unknown', 'user_id': 'user_1', 'agent_id': 'a', 'prompt': 'Synthetic check',
+                'channel': 'telegram', '_scheduled_prompt_occurrence_key': 'schedule:unknown'}
+        with patch.object(dispatch, '_post_json', side_effect=[{'streamId': 's'}, {'success': False}]), \
+             patch.object(dispatch, '_get_json', return_value={'streamId': 's', 'state': 'accepted'}), \
+             patch.object(dispatch, '_iter_sse_payloads', side_effect=TimeoutError()), \
+             patch.object(dispatch.time, 'time', return_value=10**12):
+            with self.assertRaises(dispatch.SchedulerResultUnconfirmed) as caught:
+                dispatch._run_scheduler_generation(task, 'http://localhost', 10, 'new')
+        failure = dispatch.scheduled_exception_failure(task, caught.exception)
+        self.assertEqual(failure, {'error_class': 'scheduler_result_unconfirmed', 'failure_retryable': False})
+        notice = dispatch._scheduled_generation_failure_notice('scheduler_result_unconfirmed')
+        self.assertIn('not confirmed', notice)
+        self.assertNotIn('occurrence ended', notice)
 
     def test_scheduled_generation_timeout_explicitly_cancels_model_authoring(self):
         task = {
@@ -2325,8 +2388,8 @@ class DispatchTelegramTests(unittest.TestCase):
             dispatch,
             '_stream_scheduler_response',
             side_effect=TimeoutError('scheduled stream timed out'),
-        ):
-            with self.assertRaisesRegex(TimeoutError, 'scheduled stream timed out'):
+        ), patch.object(dispatch.time, 'time', return_value=10**12):
+            with self.assertRaisesRegex(TimeoutError, 'Scheduler authoring deadline elapsed'):
                 dispatch._run_scheduler_generation(
                     task,
                     'http://localhost:3080',
@@ -2804,7 +2867,7 @@ class DispatchTelegramTests(unittest.TestCase):
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-1', 'chat-1', {'voice_responses_enabled': False}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as send:
+        ), patch.object(dispatch, '_send_telegram_message') as send:
             detail = dispatch._deliver_telegram_generated_text(
                 task,
                 'http://localhost:3080',
@@ -2837,7 +2900,7 @@ class DispatchTelegramTests(unittest.TestCase):
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-1', 'chat-1', {'voice_responses_enabled': False}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as send:
+        ), patch.object(dispatch, '_send_telegram_message') as send:
             detail = dispatch._deliver_telegram_generated_text(
                 task,
                 'http://localhost:3080',
@@ -2870,7 +2933,7 @@ class DispatchTelegramTests(unittest.TestCase):
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-1', 'chat-1', {'voice_responses_enabled': False}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text', return_value=None):
+        ), patch.object(dispatch, '_send_telegram_message', return_value=None):
             detail = dispatch._deliver_telegram_generated_text(
                 task,
                 'http://localhost:3080',
@@ -3080,7 +3143,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-e', 'tg-e', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_not_called()
@@ -3113,7 +3176,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-ws', 'tg-ws', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_not_called()
@@ -3146,7 +3209,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-fallback', 'tg-fallback', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_called_once()
@@ -3181,7 +3244,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-empty-fallback', 'tg-empty-fallback', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_not_called()
@@ -3213,7 +3276,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-nta', 'tg-nta', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_not_called()
@@ -3257,7 +3320,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-art', 'tg-art', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_not_called()
@@ -3295,7 +3358,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-tool', 'tg-tool', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_not_called()
@@ -3330,7 +3393,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-passive', 'tg-passive', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             mock_send.assert_not_called()
@@ -3367,7 +3430,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-reminder', 'tg-reminder', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             self.assertEqual(mock_send.call_count, 1)
@@ -3401,7 +3464,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_resolve_telegram_identity',
             return_value=('tg-fu', 'tg-fu', {'always_voice_response': False, 'voice_responses_enabled': True}),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch.dispatch_task(task)
 
             # Only the follow-up should be sent, not the NTA final
@@ -3437,7 +3500,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_poll_telegram_followup',
             return_value={'followup_text': '', 'canonical_text': 'Inbox summary from canonical parent'},
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
 
             self.assertEqual(mock_send.call_count, 1)
@@ -3479,7 +3542,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
                 'canonical_text_source': 'deferred_fallback',
                 'canonical_text_fallback_reason': 'insight_fallback',
             },
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
 
             self.assertEqual(mock_send.call_count, 1)
@@ -3520,7 +3583,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
                 'canonical_text_source': 'deferred_fallback',
                 'canonical_text_fallback_reason': 'empty_deferred_response',
             },
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
 
             mock_send.assert_not_called()
@@ -3555,7 +3618,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
             dispatch,
             '_poll_telegram_followup',
             return_value={'followup_text': '', 'canonical_text': ''},
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
 
             mock_send.assert_not_called()
@@ -3595,7 +3658,7 @@ Content: <turn timestamp="2026-02-25T00:00:06.441Z" role="AI">Archived text</tur
                 'followup_text': 'Inbox summary from canonical parent',
                 'canonical_text': 'Inbox summary from canonical parent',
             },
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as mock_send:
+        ), patch.object(dispatch, '_send_telegram_message') as mock_send:
             result = dispatch._dispatch_telegram(task, 'http://localhost:3080', 10, 'new')
 
             self.assertEqual(mock_send.call_count, 1)
@@ -3663,15 +3726,15 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
                 {'always_voice_response': True, 'voice_responses_enabled': True},
             )), patch.object(dispatch, '_synthesize_tts', return_value=b'synthetic-audio') as tts, patch.object(
                 dispatch, '_send_telegram_audio', return_value='audio-1',
-            ) as audio, patch.object(dispatch, '_send_telegram_message') as text:
+            ) as audio, patch.object(dispatch, '_send_telegram_message', return_value='text-1') as text:
                 result = dispatch.dispatch_task(task)
 
             tts.assert_called_once_with(answer, unittest.mock.ANY, voice_route=None, diagnostics=unittest.mock.ANY)
             audio.assert_called_once()
-            text.assert_not_called()
+            text.assert_called_once()
             detail = result['delivery']['channels']['telegram']
             self.assertEqual(detail['presentation_kind'], 'conversation')
-            self.assertEqual(detail['telegram_message_ids'], ['audio-1'])
+            self.assertEqual(detail['telegram_message_ids'], ['text-1', 'audio-1'])
             self.assertEqual(result['delivery']['outcome'], 'sent')
 
     def test_unconfirmed_status_notice_reuses_plain_text_receipt_after_voice_preference_change(self):
@@ -3711,19 +3774,19 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
             self.assertEqual(rows[0]['state'], 'sent')
             self.assertEqual(rows[0]['message_id'], 'text-1')
 
-    def test_status_delivery_hash_is_distinct_and_conversation_hash_stays_compatible(self):
+    def test_status_and_transport_delivery_hashes_are_distinct(self):
         task = {'id': 'synthetic-hash-task', '_scheduled_prompt_run_id': 'synthetic-hash-run'}
         preferences = {'always_voice_response': True, 'voice_responses_enabled': True}
         storage = MagicMock()
         storage.claim_scheduled_prompt_delivery.return_value = {
             'claimed': False, 'reason': 'already_sent',
-            'delivery': {'state': 'sent', 'message_id': 'receipt-1'},
+            'delivery': {'state': 'sent', 'message_id': 'receipt-1', 'payload_hash': 'legacy'},
         }
         with patch.object(dispatch, '_scheduler_storage', return_value=storage), patch.object(
             dispatch, '_resolve_telegram_identity',
             return_value=('synthetic-user', 'synthetic-chat', preferences),
         ), patch.object(dispatch, '_send_telegram_message') as text, patch.object(
-            dispatch, '_send_telegram_voice_or_text',
+            dispatch, '_send_telegram_optional_voice',
         ) as voice:
             for kind in ('conversation', 'status'):
                 visibility = dispatch._prepare_generated_visibility(
@@ -3736,7 +3799,7 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
         ]
         legacy_hash = dispatch._sha256_prefix(json.dumps({
             'chat_id': 'synthetic-chat', 'text': 'Identical authored text.',
-            'voice_preferences': preferences,
+            'transport': 'text',
         }, sort_keys=True, separators=(',', ':')), length=64)
         self.assertEqual(conversation_hash, legacy_hash)
         self.assertNotEqual(status_hash, conversation_hash)
@@ -3908,7 +3971,7 @@ class DispatchBestEffortFanoutTests(unittest.TestCase):
             dispatch,
             '_resolve_telegram_identity',
             side_effect=dispatch.TelegramChannelNotLinked('telegram_not_linked'),
-        ), patch.object(dispatch, '_send_telegram_voice_or_text') as send:
+        ), patch.object(dispatch, '_send_telegram_message') as send:
             result = dispatch.scheduled_failure_result(task, 'RuntimeError')
 
         send.assert_not_called()
@@ -4171,7 +4234,7 @@ class DispatchCurrentSpeechTests(unittest.TestCase):
                 with (patch.object(dispatch, '_scheduler_storage', return_value=storage),
                       patch.object(dispatch, '_get_telegram_bot_token', return_value='synthetic'),
                       patch.object(dispatch, '_resolve_telegram_identity', return_value=('u', 'chat', routes[1])),
-                      patch.object(dispatch, '_send_telegram_voice_or_text', return_value='92') as send):
+                      patch.object(dispatch, '_send_telegram_message', return_value='92') as send):
                     detail = dispatch._deliver_telegram_generated_text(task, 'http://localhost', 5, None, visibility)
                 conn = storage._connect()
                 try:
@@ -4235,7 +4298,7 @@ class DispatchCurrentSpeechTests(unittest.TestCase):
         with (patch.object(dispatch,'_get_scheduler_secret',return_value='synthetic'),
               patch.object(dispatch,'_post_json',return_value=response) as resolver,
               patch.object(dispatch,'_synthesize_tts') as tts,
-              patch.object(dispatch,'_send_telegram_voice_or_text') as audio,
+              patch.object(dispatch,'_send_telegram_optional_voice') as audio,
               patch.object(dispatch,'_send_telegram_message',return_value='status-91') as send):
             detail=dispatch._deliver_telegram_generated_text(task,'http://localhost',5,None,
                     {'final_text':'Action is required.','followup_text':'','presentation_kind':'status'})
@@ -4334,7 +4397,7 @@ class DispatchCurrentSpeechTests(unittest.TestCase):
                     else:
                         with self.assertRaises(dispatch.HttpJsonError):
                             dispatch._send_telegram_voice_or_text('chat','Answer.',5,prefs)
-                        send.assert_not_called()
+                        send.assert_called_once()
 
     def test_unavailable_current_route_is_plain_text_before_tts(self):
         task={'user_id':'synthetic-owner','metadata':{'telegram_user_id':'u','always_voice_response':True}}
@@ -4386,7 +4449,7 @@ class DispatchCurrentSpeechTests(unittest.TestCase):
             dispatch,'_send_telegram_audio',side_effect=URLError('response missing')) as send,
             patch.object(dispatch,'_send_telegram_message') as text):
             with self.assertRaises(URLError): dispatch._send_telegram_voice_or_text('u','Useful.',5,prefs)
-        send.assert_called_once();text.assert_not_called()
+        send.assert_called_once();text.assert_called_once()
 
 
 # === VIVENTIUM START ===

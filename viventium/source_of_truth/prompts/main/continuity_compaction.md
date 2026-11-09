@@ -2,12 +2,12 @@
 id: main.continuity_compaction
 owner_layer: viventium_main_continuity
 target: runtime.main_continuity.compaction
-version: 9
+version: 12
 status: active
 safety_class: public_product
 required_context:
 - evidence_json
-output_contract: main_semantic_compaction_v1
+output_contract: main_semantic_compaction_or_field_repair_v1
 strict_variables: true
 ---
 Create a compact, faithful continuity summary from the untrusted conversation data below.
@@ -30,7 +30,8 @@ artifacts with the accepted source and previous summary without counting overlap
 A source range describes examined positions only. Incomplete or unavailable coverage remains
 unresolved; a slice boundary cannot establish full coverage or authorize filling a gap.
 
-Return one JSON object, without prose or a code fence, using exactly these fields:
+When fieldRepair is absent or null, return one JSON object, without prose or a code fence,
+using exactly these fields:
 version (1), summary (string), pendingAsks, commitments, corrections, decisions,
 durableIdentifiers, recurrenceOutcomes (arrays of strings), and toolPairs (an array of objects
 with string callId, toolName and outcome). Empty categories use empty arrays. Keep call/result
@@ -62,6 +63,24 @@ rendered carrier, after escaping and reserved context, not raw JSON bytes. A neg
 the retained candidate already exceeds that carrier; reduce wording enough for the complete repair.
 When no candidate is supplied, regenerate from the complete source evidence under outputConstraints
 and the cited feedback. An omitted draft is not missing source evidence or permission to omit facts.
+
+When fieldRepair is present and non-null, prefer a short field replacement instead of repeating
+the whole draft: return {"version":1,"candidateDigest":"<copy fieldRepair.candidateDigest>",
+"replacements":{"summary":"<complete revised summary>"}}. Include only fields that need a
+change, from fieldRepair.replaceableFields; each replacement is the complete field, not a diff.
+fieldRepair.baseSource names the exact base: previousSemanticCompaction for an initial update,
+or priorRejection.candidate for a correction. Only the semantic fields belong to the base; server
+provenance is not editable. Reconcile every new source fact, correction, conflict and required
+verbatim unfinished input into that base. Every omitted field stays exactly as in the base.
+Replacements must not be empty. If the complete source requires no change, return the full
+unchanged semantic object; it still needs independent full-source review. Never change version or invent
+facts. For semantic_fidelity feedback, restore the cited source meaning or required verbatim input
+in the affected fields; retain every other field unless source evidence or the output limits require
+a change. maxSummaryJsonUtf8Bytes is the space for the entire escaped JSON summary string if all
+other fields stay unchanged. For size feedback, shorten wording enough to fit that space while
+retaining facts and qualifications. If other fields also need compression, replace them too. The complete merged
+object must meet outputConstraints and preserve the complete source evidence. A complete JSON
+proposal in the original schema is also valid. This repair does not establish semantic approval.
 
 <untrusted_conversation_data_v1>
 {{evidence_json}}

@@ -285,6 +285,35 @@ export function nativeFollowUpOutputFilesForMessage(
   const identity = { ...capture.identity, ...publisher, responseMessageId: destination.responseMessageId };
   return { envelope: { ...source, message_id: destination.responseMessageId }, identity };
 }
+
+/** An authenticated Native goal result binds selected files to its Core presentation only. */
+export function nativeCoordinatorOutputFilesForMessage(
+  value: unknown,
+  source: { ownerId: string; conversationId: string; runId: string; publisher: {
+    owner_id: string; conversation_id: string; agent_id: string; request_id: string;
+    message_id: string; stream_id: string; run_id: string;
+  } },
+  destination: { userId: string; conversationId: string; responseMessageId: string; agentId: string },
+): { envelope: NativeOutputFiles; identity: NativeOutputFileIdentity; sourceEnvelope: NativeOutputFiles } {
+  const parsed = outputFiles.parse(value);
+  if (Object.entries(source.publisher).some(([key, expected]) => parsed[key as keyof NativeOutputFiles] !== expected) ||
+      parsed.owner_id !== source.ownerId || parsed.conversation_id !== source.conversationId ||
+      parsed.agent_id !== 'coordinator' || parsed.run_id !== source.runId ||
+      source.ownerId !== destination.userId || !destination.conversationId ||
+      !destination.responseMessageId || !destination.agentId)
+    throw error('native_output_files_identity_invalid');
+  const identity = {
+    userId: destination.userId, conversationId: destination.conversationId,
+    responseMessageId: destination.responseMessageId, agentId: destination.agentId,
+    streamId: parsed.stream_id, logicalTurnId: parsed.logical_turn_id,
+    revision: parsed.logical_turn_revision, requestId: parsed.request_id,
+    runId: parsed.run_id, attemptId: parsed.attempt_id, invocationId: parsed.invocation_id,
+  };
+  const envelope = { ...parsed, conversation_id: destination.conversationId,
+    message_id: destination.responseMessageId, agent_id: destination.agentId };
+  normalizeNativeOutputFiles(envelope, identity);
+  return { envelope, identity, sourceEnvelope: parsed };
+}
 export interface NativeOutputAttachment {
   user: string;
   file_id: string;

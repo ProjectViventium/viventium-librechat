@@ -11,7 +11,10 @@
 
 import { logger } from '@librechat/data-schemas';
 import fs from 'node:fs';
+import { buildConversationRecallFileId, ConversationRecallScope, FileContext } from 'librechat-data-provider';
 import type { TFile } from 'librechat-data-provider';
+import { buildConversationRecallAttachmentFiles } from './conversationRecall';
+import type { ConversationRecallAttachmentReason } from './conversationRecall';
 
 type ConversationRecallVectorRuntimeStatus = {
   available: boolean;
@@ -197,6 +200,60 @@ export async function getConversationRecallVectorRuntimeStatus(): Promise<Conver
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Refresh execution readiness without changing the signed owner, namespace, or resource list. */
+export async function refreshConversationRecallExecutionFiles<T extends Pick<TFile, 'file_id' | 'context'>>(
+  { ownerId, agentId, activeMessageId, files }: {
+    ownerId: string;
+    agentId?: string;
+    activeMessageId?: string;
+    files: T[];
+  },
+  { readFiles, readLatestMessageCreatedAt, readVectorStatus = getConversationRecallVectorRuntimeStatus }: {
+    readFiles: (filter: { user: string; context: FileContext; file_id: { $in: string[] } }) => Promise<TFile[]>;
+    readLatestMessageCreatedAt: (filter: {
+      user: string; excludeMessageId?: string; excludeParentMessageId?: string;
+    }) => Promise<Date | string | null>;
+    readVectorStatus?: () => Promise<ConversationRecallVectorRuntimeStatus>;
+  },
+): Promise<T[]> {
+  const isRecall = (file: T) => file.context === FileContext.conversation_recall ||
+    file.file_id.startsWith('conversation_recall:');
+  if (!files.some(isRecall)) return files;
+  if (!ownerId) return files.filter((file) => !isRecall(file));
+  const allId = buildConversationRecallFileId({ userId: ownerId, scope: ConversationRecallScope.all });
+  const allowedIds = new Set([allId, ...(agentId ? [buildConversationRecallFileId({
+    userId: ownerId, scope: ConversationRecallScope.agent, agentId,
+  })] : [])]);
+  const selected = files.filter((file) => isRecall(file) && allowedIds.has(file.file_id));
+  if (!selected.length) return files.filter((file) => !isRecall(file));
+  const ids = [...new Set(selected.map((file) => file.file_id))];
+  const [rows, latest, runtime] = await Promise.all([
+    readFiles({ user: ownerId, context: FileContext.conversation_recall, file_id: { $in: ids } }),
+    ids.includes(allId) ? readLatestMessageCreatedAt({ user: ownerId,
+      excludeMessageId: activeMessageId, excludeParentMessageId: activeMessageId }) : Promise.resolve(null),
+    readVectorStatus(),
+  ]);
+  const current = new Map(rows.map((file) => [file.file_id, file]));
+  return files.flatMap((file) => {
+    if (!isRecall(file)) return [file];
+    if (!allowedIds.has(file.file_id)) return [];
+    const row = current.get(file.file_id);
+    if (row && (String(row.user) !== ownerId || row.context !== FileContext.conversation_recall)) return [];
+    const corpus = row ? [row] : [];
+    const { fresh } = evaluateConversationRecallCorpusFreshness({ recallFiles: corpus,
+      latestMessageCreatedAt: file.file_id === allId ? latest : null });
+    const mode = runtime.available && fresh && row ? 'vector' : 'source_only';
+    const reason: ConversationRecallAttachmentReason = mode === 'vector' ? 'vector_ready'
+      : !row ? 'missing_corpus' : !fresh ? 'stale_corpus'
+      : runtime.reason === 'ok' ? 'runtime_unhealthy' : `runtime_${runtime.reason}`;
+    const [ready] = buildConversationRecallAttachmentFiles({ userId: ownerId,
+      scope: file.file_id === allId ? ConversationRecallScope.all : ConversationRecallScope.agent,
+      agentId, existingFiles: corpus, mode, reason });
+    return ready?.file_id === file.file_id ? [{ ...file,
+      viventiumConversationRecallMode: mode, viventiumConversationRecallAttachmentReason: reason }] : [];
+  });
 }
 
 export const __internal = {

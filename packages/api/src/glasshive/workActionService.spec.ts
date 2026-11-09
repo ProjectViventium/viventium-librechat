@@ -383,6 +383,43 @@ it('rechecks voice authority after async preparation and before dispatch', async
   expect(deps.requestAccountApi).not.toHaveBeenCalled();
 });
 
+it('rechecks the same Voice owner at the actual send after a Native context adapter awaits', async () => {
+  const deps = dependencies();
+  let ended = false;
+  deps.assertVoiceWorkAuthority.mockImplementation(async () => {
+    if (ended)
+      throw Object.assign(new Error('Call ended during context preparation'), {
+        code: 'voice_work_authority_stale',
+      });
+  });
+  const transport = jest.fn(async () => new Response('{}'));
+  deps.requestAccountApi.mockImplementation(async (request) => {
+    await Promise.resolve();
+    ended = true;
+    await (request.fetchImpl as typeof fetch)('http://native.example/action');
+    return { workRef: 'work-1', state: 'queued' };
+  });
+  const binding = {
+    version: 1 as const,
+    callSessionId: 'call-1',
+    userId: 'owner-1',
+    kind: 'audio' as const,
+    fingerprint: 'fingerprint',
+    turnIds: ['turn-1'],
+  };
+  await expect(
+    createGlassHiveWorkActionService({ ...deps, fetchImpl: transport }).executeGlassHiveWorkAction({
+      ownerId: 'owner-1',
+      workRef: 'work-1',
+      action: 'steer',
+      instruction: 'Use the corrected source.',
+      operationId: 'late-steer',
+      voiceAuthorityContext: { callSessionId: 'call-1', binding },
+    }),
+  ).rejects.toMatchObject({ code: 'voice_work_authority_stale' });
+  expect(transport).not.toHaveBeenCalled();
+});
+
 describe('selected files on the actual shared action executor', () => {
   const crypto = require('node:crypto');
   const saved = { ...process.env };
@@ -1327,4 +1364,210 @@ test('later native continuation receives current app target references through t
     ownerId: 'owner-1',
     requestBody: second,
   });
+});
+
+const nativeDispatchRetryDetail = () => ({
+  workRef: 'xpc_synthetic_native_goal',
+  managementKind: 'native_coordinator',
+  nativeConversationId: 'native-conversation-one',
+  nativeGoalId: 'original-goal',
+  nativeRunId: '',
+  state: 'blocked',
+  actions: ['retry', 'stop'],
+});
+
+test('Native planning Retry keeps source/Voice guards and lets Native prepare fresh original context', async () => {
+  const deps = dependencies();
+  const prepareActionRuntimeBundle = jest.fn();
+  deps.requestAccountApi.mockImplementation(async (input) =>
+    input.method === 'POST'
+      ? { turn_id: 'retry-child', state: 'queued' }
+      : {
+          workRef: 'xpt_synthetic_turn',
+          managementKind: 'native_coordinator_turn',
+          nativeConversationId: 'native-conversation',
+          nativeTurnId: 'accepted-source',
+          state: 'failed',
+          actions: ['retry'],
+          nativeRetryTurnId: '',
+        },
+  );
+  await createGlassHiveWorkActionService({
+    ...deps,
+    prepareActionRuntimeBundle,
+  }).executeGlassHiveWorkAction({
+    ownerId: 'owner-1',
+    workRef: 'xpt_synthetic_turn',
+    action: 'retry',
+    operationId: 'explicit-planning-retry',
+    requestBody: { conversationId: 'conversation-one' },
+    inheritedConversation: { version: 1, conversation_id: 'conversation-one', sources: [] },
+  });
+  expect(deps.requestAccountApi).toHaveBeenLastCalledWith(
+    expect.objectContaining({ body: { action: 'retry', idempotencyKey: 'trusted-action-key' } }),
+  );
+  expect(prepareActionRuntimeBundle).not.toHaveBeenCalled();
+  expect(deps.getCoreWorkOriginRef).not.toHaveBeenCalled();
+});
+
+test.each(['not-offered', 'missing-identity', 'foreign-detail', 'instruction', 'files'])(
+  'Native planning Retry rejects %s before mutation',
+  async (mutation) => {
+    const deps = dependencies();
+    const detail = {
+      workRef: 'xpt_synthetic_turn',
+      managementKind: 'native_coordinator_turn',
+      nativeConversationId: 'native-conversation',
+      nativeTurnId: 'accepted-source',
+      state: 'failed',
+      actions: ['retry'],
+    };
+    if (mutation === 'not-offered') detail.actions = [];
+    if (mutation === 'missing-identity') detail.nativeTurnId = '';
+    if (mutation === 'foreign-detail') detail.workRef = 'foreign';
+    deps.requestAccountApi.mockResolvedValue(detail);
+    await expect(
+      createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+        ownerId: 'owner-1',
+        workRef: 'xpt_synthetic_turn',
+        action: 'retry',
+        operationId: 'retry-one',
+        ...(mutation === 'instruction' ? { instruction: 'A replacement brief' } : {}),
+        ...(mutation === 'files' ? { fileIds: ['extra-file'] } : {}),
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(deps.requestAccountApi.mock.calls.some(([input]) => input.method === 'POST')).toBe(
+      false,
+    );
+  },
+);
+
+test('Native unlaunched Retry keeps ordinary owner and Voice guards without preparing a nonexistent run', async () => {
+  const deps = dependencies();
+  const prepareActionRuntimeBundle = jest.fn(async () => ({ schedule_access: {} }));
+  const getActionFileSources = jest.fn();
+  deps.requestAccountApi.mockImplementation(async (input) =>
+    input.method === 'POST' ? { action: 'retry', status: 'accepted' } : nativeDispatchRetryDetail(),
+  );
+  await createGlassHiveWorkActionService({
+    ...deps,
+    prepareActionRuntimeBundle,
+    getActionFileSources,
+  }).executeGlassHiveWorkAction({
+    ownerId: 'owner-1',
+    workRef: 'xpc_synthetic_native_goal',
+    action: 'retry',
+    operationId: 'exact-retry-one',
+    requestBody: { conversationId: 'conversation-one', messageId: 'current-retry-source' },
+    inheritedConversation: { version: 1, conversation_id: 'conversation-one', sources: [] },
+    voiceAuthorityContext: {
+      callSessionId: 'call-one',
+      binding: { callSessionId: 'call-one' } as never,
+    },
+  });
+  expect(deps.requestAccountApi).toHaveBeenCalledTimes(2);
+  expect(deps.requestAccountApi).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      ownerId: 'owner-1',
+      method: 'POST',
+      body: { action: 'retry', idempotencyKey: 'trusted-action-key' },
+    }),
+  );
+  expect(prepareActionRuntimeBundle).not.toHaveBeenCalled();
+  expect(getActionFileSources).not.toHaveBeenCalled();
+  expect(deps.getCoreWorkOriginRef).not.toHaveBeenCalled();
+  expect(deps.reauthorizeCapabilityAuthorization).not.toHaveBeenCalled();
+  expect(deps.assertVoiceWorkAuthority).toHaveBeenCalled();
+});
+
+test.each([
+  'not-offered',
+  'wrong-state',
+  'instruction',
+  'files',
+  'foreign-detail',
+  'missing-run-proof',
+])('Native unlaunched Retry fails closed for %s', async (mutation) => {
+  const deps = dependencies();
+  const detail = nativeDispatchRetryDetail();
+  if (mutation === 'not-offered') detail.actions = ['stop'];
+  if (mutation === 'wrong-state') detail.state = 'accepted';
+  if (mutation === 'foreign-detail') detail.workRef = 'foreign-native-goal';
+  if (mutation === 'missing-run-proof') delete (detail as Partial<typeof detail>).nativeRunId;
+  deps.requestAccountApi.mockResolvedValue(detail);
+  await expect(
+    createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+      ownerId: 'owner-1',
+      workRef: 'xpc_synthetic_native_goal',
+      action: 'retry',
+      operationId: 'exact-invalid-retry',
+      ...(mutation === 'instruction' ? { instruction: 'Replace the accepted original' } : {}),
+      ...(mutation === 'files' ? { fileIds: ['new-file'] } : {}),
+    }),
+  ).rejects.toMatchObject({ status: 409 });
+  expect(deps.requestAccountApi.mock.calls.some(([input]) => input.method === 'POST')).toBe(false);
+  expect(deps.getCoreWorkOriginRef).not.toHaveBeenCalled();
+});
+
+test('Native unlaunched Retry timeout reads its unchanged existing receipt without another preparation', async () => {
+  const deps = dependencies();
+  deps.requestAccountApi.mockImplementation(async (input) => {
+    if (input.method !== 'POST') return nativeDispatchRetryDetail();
+    if (String(input.path).endsWith('/receipt')) return { action: 'retry', status: 'accepted' };
+    throw Object.assign(new Error('timeout'), { code: 'glasshive_account_request_timeout' });
+  });
+  await createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+    ownerId: 'owner-1',
+    workRef: 'xpc_synthetic_native_goal',
+    action: 'retry',
+    operationId: 'same-retry-receipt',
+  });
+  const posts = deps.requestAccountApi.mock.calls
+    .map(([input]) => input)
+    .filter((input) => input.method === 'POST');
+  expect(posts).toHaveLength(2);
+  expect(posts[1].path).toMatch(/\/actions\/receipt$/);
+  expect(posts[1].body).toEqual(posts[0].body);
+  expect(deps.buildTrustedActionIdempotencyKey).toHaveBeenCalledTimes(1);
+});
+
+test('a real delegated Native Retry retains current run source and runtime preparation', async () => {
+  const deps = dependencies();
+  const prepareActionRuntimeBundle = jest.fn(async () => ({
+    schedule_access: { destinations: [] },
+  }));
+  deps.requestAccountApi.mockImplementation(async (input) =>
+    input.method === 'POST'
+      ? { status: 'accepted' }
+      : {
+          ...nativeDispatchRetryDetail(),
+          nativeWorkRef: 'ghr_actual_native_work',
+          nativeRunId: 'run-actual',
+          state: 'failed',
+        },
+  );
+  const inheritedConversation = { version: 1, conversation_id: 'conversation-one', sources: [] };
+  await createGlassHiveWorkActionService({
+    ...deps,
+    prepareActionRuntimeBundle,
+  }).executeGlassHiveWorkAction({
+    ownerId: 'owner-1',
+    workRef: 'xpc_synthetic_native_goal',
+    action: 'retry',
+    operationId: 'ordinary-native-retry',
+    requestBody: { conversationId: 'conversation-one' },
+    inheritedConversation,
+  });
+  expect(prepareActionRuntimeBundle).toHaveBeenCalled();
+  expect(deps.getCoreWorkOriginRef).toHaveBeenCalled();
+  expect(deps.requestAccountApi).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      method: 'POST',
+      body: expect.objectContaining({
+        inheritedConversation,
+        runtimeBundle: { schedule_access: { destinations: [] } },
+        sourceContext: expect.any(Object),
+      }),
+    }),
+  );
 });

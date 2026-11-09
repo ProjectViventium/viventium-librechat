@@ -6,6 +6,8 @@
 
 let mockTerminalFindOne;
 let mockSchedulerDispatchFindOne;
+let mockActionReceiptFindOne;
+let mockMissionEvidenceFindOne;
 let mockBindingFindOne;
 let mockBindingUpdateOne;
 let mockExternalFind;
@@ -80,12 +82,16 @@ jest.mock('mongoose', () => {
             updateOne: (...args) => mockExternalUpdateOne(...args),
           };
         }
+        if (name === 'viventium_glasshive_mission_evidence') {
+          return { findOne: (...args) => mockMissionEvidenceFindOne(...args) };
+        }
+        if (name === 'viventium_interaction_durable_effects') {
+          return { findOne: (...args) => mockActionReceiptFindOne(...args) };
+        }
         if (name === 'viventium_scheduler_dispatch_intents') {
           return { findOne: (...args) => mockSchedulerDispatchFindOne(...args) };
         }
-        if (name === 'viventium_glasshive_mission_evidence') return {};
-        if (name === 'viventium_glasshive_callback_results')
-          return { findOne: (...args) => mockTerminalFindOne(...args) };
+        if (name === 'viventium_glasshive_callback_results') return { findOne: (...args) => mockTerminalFindOne(...args) };
         throw new Error(`Unexpected collection ${name}`);
       },
     },
@@ -164,6 +170,8 @@ describe('GlassHiveCallbackBindingService', () => {
     mockInvalidateActiveWorkSnapshot.mockClear();
     mockTerminalFindOne = jest.fn().mockResolvedValue(null);
     mockSchedulerDispatchFindOne = jest.fn().mockResolvedValue(null);
+    mockActionReceiptFindOne = jest.fn().mockResolvedValue(null);
+    mockMissionEvidenceFindOne = jest.fn().mockResolvedValue(null);
     mockBindingFindOne = jest.fn();
     mockBindingUpdateOne = jest.fn().mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     mockExternalCursor = {
@@ -450,77 +458,43 @@ describe('GlassHiveCallbackBindingService', () => {
     [{}, false],
   ])('retains only the existing structured isolation decision %j', async (flags, expected) => {
     await registerGlassHiveLaunchContext({
-      user: { id: 'user-1' },
-      toolName: 'workspace_launch',
-      toolArguments: { goal: 'Create the synthetic report.' },
-      toolCall: { id: 'synthetic-isolation' },
+      user: { id: 'user-1' }, toolName: 'workspace_launch',
+      toolArguments: { goal: 'Create the synthetic report.' }, toolCall: { id: 'synthetic-isolation' },
       requestBody: {
-        messageId: 'assistant-anchor',
-        parentMessageId: 'user-message',
-        conversationId: 'conversation-1',
-        viventiumSourceEventId: 'synthetic-source',
-        ...flags,
+        messageId: 'assistant-anchor', parentMessageId: 'user-message',
+        conversationId: 'conversation-1', viventiumSourceEventId: 'synthetic-source', ...flags,
       },
     });
-    const inserted = mockBindingUpdateOne.mock.calls.find(([, update]) => update.$setOnInsert)?.[1]
-      .$setOnInsert;
+    const inserted = mockBindingUpdateOne.mock.calls.find(([,update]) => update.$setOnInsert)?.[1].$setOnInsert;
     expect(inserted.feelingsIsolated === true).toBe(expected);
     expect(inserted).not.toHaveProperty('_viventiumFeelingSnapshot');
   });
 
-  test.each([undefined, false, true])(
-    'uses stored isolation %s and ignores callback-supplied state',
-    async (feelingsIsolated) => {
-      mockBindingFindOne.mockResolvedValue({
-        _id: 'ghi-origin-1',
-        originRef: 'ghi-origin-1',
-        workRef: '',
-        ownerId: 'user-1',
-        conversationId: 'conversation-1',
-        anchorMessageId: 'assistant-anchor',
-        requestedParentMessageId: 'user-message',
-        configuredDestinations: [{ surface: 'librechat' }],
-        feelingsIsolated,
-      });
-      const result = await resolveGlassHiveCallbackContext({
-        origin_ref: 'ghi-origin-1',
-        work_ref: 'gh-work-1',
-        worker_id: 'worker-1',
-        run_id: 'run-1',
-        user_id: 'user-1',
-        conversation_id: 'conversation-1',
-        message_id: 'assistant-anchor',
-        feelingsIsolated: feelingsIsolated !== true,
-      });
-      expect(result.feelingsIsolated === true).toBe(feelingsIsolated === true);
-    },
-  );
+  test.each([undefined, false, true])('uses stored isolation %s and ignores callback-supplied state', async (feelingsIsolated) => {
+    mockBindingFindOne.mockResolvedValue({
+      _id: 'ghi-origin-1', originRef: 'ghi-origin-1', workRef: '', ownerId: 'user-1',
+      conversationId: 'conversation-1', anchorMessageId: 'assistant-anchor',
+      requestedParentMessageId: 'user-message', configuredDestinations: [{ surface: 'librechat' }],
+      feelingsIsolated,
+    });
+    const result = await resolveGlassHiveCallbackContext({
+      origin_ref: 'ghi-origin-1',work_ref:'gh-work-1',worker_id:'worker-1',run_id:'run-1',
+      user_id:'user-1',conversation_id:'conversation-1',message_id:'assistant-anchor',
+      feelingsIsolated: feelingsIsolated !== true,
+    });
+    expect(result.feelingsIsolated === true).toBe(feelingsIsolated === true);
+  });
 
-  test.each(['voice_note', 'text', undefined])(
-    'launch binding retains the admitted input mode %s',
-    async (inputMode) => {
-      await registerGlassHiveLaunchContext({
-        user: { id: 'user-1' },
-        toolName: 'workspace_launch',
-        toolArguments: { goal: 'Prepare the synthetic report', require_callback: true },
-        requestBody: {
-          messageId: 'assistant-anchor',
-          parentMessageId: 'user-message',
-          conversationId: 'conversation-1',
-          viventiumSourceEventId: 'source-1',
-          viventiumSurface: 'telegram',
-          viventiumInputMode: inputMode,
-          viventiumTelegramChatId: 'chat-1',
-          viventiumTelegramUserId: 'telegram-user-1',
-          viventiumTriggeringSourceSegments: [{ ordinal: 0, text: 'Prepare the report.' }],
-        },
-        toolCall: { id: 'call-launch-1', stepId: 'step-launch-1', turn: 0 },
-      });
-      expect(mockBindingUpdateOne.mock.calls[0][1].$setOnInsert.inputMode).toBe(
-        inputMode || 'text',
-      );
-    },
-  );
+  test.each(['voice_note', 'text', undefined])('launch binding retains the admitted input mode %s', async (inputMode) => {
+    await registerGlassHiveLaunchContext({ user: { id: 'user-1' }, toolName: 'workspace_launch',
+      toolArguments: { goal: 'Prepare the synthetic report', require_callback: true },
+      requestBody: { messageId: 'assistant-anchor', parentMessageId: 'user-message', conversationId: 'conversation-1',
+        viventiumSourceEventId: 'source-1', viventiumSurface: 'telegram', viventiumInputMode: inputMode,
+        viventiumTelegramChatId: 'chat-1', viventiumTelegramUserId: 'telegram-user-1',
+        viventiumTriggeringSourceSegments: [{ ordinal: 0, text: 'Prepare the report.' }] },
+      toolCall: { id: 'call-launch-1', stepId: 'step-launch-1', turn: 0 } });
+    expect(mockBindingUpdateOne.mock.calls[0][1].$setOnInsert.inputMode).toBe(inputMode || 'text');
+  });
 
   test('persists a Core-owned target binding and required schedule relation before launch', async () => {
     const launch = await registerGlassHiveLaunchContext({
@@ -1298,21 +1272,10 @@ describe('GlassHiveCallbackBindingService', () => {
   });
 
   describe('verified current callback generation', () => {
-    const binding = {
-      ownerId: 'user-1',
-      originRef: 'origin-1',
-      workRef: 'work-1',
-      currentRunId: 'run-new',
-      currentRunState: 'running',
-    };
-    const body = {
-      worker_id: 'worker-1',
-      run_id: 'run-new',
-      work_ref: 'work-1',
-      event: 'run.needs_input',
-      work_state: 'failed',
-      work_terminal: false,
-    };
+    const binding = { ownerId: 'user-1', originRef: 'origin-1', workRef: 'work-1',
+      currentRunId: 'run-new', currentRunState: 'running' };
+    const body = { worker_id: 'worker-1', run_id: 'run-new', work_ref: 'work-1',
+      event: 'run.needs_input', work_state: 'failed', work_terminal: false };
     const effectSession = { inTransaction: () => true };
     test.each([
       'committed',
@@ -1367,80 +1330,41 @@ describe('GlassHiveCallbackBindingService', () => {
       }
       if (scenario === 'abort') expect(mockAfterCommit).toHaveLength(1);
     });
-    test.each(['run-old', 'run-new'])(
-      'advances inherited terminal truth before attention fence (%s)',
-      async (storedRun) => {
-        const row = {
-          _id: 'origin-1',
-          ownerId: 'user-1',
-          workRef: 'work-1',
-          runId: storedRun,
-          externalState: 'completed',
-          terminalCallbackRunId: 'run-old',
-          terminalCallbackId: 'old-callback',
-          deliveryState: 'sent',
-          adjudicationState: 'completed',
-          attentionPending: false,
-        };
-        mockExternalFindOne.mockImplementation(async () => ({ ...row }));
-        mockExternalUpdateOne.mockImplementation(async (_filter, update) => {
-          Object.assign(row, update.$set);
-          for (const key of Object.keys(update.$unset || {})) delete row[key];
-          return { matchedCount: 1 };
-        });
-        await expect(
-          fenceGlassHiveCallbackRunState({ binding, body, effectSession }),
-        ).resolves.toBeUndefined();
-        expect(row).toMatchObject({
-          runId: 'run-new',
-          externalState: 'running',
-          terminalCallbackRunId: 'run-old',
-          terminalCallbackId: 'old-callback',
-        });
-        expect(row).not.toHaveProperty('deliveryState');
-        expect(row).not.toHaveProperty('adjudicationState');
-        expect(mockExternalUpdateOne.mock.calls[0][0]).toEqual({
-          _id: 'origin-1',
-          ownerId: 'user-1',
-          workRef: 'work-1',
-          runId: storedRun,
-          externalState: 'completed',
-          terminalCallbackRunId: 'run-old',
-        });
-        const count = mockExternalUpdateOne.mock.calls.length;
-        row.deliveryState = 'sent';
-        row.adjudicationState = 'completed';
-        await fenceGlassHiveCallbackRunState({ binding, body, effectSession });
-        expect(
-          mockExternalUpdateOne.mock.calls.slice(count).every(([, update]) => !update.$unset),
-        ).toBe(true);
-        expect(row.deliveryState).toBe('sent');
-        expect(row.adjudicationState).toBe('completed');
-      },
-    );
-    test('same-run terminal state remains monotonic', async () => {
-      mockExternalFindOne.mockResolvedValue({
-        _id: 'origin-1',
-        ownerId: 'user-1',
-        workRef: 'work-1',
-        runId: 'run-new',
-        externalState: 'completed',
-        terminalCallbackRunId: 'run-new',
+    test.each(['run-old', 'run-new'])('advances inherited terminal truth before attention fence (%s)', async (storedRun) => {
+      const row = { _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1', runId: storedRun,
+        externalState: 'completed', terminalCallbackRunId: 'run-old', terminalCallbackId: 'old-callback',
+        deliveryState: 'sent', adjudicationState: 'completed', attentionPending: false };
+      mockExternalFindOne.mockImplementation(async () => ({ ...row }));
+      mockExternalUpdateOne.mockImplementation(async (_filter, update) => {
+        Object.assign(row, update.$set);
+        for (const key of Object.keys(update.$unset || {})) delete row[key];
+        return { matchedCount: 1 };
       });
+      await expect(fenceGlassHiveCallbackRunState({ binding, body, effectSession })).resolves.toBeUndefined();
+      expect(row).toMatchObject({ runId: 'run-new', externalState: 'running',
+        terminalCallbackRunId: 'run-old', terminalCallbackId: 'old-callback' });
+      expect(row).not.toHaveProperty('deliveryState');
+      expect(row).not.toHaveProperty('adjudicationState');
+      expect(mockExternalUpdateOne.mock.calls[0][0]).toEqual({ _id: 'origin-1', ownerId: 'user-1',
+        workRef: 'work-1', runId: storedRun, externalState: 'completed', terminalCallbackRunId: 'run-old' });
+      const count = mockExternalUpdateOne.mock.calls.length;
+      row.deliveryState = 'sent'; row.adjudicationState = 'completed';
+      await fenceGlassHiveCallbackRunState({ binding, body, effectSession });
+      expect(mockExternalUpdateOne.mock.calls.slice(count).every(([,update]) => !update.$unset)).toBe(true);
+      expect(row.deliveryState).toBe('sent');
+      expect(row.adjudicationState).toBe('completed');
+    });
+    test('same-run terminal state remains monotonic', async () => {
+      mockExternalFindOne.mockResolvedValue({ _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1',
+        runId: 'run-new', externalState: 'completed', terminalCallbackRunId: 'run-new' });
       mockExternalUpdateOne.mockResolvedValue({ matchedCount: 0 });
-      await expect(
-        fenceGlassHiveCallbackRunState({ binding, body, effectSession }),
-      ).rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
-      expect(mockExternalUpdateOne.mock.calls.every(([, update]) => !update.$unset)).toBe(true);
+      await expect(fenceGlassHiveCallbackRunState({ binding, body, effectSession }))
+        .rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
+      expect(mockExternalUpdateOne.mock.calls.every(([,update]) => !update.$unset)).toBe(true);
     });
     test('historical attention cannot replace current truth', async () => {
-      await expect(
-        fenceGlassHiveCallbackRunState({
-          binding,
-          body: { ...body, run_id: 'run-old' },
-          effectSession,
-        }),
-      ).rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
+      await expect(fenceGlassHiveCallbackRunState({ binding, body: { ...body, run_id: 'run-old' }, effectSession }))
+        .rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
       expect(mockExternalUpdateOne).not.toHaveBeenCalled();
       await confirmGlassHiveCallbackContext({ binding, body: { ...body, run_id: 'run-old' } });
       expect(mockExternalUpdateOne.mock.calls[0][1].$set).not.toHaveProperty('runId');
@@ -1450,40 +1374,56 @@ describe('GlassHiveCallbackBindingService', () => {
       expect(mockExternalFindOneAndUpdate).not.toHaveBeenCalled();
     });
     test('missing current proof cannot reopen terminal truth', async () => {
-      const row = {
-        _id: 'origin-1',
-        ownerId: 'user-1',
-        workRef: 'work-1',
-        runId: 'run-new',
-        externalState: 'completed',
-        terminalCallbackRunId: 'run-old',
-      };
+      const row = { _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1', runId: 'run-new',
+        externalState: 'completed', terminalCallbackRunId: 'run-old' };
       mockExternalFindOne.mockResolvedValue(row);
       mockExternalUpdateOne.mockResolvedValue({ matchedCount: 0 });
-      await expect(
-        fenceGlassHiveCallbackRunState({
-          binding: { ...binding, currentRunId: '' },
-          body,
-          effectSession,
-        }),
-      ).rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
-      expect(mockExternalUpdateOne.mock.calls.every(([, update]) => !update.$unset)).toBe(true);
+      await expect(fenceGlassHiveCallbackRunState({ binding: { ...binding, currentRunId: '' }, body, effectSession }))
+        .rejects.toMatchObject({ code: 'glasshive_callback_notice_superseded' });
+      expect(mockExternalUpdateOne.mock.calls.every(([,update]) => !update.$unset)).toBe(true);
     });
     test('a concurrent current projection change prevents a stale reset', async () => {
-      mockExternalFindOne.mockResolvedValue({
-        _id: 'origin-1',
-        ownerId: 'user-1',
-        workRef: 'work-1',
-        runId: 'run-old',
-        externalState: 'completed',
-        terminalCallbackRunId: 'run-old',
-      });
+      mockExternalFindOne.mockResolvedValue({ _id: 'origin-1', ownerId: 'user-1', workRef: 'work-1', runId: 'run-old',
+        externalState: 'completed', terminalCallbackRunId: 'run-old' });
       mockExternalUpdateOne.mockResolvedValue({ matchedCount: 0 });
-      await expect(
-        fenceGlassHiveCallbackRunState({ binding, body, effectSession }),
-      ).rejects.toMatchObject({ code: 'glasshive_callback_run_binding_not_ready' });
+      await expect(fenceGlassHiveCallbackRunState({ binding, body, effectSession }))
+        .rejects.toMatchObject({ code: 'glasshive_callback_run_binding_not_ready' });
       expect(mockExternalUpdateOne).toHaveBeenCalledTimes(1);
     });
+  });
+
+  test('routes an accepted Web-origin continuation to its exact Telegram topic', async () => {
+    mockBindingFindOne.mockResolvedValue({
+      _id: 'ghi-origin-1', workRef: 'gh-work-1', ownerId: 'user-1',
+      conversationId: 'conversation-1', anchorMessageId: 'web-anchor',
+      requestedParentMessageId: 'web-source', configuredDestinations: [{ surface: 'librechat' }],
+    });
+    mockRequestAccountApi.mockResolvedValue({
+      valid: true, originRef: 'ghi-origin-1', workRef: 'gh-work-1',
+      runId: 'run-1', sourceActionKey: 'accepted-action',
+    });
+    mockActionReceiptFindOne.mockResolvedValue({ sourceEventId: 'telegram-source-event' });
+    mockGetMessages.mockResolvedValue([{
+      messageId: 'telegram-source',
+      metadata: { viventium: { telegramInput: { preparation: { message: {
+        chat: { id: -100 }, from: { id: 123 }, message_id: 44, message_thread_id: 5,
+      } } } } },
+    }]);
+    const context = await resolveGlassHiveCallbackContext({
+      origin_ref: 'ghi-origin-1', work_ref: 'gh-work-1', worker_id: 'worker-1', run_id: 'run-1',
+      event: 'run.completed', work_terminal: true, work_state: 'completed',
+      telegram_chat_id: 'untrusted',
+    }, { deferConfirmation: true });
+    expect(mockActionReceiptFindOne).toHaveBeenCalledWith({
+      ownerId: 'user-1', conversationId: 'conversation-1', providerIdempotencyKey: 'accepted-action',
+      adapterId: 'glasshive.work_action.v1', surface: 'telegram',
+    }, expect.anything());
+    expect(context.anchorMessageId).toBe('web-anchor');
+    expect(context.destinations).toEqual([
+      { surface: 'telegram', telegramChatId: '-100', telegramUserId: '123',
+        telegramMessageId: '44', telegramMessageThreadId: '5' },
+      { surface: 'librechat' },
+    ]);
   });
 
   test('resolves by launch origin, verifies the authoritative GlassHive association, and ignores callback targets', async () => {
@@ -2859,14 +2799,12 @@ describe('GlassHiveCallbackBindingService', () => {
 
     expect(mockExternalFindOneAndUpdate).toHaveBeenCalledWith(
       expect.objectContaining({ _id: 'work-cleanup', deliveryState: expect.any(Object) }),
-      {
-        $set: expect.objectContaining({
-          adjudicationState: 'silent',
-          deliveryState: 'suppressed',
-          attentionPending: false,
-          adjudicationErrorCode: 'mission_origin_cleanup_tombstoned',
-        }),
-      },
+      { $set: expect.objectContaining({
+        adjudicationState: 'silent',
+        deliveryState: 'suppressed',
+        attentionPending: false,
+        adjudicationErrorCode: 'mission_origin_cleanup_tombstoned',
+      }) },
       expect.any(Object),
     );
   });

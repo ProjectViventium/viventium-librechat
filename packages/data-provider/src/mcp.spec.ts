@@ -103,3 +103,20 @@ describe('MCP Viventium server-managed fields', () => {
     expect('viventiumGlassHive' in parsed).toBe(false);
   });
 });
+
+
+describe('reviewed Native MCP ownership mapping', () => {
+  const base = { type: 'streamable-http', url: 'https://mcp.example.com/mcp' };
+  test('retains exact mappings only in trusted options', () => {
+    const policy = { version: 1, permitsAutonomousWorker: true, nativeServerIds: ['browser.native'] };
+    expect(MCPOptionsSchema.parse({ ...base, viventiumGlassHive: policy })
+      .viventiumGlassHive?.nativeServerIds).toEqual(['browser.native']);
+    expect(MCPServerUserInputSchema.parse({ ...base, viventiumGlassHive: policy }))
+      .not.toHaveProperty('viventiumGlassHive');
+  });
+  test.each(['', ' browser', 'browser '])('rejects invalid Native identity %s', (id) => {
+    expect(() => MCPOptionsSchema.parse({ ...base, viventiumGlassHive: {
+      version: 1, nativeServerIds: [id],
+    } })).toThrow();
+  });
+});

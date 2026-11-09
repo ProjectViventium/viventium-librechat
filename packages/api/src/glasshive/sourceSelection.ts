@@ -5,11 +5,11 @@
  * identifiers and attachment paths never enter the model-controlled schema.
  * === VIVENTIUM END === */
 
-import { MAIN_DELEGATION_STRING_LIMITS } from './conversationOrchestration';
+import { createHash } from 'crypto';
 
 type UnknownRecord = Record<string, unknown>;
 
-export type SourceSelectionError = 'source_selection_required' | 'invalid_source_selection';
+export type SourceSelectionError = 'source_selection_required' | 'invalid_source_selection' | 'current_task_source_unavailable';
 
 export type SourceSelectionResult =
   { requestBody: UnknownRecord; sourceOrdinals: number[] } | { error: SourceSelectionError };
@@ -26,6 +26,31 @@ function boundedString(value: unknown, maxLength: number): string {
   return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
 }
 
+/** A bounded UI preview is not the task. Resolve its exact bytes from existing authorized context. */
+function completeSelectedSources(body: UnknownRecord, sources: unknown[], ordinals: number[]) {
+  const inherited = recordFrom(body.viventiumInheritedConversation);
+  const context = Array.isArray(inherited.sources) ? inherited.sources : [];
+  return sources.map((value, index) => {
+    const source = recordFrom(value);
+    if (source.truncated !== true) return source;
+    const originalHash = source.original_sha256;
+    if (typeof originalHash !== 'string') return null;
+    const candidates = context.flatMap((entry) => {
+      const item = recordFrom(entry);
+      return item.current_input === true && Array.isArray(item.source_ordinals) &&
+        item.source_ordinals.includes(ordinals[index]) && typeof item.text === 'string'
+        ? [item.text] : [];
+    });
+    if (source.source_event_id === body.viventiumSourceEventId && typeof body.text === 'string') {
+      candidates.push(body.text);
+    }
+    const text = candidates.find((candidate) => createHash('sha256').update(candidate, 'utf8').digest('hex') === originalHash);
+    if (text === undefined) return null;
+    const { truncated: _previewOnly, original_sha256: _previewDigest, ...original } = source;
+    return { ...original, text };
+  });
+}
+
 export function canonicalSourceOrdinals(value: unknown): number[] {
   if (!Array.isArray(value)) {
     return [];
@@ -34,9 +59,8 @@ export function canonicalSourceOrdinals(value: unknown): number[] {
   return Array.from(
     new Set(
       value
-        .slice(0, 32)
         .map(Number)
-        .filter((item) => Number.isInteger(item) && item >= 1 && item <= 32),
+        .filter((item) => Number.isSafeInteger(item) && item >= 1),
     ),
   ).sort((left, right) => left - right);
 }
@@ -51,7 +75,7 @@ export function trustedUploadedFilesFromRequestBody(
     candidates = requestBody.attachments;
   }
 
-  return candidates.slice(0, 64).flatMap((candidate, index) => {
+  return candidates.flatMap((candidate, index) => {
     if (!isRecord(candidate)) {
       return [];
     }
@@ -74,7 +98,7 @@ export function trustedUploadedFilesFromRequestBody(
       ...(Number.isInteger(mediaGroupIndex) && mediaGroupIndex >= 0
         ? { media_group_index: mediaGroupIndex }
         : { media_group_index: index }),
-      ...(typeof candidate.text === 'string' ? { text: candidate.text.slice(0, 256 * 1024) } : {}),
+      ...(typeof candidate.text === 'string' ? { text: candidate.text } : {}),
     };
 
     return [
@@ -95,7 +119,6 @@ export function selectTrustedSourceInstruction(
     typeof instruction !== 'string' ||
     !instruction.trim() ||
     instruction.trim() !== instruction ||
-    instruction.length > MAIN_DELEGATION_STRING_LIMITS.instruction ||
     !originals.some((text) => text.includes(instruction))
   ) {
     throw Object.assign(new Error('invalid_source_instruction_selection'), {
@@ -115,7 +138,9 @@ export function selectTrustedLaunchRequestBody(
   const sourceOrdinals = canonicalSourceOrdinals(sourceOrdinalsValue);
 
   if (sourceSegments.length === 1) {
-    return { requestBody, sourceOrdinals: [1] };
+    const full = completeSelectedSources(requestBody, sourceSegments, [1]);
+    if (full.some((source) => source === null)) return { error: 'current_task_source_unavailable' };
+    return { requestBody: { ...requestBody, viventiumTriggeringSourceSegments: full }, sourceOrdinals: [1] };
   }
   if (sourceSegments.length === 0 && sourceOrdinals.length === 0) {
     return { requestBody, sourceOrdinals: [] };
@@ -131,6 +156,8 @@ export function selectTrustedLaunchRequestBody(
   if (selected.length !== sourceOrdinals.length) {
     return { error: 'invalid_source_selection' };
   }
+  const fullSelected = completeSelectedSources(requestBody, selected, sourceOrdinals);
+  if (fullSelected.some((source) => source === null)) return { error: 'current_task_source_unavailable' };
 
   const selectedIdentities = new Set(
     selected.map((segment) => {
@@ -173,7 +200,7 @@ export function selectTrustedLaunchRequestBody(
   const selectedRequestBody: UnknownRecord = {
     ...requestBody,
     viventiumSourceEventId: boundedString(recordFrom(selected[0]).source_event_id, 160),
-    viventiumTriggeringSourceSegments: selected.map((segment, ordinal) => ({
+    viventiumTriggeringSourceSegments: fullSelected.map((segment, ordinal) => ({
       ...recordFrom(segment),
       ordinal,
     })),

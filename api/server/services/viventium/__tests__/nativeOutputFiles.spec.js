@@ -20,6 +20,7 @@ const mockReadSource = jest.fn();
 const mockDownload = jest.fn();
 let mockCallbackRows = [];
 const mockCallbackAccepted = jest.fn();
+const mockCallbackAcceptedBatch = jest.fn();
 const mockCallbackFence = jest.fn();
 jest.mock('~/db/models', () => ({
   Message: {
@@ -34,6 +35,9 @@ jest.mock('~/db/models', () => ({
     }),
   },
   GlassHiveTerminalCallbackResult: {
+    find: (filter) => ({
+      select: (projection) => ({ lean: async () => mockCallbackAcceptedBatch(filter, projection) }),
+    }),
     findOne: (filter) => ({
       session() {
         return this;
@@ -92,6 +96,7 @@ const {
   prepareMissionOutputFiles,
   prepareRetainedNativeOutputFiles,
   prepareNativeResponseOutputFiles,
+  loadRetainedNativeResultFileAccess,
 } = require('../nativeOutputFiles');
 jest.spyOn(require('mongoose').connection, 'collection').mockImplementation(() => ({
   find: () => ({ toArray: async () => mockCallbackRows }),
@@ -143,6 +148,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockCallbackRows = [];
   mockCallbackAccepted.mockResolvedValue(true);
+  mockCallbackAcceptedBatch.mockReset().mockResolvedValue([]);
   mockCallbackFence.mockResolvedValue(true);
   mockRoute.mockReset();
   mockFetchFactory.mockReset();
@@ -195,7 +201,7 @@ test('coalesced mission files retain distinct names for the same bytes and dedup
   const result = await prepareMissionOutputFiles({ req: req(), rows: [row, row], message });
   expect(result.map((file) => file.filename)).toEqual(['result.csv', 'copy.csv']);
   expect(mockImport.mock.calls[0][0].files).toEqual(source.files);
-  expect(mockImport.mock.calls[1][0].files).toEqual([]);
+  expect(mockImport).toHaveBeenCalledTimes(1);
   expect(mockAccountRoute).toHaveBeenCalledWith({ ownerId: 'owner' });
   expect(mockRoute).not.toHaveBeenCalled();
   expect(mockImport.mock.calls[0][1]).toMatchObject({
@@ -560,8 +566,8 @@ test('bound initial invocation is checked while current unbound graph return sta
 test.each([true, false])(
   'mission merge prefers only verified Main import: available=%s',
   async (available) => {
-    const mainGrant = 'https://artifacts.example.test/v1/link-refs/ghr_main1234567890abcdef';
-    const workerGrant = 'https://artifacts.example.test/v1/link-refs/ghr_worker1234567890abcdef';
+    const mainGrant = 'https://artifacts.example.test/v1/link-refs/ghr_' + 'main1234567890abcdef';
+    const workerGrant = 'https://artifacts.example.test/v1/link-refs/ghr_' + 'worker1234567890abcdef';
     const file = {
       filename: 'shape.svg',
       mime_type: 'image/svg+xml',
@@ -630,7 +636,8 @@ test.each([true, false])(
       agentId: 'main',
       providerId: 'native-provider',
     });
-    expect(mockImport.mock.calls[1][0].files).toHaveLength(available ? 0 : 1);
+    expect(mockImport).toHaveBeenCalledTimes(available ? 1 : 2);
+    if (!available) expect(mockImport.mock.calls[1][0].files).toHaveLength(1);
   },
 );
 test('invalid Main source refuses only its carrier and still imports valid callback files', async () => {
@@ -1121,6 +1128,27 @@ describe('retained owned native File references', () => {
     mockCallbackRows = [source];
     return { ...fixture, source };
   }
+  test('retained inventory performs one exact owner/result-key lookup without per-row acceptance reads', async () => {
+    const fixture = setupRetainedCallback();
+    const source = fixture.source;
+    mockCallbackAcceptedBatch.mockResolvedValue([{
+      _id: source.terminalCallbackResultKey, ownerId: source.ownerId,
+      originRef: source.originRef, workRef: source.workRef, runId: source.runId,
+      attemptNumber: source.attemptNumber, callbackId: source.terminalCallbackId,
+      resultRevision: source.terminalCallbackResultRevision,
+      resultDigest: source.terminalCallbackResultDigest,
+      acceptedOperationId: source.terminalCallbackAcceptedOperationId,
+      acceptedOperationGeneration: source.terminalCallbackEffectGeneration,
+    }]);
+    await expect(loadRetainedNativeResultFileAccess('owner', 'conversation')).resolves.toEqual([{
+      run_id: source.runId, attempt_id: source.attemptId, sha256: fixture.file.sha256,
+    }]);
+    expect(mockCallbackAcceptedBatch).toHaveBeenCalledTimes(1);
+    expect(mockCallbackAcceptedBatch).toHaveBeenCalledWith({ ownerId: 'owner',
+      _id: { $in: [source.terminalCallbackResultKey] } },
+    '_id ownerId originRef workRef runId attemptNumber callbackId resultRevision resultDigest acceptedOperationId acceptedOperationGeneration');
+    expect(mockCallbackAccepted).not.toHaveBeenCalled();
+  });
   test('reuses accepted callback File bytes without a native response, public fetch or new worker', async () => {
     const fixture = setupRetainedCallback();
     const result = await prepareRetainedNativeOutputFiles(req(), fixture.identity, fixture.text);

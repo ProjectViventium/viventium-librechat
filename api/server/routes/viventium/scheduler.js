@@ -14,7 +14,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const { GenerationJobManager, isCurrentCallPreparationDispatch } = require('@librechat/api');
+const { GenerationJobManager, isCurrentCallPreparationDispatch, schedulerDispatchDocumentId } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
 const {
@@ -31,13 +31,8 @@ const { Message, Conversation } = require('~/db/models');
  * Feature: Scheduler <-> Telegram mapping helper import.
  * === VIVENTIUM NOTE === */
 const { resolveTelegramMappingByUserId } = require('~/server/services/TelegramLinkService');
-const {
-  resolveUserVoiceRoute,
-  getCallSession,
-} = require('~/server/services/viventium/CallSessionService');
-const {
-  normalizeScheduledAgentExecution,
-} = require('~/server/services/viventium/scheduledAgentOverride');
+const { resolveUserVoiceRoute, getCallSession } = require('~/server/services/viventium/CallSessionService');
+const { normalizeScheduledAgentExecution } = require('~/server/services/viventium/scheduledAgentOverride');
 /* === VIVENTIUM NOTE ===
  * Feature: Sidebar parity for gateway-created conversations (title + icon).
  * Purpose: Match web UI behavior for new conversations created via scheduler gateway.
@@ -103,10 +98,6 @@ function normalizeSchedulerIdempotencyKey(value) {
   return key;
 }
 
-function schedulerDispatchDocumentId(userId, idempotencyKey) {
-  return crypto.createHash('sha256').update(`${userId}\0${idempotencyKey}`).digest('hex');
-}
-
 const SCHEDULER_MESSAGE_UUID_NAMESPACE = Buffer.from('6ba7b8119dad11d180b400c04fd430c8', 'hex');
 
 function schedulerMessageId(userId, streamId) {
@@ -168,8 +159,7 @@ const SCHEDULER_PUBLIC_FAILURES = Object.freeze({
   provider_response_deadline_exceeded: 'The model provider response exceeded its deadline.',
   provider_temporarily_unavailable: 'The model provider is temporarily unavailable.',
   conversation_session_authority_conflict: 'The conversation is busy with an active response.',
-  source_context_unavailable:
-    'The conversation context could not be preserved. Please retry this turn.',
+  source_context_unavailable: 'The conversation context could not be preserved. Please retry this turn.',
   completion_error: 'The scheduled model response could not be completed.',
 });
 
@@ -527,13 +517,8 @@ function scheduledCapabilityError(res, error) {
 /* === VIVENTIUM START === Generic clock notice enters the normal Main dispatch owner. === */
 router.post('/targets', schedulerAuth, async (req, res) => {
   try {
-    const {
-      ensureConversationScheduleTargets,
-    } = require('~/server/services/viventium/ScheduleDueService');
-    const targets = await ensureConversationScheduleTargets({
-      user: req.user,
-      requestBody: req.body,
-    });
+    const { ensureConversationScheduleTargets } = require('~/server/services/viventium/ScheduleDueService');
+    const targets = await ensureConversationScheduleTargets({ user: req.user, requestBody: req.body });
     return res.json({ targets });
   } catch (error) {
     return res.status(503).json({ error: error?.code || 'schedule_target_unavailable' });
@@ -541,25 +526,21 @@ router.post('/targets', schedulerAuth, async (req, res) => {
 });
 
 router.post('/due', async (req, res) => {
-  const {
-    receiveScheduleDue,
-    reconcileScheduleDueAdmissions,
-  } = require('~/server/services/viventium/ScheduleDueService');
+  if (['coordinator.turn_due', 'coordinator.dispatch_due', 'coordinator.action_due', 'coordinator.result_ready', 'coordinator.turn_result_ready'].includes(req.body?.type)) {
+    return require('~/server/services/viventium/NativeCoordinatorService').receive(req, res);
+  }
+  const { receiveScheduleDue, reconcileScheduleDueAdmissions } =
+    require('~/server/services/viventium/ScheduleDueService');
   try {
     const { admission, duplicate } = await receiveScheduleDue(req);
     // Work release does not depend on the receiver keeping its HTTP response open.
-    setImmediate(() =>
-      reconcileScheduleDueAdmissions().catch((error) => {
-        logger.warn('[scheduleDue] Accepted admission recovery deferred', {
-          code: error?.code || error?.name,
-        });
-      }),
-    );
+    setImmediate(() => reconcileScheduleDueAdmissions().catch((error) => {
+      logger.warn('[scheduleDue] Accepted admission recovery deferred', { code: error?.code || error?.name });
+    }));
     return res.status(202).json({ accepted: true, duplicate, admission_id: admission._id });
   } catch (error) {
     const status = Number(error?.status);
-    return res
-      .status(status >= 400 && status <= 599 ? status : 503)
+    return res.status(status >= 400 && status <= 599 ? status : 503)
       .json({ error: error?.code || 'schedule_due_unavailable' });
   }
 });
@@ -601,15 +582,10 @@ router.post(
     delete sanitizedIncoming.callPreparation;
     if (incoming.authoringDeadlineAt != null) {
       const deadline = new Date(incoming.authoringDeadlineAt).getTime();
-      if (
-        typeof incoming.authoringDeadlineAt !== 'string' ||
-        !Number.isFinite(deadline) ||
-        deadline <= Date.now()
-      ) {
-        return _res.status(400).json({
-          error: 'A future authoring deadline is required',
-          reason: 'invalid_authoring_deadline',
-        });
+      if (typeof incoming.authoringDeadlineAt !== 'string' || !Number.isFinite(deadline) ||
+          deadline <= Date.now()) {
+        return _res.status(400).json({ error: 'A future authoring deadline is required',
+          reason: 'invalid_authoring_deadline' });
       }
       req.viventiumSchedulerAuthoringDeadlineAt = new Date(deadline).toISOString();
     }
@@ -687,21 +663,17 @@ router.post(
     /* === VIVENTIUM START === Bind operator preparation policy to the current exact call. === */
     if (incoming.callPreparation != null) {
       const callSessionId = incoming.callPreparation?.callSessionId;
-      const session =
-        typeof callSessionId === 'string' ? await getCallSession(callSessionId) : null;
+      const session = typeof callSessionId === 'string' ? await getCallSession(callSessionId) : null;
       // A new conversation can materialize after this exact stream was accepted. Reuse
       // only that bound accepted stream; this never grants a second execution.
-      const acceptedPreparationRetry =
-        requestedConversationId === 'new' &&
+      const acceptedPreparationRetry = requestedConversationId === 'new' &&
         existingDispatch?.status === 'accepted' &&
         existingDispatch.streamId === session?.contextPreparation?.streamId &&
         existingDispatch.conversationId === session?.conversationId;
       const current = isCurrentCallPreparationDispatch(session, {
         callSessionId,
         userId: String(req.user?.id || ''),
-        conversationId: acceptedPreparationRetry
-          ? existingDispatch.conversationId
-          : requestedConversationId,
+        conversationId: acceptedPreparationRetry ? existingDispatch.conversationId : requestedConversationId,
         agentId: requestedAgentId || session?.agentId || '',
         idempotencyKey,
         authoringDeadlineAt: req.viventiumSchedulerAuthoringDeadlineAt || '',
@@ -717,8 +689,7 @@ router.post(
       if (policy) {
         try {
           req.viventiumScheduledAgentExecution = normalizeScheduledAgentExecution(
-            JSON.parse(policy),
-            req.config?.endpoints?.agents || {},
+            JSON.parse(policy), req.config?.endpoints?.agents || {},
           );
           if (!req.viventiumScheduledAgentExecution) throw new Error('Missing preparation policy');
         } catch {
@@ -756,89 +727,41 @@ router.post(
         ? `scheduler-${crypto.createHash('sha256').update(dispatchDocumentId).digest('hex').slice(0, 32)}`
         : `scheduler-${crypto.randomUUID()}`);
     const messageId = schedulerMessageId(req.user?.id, streamId);
-    if (
-      existingDispatch?.kind === 'schedule_due' &&
-      !(
-        existingDispatch.conversationPolicy === 'new' &&
-        requestedConversationId === 'new' &&
-        existingDispatch.conversationId === 'new'
-      )
-    ) {
+    if (existingDispatch?.kind === 'schedule_due' &&
+        !(existingDispatch.conversationPolicy === 'new' && requestedConversationId === 'new' &&
+          existingDispatch.conversationId === 'new')) {
       const boundConversation = await getConvo(req.user?.id, requestedConversationId);
-      if (
-        !boundConversation ||
-        boundConversation.endpoint !== 'agents' ||
-        existingDispatch.conversationId !== requestedConversationId
-      ) {
-        return _res.status(403).json({
-          error: 'The scheduled conversation is unavailable',
-          reason: 'schedule_due_binding_unavailable',
-        });
+      if (!boundConversation || boundConversation.endpoint !== 'agents' ||
+          existingDispatch.conversationId !== requestedConversationId) {
+        return _res.status(403).json({ error: 'The scheduled conversation is unavailable',
+          reason: 'schedule_due_binding_unavailable' });
       }
     }
     let inheritedSourceFiles = [];
     if (existingDispatch?.kind === 'schedule_due') {
-      const binding = await mongoose.connection
-        .collection('viventium_glasshive_callback_bindings')
-        .findOne({
-          _id: existingDispatch.bindingRef,
-          kind: 'schedule_binding',
-          ownerId: String(req.user.id),
-        });
+      const binding = await mongoose.connection.collection('viventium_glasshive_callback_bindings')
+        .findOne({_id:existingDispatch.bindingRef,kind:'schedule_binding',ownerId:String(req.user.id)});
       req.viventiumSchedulerDueAdmissionId = existingDispatch._id;
       const sourceId = binding?.sourceConversationId || binding?.conversationId;
       if (sourceId && sourceId !== requestedConversationId) {
-        const sourceConvo = await getConvo(req.user.id, sourceId);
-        if (sourceConvo?.endpoint !== 'agents')
-          return _res.status(403).json({ reason: 'schedule_due_source_unavailable' });
-        const sourceState = await resolveReusableConversationState({
-          conversationId: sourceId,
-          userId: req.user.id,
-          surface: 'scheduler',
-        });
-        const rows = await getMessages({ user: String(req.user.id), conversationId: sourceId });
-        if (!sourceState.parentMessageId || !rows?.length)
-          return _res.status(503).json({ reason: 'schedule_due_source_context_unavailable' });
+        const sourceConvo = await getConvo(req.user.id,sourceId);
+        if (sourceConvo?.endpoint !== 'agents') return _res.status(403).json({reason:'schedule_due_source_unavailable'});
+        const sourceState = await resolveReusableConversationState({conversationId:sourceId,userId:req.user.id,surface:'scheduler'});
+        const rows = await getMessages({user:String(req.user.id),conversationId:sourceId});
+        if (!sourceState.parentMessageId || !rows?.length) return _res.status(503).json({reason:'schedule_due_source_context_unavailable'});
         const sourceMessages = require('~/app/clients/BaseClient').getMessagesForConversation({
-          messages: rows,
-          parentMessageId: sourceState.parentMessageId,
-          skipCondition: (message) =>
-            require('~/server/services/viventium/ViventiumMainContextService').isSchedulerTransportRow(
-              message,
-            ) ||
-            require('~/server/services/viventium/normalizeTextContentParts').isRuntimeOnlyAssistantMessage(
-              message,
-            ) ||
-            require('~/server/services/viventium/listenOnlyTranscript').isListenOnlyTranscriptMessage(
-              message,
-            ),
+          messages:rows,parentMessageId:sourceState.parentMessageId,
+          skipCondition:(message)=>require('~/server/services/viventium/ViventiumMainContextService').isSchedulerTransportRow(message) ||
+            require('~/server/services/viventium/normalizeTextContentParts').isRuntimeOnlyAssistantMessage(message) ||
+            require('~/server/services/viventium/listenOnlyTranscript').isListenOnlyTranscriptMessage(message),
         });
-        Object.defineProperty(req, '_viventiumInheritedConversationContext', {
-          value:
-            require('~/server/services/viventium/ViventiumMainContextService').buildInheritedConversationContext(
-              {
-                conversationId: sourceId,
-                messages: sourceMessages,
-              },
-            ),
-          enumerable: false,
-        });
-        const fileIds = [
-          ...new Set(
-            sourceMessages
-              .flatMap((message) =>
-                (Array.isArray(message.files) ? message.files : []).map((file) =>
-                  typeof file === 'string' ? file : file.file_id,
-                ),
-              )
-              .filter(Boolean),
-          ),
-        ];
-        if (fileIds.length)
-          inheritedSourceFiles = await getFiles({
-            user: String(req.user.id),
-            file_id: { $in: fileIds },
-          });
+        Object.defineProperty(req,'_viventiumInheritedConversationContext',{value:
+          require('~/server/services/viventium/ViventiumMainContextService').buildInheritedConversationContext({
+            conversationId:sourceId,messages:sourceMessages,
+          }),enumerable:false});
+        const fileIds=[...new Set(sourceMessages.flatMap(message => (Array.isArray(message.files) ? message.files : []).map(file =>
+          typeof file === 'string' ? file : file.file_id)).filter(Boolean))];
+        if (fileIds.length) inheritedSourceFiles=await getFiles({user:String(req.user.id),file_id:{$in:fileIds}});
       }
     }
     const validatedConversationId = await normalizeSchedulerConversationId({
@@ -914,14 +837,12 @@ router.post(
       { commit_authority: 'server' },
     );
 
-    const agentId =
-      verifiedPreparationAgentId ||
-      (await resolveAgentId({
-        req,
-        conversationId,
-        requestedAgentId,
-        userId: req.user?.id,
-      }));
+    const agentId = verifiedPreparationAgentId || await resolveAgentId({
+      req,
+      conversationId,
+      requestedAgentId,
+      userId: req.user?.id,
+    });
 
     if (!agentId) {
       return _res.status(400).json({ error: 'agentId is required' });
@@ -948,14 +869,7 @@ router.post(
       streamId,
       messageId,
       scheduleId,
-      ...(inheritedSourceFiles.length
-        ? {
-            files: [
-              ...(Array.isArray(sanitizedIncoming.files) ? sanitizedIncoming.files : []),
-              ...inheritedSourceFiles,
-            ],
-          }
-        : {}),
+      ...(inheritedSourceFiles.length ? {files:[...(Array.isArray(sanitizedIncoming.files) ? sanitizedIncoming.files : []),...inheritedSourceFiles]} : {}),
     };
     if (resolvedSpec) {
       req.body.spec = resolvedSpec;
@@ -997,6 +911,37 @@ router.get('/dispatches/:idempotencyKey', schedulerAuth, async (req, res) => {
     return res.status(404).json({ error: 'Scheduler dispatch not found' });
   }
   const job = await GenerationJobManager.getJob(dispatch.streamId);
+  let finalEvent;
+  if (!job && dispatch.status === 'accepted') {
+    const retained = await require('~/server/services/viventium/nativeResponseService')
+      .readRetainedMainFinal({ userId: String(req.user.id), streamId: dispatch.streamId,
+        conversationId: dispatch.conversationId, includeSettled: true });
+    if (retained?.interactionContext?.origin === 'scheduler' &&
+        retained.interactionContext.source_event_id === idempotencyKey) {
+      finalEvent = attachLogicalTurnMetadata(retained.finalEvent, retained.interactionContext);
+    } else {
+      // Failed authoring has no successful native-final receipt. Recover only the exact
+      // canonical scheduler source and its one completed error, never a neighboring turn.
+      const sourceId = schedulerMessageId(req.user.id, dispatch.streamId);
+      const sources = await getMessages({ user: String(req.user.id), conversationId: dispatch.conversationId,
+        messageId: sourceId, isCreatedByUser: true, deletedAt: null });
+      const failures = sources.length === 1 ? await getMessages({ user: String(req.user.id),
+        conversationId: dispatch.conversationId, parentMessageId: sourceId,
+        isCreatedByUser: false, unfinished: false, error: true, deletedAt: null,
+        'metadata.viventium.interactionContext.origin': 'scheduler',
+        'metadata.viventium.interactionContext.source_event_id': idempotencyKey,
+      }) : [];
+      if (failures.length === 1) {
+        const failure = failures[0];
+        const context = failure.metadata?.viventium?.interactionContext;
+        const sourceContext = sources[0].metadata?.viventium?.interactionContext;
+        if (context?.logical_turn_id && context.logical_turn_id === sourceContext?.logical_turn_id &&
+            context.revision === sourceContext.revision) {
+          finalEvent = attachLogicalTurnMetadata({ final: true, responseMessage: failure }, context);
+        }
+      }
+    }
+  }
   const externalWork = await getSchedulerExternalWorkSummary({
     ownerId: String(req.user?.id || ''),
     schedulerDispatchDocumentId: documentId,
@@ -1006,7 +951,8 @@ router.get('/dispatches/:idempotencyKey', schedulerAuth, async (req, res) => {
     streamId: dispatch.streamId,
     conversationId: dispatch.conversationId,
     idempotencyKey,
-    state: job ? 'accepted' : 'reserved',
+    state: finalEvent ? 'terminal' : job || dispatch.status === 'accepted' ? 'accepted' : 'reserved',
+    ...(finalEvent ? { finalEvent } : {}),
     externalWork,
   });
 });
@@ -1084,12 +1030,8 @@ router.post('/stream/:streamId/cancel', schedulerAuth, async (req, res) => {
   }
 
   if (releaseUnconfirmed) {
-    return res.status(202).json({
-      success: false,
-      cancelled: streamId,
-      reason: 'release_unconfirmed',
-      capacityReleased: false,
-    });
+    return res.status(202).json({ success: false, cancelled: streamId,
+      reason: 'release_unconfirmed', capacityReleased: false });
   }
   return res.json({ success: true, cancelled: streamId });
 });
@@ -1123,10 +1065,7 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       try {
         voiceRoute = await resolveUserVoiceRoute(userId, { includeSources: true });
       } catch (err) {
-        logger.warn(
-          '[VIVENTIUM][scheduler/telegram] Speaking route unavailable',
-          schedulerSafeFailure(err),
-        );
+        logger.warn('[VIVENTIUM][scheduler/telegram] Speaking route unavailable', schedulerSafeFailure(err));
         speechUnavailable = 'voice_route_unavailable';
       }
     }
@@ -1147,9 +1086,7 @@ router.post('/telegram/resolve', schedulerAuth, async (req, res) => {
       '[VIVENTIUM][scheduler/telegram] Failed to resolve mapping',
       schedulerSafeFailure(err),
     );
-    return res
-      .status(500)
-      .json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
+    return res.status(500).json({ error: 'Failed to resolve Telegram mapping', code: 'telegram_mapping_unavailable' });
   }
 });
 
@@ -1192,21 +1129,13 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
     return;
   }
   if (!job) {
-    const retained =
-      await require('~/server/services/viventium/nativeResponseService').readRetainedMainFinal({
-        userId,
-        streamId,
-        includeSettled: true,
-      });
+    const retained = await require('~/server/services/viventium/nativeResponseService')
+      .readRetainedMainFinal({ userId, streamId, includeSettled: true });
     if (requestAbort.signal.aborted) return;
     if (retained?.interactionContext?.origin === 'scheduler') {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
-      writeSseEvent(
-        res,
-        'message',
-        attachLogicalTurnMetadata(retained.finalEvent, retained.interactionContext),
-      );
+      writeSseEvent(res, 'message', attachLogicalTurnMetadata(retained.finalEvent, retained.interactionContext));
       return res.end();
     }
     return res.status(404).json({
@@ -1281,11 +1210,7 @@ router.get('/stream/:streamId', schedulerAuth, async (req, res) => {
     },
     (error, errorClass) => {
       if (!res.writableEnded) {
-        writeSseEvent(
-          res,
-          'error',
-          schedulerSafeFailure(errorClass ? { code: errorClass } : error),
-        );
+        writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
         endStream();
       }
     },
@@ -1354,25 +1279,15 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
     return;
   }
   if (!job) {
-    const retained =
-      await require('~/server/services/viventium/nativeResponseService').readRetainedMainFinal({
-        userId,
-        streamId,
-        includeSettled: true,
-      });
+    const retained = await require('~/server/services/viventium/nativeResponseService')
+      .readRetainedMainFinal({ userId, streamId, includeSettled: true });
     if (requestAbort.signal.aborted) return;
     if (retained?.interactionContext?.origin === 'scheduler') {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
-      for (const attachment of extractAttachments(retained.finalEvent))
-        writeSseEvent(res, 'attachment', attachment);
+      for (const attachment of extractAttachments(retained.finalEvent)) writeSseEvent(res, 'attachment', attachment);
       const text = extractFinalResponseText(retained.finalEvent);
-      if (text)
-        writeSseEvent(res, 'message', {
-          type: 'final',
-          text,
-          messageId: retained.responseMessageId,
-        });
+      if (text) writeSseEvent(res, 'message', { type: 'final', text, messageId: retained.responseMessageId });
       writeSseEvent(res, 'done', { final: true, messageId: retained.responseMessageId });
       return res.end();
     }
@@ -1486,11 +1401,7 @@ router.get('/events/:streamId', schedulerAuth, async (req, res) => {
       },
       (error, errorClass) => {
         if (!res.writableEnded) {
-          writeSseEvent(
-            res,
-            'error',
-            schedulerSafeFailure(errorClass ? { code: errorClass } : error),
-          );
+          writeSseEvent(res, 'error', schedulerSafeFailure(errorClass ? { code: errorClass } : error));
           res.end();
         }
       },

@@ -56,6 +56,7 @@ interface CortexDeliveryCandidate {
   userId: string;
   conversationId: string;
   parentMessageId: string;
+  publicationId?: string;
   cortexId: string;
   cortexName: string;
   insightHash: string;
@@ -82,6 +83,7 @@ export interface BuildCortexInsightDeliveryCandidatesInput {
   ownerId: unknown;
   conversationId: unknown;
   parentMessageId: unknown;
+  publicationId?: unknown;
   surface: unknown;
   streamId?: unknown;
   messageRevision?: unknown;
@@ -118,7 +120,7 @@ interface PresentationLeaseFence {
 }
 
 interface BatchDescriptor extends DataRecord {
-  type: 'claim' | 'settle' | 'present' | 'finalize' | 'renew';
+  type: 'claim' | 'settle' | 'present' | 'finalize' | 'renew' | 'resume_transport';
   ownerId?: string;
   deliveryIds?: string[];
   claims?: CortexClaim[];
@@ -138,6 +140,7 @@ interface BatchDescriptor extends DataRecord {
   renewedAt?: Date | string;
   leaseExpiresAt?: Date | string;
   presentation?: PresentationLeaseFence | null;
+  transportResume?: ResumeTransportFailureInput;
 }
 
 interface BatchIntent {
@@ -271,6 +274,8 @@ interface ClaimCortexInsightBatchInput extends RecordCortexInsightRowsInput {
 interface ClaimPendingByParentInput {
   ownerId: unknown;
   parentMessageId: unknown;
+  publicationId?: unknown;
+  deliveryIds?: readonly unknown[];
   surface: unknown;
   leaseMs?: unknown;
   terminalSettlement?: boolean;
@@ -327,6 +332,16 @@ interface OwnerClaimsInput {
 interface MarkPersistedInput extends OwnerClaimsInput {
   persistedMessageId: unknown;
   messageRevision?: unknown;
+}
+
+interface ResumeTransportFailureInput {
+  ownerId: unknown;
+  conversationId: unknown;
+  parentMessageId: unknown;
+  deliveryIds: readonly unknown[];
+  persistedMessageId: unknown;
+  persistenceStatus?: 'pending' | 'persisted';
+  messageRevision: unknown;
 }
 
 interface PresentationReceiptInput {
@@ -438,6 +453,7 @@ interface FencePresentationByParentInput {
   persistedMessageId: unknown;
   messageRevision?: unknown;
   expectedDeliveryIds?: unknown[] | null;
+  publicationId?: unknown;
   expectedGeneration?: unknown;
   leaseMs?: unknown;
 }
@@ -449,6 +465,7 @@ interface ListRecoverableParentsInput {
 interface DeferRecoverableParentInput {
   ownerId: unknown;
   parentMessageId: unknown;
+  publicationId?: unknown;
   surface: unknown;
   reason?: unknown;
 }
@@ -456,6 +473,8 @@ interface DeferRecoverableParentInput {
 interface OwnerParentInput {
   ownerId: unknown;
   parentMessageId: unknown;
+  publicationId?: unknown;
+  deliveryIds?: readonly unknown[];
 }
 
 interface ExpectedDeliveryReceiptInput {
@@ -486,6 +505,7 @@ function isTerminalStatus(status: unknown): boolean {
 interface RepairIncompleteBatchesInput {
   ownerId?: unknown;
   parentMessageId?: unknown;
+  publicationId?: unknown;
   limit?: number;
 }
 
@@ -751,6 +771,8 @@ export function cortexInsightPersistenceEnvelopeIdentity(entry: CortexDeliveryLi
     userId: strictEnvelopeText(entry?.userId, { required: true }),
     conversationId: strictEnvelopeText(entry?.conversationId, { required: true }),
     parentMessageId: strictEnvelopeText(entry?.parentMessageId, { required: true }),
+    ...(normalizeText(entry?.publicationId)
+      ? { publicationId: strictEnvelopeText(entry.publicationId) } : {}),
     cortexId: strictEnvelopeText(entry?.cortexId, { required: true }),
     cortexName: strictEnvelopeText(entry?.cortexName ?? ''),
     insightHash: strictEnvelopeText(entry?.insightHash, { required: true }),
@@ -934,6 +956,7 @@ export function buildCortexInsightDeliveryCandidates({
   ownerId,
   conversationId,
   parentMessageId,
+  publicationId = '',
   surface,
   streamId = '',
   messageRevision = 1,
@@ -942,6 +965,7 @@ export function buildCortexInsightDeliveryCandidates({
   const userId = normalizeText(ownerId);
   const normalizedConversationId = normalizeText(conversationId);
   const normalizedParentMessageId = normalizeText(parentMessageId);
+  const normalizedPublicationId = normalizeText(publicationId);
   const normalizedSurface = normalizeSurface(surface);
   if (!userId || !normalizedConversationId || !normalizedParentMessageId) {
     throw new Error('Cortex insight delivery requires owner, conversation, parent, and surface');
@@ -969,6 +993,7 @@ export function buildCortexInsightDeliveryCandidates({
       userId,
       conversationId: normalizedConversationId,
       parentMessageId: normalizedParentMessageId,
+      ...(normalizedPublicationId ? { publicationId: normalizedPublicationId } : {}),
       cortexId,
       cortexName: normalizeText(insight?.cortexName || insight?.cortex_name).slice(0, 256),
       insightHash,
@@ -994,7 +1019,7 @@ export function buildCortexInsightDeliveryCandidates({
     ].join('\u0000'),
   )}`;
   const parentAdmissionKey = `cipa_${stableHash(
-    [userId, normalizedParentMessageId].join('\u0000'),
+    [userId, normalizedParentMessageId, ...(normalizedPublicationId ? [normalizedPublicationId] : [])].join('\u0000'),
   )}`;
   const coordinatorDeliveryKey = candidates.map((candidate) => candidate.deliveryKey).sort()[0];
   for (const candidate of candidates) {
@@ -1057,6 +1082,7 @@ function selectPrivate<T>(query: CortexQuery<T> | undefined): CortexQuery<T> | u
         '+insight +events +streamId +feelingSnapshot +acceptanceToken ' +
           '+presentationReceiptHashes +batchLockToken ' +
           '+parentAdmissionKey ' +
+          '+publicationId ' +
           '+batchLockRuntimeSlot +batchLockRuntimeEpoch +batchIntent +lastBatchIntentToken ' +
           '+claimRuntimeSlot +claimRuntimeEpoch +presentationLeaseToken ' +
           '+presentationLeaseOwnerId +presentationLeaseClaimToken +presentationLeaseGeneration ' +
@@ -1111,6 +1137,7 @@ function claimBatchEnvelopeIdentity(row: CortexDeliveryLike): string {
     userId: normalizeText(row?.userId),
     conversationId: normalizeText(row?.conversationId),
     parentMessageId: normalizeText(row?.parentMessageId),
+    ...(normalizeText(row?.publicationId) ? { publicationId: normalizeText(row.publicationId) } : {}),
     surface: normalizeSurface(row?.surface),
     requiredSurfaces: (Array.isArray(row?.requiredSurfaces) ? row.requiredSurfaces : [])
       .map(normalizeSurface)
@@ -1475,38 +1502,20 @@ export function createCortexInsightDeliveryService({
   const normalizedRuntimeSlot = normalizeText(runtimeSlot) || resolveCortexRuntimeSlotIdentity();
   const normalizedRuntimeEpoch = normalizeText(runtimeEpoch) || PROCESS_RUNTIME_EPOCH;
 
-  async function acceptedVoiceDispatch(
-    row: CortexDeliveryLike,
-  ): Promise<PresentationDropFence | null> {
-    if (
-      !readAcceptedVoiceDispatch ||
-      row.status !== 'claimed' ||
-      row.persistenceStatus !== 'persisted' ||
-      !row.requiredSurfaces?.includes('voice') ||
-      !row.presentationLeaseToken
-    )
-      return null;
+  async function acceptedVoiceDispatch(row: CortexDeliveryLike): Promise<PresentationDropFence | null> {
+    if (!readAcceptedVoiceDispatch || row.status !== 'claimed' || row.persistenceStatus !== 'persisted' ||
+      !row.requiredSurfaces?.includes('voice') || !row.presentationLeaseToken) return null;
     const receipt = await readAcceptedVoiceDispatch(row);
     if (!receipt) return null;
-    const graphReceipt = receipt.deliveryReceipts.find(
-      (item) => item.deliveryId === row.deliveryId,
-    );
-    if (
-      receipt.surface !== 'voice' ||
-      receipt.parentMessageId !== row.parentMessageId ||
-      receipt.persistedMessageId !== row.persistedMessageId ||
-      receipt.presentationRef !== row.persistedMessageId ||
-      receipt.messageRevision !== presentationRevisionOf(row) ||
-      receipt.claimGeneration !== row.claimGeneration ||
-      receipt.presentationClaimToken !== row.claimToken ||
-      receipt.presentationLeaseToken !== row.presentationLeaseToken ||
-      graphReceipt?.graphResultHash !== row.graphResultHash ||
-      row.presentationLeaseOwnerId !== row.userId ||
-      row.presentationLeaseClaimToken !== row.claimToken ||
-      row.presentationLeaseGeneration !== row.claimGeneration ||
+    const graphReceipt = receipt.deliveryReceipts.find((item) => item.deliveryId === row.deliveryId);
+    if (receipt.surface !== 'voice' || receipt.parentMessageId !== row.parentMessageId ||
+      receipt.persistedMessageId !== row.persistedMessageId || receipt.presentationRef !== row.persistedMessageId ||
+      receipt.messageRevision !== presentationRevisionOf(row) || receipt.claimGeneration !== row.claimGeneration ||
+      receipt.presentationClaimToken !== row.claimToken || receipt.presentationLeaseToken !== row.presentationLeaseToken ||
+      graphReceipt?.graphResultHash !== row.graphResultHash || row.presentationLeaseOwnerId !== row.userId ||
+      row.presentationLeaseClaimToken !== row.claimToken || row.presentationLeaseGeneration !== row.claimGeneration ||
       !Number.isFinite(new Date(row.leaseExpiresAt || '').getTime()) ||
-      !Number.isFinite(new Date(row.presentationLeaseExpiresAt || '').getTime())
-    ) {
+      !Number.isFinite(new Date(row.presentationLeaseExpiresAt || '').getTime())) {
       throw settlementConflictError('Cortex accepted Voice dispatch fence did not match');
     }
     return receipt;
@@ -1581,6 +1590,44 @@ export function createCortexInsightDeliveryService({
     return privateLeanResult(DeliveryModel.findOne({ userId, deliveryId }), session);
   }
 
+  function publicationFilter(publicationId: unknown = ''): DataRecord {
+    const id = normalizeText(publicationId);
+    return { publicationId: id || { $in: ['', null] } };
+  }
+
+  async function resolveParentPublication(
+    input: OwnerParentInput, session: ClientSession | null = null,
+  ): Promise<string> {
+    if (input.deliveryIds == null) return normalizeText(input.publicationId);
+    const ids = Array.isArray(input.deliveryIds) ? input.deliveryIds.map(normalizeText).sort() : [];
+    if (!ids.length || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+      throw settlementConflictError('Cortex publication requires exact delivery IDs');
+    }
+    const rows = (await privateLeanResult(DeliveryModel.find({
+      userId: normalizeText(input.ownerId), parentMessageId: normalizeText(input.parentMessageId),
+      deliveryId: { $in: ids },
+    }), session)) || [];
+    if (!rows.length) throw codedError('Cortex publication is not recorded', 'cortex_insight_delivery_publication_missing');
+    if (rows.length !== ids.length) throw settlementConflictError();
+    assertExactCompleteClaimBatch(rows);
+    const scopes = new Set(rows.map((row) => normalizeText(row.publicationId)));
+    if (scopes.size !== 1) throw mixedBatchEnvelopeError();
+    const scope = [...scopes][0];
+    if (input.publicationId != null && normalizeText(input.publicationId) !== scope) {
+      throw mixedBatchEnvelopeError();
+    }
+    const siblings = (await privateLeanResult(DeliveryModel.find({
+      userId: normalizeText(input.ownerId), parentMessageId: normalizeText(input.parentMessageId),
+      ...publicationFilter(scope),
+    }), session)) || [];
+    assertExactCompleteClaimBatch(siblings);
+    const siblingIds = siblings.map((row) => normalizeText(row.deliveryId)).sort();
+    if (siblingIds.length !== ids.length || siblingIds.some((id, index) => id !== ids[index])) {
+      throw settlementConflictError('Cortex publication delivery IDs do not match the stored batch');
+    }
+    return scope;
+  }
+
   async function requireExactParentBatch<T extends CortexDeliveryLike>(
     userId: unknown,
     parentMessageId: unknown,
@@ -1592,6 +1639,7 @@ export function createCortexInsightDeliveryService({
       DeliveryModel.find({
         userId: normalizeText(userId),
         parentMessageId: normalizeText(parentMessageId),
+        ...publicationFilter(rows[0]?.publicationId),
       }),
     );
     const sorted = query?.sort ? query.sort({ createdAt: 1, deliveryId: 1 }) : query;
@@ -2047,6 +2095,11 @@ export function createCortexInsightDeliveryService({
     let mutationIndex = 0;
     if (!ownerId || !intentToken) throw batchConflictError('Invalid cortex batch intent');
 
+    if (descriptor.type === 'resume_transport') {
+      if (!descriptor.transportResume) throw batchConflictError();
+      return resumeTransportRows(descriptor.transportResume, null, intentToken);
+    }
+
     if (descriptor.type === 'claim') {
       for (const deliveryId of descriptor.deliveryIds || []) {
         let current = await readOwnedDelivery(ownerId, deliveryId);
@@ -2091,11 +2144,7 @@ export function createCortexInsightDeliveryService({
       }
       for (const claim of claims) {
         const current = await readOwnedDelivery(ownerId, claim.deliveryId);
-        if (
-          current &&
-          !descriptor.dropPresentation &&
-          normalizeText(current.lastBatchIntentToken) === intentToken
-        ) {
+        if (current && !descriptor.dropPresentation && normalizeText(current.lastBatchIntentToken) === intentToken) {
           results.push(redactDelivery(current));
           continue;
         }
@@ -2205,12 +2254,14 @@ export function createCortexInsightDeliveryService({
   async function repairIncompleteBatches({
     ownerId = '',
     parentMessageId = '',
+    publicationId,
     limit = 100,
   }: RepairIncompleteBatchesInput = {}): Promise<RepairIncompleteBatchesResult> {
     if (!DeliveryModel?.db) return { scanned: 0, repaired: 0, deferred: 0, failed: 0 };
     const filter: DataRecord = { batchIntent: { $ne: null } };
     if (normalizeText(ownerId)) filter.userId = normalizeText(ownerId);
     if (normalizeText(parentMessageId)) filter.parentMessageId = normalizeText(parentMessageId);
+    if (publicationId != null) Object.assign(filter, publicationFilter(publicationId));
     const query = selectPrivate(DeliveryModel.find(filter));
     const limited = query?.limit
       ? query.limit(Math.max(1, Math.min(Number(limit) || 100, 500)))
@@ -2320,7 +2371,7 @@ export function createCortexInsightDeliveryService({
     );
     if (transaction.used) return transaction.result;
 
-    const scopeKey = `${normalizeText(ownerId)}\u0000${normalizeText(parentMessageId)}`;
+    const scopeKey = `${normalizeText(ownerId)}\u0000${normalizeText(parentMessageId)}\u0000${normalizeText(rows[0]?.publicationId)}`;
     if (!DeliveryModel?.db) {
       const release = await acquireLocalBatchLock(DeliveryModel, scopeKey);
       try {
@@ -2330,7 +2381,7 @@ export function createCortexInsightDeliveryService({
       }
     }
 
-    await repairIncompleteBatches({ ownerId, parentMessageId, limit: 1 });
+    await repairIncompleteBatches({ ownerId, parentMessageId, publicationId: rows[0]?.publicationId || '', limit: 1 });
     const currentRows = await Promise.all(
       rows.map((row) => readOwnedDelivery(normalizeText(ownerId), row.deliveryId)),
     );
@@ -2692,6 +2743,7 @@ export function createCortexInsightDeliveryService({
     ownerId,
     conversationId,
     parentMessageId,
+    publicationId = '',
     surface,
     streamId = '',
     messageRevision = 1,
@@ -2703,6 +2755,7 @@ export function createCortexInsightDeliveryService({
       ownerId,
       conversationId,
       parentMessageId,
+      publicationId,
       surface,
       streamId,
       messageRevision,
@@ -2749,6 +2802,7 @@ export function createCortexInsightDeliveryService({
       const query = DeliveryModel.find({
         userId: normalizeText(ownerId),
         parentMessageId: normalizeText(parentMessageId),
+        ...publicationFilter(publicationId),
       });
       const rows = await privateLeanResult(query, session);
       return Array.isArray(rows) ? rows : [];
@@ -2930,6 +2984,7 @@ export function createCortexInsightDeliveryService({
     ownerId,
     conversationId,
     parentMessageId,
+    publicationId = '',
     surface,
     streamId = '',
     messageRevision = 1,
@@ -2941,6 +2996,7 @@ export function createCortexInsightDeliveryService({
       ownerId,
       conversationId,
       parentMessageId,
+      publicationId,
       surface,
       streamId,
       messageRevision,
@@ -2985,6 +3041,8 @@ export function createCortexInsightDeliveryService({
   async function claimPendingByParent({
     ownerId,
     parentMessageId,
+    publicationId,
+    deliveryIds,
     surface,
     leaseMs = DEFAULT_LEASE_MS,
     terminalSettlement = false,
@@ -2994,16 +3052,18 @@ export function createCortexInsightDeliveryService({
     if (!userId || !normalizedParentMessageId) {
       throw new Error('Cortex insight recovery requires owner and parent');
     }
+    const scope = await resolveParentPublication({ ownerId, parentMessageId, publicationId, deliveryIds });
     const checkedAt = now();
     const eligibleQuery = selectPrivate(
       DeliveryModel.find({
         userId,
         parentMessageId: normalizedParentMessageId,
+        ...publicationFilter(scope),
         ...recoverableFilter(checkedAt),
       }),
     );
     const parentQuery = selectPrivate(
-      DeliveryModel.find({ userId, parentMessageId: normalizedParentMessageId }),
+      DeliveryModel.find({ userId, parentMessageId: normalizedParentMessageId, ...publicationFilter(scope) }),
     );
     const sortedEligible = eligibleQuery?.sort
       ? eligibleQuery.sort({ createdAt: 1, deliveryId: 1 })
@@ -3028,25 +3088,15 @@ export function createCortexInsightDeliveryService({
     }
     const accepted = await Promise.all(nonterminalRows.map(acceptedVoiceDispatch));
     if (accepted.some(Boolean)) {
-      if (
-        accepted.some((receipt) => !receipt) ||
-        nonterminalRows.some(
-          (row) =>
-            !row.leaseExpiresAt ||
-            new Date(row.leaseExpiresAt).getTime() > checkedAt.getTime() ||
-            !row.presentationLeaseExpiresAt ||
-            new Date(row.presentationLeaseExpiresAt).getTime() > checkedAt.getTime(),
-        )
-      ) {
+      if (accepted.some((receipt) => !receipt) || nonterminalRows.some((row) =>
+        !row.leaseExpiresAt || new Date(row.leaseExpiresAt).getTime() > checkedAt.getTime() ||
+        !row.presentationLeaseExpiresAt || new Date(row.presentationLeaseExpiresAt).getTime() > checkedAt.getTime())) {
         return noClaimResult(parentRows, RECOVERY_NO_CLAIM_REASONS.NOT_CLAIMABLE);
       }
-      const settled = await markDropped({
-        ownerId: userId,
+      const settled = await markDropped({ ownerId: userId,
         claims: nonterminalRows.map((row) => normalizeClaim(row)),
-        dropReason: 'delivery_outcome_unknown',
-        allowExpiredLease: true,
-        presentation: accepted[0] ? { ...accepted[0], expiredBefore: checkedAt } : undefined,
-      });
+        dropReason: 'delivery_outcome_unknown', allowExpiredLease: true,
+        presentation: accepted[0] ? { ...accepted[0], expiredBefore: checkedAt } : undefined });
       return noClaimResult(settled, RECOVERY_NO_CLAIM_REASONS.TERMINAL);
     }
     const pinnedFeelingSnapshot = recoveryFeelingSnapshot(parentRows);
@@ -3099,11 +3149,29 @@ export function createCortexInsightDeliveryService({
       })),
       recoveryContext: {
         streamId: claimedRows[0]?.streamId || '',
+        ...(scope ? { publicationId: scope } : {}),
         messageRevision: presentationRevisionOf(claimedRows[0]),
         claimGeneration: Number(claimedRows[0]?.claimGeneration) || 0,
         ...(pinnedFeelingSnapshot ? { feelingSnapshot: pinnedFeelingSnapshot } : {}),
       },
     };
+  }
+
+  function hasPersistedClaimReceipt(
+    row: CortexDeliveryLike | null | undefined,
+    claim: CortexClaimInput,
+    projection: DataRecord,
+  ): boolean {
+    const fence = normalizeClaim(claim);
+    const receiptHash = stableHash(JSON.stringify({
+      messageId: normalizeText(projection.persistedMessageId),
+      revision: Number(projection.presentationRevision),
+      stage: 'persistence',
+    }));
+    return Boolean(row?.events?.some((event) =>
+      event.transition === 'persisted' && event.claimToken === fence.claimToken &&
+      event.claimGeneration === fence.claimGeneration && event.receiptHash === receiptHash,
+    ));
   }
 
   async function settleOne({
@@ -3138,49 +3206,33 @@ export function createCortexInsightDeliveryService({
     }
     let presentationFilter: DataRecord = {};
     if (dropPresentation) {
-      const graphResultHash = normalizeText(
-        dropPresentation.deliveryReceipts.find((receipt) => receipt.deliveryId === fence.deliveryId)
-          ?.graphResultHash,
-      );
+      const graphResultHash = normalizeText(dropPresentation.deliveryReceipts.find(
+        (receipt) => receipt.deliveryId === fence.deliveryId,
+      )?.graphResultHash);
       const presentationLeaseToken = normalizeText(dropPresentation.presentationLeaseToken);
       const revision = Number(dropPresentation.messageRevision);
-      if (
-        transition !== 'dropped' ||
-        reason !== 'delivery_outcome_unknown' ||
-        dropPresentation.surface !== 'voice' ||
-        !dropPresentation.parentMessageId ||
-        !dropPresentation.persistedMessageId ||
-        !dropPresentation.presentationRef ||
-        !Number.isSafeInteger(revision) ||
-        revision < 1 ||
-        !/^[a-f0-9]{64}$/.test(graphResultHash) ||
-        !presentationLeaseToken ||
+      if (transition !== 'dropped' || reason !== 'delivery_outcome_unknown' ||
+        dropPresentation.surface !== 'voice' || !dropPresentation.parentMessageId ||
+        !dropPresentation.persistedMessageId || !dropPresentation.presentationRef ||
+        !Number.isSafeInteger(revision) || revision < 1 ||
+        !/^[a-f0-9]{64}$/.test(graphResultHash) || !presentationLeaseToken ||
         dropPresentation.presentationClaimToken !== fence.claimToken ||
         dropPresentation.claimGeneration !== fence.claimGeneration ||
-        !existing ||
-        normalizeText(existing.parentMessageId) !== dropPresentation.parentMessageId ||
+        !existing || normalizeText(existing.parentMessageId) !== dropPresentation.parentMessageId ||
         normalizeText(existing.persistedMessageId) !== dropPresentation.persistedMessageId ||
-        existing.persistenceStatus !== 'persisted' ||
-        presentationRevisionOf(existing) !== revision ||
+        existing.persistenceStatus !== 'persisted' || presentationRevisionOf(existing) !== revision ||
         normalizeText(existing.graphResultHash) !== graphResultHash ||
         Number(existing.claimGeneration) !== fence.claimGeneration ||
-        !existing.requiredSurfaces?.includes('voice')
-      ) {
+        !existing.requiredSurfaces?.includes('voice')) {
         throw settlementConflictError('Cortex interrupted presentation fence did not match');
       }
-      const expiredBefore = dropPresentation.expiredBefore
-        ? new Date(dropPresentation.expiredBefore)
-        : null;
-      if (
-        expiredBefore &&
-        existing.status !== 'dropped' &&
-        (!Number.isFinite(expiredBefore.getTime()) ||
-          expiredBefore.getTime() > eventAt.getTime() ||
-          !Number.isFinite(new Date(existing.leaseExpiresAt || '').getTime()) ||
-          !Number.isFinite(new Date(existing.presentationLeaseExpiresAt || '').getTime()) ||
-          new Date(existing.leaseExpiresAt || '').getTime() > expiredBefore.getTime() ||
-          new Date(existing.presentationLeaseExpiresAt || '').getTime() > expiredBefore.getTime())
-      ) {
+      const expiredBefore = dropPresentation.expiredBefore ? new Date(dropPresentation.expiredBefore) : null;
+      if (expiredBefore && existing.status !== 'dropped' && (
+        !Number.isFinite(expiredBefore.getTime()) || expiredBefore.getTime() > eventAt.getTime() ||
+        !Number.isFinite(new Date(existing.leaseExpiresAt || '').getTime()) ||
+        !Number.isFinite(new Date(existing.presentationLeaseExpiresAt || '').getTime()) ||
+        new Date(existing.leaseExpiresAt || '').getTime() > expiredBefore.getTime() ||
+        new Date(existing.presentationLeaseExpiresAt || '').getTime() > expiredBefore.getTime())) {
         throw settlementConflictError('Cortex accepted dispatch lease was renewed');
       }
       receiptHash = presentationReceiptHash({ ...dropPresentation, graphResultHash });
@@ -3194,22 +3246,16 @@ export function createCortexInsightDeliveryService({
         presentationLeaseOwnerId: userId,
         presentationLeaseClaimToken: fence.claimToken,
         presentationLeaseGeneration: fence.claimGeneration,
-        presentationLeaseExpiresAt: {
-          $eq: existing.presentationLeaseExpiresAt,
-          ...(expiredBefore ? { $lte: expiredBefore } : {}),
-        },
-        ...(expiredBefore
-          ? { leaseExpiresAt: { $eq: existing.leaseExpiresAt, $lte: expiredBefore } }
-          : {}),
+        presentationLeaseExpiresAt: { $eq: existing.presentationLeaseExpiresAt,
+          ...(expiredBefore ? { $lte: expiredBefore } : {}) },
+        ...(expiredBefore ? { leaseExpiresAt: { $eq: existing.leaseExpiresAt, $lte: expiredBefore } } : {}),
       };
-      if (
-        existing.status !== 'dropped' &&
-        (normalizeText(existing.presentationLeaseToken) !== presentationLeaseToken ||
-          normalizeText(existing.presentationLeaseOwnerId) !== userId ||
-          normalizeText(existing.presentationLeaseClaimToken) !== fence.claimToken ||
-          Number(existing.presentationLeaseGeneration) !== fence.claimGeneration ||
-          !existing.presentationLeaseExpiresAt)
-      ) {
+      if (existing.status !== 'dropped' && (
+        normalizeText(existing.presentationLeaseToken) !== presentationLeaseToken ||
+        normalizeText(existing.presentationLeaseOwnerId) !== userId ||
+        normalizeText(existing.presentationLeaseClaimToken) !== fence.claimToken ||
+        Number(existing.presentationLeaseGeneration) !== fence.claimGeneration ||
+        !existing.presentationLeaseExpiresAt)) {
         throw settlementConflictError('Cortex interrupted presentation lease did not match');
       }
     }
@@ -3234,15 +3280,10 @@ export function createCortexInsightDeliveryService({
       transition === 'dropped' &&
       existing?.status === 'dropped' &&
       normalizeText(existing?.dropReason) === normalizeText(projection.dropReason) &&
-      (!dropPresentation ||
-        existing?.events?.some(
-          (event) =>
-            event.transition === 'dropped' &&
-            event.claimToken === fence.claimToken &&
-            event.claimGeneration === fence.claimGeneration &&
-            event.receiptHash === receiptHash,
-        ));
-    if (existing && samePersistedReceipt) {
+      (!dropPresentation || existing?.events?.some((event) =>
+        event.transition === 'dropped' && event.claimToken === fence.claimToken &&
+        event.claimGeneration === fence.claimGeneration && event.receiptHash === receiptHash));
+    if (existing && samePersistedReceipt && hasPersistedClaimReceipt(existing, fence, projection)) {
       if (!exactFence) throw settlementConflictError();
       return redactDelivery(existing);
     }
@@ -3328,6 +3369,7 @@ export function createCortexInsightDeliveryService({
           normalizeText(current.persistedMessageId) ===
             normalizeText(projection.persistedMessageId) &&
           presentationRevisionOf(current) === Number(projection.presentationRevision) &&
+          hasPersistedClaimReceipt(current, fence, projection) &&
           hasExactLiveClaimFence(current, fence, eventAt)
         ) {
           return redactDelivery(current);
@@ -3366,6 +3408,7 @@ export function createCortexInsightDeliveryService({
         normalizeText(existing.persistedMessageId) ===
           normalizeText(projection.persistedMessageId) &&
         presentationRevisionOf(existing) === Number(projection.presentationRevision) &&
+        hasPersistedClaimReceipt(existing, claim, projection) &&
         hasExactLiveClaimFence(existing, claim)
       );
     }
@@ -3407,6 +3450,7 @@ export function createCortexInsightDeliveryService({
       sentAt: row.sentAt || null,
       dropReason: row.dropReason || '',
       droppedAt: row.droppedAt || null,
+      expiresAt: row.expiresAt || null,
     };
   }
 
@@ -3519,11 +3563,7 @@ export function createCortexInsightDeliveryService({
         const beforeById = new Map(beforeRows.map((row) => [row.deliveryId, row]));
         for (const claim of normalizedClaims) {
           const existing = beforeById.get(claim.deliveryId);
-          if (
-            existing &&
-            !dropPresentation &&
-            settlementAlreadyApplied(existing, transition, projection, claim)
-          ) {
+          if (existing && !dropPresentation && settlementAlreadyApplied(existing, transition, projection, claim)) {
             settled.push(redactDelivery(existing));
             continue;
           }
@@ -3581,6 +3621,114 @@ export function createCortexInsightDeliveryService({
       });
     }
     return settled;
+  }
+
+  function transportResumeIdentity(input: ResumeTransportFailureInput) {
+    const ownerId = normalizeText(input.ownerId);
+    const conversationId = normalizeText(input.conversationId);
+    const parentMessageId = normalizeText(input.parentMessageId);
+    const persistedMessageId = normalizeText(input.persistedMessageId);
+    const persistenceStatus = input.persistenceStatus ?? 'persisted';
+    const messageRevision = Number(input.messageRevision);
+    const deliveryIds = Array.isArray(input.deliveryIds)
+      ? input.deliveryIds.map(normalizeText).sort() : [];
+    if (!ownerId || !conversationId || !parentMessageId ||
+      !['pending', 'persisted'].includes(persistenceStatus) ||
+      (persistenceStatus === 'persisted' ? !persistedMessageId : Boolean(persistedMessageId)) ||
+      !Number.isSafeInteger(messageRevision) || messageRevision < 1 || !deliveryIds.length ||
+      deliveryIds.some((id) => !id) || new Set(deliveryIds).size !== deliveryIds.length) {
+      throw settlementConflictError('Cortex transport recovery requires an exact publication batch');
+    }
+    const identity = { ownerId, conversationId, parentMessageId, deliveryIds,
+      persistedMessageId, messageRevision,
+      ...(persistenceStatus === 'pending' ? { persistenceStatus: 'pending' as const } : {}) };
+    return { ...identity, receiptHash: stableHash(JSON.stringify({ stage: 'transport_resume', ...identity })) };
+  }
+
+  async function transportResumeRows(input: ResumeTransportFailureInput, session: ClientSession | null) {
+    const identity = transportResumeIdentity(input);
+    const publicationId = await resolveParentPublication(identity, session);
+    const rows = (await privateLeanResult(DeliveryModel.find({
+      userId: identity.ownerId, parentMessageId: identity.parentMessageId,
+      ...publicationFilter(publicationId),
+    }), session)) || [];
+    assertExactCompleteClaimBatch(rows);
+    const ids = rows.map((row) => normalizeText(row.deliveryId)).sort();
+    if (ids.length !== identity.deliveryIds.length ||
+      ids.some((id, index) => id !== identity.deliveryIds[index])) throw settlementConflictError();
+    const checkedAt = now();
+    for (const row of rows) {
+      const resumed = row.events?.some((event) => event.transition === 'failure' &&
+        event.reason === 'presentation_failed' && event.receiptHash === identity.receiptHash);
+      const expiry = row.expiresAt ? new Date(row.expiresAt).getTime() : null;
+      const eligibleDrop = row.status === 'dropped' && row.dropReason === 'delivery_attempts_exhausted' &&
+        expiry !== null && Number.isFinite(expiry) && expiry > checkedAt.getTime() &&
+        !(row.presentedSurfaces?.length) && !(row.presentationReceiptHashes?.length);
+      const exactReplay = resumed && ['pending', 'claimed', 'sent'].includes(row.status);
+      if (normalizeText(row.conversationId) !== identity.conversationId ||
+        row.persistenceStatus !== (identity.persistenceStatus || 'persisted') ||
+        normalizeText(row.persistedMessageId) !== identity.persistedMessageId ||
+        presentationRevisionOf(row) !== identity.messageRevision ||
+        (expiry !== null && (!Number.isFinite(expiry) || expiry <= checkedAt.getTime())) ||
+        (!eligibleDrop && !exactReplay)) throw settlementConflictError();
+    }
+    return { identity, rows };
+  }
+
+  async function resumeTransportRows(
+    input: ResumeTransportFailureInput, session: ClientSession | null, intentToken = '',
+  ): Promise<CortexDeliveryLike[]> {
+    const { identity, rows } = await transportResumeRows(input, session);
+    const changedIds = new Set<string>();
+    const result: CortexDeliveryLike[] = [];
+    try {
+      for (const row of rows) {
+        if (row.status !== 'dropped') { result.push(redactDelivery(row)); continue; }
+        const updated = await privateLeanResult(DeliveryModel.findOneAndUpdate({
+          userId: identity.ownerId, conversationId: identity.conversationId,
+          parentMessageId: identity.parentMessageId, deliveryId: row.deliveryId,
+          status: 'dropped', dropReason: 'delivery_attempts_exhausted',
+          persistenceStatus: identity.persistenceStatus || 'persisted',
+          persistedMessageId: identity.persistenceStatus === 'pending'
+            ? { $in: ['', null] } : identity.persistedMessageId,
+          ...presentationRevisionCasFilter(row, identity.messageRevision),
+          claimGeneration: row.claimGeneration, attemptNumber: row.attemptNumber,
+          graphResultHash: row.graphResultHash, expiresAt: row.expiresAt,
+        }, {
+          $set: {
+            status: 'pending', dropReason: '', droppedAt: null,
+            claimToken: '', claimRuntimeSlot: '', claimRuntimeEpoch: '', claimedAt: null, leaseExpiresAt: null,
+            presentationLeaseToken: '', presentationLeaseOwnerId: '', presentationLeaseClaimToken: '',
+            presentationLeaseGeneration: 0, presentationLeaseExpiresAt: null,
+            // This is terminal retention, not a transport or authorization deadline.
+            // Unresolved deliveries follow the existing pending/no-TTL contract.
+            expiresAt: null,
+            ...(intentToken ? { lastBatchIntentToken: intentToken } : {}),
+          },
+          $push: { events: eventRecord({ transition: 'failure', reason: 'presentation_failed',
+            receiptHash: identity.receiptHash, attemptNumber: row.attemptNumber,
+            claimGeneration: row.claimGeneration, eventAt: now() }) },
+        }, { new: true, runValidators: true, ...(session ? { session } : {}) }), session);
+        if (!updated) throw settlementConflictError();
+        changedIds.add(row.deliveryId);
+        result.push(redactDelivery(updated));
+      }
+      return result;
+    } catch (error) {
+      if (!session && !DeliveryModel.db && changedIds.size) {
+        await compensateSettledRows({ ownerId: identity.ownerId, beforeRows: rows, changedIds });
+      }
+      throw error;
+    }
+  }
+
+  async function resumeTransportFailure(input: ResumeTransportFailureInput): Promise<CortexDeliveryLike[]> {
+    const { identity, rows } = await transportResumeRows(input, null);
+    return runAtomicParentBatch({
+      ownerId: identity.ownerId, parentMessageId: identity.parentMessageId, rows,
+      descriptor: { type: 'resume_transport', ownerId: identity.ownerId, transportResume: input },
+      work: ({ session }) => resumeTransportRows(input, session),
+    });
   }
 
   function presentationReceiptHash({
@@ -4066,13 +4214,10 @@ export function createCortexInsightDeliveryService({
     if (presentation) {
       const claimIds = (claims || []).map((claim) => normalizeClaim(claim).deliveryId).sort();
       const receiptIds = presentation.deliveryReceipts.map((receipt) => receipt.deliveryId).sort();
-      if (
-        normalizedReason !== 'delivery_outcome_unknown' ||
-        claimIds.length === 0 ||
-        claimIds.length !== receiptIds.length ||
+      if (normalizedReason !== 'delivery_outcome_unknown' ||
+        claimIds.length === 0 || claimIds.length !== receiptIds.length ||
         new Set(receiptIds).size !== receiptIds.length ||
-        claimIds.some((id, index) => id !== receiptIds[index])
-      ) {
+        claimIds.some((id, index) => id !== receiptIds[index])) {
         throw settlementConflictError('Cortex interrupted presentation batch did not match');
       }
     }
@@ -4389,10 +4534,12 @@ export function createCortexInsightDeliveryService({
     persistedMessageId,
     messageRevision = 1,
     expectedDeliveryIds = [],
+    publicationId,
     expectedGeneration = 0,
     leaseMs = DEFAULT_PRESENTATION_LEASE_MS,
   }: FencePresentationByParentInput): Promise<FencePresentationResult> {
-    const liveClaims = await liveClaimsByParent({ ownerId, parentMessageId });
+    const liveClaims = await liveClaimsByParent({ ownerId, parentMessageId, publicationId,
+      ...(expectedDeliveryIds?.length ? { deliveryIds: expectedDeliveryIds } : {}) });
     const normalizedExpectedIds = [
       ...new Set(
         (Array.isArray(expectedDeliveryIds) ? expectedDeliveryIds : []).map(normalizeText),
@@ -4432,14 +4579,14 @@ export function createCortexInsightDeliveryService({
     await repairIncompleteBatches({ limit });
     const checkedAt = now();
     const pageLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
-    const query = DeliveryModel.find(recoverableFilter(checkedAt));
+    const query = selectPrivate(DeliveryModel.find(recoverableFilter(checkedAt)));
     const sorted = query?.sort ? query.sort({ createdAt: 1, deliveryId: 1 }) : query;
     const limited = sorted?.limit ? sorted.limit(pageLimit) : sorted;
     const rows = (await leanResult(limited)) || [];
     const seen = new Set<string>();
     return rows
       .filter((row) => {
-        const key = JSON.stringify([normalizeText(row.userId), normalizeText(row.parentMessageId)]);
+        const key = JSON.stringify([normalizeText(row.userId), normalizeText(row.parentMessageId), normalizeText(row.publicationId)]);
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -4448,6 +4595,7 @@ export function createCortexInsightDeliveryService({
         ownerId: normalizeText(row.userId),
         conversationId: normalizeText(row.conversationId),
         parentMessageId: normalizeText(row.parentMessageId),
+        ...(normalizeText(row.publicationId) ? { publicationId: normalizeText(row.publicationId) } : {}),
         surface: normalizeSurface(row.surface),
       }));
   }
@@ -4455,6 +4603,7 @@ export function createCortexInsightDeliveryService({
   async function deferRecoverableParent({
     ownerId,
     parentMessageId,
+    publicationId = '',
     surface,
     reason = 'recovery_claim_failed',
   }: DeferRecoverableParentInput) {
@@ -4471,6 +4620,7 @@ export function createCortexInsightDeliveryService({
     const filter = {
       userId,
       parentMessageId: normalizedParentMessageId,
+      ...publicationFilter(publicationId),
       ...recoverableFilter(deferredAt),
     };
     const candidateQuery = selectPrivate(DeliveryModel.findOne(filter));
@@ -4523,12 +4673,16 @@ export function createCortexInsightDeliveryService({
   async function liveClaimsByParent({
     ownerId,
     parentMessageId,
+    publicationId,
+    deliveryIds,
   }: OwnerParentInput): Promise<CortexDeliveryLike[]> {
+    const scope = await resolveParentPublication({ ownerId, parentMessageId, publicationId, deliveryIds });
     const checkedAt = now();
     const query = selectPrivate(
       DeliveryModel.find({
         userId: normalizeText(ownerId),
         parentMessageId: normalizeText(parentMessageId),
+        ...publicationFilter(scope),
         status: 'claimed',
         leaseExpiresAt: { $gt: checkedAt },
       }),
@@ -4541,6 +4695,7 @@ export function createCortexInsightDeliveryService({
   async function markPresentationByParent({
     ownerId,
     parentMessageId,
+    publicationId,
     surface,
     persistedMessageId = '',
     messageRevision = 1,
@@ -4574,8 +4729,11 @@ export function createCortexInsightDeliveryService({
       .sort((left, right) => left.deliveryId.localeCompare(right.deliveryId));
     const normalizedExpectedLeaseToken = normalizeText(expectedPresentationLeaseToken);
 
-    await claimPendingByParent({ ownerId, parentMessageId, surface: normalizedSurface });
-    const claims = await liveClaimsByParent({ ownerId, parentMessageId });
+    const scopeInput = { ownerId, parentMessageId, publicationId,
+      ...(normalizedExpectedIds.length ? { deliveryIds: normalizedExpectedIds } : {}) };
+    const scope = await resolveParentPublication(scopeInput);
+    await claimPendingByParent({ ...scopeInput, surface: normalizedSurface });
+    const claims = await liveClaimsByParent(scopeInput);
     if (claims.length === 0) {
       if (
         normalizedExpectedIds.length === 0 ||
@@ -4590,6 +4748,7 @@ export function createCortexInsightDeliveryService({
         DeliveryModel.find({
           userId: normalizeText(ownerId),
           parentMessageId: normalizeText(parentMessageId),
+          ...publicationFilter(scope),
           status: 'sent',
         }),
       );
@@ -4717,16 +4876,26 @@ export function createCortexInsightDeliveryService({
   async function markPresentationFailedByParent({
     ownerId,
     parentMessageId,
+    publicationId,
+    deliveryIds,
   }: OwnerParentInput): Promise<CortexDeliveryLike[]> {
-    const claims = await liveClaimsByParent({ ownerId, parentMessageId });
+    const claims = await liveClaimsByParent({ ownerId, parentMessageId, publicationId, deliveryIds });
     if (claims.length === 0) return [];
     return markFailed({ ownerId, claims, reason: 'presentation_failed' });
   }
 
-  async function listByParent({ ownerId, parentMessageId, surface = '' }: ListByParentInput) {
+  async function listByParent({ ownerId, parentMessageId, publicationId, deliveryIds, surface = '' }: ListByParentInput) {
+    let scope;
+    try {
+      scope = await resolveParentPublication({ ownerId, parentMessageId, publicationId, deliveryIds });
+    } catch (error) {
+      if (errorCode(error) === 'cortex_insight_delivery_publication_missing') return [];
+      throw error;
+    }
     const filter: DataRecord = {
       userId: normalizeText(ownerId),
       parentMessageId: normalizeText(parentMessageId),
+      ...publicationFilter(scope),
     };
     const normalizedSurface = surface ? normalizeSurface(surface) : '';
     if (normalizedSurface) {
@@ -4737,6 +4906,7 @@ export function createCortexInsightDeliveryService({
       deliveryId: 1,
       conversationId: 1,
       parentMessageId: 1,
+      publicationId: 1,
       cortexId: 1,
       cortexName: 1,
       insightHash: 1,
@@ -4778,11 +4948,13 @@ export function createCortexInsightDeliveryService({
     });
   }
 
-  async function listEvents({ ownerId, parentMessageId }: OwnerParentInput) {
+  async function listEvents({ ownerId, parentMessageId, publicationId, deliveryIds }: OwnerParentInput) {
+    const scope = await resolveParentPublication({ ownerId, parentMessageId, publicationId, deliveryIds });
     const query = selectPrivate(
       DeliveryModel.find({
         userId: normalizeText(ownerId),
         parentMessageId: normalizeText(parentMessageId),
+        ...publicationFilter(scope),
       }),
     );
     const sorted = query?.sort ? query.sort({ createdAt: 1, deliveryId: 1 }) : query;
@@ -4821,6 +4993,7 @@ export function createCortexInsightDeliveryService({
     markDropped,
     markFailed,
     markPersisted,
+    resumeTransportFailure,
     markPresented,
     markPresentationByParent,
     markPresentationFailedByParent,

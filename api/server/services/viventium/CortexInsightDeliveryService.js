@@ -46,12 +46,13 @@ function latestTerminalAt(rows) {
 
 function createFollowUpTerminalOutcomeRecorder({ service, MessageModel }) {
   /** Records the ledger's terminal outcome on every follow-up of one parent whose rows all settled. */
-  async function recordParent(ownerId, parentMessageId) {
+  async function recordParent(ownerId, parentMessageId, publicationId = '') {
     const userId = String(ownerId || '').trim();
     const parent = String(parentMessageId || '').trim();
     if (!userId || !parent || !MessageModel) return 0;
     const byMessage = new Map();
-    for (const row of await service.listByParent({ ownerId: userId, parentMessageId: parent })) {
+    for (const row of await service.listByParent({ ownerId: userId, parentMessageId: parent,
+      ...(publicationId ? { publicationId } : {}) })) {
       const persistedMessageId = String(row?.persistedMessageId || '').trim();
       if (!persistedMessageId) continue;
       byMessage.set(persistedMessageId, [...(byMessage.get(persistedMessageId) || []), row]);
@@ -95,11 +96,12 @@ function withFollowUpTerminalOutcome(service, { MessageModel } = {}) {
             TERMINAL_DELIVERY_STATUSES.has(row?.status) &&
             String(row?.persistedMessageId || '').trim(),
         )
-        .map((row) => String(row?.parentMessageId || '').trim())
-        .filter(Boolean),
+        .map((row) => JSON.stringify([String(row?.parentMessageId || '').trim(), row?.publicationId || '']))
+        .filter((key) => JSON.parse(key)[0]),
     );
-    for (const parentMessageId of parents) {
-      await recordParent(ownerId, parentMessageId);
+    for (const key of parents) {
+      const [parentMessageId, publicationId] = JSON.parse(key);
+      await recordParent(ownerId, parentMessageId, publicationId);
     }
   }
 
@@ -141,6 +143,7 @@ async function reconcileFollowUpTerminalOutcomes({
   MessageModel,
   limit = 200,
   cursors = terminalReconciliationCursors,
+  recoverOwnedPresentation = null,
 } = {}) {
   if (!service || !DeliveryModel || !MessageModel) return { scanned: 0, reconciled: 0 };
   const { recordParent } = createFollowUpTerminalOutcomeRecorder({ service, MessageModel });
@@ -148,10 +151,14 @@ async function reconcileFollowUpTerminalOutcomes({
   const cursor = cursors.get(DeliveryModel) || null;
   const rows = await DeliveryModel.find({
     status: { $in: [...TERMINAL_DELIVERY_STATUSES] },
-    persistedMessageId: { $nin: ['', null] },
+    $or: [
+      { persistedMessageId: { $nin: ['', null] } },
+      { status: 'dropped', dropReason: 'delivery_attempts_exhausted',
+        persistenceStatus: 'pending', persistedMessageId: { $in: ['', null] } },
+    ],
     ...(cursor ? { _id: { $gt: cursor } } : {}),
   })
-    .select('_id userId parentMessageId persistedMessageId')
+    .select('_id userId conversationId parentMessageId persistedMessageId persistenceStatus status dropReason publicationId')
     .sort({ _id: 1 })
     .limit(batchSize)
     .lean();
@@ -163,8 +170,22 @@ async function reconcileFollowUpTerminalOutcomes({
     const userId = String(row?.userId || '').trim();
     const persistedMessageId = String(row?.persistedMessageId || '').trim();
     const parentMessageId = String(row?.parentMessageId || '').trim();
-    if (!userId || !persistedMessageId || !parentMessageId) continue;
-    const group = { userId, parentMessageId };
+    if (!userId || !parentMessageId) continue;
+    if (recoverOwnedPresentation && row.status === 'dropped' &&
+      row.dropReason === 'delivery_attempts_exhausted') {
+      try {
+        if (await recoverOwnedPresentation({ ownerId: userId,
+          conversationId: row.conversationId, parentMessageId, persistedMessageId,
+          publicationId: row.publicationId || '' })) continue;
+      } catch (error) {
+        logger.warn('[VIVENTIUM][cortex-insight-delivery] Owned saved publication remains pending', {
+          code: String(error?.code || error?.name || 'owned_presentation_unavailable'),
+        });
+        continue;
+      }
+    }
+    if (!persistedMessageId) continue;
+    const group = { userId, parentMessageId, publicationId: row.publicationId || '' };
     followUps.set(`${userId}\u0000${persistedMessageId}`, group);
     parents.set(`${userId}\u0000${parentMessageId}\u0000${persistedMessageId}`, group);
   }
@@ -189,11 +210,11 @@ async function reconcileFollowUpTerminalOutcomes({
     const group =
       followUps.get(`${user}\u0000${message?.messageId}`) ||
       parents.get(`${user}\u0000${message?.messageId}\u0000${persistedMessageId}`);
-    const parentKey = group && `${group.userId}\u0000${group.parentMessageId}`;
+    const parentKey = group && `${group.userId}\u0000${group.parentMessageId}\u0000${group.publicationId}`;
     if (!group || reflectedParents.has(parentKey)) continue;
     reflectedParents.add(parentKey);
     try {
-      reconciled += await recordParent(group.userId, group.parentMessageId);
+      reconciled += await recordParent(group.userId, group.parentMessageId, group.publicationId);
     } catch (error) {
       logger.warn(
         '[VIVENTIUM][cortex-insight-delivery] Follow-up terminal outcome not reconciled',
@@ -218,8 +239,7 @@ async function readAcceptedVoiceDispatch(row) {
     deletedAt: null,
   }).lean();
   return resolveAcceptedVoiceCortexDispatch(message, {
-    ownerId: String(row.userId),
-    parentMessageId: row.parentMessageId,
+    ownerId: String(row.userId), parentMessageId: row.parentMessageId,
   });
 }
 
@@ -263,8 +283,8 @@ const voicePresentationDependencies = {
         'metadata.viventium.cortexPresentationParentMessageId': receipt.parentMessageId,
         'metadata.viventium.cortexInsightDeliveryIds':
           message.metadata.viventium.cortexInsightDeliveryIds,
-        'metadata.viventium.deliveryAcknowledgement.cortexPresentation': message.metadata?.viventium
-          ?.deliveryAcknowledgement?.cortexPresentation || { $exists: false },
+        'metadata.viventium.deliveryAcknowledgement.cortexPresentation':
+          message.metadata?.viventium?.deliveryAcknowledgement?.cortexPresentation || { $exists: false },
       },
       { $set: { 'metadata.viventium.deliveryAcknowledgement.cortexPresentation': receipt } },
     );
@@ -316,6 +336,8 @@ module.exports = {
       service: defaultService,
       DeliveryModel: ViventiumCortexInsightDelivery,
       MessageModel: Message,
+      recoverOwnedPresentation: (parent) =>
+        require('./NativeCoordinatorPresentationService').recover(parent),
       ...options,
     }),
   recordCompletedCortexInsightDeliveryBatch: defaultService.recordBatch,

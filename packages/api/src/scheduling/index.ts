@@ -4,3 +4,4 @@ export * from './scheduleDueReceiver';
 export * from './scheduleDueHost';
 export * from './scheduledTaskSource';
 export * from './scheduleDueRecovery';
+export { schedulerDispatchDocumentId } from './scheduleOccurrenceOwner';

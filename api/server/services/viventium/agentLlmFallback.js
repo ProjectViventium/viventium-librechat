@@ -8,6 +8,7 @@
 const { ContentTypes } = require('librechat-data-provider');
 const RUNTIME_HOLD_TEXT_FLAG = 'viventium_runtime_hold';
 const NON_RETRYABLE_FALLBACK_ERROR_CLASSES = new Set([
+  'native_output_files_identity_unavailable',
   'native_input_declined',
   'native_input_expired',
   'native_input_cancelled',
@@ -667,7 +668,7 @@ function shouldRetryWithFallback(contentParts) {
       return false;
     }
     const errorClass = contentPartErrorClass(part);
-    if (isNonRetryableFallbackErrorClass(errorClass)) {
+    if ([errorClass, part.code, part.error_code].some(isNonRetryableFallbackErrorClass)) {
       return false;
     }
     if (isRecoverableFallbackErrorClass(errorClass)) {

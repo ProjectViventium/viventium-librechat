@@ -2257,7 +2257,7 @@ test('an actual native allocation carries unchanged summaries that overflow the 
       carrierMaxUtf8Bytes: 512 * 1024 + 1,
       reservedUtf8Bytes: 0,
     }),
-  ).toBeNull();
+  ).toMatchObject({ carrierMaxUtf8Bytes: 512 * 1024 + 1 });
   expect(
     createMainCompactionOutputContract({
       consumer: 'accepted_core',
@@ -3057,7 +3057,7 @@ describe('current-carrier semantic output policy', () => {
       ).toBe(false);
     },
   );
-  test.each([131073.5, 512 * 1024 + 1, 65536, NaN, Infinity])(
+  test.each([131073.5, Number.MAX_SAFE_INTEGER + 1, 65536, NaN, Infinity])(
     'rejects a carrier outside the existing bounded domain (%s)',
     (carrierMaxUtf8Bytes) => {
       expect(
@@ -3279,3 +3279,108 @@ describe('current-carrier semantic output policy', () => {
     },
   );
 });
+
+/* === VIVENTIUM START === Responsive admission changes the view, never summary promotion. === */
+describe('responsive continuity view', () => {
+  const turn = (id: string, text: string): AcceptedMainTurn => ({
+    logicalTurnId: id, revision: 1, conversationId: 'synthetic',
+    userMessageId: `${id}-user`, assistantMessageId: `${id}-answer`, origin: 'interactive',
+    userText: text, assistantText: 'Acknowledged.', toolPairs: [], committedAt: new Date(),
+  });
+  const outputCarrier = { carrierMaxUtf8Bytes: 131072, reservedContextUtf8Bytes: 129500 };
+
+  test('a source-resolution gap retains its distinct status and shares the registered guidance', () => {
+    const view = renderAcceptedMainContextForCarrier({ status: 'unavailable', reason: 'source_unavailable',
+      messageCapsule: '<viventium_main_continuity_unavailable reason="source_resolution" />' },
+      outputCarrier, { allowDegraded: true, unavailableInstructions: 'Disclose the temporary gap.' });
+    expect(view).toMatchObject({ status: 'unavailable', reason: 'source_unavailable', continuityDegraded: true });
+    expect(String(view.capsule)).toContain('reason="source_resolution"');
+    expect(String(view.capsule)).toContain('Disclose the temporary gap.');
+  });
+
+  test('never carries an older fact across an omitted newer correction', () => {
+    const old = turn('old', 'The old total was 17.');
+    const correction = turn('correction', 'New evidence. '.repeat(600) + 'The corrected total is 18.');
+    const view = renderAcceptedMainContextForCarrier({ status: 'context_budget', turns: [old, correction] },
+      outputCarrier, { allowDegraded: true, unavailableInstructions: 'Disclose the temporary gap.' });
+    expect(view).toMatchObject({ status: 'available', continuityDegraded: true });
+    expect(String(view.capsule)).not.toContain(old.userText);
+    expect(String(view.capsule)).not.toContain('The corrected total is 18.');
+    expect(String(view.capsule)).toContain('Disclose the temporary gap.');
+  });
+
+  test('keeps whole recent evidence, marks omitted older context, and leaves the strict owner intact', () => {
+    const recent = turn('recent', 'Use the corrected total 18 and keep it private.');
+    const older = turn('older', '🟢'.repeat(3000) + 'Never publish.');
+    const summary = { ...faithful, summary: 'Earlier context. '.repeat(400).trim() };
+    const context = { status: 'context_budget', turns: [older, recent],
+      pendingCompactionTurns: [], semanticCompaction: summary,
+      semanticCompactionContract: createMainCompactionOutputContract({
+        consumer: 'accepted_core', carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 0 }),
+      legacyPending: true };
+    const original = JSON.stringify(context);
+    const strict = renderAcceptedMainContextForCarrier(context, outputCarrier);
+    expect(strict.status).toBe('context_budget');
+    const view = renderAcceptedMainContextForCarrier(context, outputCarrier, { allowDegraded: true });
+    expect(view).toMatchObject({ status: 'available', continuityDegraded: true,
+      semanticCompaction: summary });
+    const capsule = String(view.capsule);
+    expect(capsule).toContain('<viventium_main_continuity_unavailable');
+    expect(capsule).toContain('original_sources="retained"');
+    expect(capsule).toContain(recent.userText);
+    expect(capsule).not.toContain('🟢');
+    expect(capsule).not.toContain('<semantic_compaction');
+    expect(Buffer.byteLength(capsule, 'utf8')).toBeLessThanOrEqual(1572);
+    expect(JSON.stringify(context)).toBe(original);
+    expect(renderAcceptedMainContextForCarrier(context, outputCarrier).status).toBe('context_budget');
+    const recovered = renderAcceptedMainContextForCarrier(context,
+      { carrierMaxUtf8Bytes: 131072, reservedContextUtf8Bytes: 0 }, { allowDegraded: true });
+    expect(String(recovered.capsule)).toContain(summary.summary);
+  });
+
+  test('a pending source backlog is visible even when the selected recent sources fit', () => {
+    const context = { status: 'available', turns: [turn('current', 'Current intact request.')],
+      pendingCompactionTurns: [], pendingCompactionCount: 8 };
+    const view = renderAcceptedMainContextForCarrier(context, outputCarrier, { allowDegraded: true });
+    expect(view).toMatchObject({ status: 'available', continuityDegraded: true });
+    expect(String(view.capsule)).toContain('reason="source_backlog" turns="8"');
+    expect(String(view.capsule)).toContain('Current intact request.');
+  });
+
+  test('loaded pending evidence that does not fit triggers a truthful degraded view', () => {
+    const context = { status: 'available', turns: [turn('recent', 'The current request is intact.')],
+      pendingCompactionTurns: [turn('pending', 'Retained older details. '.repeat(200))],
+      pendingCompactionCount: 1 };
+    const view = renderAcceptedMainContextForCarrier(context, outputCarrier,
+      { allowDegraded: true, unavailableInstructions: 'Retrieve missing detail through authorized Workers.' });
+    expect(view).toMatchObject({ status: 'available', continuityDegraded: true });
+    expect(String(view.capsule)).toContain('The current request is intact.');
+    expect(String(view.capsule)).toContain('Retrieve missing detail through authorized Workers.');
+    expect(String(view.capsule)).toContain('turns="1"');
+    expect(context.pendingCompactionTurns[0].userText).toBe('Retained older details. '.repeat(200));
+  });
+
+  test('guidance bytes count against the same carrier and may require the newest-source view', () => {
+    const context = { status: 'available', turns: [turn('recent', 'Keep this intact.')],
+      pendingCompactionCount: 1, pendingCompactionTurns: [],
+      semanticCompaction: { ...faithful, summary: 'Retained summary context. '.repeat(100).trim() },
+      semanticCompactionContract: createMainCompactionOutputContract({
+        consumer: 'accepted_core', carrierMaxUtf8Bytes: 131072, reservedUtf8Bytes: 0 }) };
+    const base = renderAcceptedMainContextForCarrier(context, undefined, { allowDegraded: true });
+    const carrier = { carrierMaxUtf8Bytes: 131072,
+      reservedContextUtf8Bytes: 131072 - Buffer.byteLength(String(base.capsule), 'utf8') - 8 };
+    const view = renderAcceptedMainContextForCarrier(context, carrier,
+      { allowDegraded: true, unavailableInstructions: 'Registered policy. '.repeat(8) });
+    expect(view).toMatchObject({ status: 'available', continuityDegraded: true });
+    expect(String(view.capsule)).toContain('Registered policy.');
+    expect(Buffer.byteLength(String(view.capsule), 'utf8')).toBeLessThanOrEqual(
+      carrier.carrierMaxUtf8Bytes - carrier.reservedContextUtf8Bytes);
+  });
+
+  test('a carrier too small for disclosure remains a typed admission failure', () => {
+    expect(renderAcceptedMainContextForCarrier({ status: 'context_budget', turns: [turn('large', 'x'.repeat(4000))] },
+      { carrierMaxUtf8Bytes: 131072, reservedContextUtf8Bytes: 131060 }, { allowDegraded: true }))
+      .toMatchObject({ status: 'context_budget', capsule: '' });
+  });
+});
+/* === VIVENTIUM END === */

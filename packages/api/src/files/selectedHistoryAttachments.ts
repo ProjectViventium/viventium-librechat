@@ -82,7 +82,7 @@ export async function resolveSelectedHistoryAttachments(
     }
   }
   const selectedMessages = new Set(thread.messageIds);
-  const ids = (selectedIds ? historyIds.filter((id) => selectedIds.has(id)) : historyIds).slice(0, 64);
+  const ids = selectedIds ? historyIds.filter((id) => selectedIds.has(id)) : historyIds;
   if (!ids.length) return [];
   const files = await db.getFiles(
     { user: scope.userId, file_id: { $in: ids } }, null,
@@ -130,6 +130,6 @@ export async function resolveSelectedDelegationAttachments(
     const file = currentById.has(id) ? undefined : historyById.get(id);
     return file ? [file] : [];
   })];
-  return files.length > 64 ? { error: 'delegation_file_selection_unauthorized' } : { files };
+  return { files };
 }
 /* === VIVENTIUM END === */

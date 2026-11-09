@@ -255,6 +255,7 @@ export type GlassHiveOptions = {
     parallel_available: boolean;
     default_mode: 'focused' | 'parallel';
     tool_mode?: 'full' | 'coordination';
+    conversation_process_reuse?: boolean;
     worker_profile?: string;
     fallback_worker_profile?: string;
     worker_model?: string;

@@ -7,9 +7,8 @@ const runInputSchema = z.object({
   instruction: z.string().min(1),
   continuation_context: z.object({
     version: z.literal(1),
-    base_instruction: z.string().min(1).refine((text) => Buffer.byteLength(text) <= 128 * 1024),
-    guidance: z.array(z.string().min(1).refine((text) => Buffer.byteLength(text) <= 100 * 1024))
-      .max(128).refine((items) => items.reduce((size, text) => size + Buffer.byteLength(text), 0) <= 512 * 1024),
+    base_instruction: z.string().min(1),
+    guidance: z.array(z.string().min(1)),
   }).strict().optional(),
 }).strict();
 

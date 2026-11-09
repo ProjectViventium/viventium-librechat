@@ -5,8 +5,10 @@ const {
   buildPromptBundleFixture,
 } = require('../../../../../scripts/test-support/promptBundle.cjs');
 const previousPromptBundlePath = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+const previousBootstrapSecret = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
 let promptFixtureDirectory;
 beforeAll(() => {
+  process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-phase-b-bank-signing-key';
   promptFixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'followup-test-prompts-'));
   const bundlePath = path.join(promptFixtureDirectory, 'bundle.json');
   fs.writeFileSync(
@@ -20,6 +22,9 @@ beforeAll(() => {
   process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundlePath;
 });
 afterAll(() => {
+  if (previousBootstrapSecret === undefined)
+    delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+  else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = previousBootstrapSecret;
   if (previousPromptBundlePath === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
   else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousPromptBundlePath;
   fs.rmSync(promptFixtureDirectory, { recursive: true, force: true });
@@ -34,7 +39,9 @@ const { Run } = require('@librechat/agents');
 
 jest.mock('@librechat/api', () => {
   const actual = jest.requireActual('@librechat/api');
-  return { ...actual, createNativeCapacityFetch: jest.fn(actual.createNativeCapacityFetch) };
+  return { ...actual, createNativeCapacityFetch: jest.fn(actual.createNativeCapacityFetch),
+    prepareMainAuthorContext: jest.fn((...args) => require('~/test/helpers/mainAuthorContext')
+      .mockMainAuthorContext(actual.prepareMainAuthorContext, ...args)) };
 });
 
 jest.mock('~/server/services/BackgroundCortexService', () => {
@@ -277,11 +284,11 @@ describe('owned occupied-session recovery producer', () => {
     }
   });
   test.each([
-    [409, 'conversation_session_authority_conflict', cause],
-    [409, 'other_conflict', undefined],
-    [503, 'host_capacity_unavailable', undefined],
+    [409, 'conversation_session_authority_conflict', { ...cause, retryable: true }],
+    [409, 'other_conflict', { status: 409, code: 'other_conflict', retryable: false }],
+    [503, 'host_capacity_unavailable', { status: 503, code: 'host_capacity_unavailable', retryable: true }],
   ])(
-    'only exact pre-admission failure %s/%s is retained for recovery',
+    'retains typed failure %s/%s without conflating occupied-session recovery',
     async (status, code, expected) => {
       const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
       const message = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
@@ -535,8 +542,8 @@ describe('Phase B follow-up serial fallback arming', () => {
         expect(createRun).toHaveBeenCalledTimes(1);
         const headers =
           createRun.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
-        expect(headers['X-Viventium-Actor-Kind']).toBe(context.actor_kind);
-        expect(headers['X-Viventium-Origin']).toBe(context.origin);
+        expect(headers['X-Viventium-Actor-Kind']).toBe('system');
+        expect(headers['X-Viventium-Origin']).toBe(context.origin === 'scheduler' ? 'scheduler' : 'callback');
         expect(headers['X-Synthetic-Endpoint']).toBe('keep-endpoint-header');
         expect(headers['X-GlassHive-Fallback-Model']).toBe('claude-code:opus');
         expect(headers['X-GlassHive-Fallback-Reasoning-Effort']).toBe('high');
@@ -796,7 +803,7 @@ describe('Phase B follow-up carrier', () => {
         expect(ownTail).not.toContain(mainCapsule);
         expect(createRun.mock.calls[0][0].graphConfig.instructions.endsWith(ownTail)).toBe(true);
         expect(headers['X-GlassHive-Agent-Id']).toBe('agent-main:phase_b:followup');
-        expect(headers['X-Viventium-Origin']).toBe('interactive');
+        expect(headers['X-Viventium-Origin']).toBe('callback');
         expect(headers['X-Synthetic-Endpoint']).toBe('keep-endpoint-header');
         expect(headers['X-GlassHive-Agent-Id']).toContain('agent-main');
         expect(headers['X-GlassHive-Fallback-Model']).toBe('claude-code:claude-opus-5-5');
@@ -1146,13 +1153,18 @@ describe('Phase B signed bootstrap body dispatch', () => {
           insightsData: { insights: [{ insight: 'Verified result.' }] },
         });
         const configuration = createRun.mock.calls[0][0].graphConfig.llmConfig.configuration;
-        if (['native', 'conflicting'].includes(mode)) {
-          expect(bootstrap).toHaveBeenCalledTimes(1);
-          expect(configuration.defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64']).toBe(encoded);
+        expect(bootstrap).not.toHaveBeenCalled();
+        const nativeBound = mode !== 'non-native';
+        const currentEncoded = configuration.defaultHeaders['X-GlassHive-Bootstrap-Bundle-B64'];
+        if (nativeBound) {
+          expect(JSON.parse(Buffer.from(currentEncoded, 'base64'))).toEqual({
+            provider_capabilities: { native_tools: false },
+          });
+          expect(currentEncoded).not.toBe(encoded);
           expect(configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature']).not.toBe(
             'synthetic-signature',
           );
-        } else expect(bootstrap).not.toHaveBeenCalled();
+        } else expect(currentEncoded).toBeUndefined();
         const body = JSON.stringify({
           model: 'synthetic-model',
           messages: [{ role: 'user', content: 'Review.' }],
@@ -1183,11 +1195,11 @@ describe('Phase B signed bootstrap body dispatch', () => {
         expect(sent).toHaveLength(2);
         const wireHeaders = new Headers(sent[0].headers);
         const payload = JSON.parse(sent[0].body);
-        if (mode === 'native') {
+        if (nativeBound) {
           expect(wireHeaders.has('X-GlassHive-Bootstrap-Bundle-B64')).toBe(false);
           expect(wireHeaders.has('content-length')).toBe(false);
           expect(payload.metadata.retain).toBe('original');
-          expect(payload.metadata.bootstrap_bundle_b64 === encoded).toBe(true);
+          expect(payload.metadata.bootstrap_bundle_b64).toBe(currentEncoded);
         } else {
           if (mode === 'non-native') expect(configuration.fetch).toBeUndefined();
           expect(payload.metadata.retain).toBe('original');
@@ -1195,12 +1207,12 @@ describe('Phase B signed bootstrap body dispatch', () => {
           expect(wireHeaders.get('X-GlassHive-Bootstrap-Bundle-B64')).toBe(null);
         }
         expect(wireHeaders.get('X-GlassHive-Bootstrap-Signature')).toBe(
-          mode === 'native'
+          nativeBound
             ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Signature']
             : null,
         );
         expect(wireHeaders.get('X-GlassHive-Bootstrap-Timestamp')).toBe(
-          mode === 'native'
+          nativeBound
             ? configuration.defaultHeaders['X-GlassHive-Bootstrap-Timestamp']
             : null,
         );
@@ -1572,98 +1584,40 @@ describe('installed Phase B model caller result status', () => {
 describe('Phase B native file carrier transport', () => {
   test('recovered emitter source survives actual preparation and strict file persistence without a synthetic native identity', async () => {
     const db = require('~/models');
-    const {
-      prepareCortexFollowUpMessage,
-      persistPreparedCortexFollowUpMessage,
-    } = require('../BackgroundCortexFollowUpService');
+    const { prepareCortexFollowUpMessage, persistPreparedCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
     const { nativeFollowUpOutputFilesForMessage } = jest.requireActual('@librechat/api');
     const messages = jest.spyOn(db, 'getMessages').mockResolvedValue([]);
     const parent = jest.spyOn(db, 'getMessage').mockResolvedValue(null);
-    const author = {
-      messageId: 'recovered-emitter',
-      recoveredSourceMessageId: 'recovered-emitter',
-      wrapFetch: (fetch) => fetch,
-      finish: jest.fn(),
-    };
+    const author = { messageId: 'recovered-emitter', recoveredSourceMessageId: 'recovered-emitter',
+      wrapFetch: (fetch) => fetch, finish: jest.fn() };
     const createRun = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
       processStream: async () => {
         const headers = options.graphConfig.llmConfig.configuration.defaultHeaders;
-        const envelope = {
-          version: 1,
-          owner_id: headers['X-Viventium-User-Id'],
-          conversation_id: headers['X-Viventium-Conversation-Id'],
-          message_id: headers['X-Viventium-Message-Id'],
-          stream_id: headers['X-Viventium-Stream-Id'],
-          agent_id: headers['X-GlassHive-Agent-Id'],
-          logical_turn_id: '',
-          logical_turn_revision: 1,
-          request_id: 'saved-request',
-          run_id: 'saved-run',
-          attempt_id: 'saved-attempt',
-          invocation_id: '',
-          files: [
-            {
-              filename: 'shape.svg',
-              mime_type: 'image/svg+xml',
-              bytes: 138,
-              sha256: 'a'.repeat(64),
-              download_url:
-                'https://artifacts.example.test/v1/link-refs/ghr_' + 'saved1234567890abcdef',
-            },
-          ],
-        };
+        const envelope = { version: 1, owner_id: headers['X-Viventium-User-Id'],
+          conversation_id: headers['X-Viventium-Conversation-Id'], message_id: headers['X-Viventium-Message-Id'],
+          stream_id: headers['X-Viventium-Stream-Id'], agent_id: headers['X-GlassHive-Agent-Id'],
+          logical_turn_id: '', logical_turn_revision: 1, request_id: 'saved-request', run_id: 'saved-run',
+          attempt_id: 'saved-attempt', invocation_id: '', files: [{ filename: 'shape.svg', mime_type: 'image/svg+xml',
+            bytes: 138, sha256: 'a'.repeat(64), download_url: 'https://artifacts.example.test/v1/link-refs/ghr_' + 'saved1234567890abcdef' }] };
         options.customHandlers.on_chat_model_start.handle('on_chat_model_start', {});
-        options.customHandlers.on_chat_model_end.handle('on_chat_model_end', {
-          output: {
-            additional_kwargs: {
-              __raw_response: {
-                id: 'saved-request',
-                object: 'chat.completion',
-                glasshive: { output_files: envelope },
-              },
-            },
-          },
-        });
+        options.customHandlers.on_chat_model_end.handle('on_chat_model_end', { output: {
+          additional_kwargs: { __raw_response: { id: 'saved-request', object: 'chat.completion',
+            glasshive: { output_files: envelope } } },
+        } });
         return 'Here is your file.';
       },
     }));
     const input = {
-      req: {
-        id: 'synthetic-recovered-files',
-        user: { id: 'owner' },
-        body: {
-          conversationId: 'conversation',
-          messageId: 'accepted-parent',
-          viventiumSurface: 'web',
-        },
-        config: {
-          endpoints: {
-            agents: {
-              providerCapabilities: {
-                'glasshive-harness': {
-                  workspace_binding: true,
-                  conversation_session: true,
-                  responses_api: false,
-                },
-              },
-            },
-          },
-        },
-      },
-      agent: {
-        id: 'main',
-        provider: 'glasshive-harness',
-        model: 'codex-cli:gpt-6.1-sol',
-        model_parameters: { model: 'codex-cli:gpt-6.1-sol' },
-      },
-      insightsData: {
-        insights: [{ cortexName: 'Worker', insight: 'The verified shape is ready.' }],
-      },
-      recentResponse: 'Preparing your file.',
-      runId: 'stable-synthesis',
-      conversationId: 'conversation',
-      parentMessageId: 'accepted-parent',
-      nativeAuthor: author,
+      req: { id: 'synthetic-recovered-files', user: { id: 'owner' },
+        body: { conversationId: 'conversation', messageId: 'accepted-parent', viventiumSurface: 'web' },
+        config: { endpoints: { agents: { providerCapabilities: { 'glasshive-harness': {
+          workspace_binding: true, conversation_session: true, responses_api: false,
+        } } } } } },
+      agent: { id: 'main', provider: 'glasshive-harness', model: 'codex-cli:gpt-6.1-sol',
+        model_parameters: { model: 'codex-cli:gpt-6.1-sol' } },
+      insightsData: { insights: [{ cortexName: 'Worker', insight: 'The verified shape is ready.' }] },
+      recentResponse: 'Preparing your file.', runId: 'stable-synthesis',
+      conversationId: 'conversation', parentMessageId: 'accepted-parent', nativeAuthor: author,
       forceVisibleFollowUp: true,
     };
     const save = jest.fn(async (_req, message) => message);
@@ -1671,54 +1625,25 @@ describe('Phase B native file carrier transport', () => {
       const prepared = await prepareCortexFollowUpMessage(input);
       expect(author.identity).toBeUndefined();
       expect(prepared.nativeOutputFiles.identity.responseMessageId).toBe(author.messageId);
-      const persisted = await persistPreparedCortexFollowUpMessage(
-        {
-          ...input,
-          dependencies: {
-            saveMessage: save,
-            prepareAttachments: (message) => {
-              const rebound = nativeFollowUpOutputFilesForMessage(prepared.nativeOutputFiles, {
-                userId: 'owner',
-                conversationId: 'conversation',
-                sourceMessageId: prepared.nativeSourceMessageId || input.parentMessageId,
-                responseMessageId: message.messageId,
-                agentId: 'main',
-              });
-              return [
-                {
-                  file_id: 'owned-saved-file',
-                  filename: rebound.envelope.files[0].filename,
-                  nativeOutputFile: {
-                    status: 'available',
-                    messageId: rebound.identity.responseMessageId,
-                  },
-                },
-              ];
-            },
-          },
+      const persisted = await persistPreparedCortexFollowUpMessage({ ...input, dependencies: {
+        saveMessage: save,
+        prepareAttachments: (message) => {
+          const rebound = nativeFollowUpOutputFilesForMessage(prepared.nativeOutputFiles, {
+            userId: 'owner', conversationId: 'conversation',
+            sourceMessageId: prepared.nativeSourceMessageId || input.parentMessageId,
+            responseMessageId: message.messageId, agentId: 'main',
+          });
+          return [{ file_id: 'owned-saved-file', filename: rebound.envelope.files[0].filename,
+            nativeOutputFile: { status: 'available', messageId: rebound.identity.responseMessageId } }];
         },
-        prepared,
-      );
-      expect(persisted.attachments).toEqual([
-        expect.objectContaining({
-          filename: 'shape.svg',
-          nativeOutputFile: { status: 'available', messageId: author.messageId },
-        }),
-      ]);
-      expect(save).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          messageId: author.messageId,
-          attachments: expect.arrayContaining([
-            expect.objectContaining({ file_id: 'owned-saved-file' }),
-          ]),
-        }),
-        expect.anything(),
-      );
+      } }, prepared);
+      expect(persisted.attachments).toEqual([expect.objectContaining({ filename: 'shape.svg',
+        nativeOutputFile: { status: 'available', messageId: author.messageId } })]);
+      expect(save).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        messageId: author.messageId, attachments: expect.arrayContaining([expect.objectContaining({ file_id: 'owned-saved-file' })]),
+      }), expect.anything());
     } finally {
-      messages.mockRestore();
-      parent.mockRestore();
-      createRun.mockRestore();
+      messages.mockRestore(); parent.mockRestore(); createRun.mockRestore();
     }
   });
 
@@ -1999,9 +1924,7 @@ describe('Phase B invocation-fresh native declarations', () => {
         });
         expect(canonical).toHaveBeenCalledTimes(persisted === 'partial' ? 2 : 1);
         expect(canonical).toHaveBeenCalledWith({ id: 'native-main' });
-        expect(bootstrap).toHaveBeenCalledTimes(
-          ['declared', 'denied', 'null_bundle', 'empty_bundle'].includes(mode) ? 1 : 0,
-        );
+        expect(bootstrap).not.toHaveBeenCalled();
         const config = run.mock.calls[0][0].graphConfig.llmConfig;
         if (persisted) expect(config.temperature).toBe(0.37);
         const headers = config.configuration.defaultHeaders;
@@ -2009,25 +1932,13 @@ describe('Phase B invocation-fresh native declarations', () => {
         for (const stale of ['old-main-bundle', 'old-main-timestamp', 'old-main-signature']) {
           expect(Object.values(headers)).not.toContain(stale);
         }
-        if (mode !== 'declared') {
+        if (mode === 'workspace_unbound') {
           expect(headers).not.toHaveProperty('X-GlassHive-Bootstrap-Bundle-B64');
-          return;
+        } else {
+          expect(JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')))
+            .toEqual({ provider_capabilities: { native_tools: false } });
+          expect(headers['X-GlassHive-Bootstrap-Signature']).toMatch(/^sha256=/);
         }
-        expect(bootstrap.mock.calls[0][0]).toMatchObject({
-          allowedServerNames: ['synthetic-account'],
-          allowedHostTools: ['web_search'],
-          requestBody: {
-            conversationId: 'synthetic-conversation',
-            parentMessageId: 'synthetic-parent',
-            messageId: 'synthetic-parent',
-            viventiumGlassHiveIdempotencyKey: 'phase_b:native-main:worker-result',
-            viventiumStreamId: 'phase_b:native-main:worker-result',
-          },
-        });
-        expect(
-          JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')),
-        ).toEqual(bundle);
-        expect(headers['X-GlassHive-Bootstrap-Signature']).toMatch(/^sha256=/);
         expect(JSON.stringify(agent)).toBe(beforeAgent);
       } finally {
         expect(JSON.stringify(agent)).toBe(beforeAgent);
@@ -2046,120 +1957,156 @@ describe('Phase B invocation-fresh native declarations', () => {
 });
 /* === VIVENTIUM END === */
 
-describe('Phase B thin Queen inherited source', () => {
-  test.each([
-    ['coordination', true],
-    ['coordination', false],
-    ['full', true],
-  ])(
-    '%s preserves callback source without replaying old input (trusted request %s)',
-    async (toolMode, trusted) => {
-      const tools = [
-        'worker_delegate_once_mcp_glasshive-workers-projects',
-        'active_work_list',
-        'active_work_action',
-      ];
-      const req = {
-        user: { id: 'synthetic-owner' },
-        body: {
-          conversationId: 'synthetic-conversation',
-          text: 'Earlier action. Do not replay.',
-          viventiumTriggeringSourceSegments: [
-            { ordinal: 0, text: 'Earlier action. Do not replay.' },
-          ],
-        },
-        config: {
-          endpoints: {
-            agents: {
-              providerCapabilities: {
-                'glasshive-harness': {
-                  workspace_binding: true,
-                  phase_b_followup: true,
-                  responses_api: false,
-                  native_tools: true,
-                  host_tools_transport: 'broker_mcp',
-                  conversation_orchestration_tools: tools,
-                  models: [{ id: 'direct-test', harnessProfile: 'direct-xai' }],
-                },
-              },
-            },
-          },
-        },
-      };
-      if (trusted)
-        setTrustedInteractionContext(req, {
-          actor_kind: 'external_user',
-          origin: 'interactive',
-          surface: 'web',
-          conversation_id: 'synthetic-conversation',
-          source_event_id: 'old-input',
-        });
-      const originalBody = JSON.stringify(req.body);
-      const bootstrap = jest
-        .spyOn(
-          require('../GlassHiveCapabilityBootstrapService'),
-          'buildConversationProviderBootstrapBundle',
-        )
-        .mockResolvedValue({ glasshive_capability_broker: { grant_id: 'fresh-callback' } });
-      const run = jest
-        .spyOn(Run, 'create')
-        .mockResolvedValue({ processStream: jest.fn().mockResolvedValue('Verified result.') });
-      require('~/models/Agent').getAgent.mockResolvedValue(null);
-      const prior = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
-      process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-thin-callback';
-      try {
-        await generateFollowUpText({
-          req,
-          agent: {
-            id: 'synthetic-main',
-            provider: 'glasshive-harness',
-            model: 'direct-test',
-            tools,
-            model_parameters: { model: 'direct-test' },
-            glasshive_options: {
-              orchestration: {
-                parallel_available: true,
-                tool_mode: toolMode,
-              },
-            },
-          },
-          conversationId: 'synthetic-conversation',
-          parentMessageId: 'synthetic-parent',
-          runId: 'new-callback',
-          conversationMessages: [
-            { messageId: 'old-input', role: 'user', content: 'Earlier action. Do not replay.' },
-          ],
-          continuationContext: 'Exact retained conversation context.',
-          insightsData: { insights: [{ cortexName: 'Worker', insight: 'Verified new result.' }] },
-        });
-        expect(bootstrap).toHaveBeenCalledTimes(1);
-        const params = bootstrap.mock.calls[0][0];
-        const headers = run.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
-        if (toolMode === 'coordination') {
-          expect(params.conversationToolMode).toBe('coordination');
-          expect(params.inheritedConversation.sources[0].text).toBe(
-            'Earlier action. Do not replay.',
-          );
-          expect(params.requestBody.text).toContain('Verified new result.');
-          expect(params.requestBody.viventiumTriggeringSourceSegments).toEqual([
-            expect.objectContaining({
-              text: params.requestBody.text,
-              source_event_id: 'new-callback',
-            }),
-          ]);
-          expect(headers['X-Viventium-Actor-Kind']).toBe('system');
-          expect(headers['X-Viventium-Origin']).toBe('callback');
-        } else {
-          expect(params).not.toHaveProperty('inheritedConversation');
-          expect(params.requestBody.text).toBe('Earlier action. Do not replay.');
-        }
-        expect(JSON.stringify(req.body)).toBe(originalBody);
-      } finally {
-        bootstrap.mockRestore();
-        run.mockRestore();
-        if (prior === undefined) delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
-        else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = prior;
+describe('Phase B presentation source inheritance', () => {
+  test.each(['direct-xai', 'codex-cli', 'claude-code'].flatMap((profile) => [['coordination', true], ['coordination', false], ['coordination', 'scheduled'], ['full', true]].map(([mode, trusted]) => [mode, trusted, profile])))('%s presentation retains original sources without action grants (trusted request %s, profile %s)', async (toolMode, trusted, profile) => {
+    const tools = ['worker_delegate_once_mcp_glasshive-workers-projects', 'active_work_list', 'active_work_action'];
+    const req = { user: { id: 'synthetic-owner' }, body: {
+      conversationId: 'synthetic-conversation', viventiumSurface: 'telegram', text: 'Earlier action. Do not replay.',
+      viventiumTriggeringSourceSegments: [{ ordinal: 0, text: 'Earlier action. Do not replay.' }],
+    }, config: { endpoints: { agents: { providerCapabilities: { 'glasshive-harness': {
+      workspace_binding: true, phase_b_followup: true, responses_api: false,
+      native_tools: true, host_tools_transport: 'broker_mcp', conversation_orchestration_tools: tools,
+      models: [{ id: 'direct-test', harnessProfile: profile }],
+    } } } } } };
+    setTrustedInteractionContext(req, { actor_kind: trusted === 'scheduled' ? 'system' : 'external_user',
+      origin: trusted === 'scheduled' ? 'scheduler' : trusted ? 'interactive' : 'callback', surface: 'telegram',
+      ...(trusted === 'scheduled' ? { schedule_id: 'schedule-original', schedule_run_id: 'occurrence-original' } : {}),
+      conversation_id: 'synthetic-conversation', source_event_id: 'old-input',
+      source_segments: [{ source_event_id: 'old-input', source_index: 0, text: 'Earlier action. Do not replay.' }] });
+    if (trusted === 'scheduled') {
+      req._resumableStreamId = 'schedule-source-stream';
+      req.viventiumSchedulerDueAdmissionId = 'accepted-schedule-admission';
+      require('../interactionContext').bindLogicalTurnContext(req, { ...require('../interactionContext').getTrustedInteractionContext(req),
+        logical_turn_id: 'schedule-logical-turn', revision: 1 });
+    }
+    req.config.endpoints.agents.providerCapabilities['glasshive-harness'].conversation_session = true;
+    req.config.endpoints.agents.providerCapabilities['glasshive-harness'].activity_stream = true;
+    const originalBody = JSON.stringify(req.body);
+    const bootstrap = jest.spyOn(require('../GlassHiveCapabilityBootstrapService'), 'buildConversationProviderBootstrapBundle')
+      .mockResolvedValue({ glasshive_capability_broker: { grant_id: 'fresh-callback' } });
+    const run = jest.spyOn(Run, 'create').mockResolvedValue({ processStream: jest.fn().mockResolvedValue('Verified result.') });
+    require('~/models/Agent').getAgent.mockResolvedValue(null);
+    const prior = process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+    process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = 'synthetic-thin-callback';
+    try {
+      await generateFollowUpText({ req, agent: { id: 'synthetic-main', provider: 'glasshive-harness', model: 'direct-test', tools,
+        model_parameters: { model: 'direct-test' }, glasshive_options: { orchestration: {
+          parallel_available: true, tool_mode: toolMode,
+        } } }, conversationId: 'synthetic-conversation', parentMessageId: 'synthetic-parent', runId: 'new-callback',
+        conversationMessages: [{ messageId: 'old-input', role: 'user', content: 'Earlier action. Do not replay.' }],
+        continuationContext: 'Exact retained conversation context.',
+        insightsData: { insights: [{ cortexName: 'Worker', insight: 'Verified new result.',
+          authority: { kind: 'durable_terminal_callback', userSource: { status: 'available', messageId: 'old-input',
+            conversationId: 'synthetic-conversation', text: 'Earlier action. Do not replay.' } } }] },
+      });
+      expect(bootstrap).not.toHaveBeenCalled();
+      const author = require('@librechat/api').prepareMainAuthorContext;
+      const preparedContext = await author.mock.results.at(-1).value;
+      const authorInput = author.mock.calls.at(-1)[0];
+      const params = { requestBody: preparedContext.req.body };
+      expect(preparedContext.req._resumableStreamId).toBeUndefined();
+      expect(require('@librechat/api').createNativeCapacityFetch.mock.calls.at(-1)[1].streamId)
+        .toBe(trusted === 'scheduled' ? 'schedule-source-stream' : 'new-callback');
+      if (trusted === 'scheduled') {
+        expect(params.requestBody.viventiumStreamId).toBe('schedule-source-stream');
+        expect(params.requestBody.viventiumLogicalTurnId).toBe('schedule-logical-turn');
+        expect(params.requestBody.viventiumSchedulerDueAdmissionId).toBe('accepted-schedule-admission');
+        expect(preparedContext.req.viventiumSchedulerDueStreamId).toBe('schedule-source-stream');
+      } else expect(params.requestBody.viventiumResultAuthor).toBeNull();
+      const headers = run.mock.calls[0][0].graphConfig.llmConfig.configuration.defaultHeaders;
+      expect(JSON.parse(Buffer.from(headers['X-GlassHive-Bootstrap-Bundle-B64'], 'base64')))
+        .toEqual({ provider_capabilities: { native_tools: false } });
+      expect(authorInput.sourceSegments).toEqual([
+        expect.objectContaining({ text: 'Earlier action. Do not replay.', source_event_id: 'old-input' }),
+      ]);
+      expect(authorInput.messages[0]).toMatchObject({
+        messageId: 'old-input', content: 'Earlier action. Do not replay.',
+      });
+      expect(authorInput.text).toContain('Verified new result.');
+      expect(params.requestBody.text).toBe('Earlier action. Do not replay.');
+      expect(params.requestBody.viventiumTriggeringSourceSegments).toEqual([
+        expect.objectContaining({ text: params.requestBody.text, source_event_id: 'old-input' }),
+      ]);
+      expect(headers['X-Viventium-Actor-Kind']).toBe('system');
+      expect(headers['X-Viventium-Origin']).toBe(trusted === 'scheduled' ? 'scheduler' : 'callback');
+      if (trusted === 'scheduled') {
+        const interaction = require('../interactionContext').getTrustedInteractionContext(preparedContext.req);
+        expect(interaction).toMatchObject({ origin: 'scheduler', source_event_id: 'old-input',
+          schedule_id: 'schedule-original', schedule_run_id: 'occurrence-original' });
       }
-    },
-  );
+      expect(params.requestBody.text).not.toContain('You are the main AI');
+      expect(headers['X-Viventium-Surface']).toBe('telegram');
+      expect(params.requestBody.text).not.toContain('## CRITICAL');
+      const api = jest.requireActual('@librechat/api');
+      const selected = api.selectTrustedLaunchRequestBody(params.requestBody, [1]);
+      expect(selected.requestBody.viventiumTriggeringSourceSegments[0].text).toBe('Earlier action. Do not replay.');
+      expect(api.selectTrustedSourceInstruction([params.requestBody.text], 'Do not replay.')).toBe('Do not replay.');
+      expect(JSON.stringify(req.body)).toBe(originalBody);
+    } finally {
+      bootstrap.mockRestore(); run.mockRestore();
+      if (prior === undefined) delete process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET;
+      else process.env.VIVENTIUM_GLASSHIVE_CAPABILITY_BROKER_SECRET = prior;
+    }
+  });
+});
+
+
+describe('ordinary native context body courier', () => {
+  test.each([false, true])('preserves full long Unicode context and fresh allocation, with bootstrap=%s', async (bootstrap) => {
+    const context = 'Exact context. 🌱\n'.repeat(10000);
+    const encoded = Buffer.from(context, 'utf8').toString('base64');
+    const selectedCarrierBytes = Buffer.byteLength(context) + 128;
+    expect(Buffer.byteLength(encoded)).toBeGreaterThan(32 * 1024);
+    expect(Buffer.byteLength(context)).toBeGreaterThan(128 * 1024);
+    const api = require('@librechat/api');
+    const actual = jest.requireActual('@librechat/api');
+    api.prepareMainAuthorContext.mockImplementationOnce(async (...args) => {
+      const result = await require('~/test/helpers/mainAuthorContext')
+        .mockMainAuthorContext(actual.prepareMainAuthorContext, ...args);
+      result.req.body.viventiumGlassHiveTurnContextB64 = encoded;
+      result.selectedCarrierBytes = selectedCarrierBytes;
+      return result;
+    });
+    const fetch = jest.spyOn(global, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }));
+    const create = jest.spyOn(Run, 'create').mockImplementation(async (options) => ({
+      processStream: async () => {
+        const config = options.graphConfig.llmConfig.configuration;
+        expect(config.defaultHeaders['X-Viventium-Turn-Context-Max-Bytes']).toBe(String(selectedCarrierBytes));
+        expect(Object.keys(config.defaultHeaders).some((name) => name.toLowerCase() === 'x-viventium-main-context-state-blocks-b64')).toBe(false);
+        const headers = { ...config.defaultHeaders,
+          ...(bootstrap ? { 'X-GlassHive-Bootstrap-Bundle-B64': 'opaque-signed-bootstrap' } : {}) };
+        await config.fetch('http://127.0.0.1:8766/v1/chat/completions', {
+          method: 'POST', headers, body: JSON.stringify({ messages: [{ role: 'user', content: 'Evidence.' }] }),
+        });
+        return 'Verified result.';
+      },
+    }));
+    try {
+      await expect(generateFollowUpText({
+        req: { user: { id: 'owner' }, body: {}, config: { endpoints: { agents: { providerCapabilities: {
+          'glasshive-harness': { workspace_binding: true, phase_b_followup: true, responses_api: false },
+        } } } } },
+        agent: { id: 'main', provider: 'glasshive-harness', model: 'codex-cli:gpt-6.1-sol',
+          model_parameters: { model: 'codex-cli:gpt-6.1-sol', configuration: { defaultHeaders: {
+            'X-Viventium-Main-Context-State-Blocks-B64': 'stale-invalid-state-blocks',
+            'X-Viventium-Turn-Context-Max-Bytes': '1',
+            'X-Viventium-Main-Context-Protocol': 'stale-protocol',
+          } } } },
+        insightsData: { insights: [{ cortexName: 'Synthetic', insight: 'Verified result.' }] },
+      })).resolves.toBe('Verified result.');
+      expect(fetch).toHaveBeenCalledTimes(1);
+      const init = fetch.mock.calls[0][1];
+      const headers = new Headers(init.headers);
+      const body = JSON.parse(init.body);
+      expect(headers.has('X-GlassHive-Turn-Context-B64')).toBe(false);
+      expect(headers.has('X-GlassHive-Bootstrap-Bundle-B64')).toBe(false);
+      expect(headers.has('X-Viventium-Turn-Context-Max-Bytes')).toBe(false);
+      expect(headers.has('X-Viventium-Main-Context-State-Blocks-B64')).toBe(false);
+      expect(headers.has('X-Viventium-Main-Context-Protocol')).toBe(false);
+      expect(body.metadata.main_context_v1).toBeUndefined();
+      expect(body.metadata.main_context_state_blocks).toBeUndefined();
+      expect(body.metadata.turn_context).toBe(context);
+      if (bootstrap) expect(body.metadata.bootstrap_bundle_b64).toBe('opaque-signed-bootstrap');
+    } finally { fetch.mockRestore(); create.mockRestore(); }
+  });
 });

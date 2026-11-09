@@ -5139,11 +5139,13 @@ describe('native whole-source courier admission', () => {
     req._gatewayImages = [image];
     source[1].image_urls = [{ type: 'image_url', image_url: {} }];
     expect(caller()(req, agent, source, 131072, hydration, 237500)).toBeNull();
-    source[1].image_urls = Array.from(
+    source[1].image_urls = [image];
+    source[0].image_urls = Array.from(
       { length: require('@librechat/api').GLASSHIVE_NATIVE_MEDIA_MAX_IMAGES + 1 },
       () => image,
     );
-    expect(caller()(req, agent, source, 131072, hydration, 237500)).toBeNull();
+    // Native owns the current image batch. Valid archived history has no copied lifetime cap.
+    expect(caller()(req, agent, source, 131072, hydration, 237500)).toBe(true);
   });
 
   test.each(['audios', 'videos', 'documents'])(
@@ -5174,7 +5176,8 @@ describe('native whole-source courier admission', () => {
     const visit = (node) => {
       if (
         ts.isCallExpression(node) &&
-        node.expression.getText(ast) === 'nativeMainContinuityAllocation'
+        node.expression.getText(ast) === 'nativeMainContinuityAllocation' &&
+        node.arguments.at(-1)?.getText(ast) === 'selectedCarrierBytes'
       )
         finalCall = node;
       ts.forEachChild(node, visit);
@@ -5567,7 +5570,6 @@ describe('native whole-source courier admission', () => {
       Math,
       conversationProviderUsesNativeBody: usesNative,
       nativeWholeHistoryFits: fits,
-      NATIVE_MAIN_TURN_CONTEXT_BODY_MAX_BYTES: 512 * 1024,
     };
     vm.runInNewContext(fn.getText(ast) + ';module.exports=nativeMainContinuityAllocation;', scope);
     return scope.module.exports;
@@ -5580,7 +5582,7 @@ describe('native whole-source courier admission', () => {
     { budget: 250000, native: true, fit: null, capacity: 185108, expected: 131072 },
     { budget: null, native: true, fit: true, capacity: 185108, expected: 131072 },
     { budget: 250000, native: false, fit: true, capacity: 185108, expected: 131072 },
-    { budget: 250000, native: true, fit: true, capacity: 900000, expected: 524288 },
+    { budget: 1000000, native: true, fit: true, capacity: 900000, expected: 900000 },
   ])('shared current-carrier allocation is positive-only (%j)', (row) => {
     const fits = jest.fn((...args) => {
       args[4].sizingReceipt.contextBudgetBytes = row.capacity;
@@ -5690,7 +5692,7 @@ describe('native whole-source courier admission', () => {
     ).toBeNull();
   });
 
-  test('the actual native callback reserves the final context cap, including later dynamic growth', async () => {
+  test('the actual native callback prices Core peers and retains the conservative floor', async () => {
     const file = path.resolve(__dirname, '../../../controllers/agents/client.js');
     const ast = ts.createSourceFile(
       file,
@@ -5713,14 +5715,11 @@ describe('native whole-source courier admission', () => {
     const uploads = [];
     const scope = {
       module: { exports: {} },
+      Buffer,
+      TURN_CONTEXT_SEPARATOR_BYTES: 2,
       req: request(),
       conversationProviderUsesNativeBody: () => true,
-      resolveLegacyOutputCarrier: jest.fn(async () => {
-        throw Object.assign(new Error('Reviewed Core needs the larger final body allocation'), {
-          code: 'source_context_unavailable',
-          status: 413,
-        });
-      }),
+      resolveLegacyOutputCarrier: jest.fn(async () => ({ reservedContextUtf8Bytes: 90000 })),
       nativeUploadRequestBody: request().body,
       resolveConversationProviderUploadedFiles: async () => uploads,
       nativeWholeHistoryFits: fits,
@@ -5736,7 +5735,7 @@ describe('native whole-source courier admission', () => {
     const check = scope.module.exports.call({ options: { agent, endpoint: 'agents' } });
     const source = rows();
     expect(await check(source, 'Earlier small summary')).toBe(true);
-    expect(scope.resolveLegacyOutputCarrier).not.toHaveBeenCalled();
+    expect(scope.resolveLegacyOutputCarrier).toHaveBeenCalledTimes(1);
     expect(fits.mock.calls[0][3]).toBe(131072);
     expect(fits.mock.calls[0][4].nativeHistoryUploads).toBe(uploads);
     expect(fits.mock.calls[0][5]).toBe(196608);
@@ -5746,6 +5745,7 @@ describe('native whole-source courier admission', () => {
     expect(persistedMessage.startsWith('[VIVENTIUM][native-history-fit] ')).toBe(true);
     expect(JSON.parse(persistedMessage.slice('[VIVENTIUM][native-history-fit] '.length))).toEqual({
       nativeBudgetKnown: true,
+      nativeBudgetSource: 'discovery_floor',
       fitOutcome: 'fit',
       selectedHistoryCount: source.length,
       nativeBudgetBytes: 196608,
@@ -5815,7 +5815,7 @@ describe('native whole-source courier admission', () => {
       const check = scope.module.exports.call({ options: { agent, endpoint: 'agents' } });
       const capsule = 'Reviewed history.';
       expect(await check(rows(), capsule)).toBe(fit);
-      expect(reserve).toHaveBeenCalledTimes(budget === null ? 1 : 0);
+      expect(reserve).toHaveBeenCalledTimes(1);
       expect(uploads).toHaveBeenCalledTimes(budget === null ? 0 : 1);
       expect(fits.mock.calls[0][3]).toBe(
         budget === null ? 1000 + Buffer.byteLength(JSON.stringify(capsule)) + 2 : 131072,
@@ -5826,8 +5826,8 @@ describe('native whole-source courier admission', () => {
           scheduleMainContinuityMaintenance: jest.fn(),
         };
         const outcome = await resolve(rows(260), recordFor(rows(260)), check, compaction, true);
-        expect(outcome.compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
-        expect(outcome.compaction.scheduleMainContinuityMaintenance).not.toHaveBeenCalled();
+        expect(outcome.compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+        expect(outcome.compaction.scheduleMainContinuityMaintenance).toHaveBeenCalledTimes(1);
       }
     },
   );
@@ -5888,15 +5888,20 @@ describe('native whole-source courier admission', () => {
     },
   );
   test.each([false, null, undefined])(
-    'native unknown or over-budget source retains foreground reconciliation (%j)',
+    'native unknown or over-budget estimates preserve full source and defer backfill (%j)',
     async (fit) => {
       const compaction = {
         ensureAcceptedMainCompaction: jest.fn(async () => ({ status: 'degraded' })),
         scheduleMainContinuityMaintenance: jest.fn(),
       };
-      await resolve(rows(260), null, async () => fit, compaction, true);
-      expect(compaction.ensureAcceptedMainCompaction).toHaveBeenCalledTimes(1);
-      expect(compaction.scheduleMainContinuityMaintenance).not.toHaveBeenCalled();
+      const source = rows(260);
+      const before = JSON.stringify(source);
+      const estimate = jest.fn(async () => fit);
+      await resolve(source, null, estimate, compaction, true);
+      expect(estimate).not.toHaveBeenCalled();
+      expect(JSON.stringify(source)).toBe(before);
+      expect(compaction.ensureAcceptedMainCompaction).not.toHaveBeenCalled();
+      expect(compaction.scheduleMainContinuityMaintenance).toHaveBeenCalledTimes(1);
     },
   );
 

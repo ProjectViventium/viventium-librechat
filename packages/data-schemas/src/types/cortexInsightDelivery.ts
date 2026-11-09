@@ -63,6 +63,7 @@ export interface IViventiumCortexInsightDelivery {
   userId: string;
   conversationId: string;
   parentMessageId: string;
+  publicationId?: string;
   cortexId: string;
   cortexName: string;
   insight: string;

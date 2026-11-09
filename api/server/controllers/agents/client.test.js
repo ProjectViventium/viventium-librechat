@@ -67,6 +67,8 @@ const createProviderDeadlineApiError = (status) => {
     : APIError.generate(status, { error: payload }, undefined, new Headers());
 };
 
+afterEach(() => jest.requireActual('@librechat/api').resetMainCompactionSchedulingForTests());
+
 describe('source context failure presentation', () => {
   test.each([false, true])('keeps a local source failure distinct (wrapped=%s)', (wrapped) => {
     const sourceError = Object.assign(new Error('Synthetic source unavailable'), {
@@ -86,6 +88,17 @@ describe('source context failure presentation', () => {
         error,
       ),
     ).toBe(false);
+  });
+});
+
+test.each([false, true])('file courier failure stays typed without model retry (wrapped=%s)', (wrapped) => {
+  const original = Object.assign(new Error('Synthetic private file detail'), {
+    code: 'native_output_files_identity_unavailable', status: 409,
+  });
+  const error = wrapped ? new Error('Outer provider failure', { cause: original }) : original;
+  expect(AgentClient.createCompletionErrorContentPart(error)).toEqual({
+    type: ContentTypes.ERROR, [ContentTypes.ERROR]: 'The selected file could not be attached.',
+    error_class: 'native_output_files_identity_unavailable',
   });
 });
 
@@ -229,8 +242,11 @@ jest.mock('~/server/services/BackgroundCortexService', () => ({
       ? mockBackgroundExecution(...args)
       : jest.requireActual('~/server/services/BackgroundCortexService').executeActivated(...args),
 }));
+
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  prepareMainAuthorContext: (...args) => require('~/test/helpers/mainAuthorContext').mockMainAuthorContext(
+    jest.requireActual('@librechat/api').prepareMainAuthorContext, ...args),
   isNativeCapacityRefusal: (...args) => mockIsNativeCapacityRefusal(...args),
   createRun: (...args) => mockCreateRun(...args),
   getRequiredPromptText: jest.fn((key, ...args) =>
@@ -855,6 +871,8 @@ describe('buildViventiumMcpRequestBody', () => {
         req: {
           body: {
             viventiumVoiceCallSessionId: 'call-spoofed',
+            viventiumCallSessionId: 'call-spoofed',
+            viventiumVoiceTaskId: 'task-spoofed',
             viventiumVoiceWorkAuthority: { callSessionId: 'call-spoofed' },
           },
           ...serverFields,
@@ -862,12 +880,17 @@ describe('buildViventiumMcpRequestBody', () => {
       });
     const nonVoice = build();
     expect(nonVoice.viventiumVoiceCallSessionId).toBeUndefined();
+    expect(nonVoice.viventiumCallSessionId).toBeUndefined();
+    expect(nonVoice.viventiumVoiceTaskId).toBeUndefined();
     expect(nonVoice.viventiumVoiceWorkAuthority).toBeUndefined();
     const voice = build({
       viventiumCallSession: { callSessionId: 'call-trusted' },
       viventiumVoiceWorkAuthority: trustedBinding,
+      body: { viventiumVoiceTaskId: 'task-trusted' },
     });
     expect(voice.viventiumVoiceCallSessionId).toBe('call-trusted');
+    expect(voice.viventiumCallSessionId).toBe('call-trusted');
+    expect(voice.viventiumVoiceTaskId).toBe('task-trusted');
     expect(voice.viventiumVoiceWorkAuthority).toBe(trustedBinding);
     const missingBinding = build({ viventiumCallSession: { callSessionId: 'call-trusted' } });
     expect(missingBinding.viventiumVoiceCallSessionId).toBe('call-trusted');
@@ -1717,57 +1740,33 @@ describe('late completion error content parts', () => {
   });
 
   test.each([
-    [
-      'diskBytes',
-      'The computer running Viventium is low on disk space and could not start this reply. Free some space, then retry.',
-    ],
-    [
-      'memoryBytes',
-      'The computer running Viventium is low on memory and could not start this reply. Close unused apps, then retry.',
-    ],
-  ])(
-    'preserves numeric %s admission evidence without leaking diagnostics',
-    (dimension, message) => {
-      const error = new Error('Private diagnostic must not reach the reply');
-      error.response = {
-        status: 503,
-        data: {
-          error: {
-            code: 'host_capacity',
-            capacityClass: 'resource_pressure',
-            available: { [dimension]: 2, privatePath: '/private/synthetic' },
-            required: { [dimension]: 4 },
-            shortage: { [dimension]: 2 },
-            privateDiagnostic: 'secret-placeholder',
-          },
-        },
-      };
-      const part = AgentClient.createCompletionErrorContentPart(error);
-      expect(part).toMatchObject({
-        [ContentTypes.ERROR]: message,
-        error_class: 'host_capacity',
-        retryable: true,
-        capacity_available: { [dimension]: 2 },
-        capacity_required: { [dimension]: 4 },
-        capacity_shortage: { [dimension]: 2 },
-      });
-      expect(JSON.stringify(part)).not.toMatch(
-        /Private diagnostic|privatePath|secret-placeholder|synthetic/,
-      );
-    },
-  );
+    ['diskBytes', 'The computer running Viventium is low on disk space and could not start this reply. Free some space, then retry.'],
+    ['memoryBytes', 'The computer running Viventium is low on memory and could not start this reply. Close unused apps, then retry.'],
+  ])('preserves numeric %s admission evidence without leaking diagnostics', (dimension, message) => {
+    const error = new Error('Private diagnostic must not reach the reply');
+    error.response = { status: 503, data: { error: {
+      code: 'host_capacity', capacityClass: 'resource_pressure',
+      available: { [dimension]: 2, privatePath: '/private/synthetic' },
+      required: { [dimension]: 4 }, shortage: { [dimension]: 2 },
+      privateDiagnostic: 'secret-placeholder',
+    } } };
+    const part = AgentClient.createCompletionErrorContentPart(error);
+    expect(part).toMatchObject({
+      [ContentTypes.ERROR]: message, error_class: 'host_capacity', retryable: true,
+      capacity_available: { [dimension]: 2 }, capacity_required: { [dimension]: 4 },
+      capacity_shortage: { [dimension]: 2 },
+    });
+    expect(JSON.stringify(part)).not.toMatch(/Private diagnostic|privatePath|secret-placeholder|synthetic/);
+  });
 
   test.each([undefined, 'resource_probe_unavailable', 'family_lane'])(
     'does not call unknown or unavailable capacity probes a measured disk shortage: %s',
     (capacityClass) => {
       const error = new Error('Synthetic unavailable probe');
-      Object.assign(error, {
-        code: 'host_capacity',
-        capacityClass,
+      Object.assign(error, { code: 'host_capacity', capacityClass,
         available: { diskBytes: 0, memoryBytes: 0 },
         required: { diskBytes: 4096, memoryBytes: 2048 },
-        shortage: { diskBytes: 4096, memoryBytes: 2048 },
-      });
+        shortage: { diskBytes: 4096, memoryBytes: 2048 } });
       expect(AgentClient.createCompletionErrorContentPart(error)[ContentTypes.ERROR]).toBe(
         'Local AI capacity is busy. Please try again shortly.',
       );
@@ -1810,6 +1809,7 @@ describe('late completion error content parts', () => {
 
   test('suppresses terminated stream errors after visible assistant text', () => {
     const contentParts = [{ type: ContentTypes.TEXT, text: 'Partial but visible answer.' }];
+
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(contentParts, new Error('terminated')),
     ).toBe(true);
@@ -1829,23 +1829,13 @@ describe('late completion error content parts', () => {
     );
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
-        [
-          {
-            type: ContentTypes.TEXT,
-            text: 'Final answer.',
-          },
-        ],
+        [{ type: ContentTypes.TEXT, text: 'Final answer.' }],
         new Error('provider stream ended after final text'),
       ),
     ).toBe(false);
     expect(
       AgentClient.shouldSuppressCompletionErrorContentPart(
-        [
-          {
-            type: ContentTypes.TEXT,
-            text: 'Partial answer.',
-          },
-        ],
+        [{ type: ContentTypes.TEXT, text: 'Partial answer.' }],
         new Error('status 429 rate_limit_error'),
       ),
     ).toBe(false);
@@ -1894,9 +1884,7 @@ describe('late completion error content parts', () => {
   ])('preserves typed native provider failure %s', (code, expected) => {
     const error = Object.assign(new Error('Private provider detail'), { code });
     expect(AgentClient.createCompletionErrorContentPart(error).error_class).toBe(expected);
-    expect(JSON.stringify(AgentClient.createCompletionErrorContentPart(error))).not.toContain(
-      'Private provider detail',
-    );
+    expect(JSON.stringify(AgentClient.createCompletionErrorContentPart(error))).not.toContain('Private provider detail');
   });
 
   test.each([
@@ -4788,29 +4776,22 @@ describe('AgentClient - titleConvo', () => {
     it.each([
       { ranges: [] },
       { ranges: [{ start: 0, end: 20, disposition: { version: 1, audio: 'skip', valid: true } }] },
-      {
-        ranges: [
-          { start: 0, end: 20, disposition: { version: 1, audio: 'eligible', valid: true } },
-        ],
-      },
-    ])(
-      'keeps memory source stable when speech presentation ranges are removed (%j)',
-      ({ ranges }) => {
-        const source = {
-          text: 'Exact source content',
-          content: [{ type: ContentTypes.TEXT, text: 'Exact source content' }],
-          metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
-        };
-        const projected = {
-          ...source,
-          content: [{ ...source.content[0], deliveryDispositionRanges: ranges }],
-        };
-        expect(AgentClient.memoryWriterSourceDigest(projected)).toBe(
-          AgentClient.memoryWriterSourceDigest(source),
-        );
-        expect(projected.content[0].deliveryDispositionRanges).toBe(ranges);
-      },
-    );
+      { ranges: [{ start: 0, end: 20, disposition: { version: 1, audio: 'eligible', valid: true } }] },
+    ])('keeps memory source stable when speech presentation ranges are removed (%j)', ({ ranges }) => {
+      const source = {
+        text: 'Exact source content',
+        content: [{ type: ContentTypes.TEXT, text: 'Exact source content' }],
+        metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
+      };
+      const projected = {
+        ...source,
+        content: [{ ...source.content[0], deliveryDispositionRanges: ranges }],
+      };
+      expect(AgentClient.memoryWriterSourceDigest(projected)).toBe(
+        AgentClient.memoryWriterSourceDigest(source),
+      );
+      expect(projected.content[0].deliveryDispositionRanges).toBe(ranges);
+    });
 
     it.each(['text', 'tool_arguments', 'tool_output', 'tool_ranges', 'native_evidence'])(
       'keeps memory source changes protected when %s changes',
@@ -4819,14 +4800,9 @@ describe('AgentClient - titleConvo', () => {
           text: 'Exact source content',
           content: [
             { type: ContentTypes.TEXT, text: 'Exact source content' },
-            {
-              type: ContentTypes.TOOL_CALL,
-              tool_call: {
-                id: 'call-one',
-                args: '{"target":"original"}',
-                output: 'Original result',
-              },
-            },
+            { type: ContentTypes.TOOL_CALL, tool_call: {
+              id: 'call-one', args: '{"target":"original"}', output: 'Original result',
+            } },
           ],
           metadata: { viventium: { nativeToolEvidence: { revision: 1, evidence: 'exact' } } },
         };
@@ -4835,8 +4811,7 @@ describe('AgentClient - titleConvo', () => {
         if (change === 'tool_arguments') revised.content[1].tool_call.args = '{"target":"changed"}';
         if (change === 'tool_output') revised.content[1].tool_call.output = 'Different result';
         if (change === 'tool_ranges') revised.content[1].deliveryDispositionRanges = [];
-        if (change === 'native_evidence')
-          revised.metadata.viventium.nativeToolEvidence.revision = 2;
+        if (change === 'native_evidence') revised.metadata.viventium.nativeToolEvidence.revision = 2;
         expect(AgentClient.memoryWriterSourceDigest(revised)).not.toBe(
           AgentClient.memoryWriterSourceDigest(source),
         );
@@ -7452,7 +7427,8 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       mockLoadAcceptedMainContext.mockResolvedValueOnce({
         status: 'available',
         capsule: full,
-        turns: [],
+        turns: recent,
+        semanticCompaction: summary,
       });
       if (carrierKiB === 128) {
         req.config.endpoints = {
@@ -7605,7 +7581,7 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
       textSha256: crypto.createHash('sha256').update(backgroundText).digest('hex'),
       sources: [{ cortexId: 'synthetic-cortex', insightSha256: 'e'.repeat(64) }],
     };
-    const capsule = api.buildAcceptedMainContextCapsule({
+    const acceptedState = {
       turns: [
         {
           logicalTurnId: 'earlier-turn',
@@ -7621,8 +7597,9 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
           committedAt: new Date(),
         },
       ],
-    });
-    mockLoadAcceptedMainContext.mockResolvedValueOnce({ status: 'available', capsule, turns: [] });
+    };
+    const capsule = api.buildAcceptedMainContextCapsule(acceptedState);
+    mockLoadAcceptedMainContext.mockResolvedValueOnce({ status: 'available', capsule, ...acceptedState });
     let runOptions;
     mockCreateRun = jest.fn(async (options) => {
       runOptions = options;
@@ -8146,173 +8123,107 @@ describe('AgentClient Phase B persistence across main-model fallback', () => {
   );
 
   test.each([
-    [
-      'recalled_unfulfilled_work',
-      '{NTA}',
-      false,
-      false,
+    ['recalled_unfulfilled_work', '{NTA}', false, false,
       'Review whether anything useful deserves an update. This is a continuity check, not a new artifact request.',
-      'Memory recalls that the user previously requested an illustration. That old request remains unfulfilled. No artifact exists, no tool has run, and no completed work or new fact was found.',
-    ],
-    [
-      'completed_canonical_file',
-      '{NTA}',
-      false,
-      false,
+      'Memory recalls that the user previously requested an illustration. That old request remains unfulfilled. No artifact exists, no tool has run, and no completed work or new fact was found.'],
+    ['completed_canonical_file', '{NTA}', false, false,
       'Make the requested illustration and send it here when available.',
-      'Verified completed worker result: the requested illustration is finished. Canonical file receipt: filename illustration.svg; media type image/svg+xml; authorized download URL https://files.example.invalid/illustration.svg. The receipt and completed result match this original request. This is an actual completed artifact, not a memory of a request.',
-    ],
-    [
-      'useful_new_fact',
-      '{NTA}',
-      false,
-      false,
+      'Verified completed worker result: the requested illustration is finished. Canonical file receipt: filename illustration.svg; media type image/svg+xml; authorized download URL https://files.example.invalid/illustration.svg. The receipt and completed result match this original request. This is an actual completed artifact, not a memory of a request.'],
+    ['useful_new_fact', '{NTA}', false, false,
       'Tell me when the workshop room booking changes.',
-      'Verified new booking result: the workshop has moved from Room One to Room Two. The user has not yet been told this change. No further action or question is required.',
-    ],
-    [
-      'deferred_hold',
-      'Checking now.',
-      true,
-      true,
-      'Review the completed check.',
-      'A verified finding.',
-    ],
+      'Verified new booking result: the workshop has moved from Room One to Room Two. The user has not yet been told this change. No further action or question is required.'],
+    ['deferred_hold', 'Checking now.', true, true, 'Review the completed check.',
+      'A verified finding.'],
     ['blank_primary', '', false, true, 'Review the completed check.', 'A verified finding.'],
-  ])(
-    'routes real completion into actual Phase B preparation: %s',
-    async (caseId, parentText, deferredMain, expectedForced, userRequest, insight) => {
-      const fs = require('node:fs');
-      const path = require('node:path');
-      const os = require('node:os');
-      const { Run } = require('@librechat/agents');
-      const registry = require('~/server/services/viventium/promptRegistry');
-      const {
-        buildPromptBundleFixture,
-      } = require('../../../../scripts/test-support/promptBundle.cjs');
-      const actualFollowUp = jest.requireActual(
-        '~/server/services/viventium/BackgroundCortexFollowUpService',
-      );
-      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'phase-b-caller-'));
-      const previousBundle = process.env[registry.PROMPT_BUNDLE_ENV];
-      const previousKey = process.env.XAI_API_KEY;
-      const previousNta = process.env.VIVENTIUM_NO_RESPONSE_ENABLED;
-      const bundleFile = path.join(directory, 'bundle.json');
-      fs.writeFileSync(
-        bundleFile,
-        JSON.stringify(
-          buildPromptBundleFixture(
-            path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts'),
-          ),
-        ),
-      );
-      process.env[registry.PROMPT_BUNDLE_ENV] = bundleFile;
-      process.env.XAI_API_KEY = 'synthetic-key';
-      process.env.VIVENTIUM_NO_RESPONSE_ENABLED = 'false';
-      registry.resetPromptRegistryForTests();
-      const requiredPrompt = require('@librechat/api').getRequiredPromptText;
-      const previousRequiredPrompt = requiredPrompt.getMockImplementation();
-      requiredPrompt.mockImplementation((...args) =>
-        jest.requireActual('@librechat/api').getRequiredPromptText(...args),
-      );
-      req.body.viventiumSurface = 'telegram';
-      client.options.agent = { provider: 'xai', model: 'synthetic-model', model_parameters: {} };
-      client.contentParts = parentText ? [{ type: ContentTypes.TEXT, text: parentText }] : [];
-      const messages = [
-        { messageId: 'synthetic-user', isCreatedByUser: true, text: userRequest },
-        {
-          messageId: 'resp-1',
-          parentMessageId: 'synthetic-user',
-          isCreatedByUser: false,
-          text: parentText,
-        },
-      ];
-      const readMessages = jest.spyOn(db, 'getMessages').mockResolvedValue(messages);
-      const readMessage = jest
-        .spyOn(db, 'getMessage')
-        .mockImplementation(
-          async ({ messageId }) =>
-            messages.find((message) => message.messageId === messageId) || null,
-        );
-      const native = require('~/server/services/viventium/nativeResponseService');
-      const evidence = jest.spyOn(native, 'getService').mockReturnValue({
-        readToolEvidenceForPresentation: async () => [],
+  ])('routes real completion into actual Phase B preparation: %s', async (
+    caseId, parentText, deferredMain, expectedForced, userRequest, insight,
+  ) => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const os = require('node:os');
+    const { Run } = require('@librechat/agents');
+    const registry = require('~/server/services/viventium/promptRegistry');
+    const { buildPromptBundleFixture } = require('../../../../scripts/test-support/promptBundle.cjs');
+    const actualFollowUp = jest.requireActual('~/server/services/viventium/BackgroundCortexFollowUpService');
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'phase-b-caller-'));
+    const previousBundle = process.env[registry.PROMPT_BUNDLE_ENV];
+    const previousKey = process.env.XAI_API_KEY;
+    const previousNta = process.env.VIVENTIUM_NO_RESPONSE_ENABLED;
+    const bundleFile = path.join(directory, 'bundle.json');
+    fs.writeFileSync(bundleFile, JSON.stringify(buildPromptBundleFixture(
+      path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts'),
+    )));
+    process.env[registry.PROMPT_BUNDLE_ENV] = bundleFile;
+    process.env.XAI_API_KEY = 'synthetic-key';
+    process.env.VIVENTIUM_NO_RESPONSE_ENABLED = 'false';
+    registry.resetPromptRegistryForTests();
+    const requiredPrompt = require('@librechat/api').getRequiredPromptText;
+    const previousRequiredPrompt = requiredPrompt.getMockImplementation();
+    requiredPrompt.mockImplementation((...args) =>
+      jest.requireActual('@librechat/api').getRequiredPromptText(...args));
+    req.body.viventiumSurface = 'telegram';
+    client.options.agent = { provider: 'xai', model: 'synthetic-model', model_parameters: {} };
+    client.contentParts = parentText ? [{ type: ContentTypes.TEXT, text: parentText }] : [];
+    const messages = [
+      { messageId: 'synthetic-user', isCreatedByUser: true, text: userRequest },
+      { messageId: 'resp-1', parentMessageId: 'synthetic-user', isCreatedByUser: false, text: parentText },
+    ];
+    const readMessages = jest.spyOn(db, 'getMessages').mockResolvedValue(messages);
+    const readMessage = jest.spyOn(db, 'getMessage').mockImplementation(async ({ messageId }) =>
+      messages.find((message) => message.messageId === messageId) || null);
+    const native = require('~/server/services/viventium/nativeResponseService');
+    const evidence = jest.spyOn(native, 'getService').mockReturnValue({
+      readToolEvidenceForPresentation: async () => [],
+    });
+    const processStream = jest.fn().mockResolvedValue('{NTA}');
+    const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    let prepared;
+    mockCreateCortexFollowUpMessage.mockImplementation(async (input) => {
+      prepared = await actualFollowUp.prepareCortexFollowUpMessage(input);
+      return null;
+    });
+    try {
+      await client.attachBackgroundCortexCompletionPipeline({
+        cortexExecutionPromise: Promise.resolve({
+          insights: [{ cortexName: 'Synthetic verified evidence', insight }],
+          mergedPrompt: insight, cortexCount: 1,
+        }),
+        pendingCortexParts: [], req, conversationId: 'conv-1', responseMessageId: 'resp-1',
+        agent: client.options.agent, getResponseContentParts: () => client.contentParts,
+        responseController: { lastUserInputTime: 10 }, turnUserInputTime: 10,
+        followupGraceMs: 0, shouldDeferMainResponse: deferredMain,
+        getActivatedCorticesList: () => [{ agentId: 'synthetic-background' }],
       });
-      const processStream = jest.fn().mockResolvedValue('{NTA}');
-      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
-      let prepared;
-      mockCreateCortexFollowUpMessage.mockImplementation(async (input) => {
-        prepared = await actualFollowUp.prepareCortexFollowUpMessage(input);
-        return null;
-      });
-      try {
-        await client.attachBackgroundCortexCompletionPipeline({
-          cortexExecutionPromise: Promise.resolve({
-            insights: [{ cortexName: 'Synthetic verified evidence', insight }],
-            mergedPrompt: insight,
-            cortexCount: 1,
-          }),
-          pendingCortexParts: [],
-          req,
-          conversationId: 'conv-1',
-          responseMessageId: 'resp-1',
-          agent: client.options.agent,
-          getResponseContentParts: () => client.contentParts,
-          responseController: { lastUserInputTime: 10 },
-          turnUserInputTime: 10,
-          followupGraceMs: 0,
-          shouldDeferMainResponse: deferredMain,
-          getActivatedCorticesList: () => [{ agentId: 'synthetic-background' }],
-        });
-        expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
-        expect(createRun).toHaveBeenCalledTimes(1);
-        const input = mockCreateCortexFollowUpMessage.mock.calls[0][0];
-        const configuration = createRun.mock.calls[0][0].graphConfig;
-        const user = processStream.mock.calls[0][0].messages[0].content;
-        const trace = {
-          caseId,
-          parentText,
-          deferredMain,
-          callerForceVisibleFollowUp: input.forceVisibleFollowUp,
-          preparedForceVisibleFollowUp: prepared.shouldForceVisibleFollowUp,
-          system: configuration.instructions,
-          user,
-          maxTokens: configuration.llmConfig.maxTokens,
-        };
-        if (process.env.VIVENTIUM_TEST_PHASE_B_TRACE_DIR) {
-          fs.writeFileSync(
-            path.join(process.env.VIVENTIUM_TEST_PHASE_B_TRACE_DIR, `${caseId}.json`),
-            JSON.stringify(trace, null, 2),
-            { mode: 0o600 },
-          );
-        }
-        expect(input.forceVisibleFollowUp).toBe(deferredMain);
-        expect(prepared.shouldForceVisibleFollowUp).toBe(expectedForced);
-        expect(configuration.instructions.includes('completing a deferred response')).toBe(
-          expectedForced,
-        );
-        expect(user).toContain(userRequest);
-        expect(user).toContain(insight);
-      } finally {
-        readMessages.mockRestore();
-        readMessage.mockRestore();
-        evidence.mockRestore();
-        createRun.mockRestore();
-        requiredPrompt.mockImplementation(previousRequiredPrompt);
-        mockCreateCortexFollowUpMessage.mockReset().mockResolvedValue(null);
-        for (const [key, value] of [
-          [registry.PROMPT_BUNDLE_ENV, previousBundle],
-          ['XAI_API_KEY', previousKey],
-          ['VIVENTIUM_NO_RESPONSE_ENABLED', previousNta],
-        ]) {
-          if (value == null) delete process.env[key];
-          else process.env[key] = value;
-        }
-        registry.resetPromptRegistryForTests();
-        fs.rmSync(directory, { recursive: true, force: true });
+      expect(mockCreateCortexFollowUpMessage).toHaveBeenCalledTimes(1);
+      expect(createRun).toHaveBeenCalledTimes(1);
+      const input = mockCreateCortexFollowUpMessage.mock.calls[0][0];
+      const configuration = createRun.mock.calls[0][0].graphConfig;
+      const user = processStream.mock.calls[0][0].messages.at(-1).content;
+      const trace = { caseId, parentText, deferredMain,
+        callerForceVisibleFollowUp: input.forceVisibleFollowUp,
+        preparedForceVisibleFollowUp: prepared.shouldForceVisibleFollowUp,
+        system: configuration.instructions, user, maxTokens: configuration.llmConfig.maxTokens };
+      if (process.env.VIVENTIUM_TEST_PHASE_B_TRACE_DIR) {
+        fs.writeFileSync(path.join(process.env.VIVENTIUM_TEST_PHASE_B_TRACE_DIR, `${caseId}.json`),
+          JSON.stringify(trace, null, 2), { mode: 0o600 });
       }
-    },
-  );
+      expect(input.forceVisibleFollowUp).toBe(deferredMain);
+      expect(prepared.shouldForceVisibleFollowUp).toBe(expectedForced);
+      expect(configuration.instructions.includes('to complete the deferred answer')).toBe(expectedForced);
+      expect(user).toContain(userRequest);
+      expect(user).toContain(insight);
+    } finally {
+      readMessages.mockRestore(); readMessage.mockRestore(); evidence.mockRestore(); createRun.mockRestore();
+      requiredPrompt.mockImplementation(previousRequiredPrompt);
+      mockCreateCortexFollowUpMessage.mockReset().mockResolvedValue(null);
+      for (const [key, value] of [[registry.PROMPT_BUNDLE_ENV, previousBundle],
+        ['XAI_API_KEY', previousKey], ['VIVENTIUM_NO_RESPONSE_ENABLED', previousNta]]) {
+        if (value == null) delete process.env[key]; else process.env[key] = value;
+      }
+      registry.resetPromptRegistryForTests();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
 
   test('persists Phase B parts and waits for fallback text before follow-up synthesis', async () => {
     const phaseB = deferred();
@@ -11600,4 +11511,143 @@ describe('typed native MCP startup error presentation', () => {
       ).toBe('provider_auth_missing');
     },
   );
+});
+
+
+describe('ordinary Main result context preparation', () => {
+  let promptDirectory;
+  let previousPromptGetter;
+  const previousBundle = process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+  beforeAll(() => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const os = require('node:os');
+    promptDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'main-result-context-'));
+    const { buildPromptBundleFixture } = require('../../../../scripts/test-support/promptBundle.cjs');
+    const bundle = path.join(promptDirectory, 'bundle.json');
+    fs.writeFileSync(bundle, JSON.stringify(buildPromptBundleFixture(
+      path.resolve(__dirname, '../../../../viventium/source_of_truth/prompts'),
+    )));
+    process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = bundle;
+    const api = require('@librechat/api');
+    previousPromptGetter = api.getRequiredPromptText.getMockImplementation();
+    api.getRequiredPromptText.mockImplementation((...args) =>
+      jest.requireActual('@librechat/api').getRequiredPromptText(...args));
+  });
+  afterAll(() => {
+    require('@librechat/api').getRequiredPromptText.mockImplementation(previousPromptGetter);
+    if (previousBundle === undefined) delete process.env.VIVENTIUM_PROMPT_BUNDLE_PATH;
+    else process.env.VIVENTIUM_PROMPT_BUNDLE_PATH = previousBundle;
+    require('node:fs').rmSync(promptDirectory, { recursive: true, force: true });
+  });
+
+  test.each([
+    ['telegram', false, false, 'interactive'],
+    ['telegram', true, false, 'interactive'],
+    ['voice', true, false, 'interactive'],
+    ['playground', false, false, 'interactive'],
+    ['telegram', true, true, 'interactive'],
+    ['web', false, false, 'interactive'],
+    ['web', true, false, 'interactive'],
+    ['', false, false, 'interactive'],
+    ['workbench', false, false, 'interactive'],
+    ['workbench', false, false, 'scheduler'],
+    ['telegram', false, false, 'scheduler'],
+    ['unknown', false, false, 'interactive'],
+  ])(
+    'uses ordinary memory, Feelings and channel rules without starting work (%s, native=%s, isolated=%s, origin=%s)', async (surface, native, feelingsIsolated, origin) => {
+    const req = {
+      user: { id: 'owner', role: 'USER' }, body: { viventiumSurface: surface, ...(feelingsIsolated ? { viventiumQaRun: true, viventiumEvalIsolation: { feelings: true } } : {}), voiceMode: surface === 'voice',
+        ...(surface === 'voice' ? { viventiumActorTrust: 'owner_participant', viventiumCanAuthorizeSideEffects: true } : {}), text: 'Verified evidence.' },
+      config: native ? { endpoints: { agents: { providerCapabilities: { openAI: {
+        workspace_binding: true, time_context_delivery: 'per_turn_header',
+      } } } } } : {}, _viventiumContinuityActiveWorkContext: '',
+      _viventiumActiveWorkTurnContextPromise: Promise.resolve(''),
+      _viventiumFeelingSnapshotPromise: Promise.resolve({ enabled: true, agentScope: 'all_agents',
+        capsule: '<viventium_feeling_state>Current synthetic state.</viventium_feeling_state>',
+        snapshotHash: 'synthetic-state', version: 1 }),
+    };
+    if (origin === 'scheduler') {
+      setTrustedInteractionContext(req, createSchedulerInteractionContext({
+        conversation_id: 'conversation', source_event_id: 'scheduled-occurrence',
+        schedule_id: 'synthetic-schedule', schedule_run_id: 'synthetic-schedule-run',
+      }));
+    }
+    let callContext = '';
+    if (surface === 'voice') {
+      const api = jest.requireActual('@librechat/api');
+      req.viventiumCallSession = {
+        userId: 'owner', callSessionId: 'synthetic-call', agentId: 'main', mode: 'call',
+        requestedVoiceRoute: { stt: { provider: 'whisper' }, tts: { provider: 'xai' } },
+      };
+      expect(api.bindCurrentCallContext(req)).toBe(true);
+      callContext = api.getCurrentCallContext(req);
+    }
+    const client = new AgentClient({ req, agent: { id: 'main', provider: 'openAI', instructions: 'SYNTHETIC MAIN IDENTITY.',
+      model_parameters: { model: 'gpt-4' }, tools: [] }, maxContextTokens: 128000 });
+    client.responseMessageId = 'result-event'; client.conversationId = 'conversation';
+    client.useMemory = jest.fn(async () => {
+      client.memoryReadAvailability = 'available';
+      return 'SYNTHETIC SAVED PREFERENCE.';
+    });
+    client.chatCompletion = jest.fn(); client.sendMessage = jest.fn();
+    client.startDeferredMemoryWriter = jest.fn(); client.startEmotionalReaction = jest.fn();
+    const correction = 'Exact correction.\n'.repeat(100) + ' END CURRENT CORRECTION';
+    const result = await client.prepareMainResultContext([
+      { messageId: 'correction', sender: 'User', isCreatedByUser: true, text: correction },
+      { messageId: 'result-event', parentMessageId: 'correction', sender: 'User',
+        isCreatedByUser: true, text: 'Verified evidence.' },
+    ], 'result-event');
+    expect(Number.isSafeInteger(result.selectedCarrierBytes)).toBe(true);
+    expect(result.selectedCarrierBytes).toBeGreaterThan(0);
+    expect(result.messages.at(-1)._getType()).toBe('human');
+    expect(result.instructions).toContain('SYNTHETIC MAIN IDENTITY.');
+    expect(result.instructions).not.toContain('owner_layer:');
+    expect(result.instructions).not.toMatch(/^---\n(?:id|version):/m);
+    expect(result.instructions.split(
+      jest.requireActual('@librechat/api').getRequiredPromptText('main.user_fact_guard'),
+    )).toHaveLength(2);
+    expect(native ? result.memoryContext : result.instructions).toContain('SYNTHETIC SAVED PREFERENCE.');
+    if (native) expect(result.instructions).not.toContain('SYNTHETIC SAVED PREFERENCE.');
+    const prompts = require('~/server/services/viventium/surfacePrompts');
+    const rules = origin === 'scheduler' ? prompts.buildScheduledCanonicalOutputInstructions()
+      : surface === 'telegram' ? prompts.buildTelegramTextInstructions()
+        : surface === 'voice' ? prompts.buildVoiceModeInstructions('')
+          : surface === 'playground' ? prompts.buildPlaygroundTextInstructions()
+            : surface === 'unknown' ? '' : prompts.buildWebTextInstructions();
+    if (rules) {
+      expect(result.instructions.split(rules)).toHaveLength(2);
+      expect(JSON.stringify(result.messages)).not.toContain(rules);
+    } else {
+      expect(result.instructions).not.toContain(prompts.buildWebTextInstructions());
+    }
+    if (origin === 'scheduler') {
+      expect(result.instructions).not.toContain(prompts.buildWebTextInstructions());
+      expect(result.instructions).not.toContain(prompts.buildTelegramTextInstructions());
+    }
+    if (callContext) {
+      const carrier = native
+        ? Buffer.from(req.body.viventiumGlassHiveTurnContextB64, 'base64').toString('utf8')
+        : result.instructions;
+      expect(carrier.split(callContext)).toHaveLength(2);
+      if (native) expect(result.instructions).not.toContain(callContext);
+      expect(JSON.stringify(result.messages)).not.toContain(callContext);
+    }
+    expect(JSON.stringify(result.messages)).toContain('END CURRENT CORRECTION');
+    expect(req._viventiumGlassHiveWorkerMemory).toBe('SYNTHETIC SAVED PREFERENCE.');
+    if (feelingsIsolated) {
+      expect(req._viventiumGlassHiveWorkerFeelings).toBeFalsy();
+      expect(result.instructions).not.toContain('Current synthetic state.');
+      expect(req._viventiumFeelingReadFailureClass).toBe('temporary_eval_isolation');
+      expect(result.developerInstructionTail).toBe('');
+    } else {
+      expect(req._viventiumGlassHiveWorkerFeelings).toContain('Current synthetic state.');
+      expect(result.developerInstructionTail).toBe('<viventium_feeling_state>Current synthetic state.</viventium_feeling_state>');
+      expect(result.instructions.split(result.developerInstructionTail)).toHaveLength(2);
+    }
+    expect(client.chatCompletion).not.toHaveBeenCalled();
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    expect(client.startDeferredMemoryWriter).not.toHaveBeenCalled();
+    expect(client.startEmotionalReaction).not.toHaveBeenCalled();
+  });
 });

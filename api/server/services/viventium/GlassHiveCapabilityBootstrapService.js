@@ -142,6 +142,21 @@ function appendText(existing, addition) {
   return `${left}\n\n${right}`;
 }
 
+/* === VIVENTIUM START === Reuse operator-configured local media for delegated host workers. === */
+function applyLocalMediaWorkerBootstrap(bundle, executionMode) {
+  if (executionMode !== 'host') return bundle;
+  const media = normalizeBootstrapBundle(process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP);
+  const server = media.claude_project_mcp?.mcpServers?.viventium_media;
+  if (!server || typeof media.codex_config_append !== 'string') return bundle;
+  bundle.claude_project_mcp = {
+    ...(bundle.claude_project_mcp || {}),
+    viventium_media: server,
+  };
+  bundle.codex_config_append = appendText(bundle.codex_config_append, media.codex_config_append);
+  return bundle;
+}
+/* === VIVENTIUM END === */
+
 function truthyFlag(value) {
   if (value === true) {
     return true;
@@ -1430,21 +1445,9 @@ async function maybeInjectGlassHiveCapabilityBroker({
     /* === VIVENTIUM START === Project operator-configured local media only into delegated host workers. === */
     if (
       toolName === 'worker_delegate_once' &&
-      launchAuthorityKind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR &&
-      executionModeForBroker(args) === 'host'
+      launchAuthorityKind === BROKER_AUTHORITY_KINDS.CONVERSATION_ORCHESTRATOR
     ) {
-      const media = normalizeBootstrapBundle(process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP);
-      const server = media.claude_project_mcp?.mcpServers?.viventium_media;
-      if (server && typeof media.codex_config_append === 'string') {
-        bundle.claude_project_mcp = {
-          ...(bundle.claude_project_mcp || {}),
-          viventium_media: server,
-        };
-        bundle.codex_config_append = appendText(
-          bundle.codex_config_append,
-          media.codex_config_append,
-        );
-      }
+      applyLocalMediaWorkerBootstrap(bundle, executionModeForBroker(args));
     }
     /* === VIVENTIUM END === */
     const trustedLaunchArgs = attachGlassHiveTrustedLaunchMetadata(
@@ -1976,6 +1979,7 @@ async function buildConversationProviderBootstrapBundle({
 
 /* === VIVENTIUM START === Capability-bootstrap public export contract. === */
 module.exports = {
+  applyLocalMediaWorkerBootstrap,
   assertCurrentGlassHiveResultAuthor,
   DirectGlassHiveCapabilityError,
   GLASSHIVE_LAUNCH_TOOLS,

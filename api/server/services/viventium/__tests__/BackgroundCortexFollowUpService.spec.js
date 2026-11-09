@@ -2545,6 +2545,8 @@ describe('typed terminal-result follow-up mode', () => {
   test.each([
     ['durable_terminal_callback', 'The requested check is running.', false],
     ['durable_terminal_callback', '', false],
+    ['native_coordinator_result', 'The requested check is running.', false],
+    ['native_coordinator_turn_result', 'The requested check is running.', false],
     ['scheduled_evidence', 'The requested check is running.', true],
   ])(
     'selects mode from authority while preserving empty-primary recovery: %s / %s',
@@ -2580,6 +2582,106 @@ describe('typed terminal-result follow-up mode', () => {
       } finally {
         if (priorKey == null) delete process.env.XAI_API_KEY;
         else process.env.XAI_API_KEY = priorKey;
+        createRun.mockRestore();
+      }
+    },
+  );
+
+  test.each(['native_coordinator_result', 'native_coordinator_turn_result'])(
+    'keeps the original result separate from a later exact-reply request: %s',
+    async (kind) => {
+      const originalRequest = 'Create an image and send it when it is ready.';
+      const laterRequest = 'While that runs, reply exactly: CHECK_READY';
+      const messages = [
+        {
+          user: 'synthetic-owner',
+          conversationId: 'synthetic-conversation',
+          messageId: 'synthetic-user',
+          parentMessageId: null,
+          isCreatedByUser: true,
+          text: originalRequest,
+          createdAt: new Date(1000),
+        },
+        {
+          messageId: 'synthetic-parent',
+          parentMessageId: 'synthetic-user',
+          isCreatedByUser: false,
+          text: 'The accepted image is running.',
+          createdAt: new Date(2000),
+        },
+        {
+          messageId: 'synthetic-later-user',
+          parentMessageId: 'synthetic-parent',
+          isCreatedByUser: true,
+          text: laterRequest,
+          createdAt: new Date(3000),
+        },
+        {
+          messageId: 'synthetic-later-answer',
+          parentMessageId: 'synthetic-later-user',
+          isCreatedByUser: false,
+          text: 'CHECK_READY',
+          createdAt: new Date(4000),
+        },
+      ];
+      const getMessages = jest.spyOn(db, 'getMessages').mockResolvedValue(messages);
+      const native = require('../nativeResponseService');
+      const offer = jest
+        .spyOn(native, 'offerMissionEvidenceToCurrentMain')
+        .mockResolvedValue(false);
+      const service = jest.spyOn(native, 'getService').mockReturnValue({
+        readToolEvidenceForPresentation: jest.fn().mockResolvedValue([]),
+      });
+      const processStream = jest.fn().mockResolvedValue('Your image is ready.');
+      const createRun = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+      const oldKey = process.env.XAI_API_KEY;
+      try {
+        process.env.XAI_API_KEY = 'synthetic-xai-key';
+        const prepared = await prepareCortexFollowUpMessage({
+          req: { user: { id: 'synthetic-owner' }, body: { viventiumSurface: 'telegram' } },
+          conversationId: 'synthetic-conversation',
+          parentMessageId: 'synthetic-parent',
+          agent: { provider: 'xai', model: 'synthetic-model', model_parameters: {} },
+          forceVisibleFollowUp: true,
+          recentResponse: 'The accepted image is running.',
+          insightsData: {
+            cortexCount: 1,
+            insights: [
+              {
+                cortexName: 'Accepted result',
+                insight: 'The image is ready.',
+                authority: { kind, runId: 'synthetic-run' },
+              },
+            ],
+          },
+        });
+        expect(prepared.durableMissionEvidence).toBe(true);
+        expect(prepared.shouldForceVisibleFollowUp).toBe(false);
+        const content = processStream.mock.calls[0][0].messages.at(-1).content;
+        const prompt =
+          typeof content === 'string'
+            ? content
+            : content
+                .filter((part) => part.type === 'text')
+                .map((part) => part.text)
+                .join('');
+        expect(prompt).toContain(originalRequest);
+        expect(prompt).toContain(laterRequest);
+        expect(prompt).toContain('## Current Conversation State');
+        expect(prompt).not.toContain('User request for this turn:');
+        expect(prompt).toContain(
+          JSON.stringify({
+            report: 'The image is ready.',
+            authority: { kind, runId: 'synthetic-run' },
+          }),
+        );
+        expect(offer).toHaveBeenCalledTimes(1);
+      } finally {
+        if (oldKey == null) delete process.env.XAI_API_KEY;
+        else process.env.XAI_API_KEY = oldKey;
+        getMessages.mockRestore();
+        offer.mockRestore();
+        service.mockRestore();
         createRun.mockRestore();
       }
     },

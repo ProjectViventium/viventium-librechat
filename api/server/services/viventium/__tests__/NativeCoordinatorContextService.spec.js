@@ -36,6 +36,7 @@ jest.mock('../GlassHiveCapabilityAuthorizationService', () => ({
   readCapabilityAuthorizationServerScope: jest.fn(),
 }));
 jest.mock('../GlassHiveCapabilityBootstrapService', () => ({
+  applyLocalMediaWorkerBootstrap: jest.fn((bundle) => bundle),
   buildConversationProviderBootstrapBundle: jest.fn(),
   maybeInjectGlassHiveCapabilityBroker: jest.fn(),
   mergeWorkerContextBundle: jest.fn(({ existingBundle }) => ({ ...existingBundle })),
@@ -82,6 +83,7 @@ const {
   resolveConversationProviderUploadedFiles,
 } = require('../GlassHiveConversationProviderService');
 const {
+  applyLocalMediaWorkerBootstrap,
   buildConversationProviderBootstrapBundle,
 } = require('../GlassHiveCapabilityBootstrapService');
 const { bindOwnedVoiceCortexRecovery } = require('../BackgroundCortexFollowUpService');
@@ -296,6 +298,29 @@ test('uses the declared Native endpoint capability after initializeClient remaps
       targetAgent: expect.objectContaining({ provider: 'openAI', endpoint: 'glasshive-harness' }),
     }),
   );
+});
+
+test.each(['host', 'docker', undefined])(
+  'local media Worker projection uses the saved execution scope: %s',
+  async (executionMode) => {
+    const context = await service.prepareContext({
+      binding: { ...binding, configuration: { scope: { execution_mode: executionMode } } },
+      source: { requestBody: original },
+      eventId: 'native-media-worker',
+      purpose: 'worker',
+    });
+    expect(applyLocalMediaWorkerBootstrap).toHaveBeenCalledWith(context.bundle, executionMode);
+  },
+);
+
+test('local media Worker projection does not expand callback Main capabilities', async () => {
+  await service.prepareContext({
+    binding: { ...binding, configuration: { scope: { execution_mode: 'host' } } },
+    source: { requestBody: original },
+    eventId: 'native-media-callback',
+    purpose: 'callback',
+  });
+  expect(applyLocalMediaWorkerBootstrap).not.toHaveBeenCalled();
 });
 
 test('fails before preparing a broker when the declared Native endpoint has no workspace capability', async () => {
@@ -954,6 +979,76 @@ test('binds the existing Native v2 source before saving a no-file Main reply', a
     },
   });
 });
+
+test.each([null, 'owner_id', 'conversation_id', 'run_id'])(
+  'current result file access is verified before Main authors: %s',
+  async (changedField) => {
+    const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+    require('../CortexInsightDeliveryService').getCortexInsightDeliveriesForParent.mockResolvedValue(
+      [],
+    );
+    const publisher = {
+      owner_id: 'owner',
+      conversation_id: 'native-chat',
+      agent_id: 'coordinator',
+      request_id: 'request',
+      message_id: 'native-turn',
+      stream_id: 'native-turn',
+      run_id: 'run',
+    };
+    const outputFiles = {
+      version: 1,
+      ...publisher,
+      logical_turn_id: '',
+      logical_turn_revision: 1,
+      attempt_id: 'attempt',
+      invocation_id: 'invocation',
+      files: [
+        {
+          filename: 'portrait.png',
+          mime_type: 'image/png',
+          bytes: 64,
+          sha256: 'a'.repeat(64),
+          download_url: '/v1/conversation/requests/request/files/' + 'a'.repeat(64),
+        },
+        {
+          filename: 'clip.mp4',
+          mime_type: 'video/mp4',
+          bytes: 128,
+          sha256: 'b'.repeat(64),
+          download_url: '/v1/conversation/requests/request/files/' + 'b'.repeat(64),
+        },
+      ],
+      ...(changedField ? { [changedField]: 'other' } : {}),
+    };
+    const operation = service.presentResult.createFollowUp({
+      context: { req: { user: { id: 'owner' }, body: {} }, agent },
+      binding,
+      source: { turnId: 'source', requestBody: original },
+      parentMessageId: original.messageId,
+      eventId: 'native-result',
+      insights: [],
+      outputFiles,
+      publisher,
+      data: nativeResultData,
+    });
+    if (changedField) {
+      await expect(operation).rejects.toThrow('native_output_files_identity_invalid');
+      expect(createCortexFollowUpMessage).not.toHaveBeenCalled();
+      return;
+    }
+    await operation;
+    expect(createCortexFollowUpMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authorizedResultFiles: [
+          { run_id: 'run', attempt_id: 'attempt', sha256: 'a'.repeat(64) },
+          { run_id: 'run', attempt_id: 'attempt', sha256: 'b'.repeat(64) },
+        ],
+        dependencies: expect.objectContaining({ prepareAttachments: expect.any(Function) }),
+      }),
+    );
+  },
+);
 
 test.each(['retained-publication', ''])(
   'same-event author replay preserves accepted admission scope %s and fresh cognition',

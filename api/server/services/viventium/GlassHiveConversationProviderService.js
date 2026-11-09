@@ -489,12 +489,14 @@ function signBootstrapBundle(encodedBundle, issuedAt) {
 
 function restrictedConversationProviderBootstrapHeaders({
   privateStructuredResponse = false,
+  authorizedResultFiles = [],
 } = {}) {
   if (typeof privateStructuredResponse !== 'boolean') {
     throw new TypeError('privateStructuredResponse must be a boolean');
   }
   const encodedBundle = Buffer.from(
     JSON.stringify({
+      ...(authorizedResultFiles.length ? { authorized_result_files: authorizedResultFiles } : {}),
       provider_capabilities: {
         native_tools: false,
         ...(privateStructuredResponse
@@ -1938,6 +1940,21 @@ async function attachDeclaredConversationProviderCapabilityBundle({
   });
 }
 
+async function conversationProviderResultFileAccess(req, conversationId, current = []) {
+  try {
+    const retained = await require('./nativeOutputFiles').loadRetainedNativeResultFileAccess(
+      String(req?.user?.id || req?.user?._id || ''),
+      String(conversationId || ''),
+    );
+    return [...retained, ...current];
+  } catch (error) {
+    logger.warn('[VIVENTIUM][native-result-files] Current source scope unavailable', {
+      code: String(error?.code || 'retained_result_file_scope_unavailable'),
+    });
+    return current;
+  }
+}
+
 async function attachConversationProviderCapabilityBundle({
   targetAgent,
   declaredAgent = targetAgent,
@@ -1950,6 +1967,7 @@ async function attachConversationProviderCapabilityBundle({
   privateStructuredResponse = false,
   deferUntilInvocation = false,
   inheritedConversation: suppliedInheritedConversation,
+  authorizedResultFiles = [],
 } = {}) {
   if (
     typeof privateStructuredResponse !== 'boolean' ||
@@ -1982,7 +2000,16 @@ async function attachConversationProviderCapabilityBundle({
         throw new Error('Native zero-tool capability requires a tool-less participant');
       }
     }
-    const headers = restrictedConversationProviderBootstrapHeaders({ privateStructuredResponse });
+    const headers = restrictedConversationProviderBootstrapHeaders({
+      privateStructuredResponse,
+      authorizedResultFiles: privateStructuredResponse
+        ? []
+        : await conversationProviderResultFileAccess(
+            req,
+            requestBody.conversationId,
+            authorizedResultFiles,
+          ),
+    });
     clearConversationProviderCapabilityBundle(targetAgent);
     const modelParameters = { ...(targetAgent.model_parameters || {}) };
     const configuration = { ...(modelParameters.configuration || {}) };
@@ -2228,17 +2255,12 @@ async function attachConversationProviderCapabilityBundle({
     return false;
   }
   // File inventory is independent of connected-tool availability and grants no new paths.
-  try {
-    const access = await require('./nativeOutputFiles').loadRetainedNativeResultFileAccess(
-      String(req?.user?.id || req?.user?._id || ''),
-      String(trustedRequestBody.conversationId || ''),
-    );
-    if (access.length) bundle.authorized_result_files = access;
-  } catch (error) {
-    logger.warn('[VIVENTIUM][native-result-files] Current source scope unavailable', {
-      code: String(error?.code || 'retained_result_file_scope_unavailable'),
-    });
-  }
+  const access = await conversationProviderResultFileAccess(
+    req,
+    trustedRequestBody.conversationId,
+    authorizedResultFiles,
+  );
+  if (access.length) bundle.authorized_result_files = access;
   return attachConversationProviderBootstrapBundle({
     targetAgent,
     bundle,

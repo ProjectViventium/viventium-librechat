@@ -10,6 +10,7 @@ const {
   normalizeNativeCallbackOutputFiles,
   nativeCallbackOutputFilesForMessage,
   nativeFollowUpOutputFilesForMessage,
+  nativeCoordinatorOutputFilesForMessage,
   nativeOutputFileDescriptorKey,
   mergeVerifiedNativeOutputFileImports,
   retainedNativeOutputFilesForMessage,
@@ -616,10 +617,76 @@ function retainedNativeMediaStore() {
   };
 }
 async function loadRetainedNativeResultFileAccess(ownerId, conversationId) {
-  return resolveGlassHiveRetainedResultFileAccess(
+  if (!ownerId || !conversationId) return [];
+  const grants = await resolveGlassHiveRetainedResultFileAccess(
     { ownerId, conversationId },
     retainedNativeMediaStore(),
   );
+  const messages = await require('~/db/models')
+    .Message.find({
+      user: ownerId,
+      conversationId,
+      isCreatedByUser: false,
+      deletedAt: null,
+      error: { $ne: true },
+      unfinished: { $ne: true },
+      $or: [{ expiredAt: null }, { expiredAt: { $gt: new Date() } }],
+      'metadata.viventium.mainGenerationPresentation.version': 2,
+      'metadata.viventium.mainGenerationPresentation.nativeCoordinatorResult': { $exists: true },
+      'attachments.nativeOutputFile.status': 'available',
+    })
+    .select('user conversationId messageId agent_id parentMessageId metadata attachments')
+    .lean();
+  for (const message of messages) {
+    if (
+      String(message.user || '') !== ownerId ||
+      message.conversationId !== conversationId ||
+      message.metadata?.viventium?.mainGenerationPresentation?.version !== 2
+    )
+      continue;
+    try {
+      const owned = await require('./NativeCoordinatorPresentationService').resolve({
+        ownerId,
+        conversationId,
+        parentMessageId:
+          message.metadata.viventium.cortexPresentationParentMessageId || message.parentMessageId,
+        deliveryIds: message.metadata.viventium.cortexInsightDeliveryIds,
+      });
+      if (
+        !owned?.eligible ||
+        owned.message?.messageId !== message.messageId ||
+        !owned.result?.output_files
+      )
+        continue;
+      const { sourceEnvelope } = nativeCoordinatorOutputFilesForMessage(
+        owned.result.output_files,
+        {
+          ownerId,
+          conversationId: owned.binding.nativeConversationId,
+          runId: owned.data.run_id,
+          publisher: owned.result.publisher,
+        },
+        {
+          userId: ownerId,
+          conversationId,
+          responseMessageId: message.messageId,
+          agentId: owned.binding.agentId,
+        },
+      );
+      grants.push(
+        ...sourceEnvelope.files.map((file) => ({
+          run_id: sourceEnvelope.run_id,
+          attempt_id: sourceEnvelope.attempt_id,
+          sha256: file.sha256,
+        })),
+      );
+    } catch (error) {
+      logger.debug('[VIVENTIUM][native-result-files] Retained Native source unavailable', {
+        code: String(error?.code || 'native_result_file_scope_unavailable'),
+      });
+    }
+  }
+  return [...new Map(grants.map((grant) => [JSON.stringify(grant), grant])).values()];
 }
 async function prepareNativeResponseOutputFiles(req, response, identity, text) {
   const selected = await resolveGlassHiveNativeMediaMessageSelection(

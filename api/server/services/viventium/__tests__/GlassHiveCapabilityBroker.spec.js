@@ -7154,9 +7154,15 @@ describe('local media Worker bootstrap', () => {
       const { applyLocalMediaWorkerBootstrap } = require('../GlassHiveCapabilityBootstrapService');
       if (configuration === undefined) delete process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP;
       else process.env.VIVENTIUM_LOCAL_MEDIA_WORKER_BOOTSTRAP = configuration;
-      const bundle = { agents_md: 'Original context.', env: { EXISTING_VALUE: 'retained' } };
+      const bundle = {
+        agents_md: 'Original context.',
+        env: { EXISTING_VALUE: 'retained' },
+      };
       expect(applyLocalMediaWorkerBootstrap(bundle, 'host')).toBe(bundle);
-      expect(bundle).toEqual({ agents_md: 'Original context.', env: { EXISTING_VALUE: 'retained' } });
+      expect(bundle).toEqual({
+        agents_md: 'Original context.',
+        env: { EXISTING_VALUE: 'retained' },
+      });
     },
   );
 
@@ -7178,7 +7184,10 @@ describe('local media Worker bootstrap', () => {
     expect(applyLocalMediaWorkerBootstrap(bundle, 'host')).toBe(bundle);
     expect(bundle).toEqual({
       agents_md: 'Original context.',
-      claude_project_mcp: { existing: { command: 'existing-service' }, viventium_media: mediaServer },
+      claude_project_mcp: {
+        existing: { command: 'existing-service' },
+        viventium_media: mediaServer,
+      },
       codex_config_append: '[mcp_servers.existing]\ncommand = "existing-service"\n\n' + mediaConfig,
       env: { EXISTING_VALUE: 'retained' },
     });

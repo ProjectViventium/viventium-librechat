@@ -73,9 +73,15 @@ describe('promptRegistry', () => {
     expect(main).toContain('An explicit focused preference limits new automatic delegation');
     expect(
       main.split(
-        'Report acceptance only after its receipt; acknowledge the accepted work once and end the turn.',
+        'After a delegation receipt, briefly acknowledge the action that receipt proves, then end the turn.',
       ),
     ).toHaveLength(2);
+    expect(main).toContain(
+      'A request accepted for a downstream action means you asked for that action; do not describe the downstream action as completed.',
+    );
+    expect(main).toContain(
+      'A completed run can still await delivery; acceptance proves neither completion nor delivery.',
+    );
     expect(
       main.split(
         'Never say work was delegated, accepted, queued, or is running unless a successful delegation-tool receipt proves it.',

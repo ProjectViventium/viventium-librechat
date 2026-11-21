@@ -802,22 +802,53 @@ describe('native response source and final persistence', () => {
     expect(authorize).not.toHaveBeenCalled();
     expect((await methods.getNativeResponse(user, 'answer'))?.text).toBe('Stopped partial');
   });
-  it('rejects changed source before storing terminal proof', async () => {
-    await methods.admitNativeResponse(identity, transaction);
-    await mongoose.models.Message.updateOne(
-      { messageId: 'question' },
-      { $set: { text: 'Changed' } },
-    );
-    await expect(
-      methods.materializeNativeResponseTerminal(
-        identity,
-        'failed',
-        async () => true,
-        transaction,
-        (message) => message,
-      ),
-    ).rejects.toThrow('source_changed');
-  });
+  it.each([
+    undefined,
+    {
+      error_class: 'provider_rate_limited',
+      error: 'The model is busy. Please try again shortly.',
+    },
+  ])(
+    'rejects changed source before storing terminal proof with public failure %p',
+    async (nativeFailure) => {
+      await methods.admitNativeResponse(identity, transaction);
+      await mongoose.models.Message.updateOne(
+        { messageId: 'question' },
+        { $set: { text: 'Changed' } },
+      );
+      await expect(
+        methods.materializeNativeResponseTerminal(
+          identity,
+          'failed',
+          async () => true,
+          transaction,
+          (message) => message,
+          nativeFailure?.error_class,
+          undefined,
+          nativeFailure,
+        ),
+      ).rejects.toThrow('source_changed');
+    },
+  );
+  it.each(['cancelled', 'mismatched_class'])(
+    'rejects invalid public native failure presentation %s before publication',
+    async (change) => {
+      const authorize = jest.fn(async () => true);
+      await expect(
+        methods.materializeNativeResponseTerminal(
+          identity,
+          change === 'cancelled' ? 'cancelled' : 'failed',
+          authorize,
+          transaction,
+          (message) => message,
+          change === 'mismatched_class' ? 'provider_unauthorized' : 'provider_rate_limited',
+          undefined,
+          { error_class: 'provider_rate_limited', error: 'The model is busy.' },
+        ),
+      ).rejects.toThrow('native_response_failure_snapshot_invalid');
+      expect(authorize).not.toHaveBeenCalled();
+    },
+  );
   it.each(['question', 'answer'])(
     'explicit edit of %s retires terminal snapshot and replay',
     async (messageId) => {

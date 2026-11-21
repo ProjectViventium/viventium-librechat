@@ -96,6 +96,53 @@ test('Native result Telegram uses current owner mapping and source proof indepen
   expect(await f.verify(f.row)).toBe(false);
 });
 
+function nativeFilesFixture() {
+  const f = nativeFixture();
+  f.row.surface = 'telegram';
+  f.message.text = '';
+  f.row.text = '';
+  const attachment = {
+    user: f.row.userId,
+    file_id: 'native-file',
+    nativeOutputFile: { version: 1, status: 'available', messageId: f.message.messageId },
+  };
+  f.message.attachments = [attachment];
+  f.row.attachments = JSON.parse(JSON.stringify(f.message.attachments));
+  f.row.mainGenerationPresentation = buildMainGenerationPresentation(
+    { nativeCoordinatorResult: f.source },
+    f.message.messageId,
+    '',
+  )!;
+  return { ...f, attachment };
+}
+
+test('Native file-only result uses the exact saved owner attachments and current source proof', async () => {
+  const f = nativeFilesFixture();
+  expect(await f.verify(f.row)).toBe(true);
+  expect(f.native).toHaveBeenCalled();
+  f.native.mockResolvedValue(false);
+  expect(await f.verify(f.row)).toBe(false);
+});
+
+test.each(['absent', 'different', 'owner', 'message', 'status', 'version', 'file', 'voice'])(
+  'Native file-only result rejects %s attachment authority',
+  async (change) => {
+    const f = nativeFilesFixture();
+    const attachment = f.attachment;
+    if (change === 'absent') f.message.attachments = [];
+    if (change === 'different') f.row.attachments = [];
+    if (change === 'owner') attachment.user = 'foreign-owner';
+    if (change === 'message') attachment.nativeOutputFile.messageId = 'other-message';
+    if (change === 'status') attachment.nativeOutputFile.status = 'unavailable';
+    if (change === 'version') attachment.nativeOutputFile.version = 2;
+    if (change === 'file') attachment.file_id = '';
+    if (change === 'voice') f.row.surface = 'voice';
+    if (!['absent', 'different', 'voice'].includes(change))
+      f.row.attachments = JSON.parse(JSON.stringify(f.message.attachments));
+    expect(await f.verify(f.row)).toBe(false);
+  },
+);
+
 test('Native result Telegram requires no invented Call while Voice still requires the original Call', async () => {
   const f = nativeFixture();
   const source = { ...f.source, sourceCallSessionId: '' };
@@ -426,4 +473,164 @@ describe('distinct Native turn result source', () => {
     f.call.status = 'ended';
     expect(await f.verify(f.row)).toBe(false);
   });
+});
+
+function progressFixture() {
+  const f = fixture('voice');
+  const source = {
+    kind: 'native_coordinator_progress' as const,
+    bindingRef: 'native-binding',
+    nativeConversationId: 'native-conversation',
+    goalId: 'goal',
+    runId: 'run',
+    attemptId: 'attempt',
+    progressId: 'c'.repeat(64),
+    progressDigest: 'sha256:' + 'd'.repeat(64),
+    sourceTurnId: 'source-turn',
+    sourceCallSessionId: 'call-a',
+  };
+  f.row.originRef = source.bindingRef;
+  f.row.mainGenerationPresentation = buildMainGenerationPresentation(
+    { nativeCoordinatorProgress: source },
+    f.message.messageId,
+    f.message.text!,
+  );
+  const progress = jest.fn(
+    async ({ source: current }) => current.progressDigest === source.progressDigest,
+  );
+  const terminal = jest.fn(async () => true);
+  const active = jest.fn(async () => ({ callSessionId: 'call-a' }));
+  const deps = {
+    ...f.deps,
+    readNativeCoordinatorProgress: progress,
+    readNativeCoordinatorResult: terminal,
+    readActiveCall: active,
+  };
+  return {
+    ...f,
+    source,
+    progress,
+    terminal,
+    active,
+    progressDeps: deps,
+    verify: createMainGenerationPresentationVerifier(deps),
+  };
+}
+
+test('progress bridge builds strict version 3 goal or turn evidence without invented terminal or schedule authority', () => {
+  const f = progressFixture();
+  expect(f.row.mainGenerationPresentation).toEqual({
+    version: 3,
+    nativeCoordinatorProgress: f.source,
+    responseMessageId: f.message.messageId,
+    responseDigest: 'sha256:' + createHash('sha256').update(f.message.text!).digest('hex'),
+  });
+  const { goalId: _goalId, ...common } = f.source;
+  const turn = { ...common, turnId: 'turn', requestId: 'request' };
+  expect(
+    buildMainGenerationPresentation({ nativeCoordinatorProgress: turn }, 'message', 'Progress.'),
+  ).toMatchObject({ version: 3, nativeCoordinatorProgress: turn });
+  const { mainGenerationPresentation } = jest.requireActual('./mainGenerationPresentation');
+  for (const change of [
+    { resultRevision: 1 },
+    { resultDigest: 'sha256:' + 'e'.repeat(64) },
+    { outputFiles: [] },
+    { turnId: 'mixed-turn' },
+    { kind: 'native_coordinator_goal' },
+    { attemptId: '' },
+    { sourceTurnId: '' },
+    { progressId: 'bad-id' },
+    { progressDigest: 'bad-digest' },
+  ])
+    expect(
+      mainGenerationPresentation({
+        ...f.row,
+        mainGenerationPresentation: {
+          ...f.row.mainGenerationPresentation,
+          nativeCoordinatorProgress: { ...f.source, ...change },
+        },
+      }),
+    ).toBeNull();
+  for (const mixed of [
+    { nativeCoordinatorResult: {} },
+    { streamId: 'fake-job' },
+    { admissionId: 'fake-admission' },
+  ])
+    expect(
+      mainGenerationPresentation({
+        ...f.row,
+        mainGenerationPresentation: {
+          ...f.row.mainGenerationPresentation,
+          ...mixed,
+        },
+      }),
+    ).toBeNull();
+});
+
+test('progress bridge requires exact owner, saved message, source proof and selected Telegram destination', async () => {
+  const f = progressFixture();
+  f.row.surface = 'telegram';
+  const session = {};
+  expect(await f.verify(f.row, session)).toBe(true);
+  expect(f.progress).toHaveBeenCalledWith({
+    source: f.source,
+    ownerId: f.row.userId,
+    conversationId: f.row.conversationId,
+    message: f.message,
+    destination: f.row,
+    session,
+  });
+  expect(f.terminal).not.toHaveBeenCalled();
+  expect(f.deps.readAdmission).not.toHaveBeenCalled();
+  expect(f.deps.readBinding).not.toHaveBeenCalled();
+  for (const change of [
+    'owner',
+    'conversation',
+    'binding',
+    'message',
+    'text',
+    'chat',
+    'account',
+    'source',
+  ]) {
+    const current = progressFixture();
+    current.row.surface = 'telegram';
+    if (change === 'owner') current.deps.readOwner.mockResolvedValue(false);
+    if (change === 'conversation')
+      current.deps.readConversation.mockResolvedValue({ endpoint: 'other' });
+    if (change === 'binding') current.row.originRef = 'foreign-binding';
+    if (change === 'message') current.message.isCreatedByUser = true;
+    if (change === 'text') current.message.text = 'Changed canonical text.';
+    if (change === 'chat') current.row.telegramChatId = 'foreign-chat';
+    if (change === 'account') current.mapping.telegramUserId = 'foreign-account';
+    if (change === 'source' && current.row.mainGenerationPresentation?.version === 3)
+      current.row.mainGenerationPresentation.nativeCoordinatorProgress.progressDigest =
+        'sha256:' + 'e'.repeat(64);
+    expect(await current.verify(current.row)).toBe(false);
+  }
+  expect(
+    await createMainGenerationPresentationVerifier({
+      ...f.progressDeps,
+      readNativeCoordinatorProgress: undefined,
+    })(f.row),
+  ).toBe(false);
+});
+
+test('progress bridge uses current original Call authority while Telegram progress survives an ended Call', async () => {
+  for (const change of ['ended', 'moved', 'mode', 'owner', 'conversation']) {
+    const f = progressFixture();
+    expect(await f.verify(f.row)).toBe(true);
+    if (change === 'ended') f.call.status = 'ended';
+    if (change === 'moved') f.active.mockResolvedValue({ callSessionId: 'other-call' });
+    if (change === 'mode') f.call.mode = 'listen_only';
+    if (change === 'owner') f.call.userId = 'other-owner';
+    if (change === 'conversation') f.call.conversationId = 'other-conversation';
+    expect(await f.verify(f.row)).toBe(false);
+  }
+  const f = progressFixture();
+  f.call.status = 'ended';
+  f.row.surface = 'telegram';
+  expect(await f.verify(f.row)).toBe(true);
+  expect(f.active).not.toHaveBeenCalled();
+  expect(f.terminal).not.toHaveBeenCalled();
 });

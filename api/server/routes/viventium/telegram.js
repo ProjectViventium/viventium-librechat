@@ -2002,7 +2002,7 @@ router.post(
           attachmentProcessingError: true,
           code: err.code,
           retryable: false,
-          error: reason,
+          error: `This request did not start. ${reason}`,
         });
       }
       return _res.status(422).json({ attachmentProcessingError: true, error: reason });
@@ -3188,6 +3188,7 @@ router.post('/glasshive/deliveries/:deliveryId/status', telegramBridgeAuth, asyn
       delivery = await markGlassHiveCallbackDeliveryFailed({
         deliveryId,
         claimId,
+        ...(req.body?.dispatchPermit ? { dispatchPermit: req.body.dispatchPermit } : {}),
         error: req.body?.error || '',
       });
     } else if (status === 'suppressed') {

@@ -28,6 +28,8 @@ export { createStreamServices } from './createStreamServices';
 export { startSseKeepAlive } from './sseKeepAlive';
 export type { StreamServicesConfig, StreamServices } from './createStreamServices';
 export { initializeStreamServicesBeforeTraffic } from './initializeStreamServicesBeforeTraffic';
+/* VIVENTIUM: regular and recovered Native finals share committed-work proof. */
+export { resolveCurrentDurableWorkReceipt, publicDurableWorkReceipt } from './durableWorkReceipt';
 
 // Implementations (for advanced use cases)
 export { InMemoryJobStore } from './implementations/InMemoryJobStore';

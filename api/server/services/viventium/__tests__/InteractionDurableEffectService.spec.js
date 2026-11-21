@@ -21,6 +21,7 @@ describe('InteractionDurableEffectService', () => {
   let session;
   let segments;
   let service;
+  let getJob;
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
@@ -77,9 +78,10 @@ describe('InteractionDurableEffectService', () => {
         viventiumVoiceEffectAuthority: authority,
       },
     };
+    getJob = jest.fn().mockImplementation(async () => job);
     service = createInteractionDurableEffectService({
       EffectModel,
-      generationJobManager: { getJob: jest.fn().mockImplementation(async () => job) },
+      generationJobManager: { getJob },
       getCallSession: jest.fn().mockImplementation(async () => session),
       listSpeakerSegments: jest.fn().mockImplementation(async () => segments),
       now: () => new Date(observedAt),
@@ -547,6 +549,187 @@ describe('InteractionDurableEffectService', () => {
       decision: 'reconcile',
       effectKey: prepared.effectKey,
       providerIdempotencyKey: 'legacy-provider-key',
+    });
+  });
+  async function retainedReconciliationInput(effectKey) {
+    const row = await EffectModel.findOne({ effectKey }).lean();
+    return {
+      userId: row.ownerId,
+      effectKey: row.effectKey,
+      conversationId: row.conversationId,
+      logicalTurnId: row.logicalTurnId,
+      logicalTurnRevision: row.logicalTurnRevision,
+      sourceEventId: row.sourceEventId,
+      sourceRevision: row.sourceRevision,
+      responseMessageId: row.responseMessageId,
+      presentationRevision: row.presentationRevision,
+      surface: row.surface,
+      effectOrdinal: row.effectOrdinal,
+      effectOccurrenceRef: row.effectOccurrenceRef,
+      adapterId: row.adapterId,
+      routeId: row.routeId,
+      operation: row.operation,
+      effectKind: row.effectKind,
+      providerIdempotencyKey: row.providerIdempotencyKey,
+      providerIdempotencyMode: row.providerIdempotencyMode,
+      canonicalArgs: input().canonicalArgs,
+      ...(row.voiceAuthorityRef ? { voiceAuthorityRef: row.voiceAuthorityRef } : {}),
+    };
+  }
+
+  test('reconciliation-only claims the exact uncertain effect after the original job expired', async () => {
+    const prepared = await service.prepareDurableEffect(input());
+    await service.settleDurableEffectFailure({
+      ...prepared,
+      outcome: 'provider_outcome_unknown',
+      failureCode: 'provider_timeout',
+    });
+    const retained = await retainedReconciliationInput(prepared.effectKey);
+    observedAt = new Date('2026-09-01T12:00:02.000Z');
+    job = null;
+    await expect(service.prepareDurableEffect(input())).rejects.toMatchObject({
+      code: 'durable_effect_job_missing',
+    });
+    getJob.mockClear();
+    const claim = await service.prepareDurableEffectReconciliation(retained);
+    expect(claim).toMatchObject({
+      decision: 'reconcile',
+      effectKey: prepared.effectKey,
+      providerIdempotencyKey: 'legacy-provider-key',
+      claimToken: expect.any(String),
+    });
+    expect(getJob).not.toHaveBeenCalled();
+    await service.settleDurableEffectFailure({
+      ...claim,
+      outcome: 'failed_without_effect',
+      failureCode: 'local_preparation_failed_before_dispatch',
+    });
+    await expect(
+      EffectModel.findOne({ effectKey: prepared.effectKey }).lean(),
+    ).resolves.toMatchObject({
+      status: 'failed_without_effect',
+      claimRevision: 2,
+      attemptCount: 2,
+    });
+  });
+
+  test('reconciliation-only turns an expired reservation into receipt authority without Voice renewal', async () => {
+    const prepared = await service.prepareDurableEffect(input());
+    const retained = await retainedReconciliationInput(prepared.effectKey);
+    observedAt = new Date('2026-09-01T12:00:02.000Z');
+    job = null;
+    session = { ...session, status: 'ended', revision: 99 };
+    getJob.mockClear();
+    await expect(service.prepareDurableEffectReconciliation(retained)).resolves.toMatchObject({
+      decision: 'reconcile',
+      effectKey: prepared.effectKey,
+    });
+    expect(getJob).not.toHaveBeenCalled();
+  });
+
+  test('reconciliation-only replays the retained committed receipt without a job or another claim', async () => {
+    const prepared = await service.prepareDurableEffect(input());
+    const retained = await retainedReconciliationInput(prepared.effectKey);
+    await service.commitDurableEffect({
+      ...prepared,
+      providerReceiptRef: 'accepted-control-1',
+      replayResult: { accepted: true },
+    });
+    job = null;
+    getJob.mockClear();
+    await expect(service.prepareDurableEffectReconciliation(retained)).resolves.toEqual({
+      decision: 'return_committed',
+      effectKey: prepared.effectKey,
+      providerIdempotencyKey: 'legacy-provider-key',
+      providerReceiptRef: 'accepted-control-1',
+      replayResult: { accepted: true },
+    });
+    expect(getJob).not.toHaveBeenCalled();
+    await expect(
+      EffectModel.findOne({ effectKey: prepared.effectKey }).lean(),
+    ).resolves.toMatchObject({
+      status: 'committed',
+      claimRevision: 1,
+      attemptCount: 1,
+    });
+  });
+
+  test('reconciliation-only cannot take over the current lease', async () => {
+    const prepared = await service.prepareDurableEffect(input());
+    const retained = await retainedReconciliationInput(prepared.effectKey);
+    job = null;
+    await expect(service.prepareDurableEffectReconciliation(retained)).resolves.toEqual({
+      decision: 'in_progress',
+      effectKey: prepared.effectKey,
+      providerIdempotencyKey: 'legacy-provider-key',
+    });
+    await expect(
+      EffectModel.findOne({ effectKey: prepared.effectKey }).lean(),
+    ).resolves.toMatchObject({
+      status: 'reserved',
+      claimRevision: 1,
+      attemptCount: 1,
+    });
+  });
+
+  test('reconciliation-only does not create a missing durable effect', async () => {
+    const prepared = await service.prepareDurableEffect(input());
+    const retained = await retainedReconciliationInput(prepared.effectKey);
+    await EffectModel.deleteMany({});
+    job = null;
+    await expect(service.prepareDurableEffectReconciliation(retained)).rejects.toMatchObject({
+      code: 'durable_effect_conflict',
+      status: 409,
+    });
+    await expect(EffectModel.countDocuments({})).resolves.toBe(0);
+  });
+
+  test('reconciliation-only rejects changed identity and never redispatches a known no-effect failure', async () => {
+    const prepared = await service.prepareDurableEffect(input());
+    await service.settleDurableEffectFailure({
+      ...prepared,
+      outcome: 'provider_outcome_unknown',
+      failureCode: 'provider_timeout',
+    });
+    const retained = await retainedReconciliationInput(prepared.effectKey);
+    observedAt = new Date('2026-09-01T12:00:02.000Z');
+    job = null;
+    for (const change of [
+      { userId: 'owner-2' },
+      { sourceEventId: 'voice:event-2' },
+      { conversationId: 'conversation-2' },
+      { operation: 'resume' },
+      { providerIdempotencyKey: 'other-key' },
+      { voiceAuthorityRef: 'other-authority' },
+      { canonicalArgs: { workRef: 'work-1', action: 'resume' } },
+    ]) {
+      await expect(
+        service.prepareDurableEffectReconciliation({ ...retained, ...change }),
+      ).rejects.toMatchObject({ code: 'durable_effect_conflict', status: 409 });
+    }
+    await expect(
+      EffectModel.findOne({ effectKey: prepared.effectKey }).lean(),
+    ).resolves.toMatchObject({
+      status: 'provider_outcome_unknown',
+      claimRevision: 1,
+      attemptCount: 1,
+    });
+    const claim = await service.prepareDurableEffectReconciliation(retained);
+    await service.settleDurableEffectFailure({
+      ...claim,
+      outcome: 'failed_without_effect',
+      failureCode: 'local_preparation_failed_before_dispatch',
+    });
+    await expect(service.prepareDurableEffectReconciliation(retained)).rejects.toMatchObject({
+      code: 'durable_effect_reconciliation_unavailable',
+      status: 409,
+    });
+    await expect(
+      EffectModel.findOne({ effectKey: prepared.effectKey }).lean(),
+    ).resolves.toMatchObject({
+      status: 'failed_without_effect',
+      claimRevision: 2,
+      attemptCount: 2,
     });
   });
 });

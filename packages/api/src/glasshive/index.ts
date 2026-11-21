@@ -55,3 +55,5 @@ export * from './nativeCoordinatorVoicePresentation';
 export * from './brokerNativeMcpSelection';
 export * from './nativeConversationInstructions';
 export * from './nativeCoordinatorResultDelivery';
+
+export * from './nativeCoordinatorProgress';

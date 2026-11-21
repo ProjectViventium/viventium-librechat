@@ -745,8 +745,11 @@ const processAgentFileUpload = async ({ req, res, metadata, resolvedAttachmentSu
           originalname: file.originalname,
         });
       } else {
-        throw new Error(
-          `Unsupported message attachment type ${file.mimetype}. This file can't be sent provider-natively or extracted as readable text on this surface.`,
+        throw Object.assign(
+          new Error(
+            `Unsupported message attachment type ${file.mimetype}. This file can't be sent provider-natively or extracted as readable text on this surface.`,
+          ),
+          { code: 'unsupported_file_type', status: 415, retryable: false },
         );
       }
     }

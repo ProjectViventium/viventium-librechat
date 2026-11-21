@@ -10,6 +10,7 @@ import { performance } from 'node:perf_hooks';
 import type { Document } from 'mongodb';
 import { PermissionBits, ResourceType } from 'librechat-data-provider';
 import { activeWorkColdTimeoutMs } from './activeWorkService';
+import { nativeStorageReadiness } from './nativeStorageReadiness';
 import {
   CONVERSATION_ORCHESTRATION_TOOLS,
   isDeclaredConversationOrchestrator,
@@ -376,6 +377,20 @@ function storagePressureAllowsReadiness(value: ReadinessFact): boolean {
   return value.status === 'healthy' || value.status === 'warning';
 }
 
+function storageReadiness(capability: ValueRecord, pressure: ReadinessFact) {
+  if (process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE === 'host')
+    return nativeStorageReadiness(capability.nativeStorage);
+  const ready = storagePressureAllowsReadiness(pressure);
+  return {
+    ready,
+    reason: ready
+      ? ''
+      : ['critical', 'warning'].includes(pressure.status)
+        ? 'storage_pressure'
+        : pressure.reason || 'storage_capability_invalid',
+  };
+}
+
 function promptLayersAllowReadiness(value: ReadinessFact): boolean {
   return value.status === 'verified';
 }
@@ -629,6 +644,7 @@ export async function refreshOrchestrationReadiness({
       const isolationReady = validReadyCapability(capability);
       const main = mainAgentReadiness(mainAgent, mainAgentId);
       const storagePressure = normalizedStoragePressure(capability);
+      const storage = storageReadiness(capability, storagePressure);
       const promptLayers = normalizedPromptLayers(capability);
       const sourceOrder = sourceOrderReadiness();
       const workTraceContract = normalizedWorkTraceContract(capability);
@@ -640,7 +656,7 @@ export async function refreshOrchestrationReadiness({
         sourceOrder.status === 'verified' &&
         workTraceContractAllowsReadiness(workTraceContract) &&
         promptLayersAllowReadiness(promptLayers) &&
-        storagePressureAllowsReadiness(storagePressure);
+        storage.ready;
       let reason = '';
       if (!isolationReady) {
         reason = safeReadinessReason(
@@ -662,10 +678,8 @@ export async function refreshOrchestrationReadiness({
         reason = workTraceContract.reason || 'work_trace_contract_invalid';
       } else if (!promptLayersAllowReadiness(promptLayers)) {
         reason = promptLayers.reason || 'prompt_layers_unknown';
-      } else if (!storagePressureAllowsReadiness(storagePressure)) {
-        reason = ['critical', 'warning'].includes(storagePressure.status)
-          ? 'storage_pressure'
-          : storagePressure.reason || 'storage_capability_invalid';
+      } else if (!storage.ready) {
+        reason = storage.reason;
       }
       const previous = readinessRecord(normalizedOwnerId);
       const next: InternalReadiness = {
@@ -864,6 +878,7 @@ export async function refreshStartupOrchestrationReadiness(): Promise<Orchestrat
       const deploymentScoped = hasTypedDeploymentScope(capability);
       const isolationReady = validReadyCapability(capability);
       const storagePressure = normalizedStoragePressure(capability);
+      const storage = storageReadiness(capability, storagePressure);
       const promptLayers = normalizedPromptLayers(capability);
       const sourceOrder = sourceOrderReadiness();
       const workTraceContract = normalizedWorkTraceContract(capability);
@@ -873,7 +888,7 @@ export async function refreshStartupOrchestrationReadiness(): Promise<Orchestrat
         sourceOrder.status === 'verified' &&
         workTraceContractAllowsReadiness(workTraceContract) &&
         promptLayersAllowReadiness(promptLayers) &&
-        storagePressureAllowsReadiness(storagePressure);
+        storage.ready;
       let reason = '';
       if (!deploymentScoped) {
         reason = 'deployment_scope_unverified';
@@ -889,10 +904,8 @@ export async function refreshStartupOrchestrationReadiness(): Promise<Orchestrat
         reason = workTraceContract.reason || 'work_trace_contract_invalid';
       } else if (!promptLayersAllowReadiness(promptLayers)) {
         reason = promptLayers.reason || 'prompt_layers_unknown';
-      } else if (!storagePressureAllowsReadiness(storagePressure)) {
-        reason = ['critical', 'warning'].includes(storagePressure.status)
-          ? 'storage_pressure'
-          : storagePressure.reason || 'storage_capability_invalid';
+      } else if (!storage.ready) {
+        reason = storage.reason;
       }
       deploymentReadiness = {
         status: ready ? 'ready' : 'unready',

@@ -30,4 +30,47 @@ export function normalizeWorkDeliveryScope(value: unknown): WorkDeliveryScope | 
     return null;
   return { originConversationId, destinations, resultRunId, resultRevision };
 }
+/** Model observations distinguish completed execution from a delivered result message.
+ * Original content stays with the existing exact owner-scoped result reader.
+ */
+export function projectWorkResultObservation(value: unknown) {
+  const item =
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const delivery =
+    item.delivery && typeof item.delivery === 'object' && !Array.isArray(item.delivery)
+      ? (item.delivery as Record<string, unknown>)
+      : {};
+  const scope = normalizeWorkDeliveryScope(item.deliveryScope);
+  const workRef = identifier(item.workRef);
+  return {
+    execution: {
+      state: typeof item.state === 'string' ? item.state : 'unknown',
+      ...(typeof item.statusSummary === 'string' && item.statusSummary
+        ? { status: item.statusSummary }
+        : {}),
+    },
+    result: {
+      bodyIncluded: false as const,
+      ...(workRef
+        ? {
+            readerArguments: {
+              scope: 'result' as const,
+              workRef,
+              ...(scope?.resultRunId ? { runId: scope.resultRunId } : {}),
+            },
+          }
+        : {}),
+      ...(scope?.resultRevision ? { revision: scope.resultRevision } : {}),
+    },
+    presentationReceipt: {
+      scope: 'result_message' as const,
+      state: typeof delivery.state === 'string' ? delivery.state : 'unknown',
+      unreadTerminal: delivery.unreadTerminal === true,
+      ...(scope ? { deliveryScope: scope } : {}),
+    },
+    artifactDelivery: { state: 'unknown' as const },
+  };
+}
 /* === VIVENTIUM END === */

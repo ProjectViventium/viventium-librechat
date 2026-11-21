@@ -12,7 +12,7 @@ const { promptFrameLoggingEnabled, logTurnContextRetention } = require('./prompt
 const { buildActiveWorkCapsule } = require('./ViventiumDynamicTurnContext');
 const { sanitizeVoiceAssistantMessageForPersistence } = require('./voiceArtifactText');
 const { projectVisibleTextFromContentParts } = require('./ViventiumVisibleContentProjection');
-const { Constants } = require('librechat-data-provider');
+const { Constants, Tools } = require('librechat-data-provider');
 const {
   buildMainContinuityHeaders,
   encodeMainContextStateBlock,
@@ -486,13 +486,34 @@ function isContextOnlyMainCarrier(message) {
   return isContextOnlyMainHistory(message) || isInterruptedMainCarrier(message);
 }
 
+/* === VIVENTIUM START ===
+ * Feature: Failed-turn retrieval receipts in protected history.
+ * Purpose: The history projection never carries a failed turn's retrieval receipts
+ * (attachmentHistoryData), so they are not source the carrier could lose. Stored files and every
+ * other attachment keep the fail-closed fence.
+ * === VIVENTIUM END === */
+function hasUncarriedAttachment(message) {
+  const attachments = message?.attachments;
+  if (!attachments?.length) return false;
+  return !(
+    message.error === true &&
+    Array.isArray(attachments) &&
+    attachments.every(
+      (attachment) =>
+        attachment?.type === Tools.file_search &&
+        attachment.file_id == null &&
+        attachment.filepath == null,
+    )
+  );
+}
+
 function isBlankContextOnlyMainCarrier(message, text) {
   return (
     message?.isCreatedByUser === false &&
     isContextOnlyMainCarrier(message) &&
     !text.trim() &&
     !message?.files?.length &&
-    !message?.attachments?.length &&
+    !hasUncarriedAttachment(message) &&
     !message?.image_urls?.length &&
     (!Array.isArray(message?.content) ||
       message.content.every(
@@ -999,9 +1020,20 @@ function assertUnreconciledHistoryCarrier(
   return matchedCarriers;
 }
 
-function stableAuthorityDigest(agent) {
+function stableAuthorityDigest(agent, req) {
   const headers = agent?.model_parameters?.configuration?.defaultHeaders;
   const declared = String(headers?.['X-GlassHive-Stable-Authority-SHA256'] || '').trim();
+  if (/^[a-f0-9]{64}$/.test(declared)) return declared;
+  // The stored declaration's fingerprint, taken when this request loaded the agent.
+  const loaded = req?._viventiumDeclaredStableAuthorityV1;
+  if (
+    loaded &&
+    loaded.agentId &&
+    loaded.agentId === String(agent?.id || '') &&
+    /^[a-f0-9]{64}$/.test(String(loaded.stableAuthoritySha256 || ''))
+  ) {
+    return loaded.stableAuthoritySha256;
+  }
   return /^[a-f0-9]{64}$/.test(declared)
     ? declared
     : digest({
@@ -1190,7 +1222,7 @@ function captureMainContextSnapshot(
   const interaction = getTrustedInteractionContext(req) || {};
   const ownerId = String(req.user?.id || '');
   const agentId = String(agent?.id || '');
-  const stableAuthoritySha256 = stableAuthorityDigest(agent);
+  const stableAuthoritySha256 = stableAuthorityDigest(agent, req);
   assertMainHistoryAncestry(
     ownerId,
     String(interaction.conversation_id || req.body?.conversationId || ''),

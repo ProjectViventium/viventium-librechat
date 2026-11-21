@@ -70,6 +70,21 @@ test('uses the exact owner-scoped observed budget without starting or changing w
   expect(input.readResult).toHaveBeenCalledWith(identity);
 });
 
+test('retains a configured fallback receipt under its actual model identity', async () => {
+  const input = fixture();
+  input.readResult.mockResolvedValue({
+    ...result,
+    native_history_budget_v1: {
+      ...result.native_history_budget_v1!,
+      model_id: 'fallback-model',
+    },
+  });
+  expect(
+    await readNativeConversationHistoryBudget({ ...input, alternateModelIds: ['fallback-model'] }),
+  ).toEqual({ providerId: 'native', modelId: 'fallback-model', budgetBytes: 487824 });
+  expect(await readNativeConversationHistoryBudget(input)).toBeNull();
+});
+
 test.each(['userId', 'conversationId', 'agentId', 'responseMessageId'] as const)(
   'never reads a foreign %s result',
   async (field) => {

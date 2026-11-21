@@ -2,6 +2,7 @@ import type { GlassHiveCallbackBindingDependencies } from './callbackBinding';
 
 import { createGlassHiveCallbackBindingService } from './callbackBinding';
 import { normalizeInteractionSourceSegments } from './interactionSourceSegments';
+import { nativeCoordinatorSourceBody } from './nativeCoordinator';
 
 /* === VIVENTIUM START === A closed launch cannot regain provider dispatch authority. === */
 function fixture(bindingState = 'prepared', externalState = 'prepared') {
@@ -209,6 +210,50 @@ test('scheduled callback retains its topic and resolves only its stored owner ma
     { surface: 'librechat' },
   ]);
   expect(mapping).toHaveBeenCalledWith({ libreChatUserId: 'stored-owner' });
+});
+
+test('a scheduled hand-off source returns results to its schedule channels, not web only', async () => {
+  const { dependencies } = fixture();
+  const mapping = jest.fn(async () => ({
+    telegramChatId: 'owner-chat',
+    telegramUserId: 'owner-user',
+  }));
+  dependencies.resolveTelegramMappingByUserId = mapping;
+  const service = createGlassHiveCallbackBindingService(dependencies);
+  const scheduled = nativeCoordinatorSourceBody({
+    conversationId: 'conversation',
+    messageId: 'answer',
+    parentMessageId: 'input',
+    viventiumSourceEventId: 'schedule:occurrence',
+    viventiumSchedulerDeliveryChannels: ['telegram', 'librechat'],
+    viventiumTelegramMessageThreadId: '42',
+    telegram_chat_id: 'forged-chat',
+  });
+  expect(
+    await service.resolveConfiguredGlassHiveDestinations({
+      ownerId: 'stored-owner',
+      requestBody: scheduled,
+    }),
+  ).toEqual([
+    {
+      surface: 'telegram',
+      telegramChatId: 'owner-chat',
+      telegramUserId: 'owner-user',
+      telegramMessageThreadId: '42',
+    },
+    { surface: 'librechat' },
+  ]);
+  expect(mapping).toHaveBeenCalledWith({ libreChatUserId: 'stored-owner' });
+  // A web turn's source still resolves to web only.
+  expect(
+    await service.resolveConfiguredGlassHiveDestinations({
+      ownerId: 'stored-owner',
+      requestBody: nativeCoordinatorSourceBody({
+        conversationId: 'conversation',
+        messageId: 'answer',
+      }),
+    }),
+  ).toEqual([{ surface: 'librechat' }]);
 });
 
 test('admits provider dispatch only after both exact prepared rows transition', async () => {

@@ -3870,6 +3870,56 @@ describe('interrupted authored Main history carrier', () => {
       ).toThrow(expect.objectContaining({ code: 'source_context_unavailable' }));
     },
   );
+  describe('failed turn that kept only retrieval receipts', () => {
+    const receipt = (changes = {}) => ({
+      type: 'file_search',
+      messageId: 'stopped-answer',
+      conversationId: 'conversation',
+      toolCallId: 'synthetic-call-1',
+      name: 'file_search',
+      file_search: { sources: [{ content: 'synthetic source' }] },
+      ...changes,
+    });
+    const failed = (attachments) => {
+      const raw = history('');
+      Object.assign(raw[1], {
+        error: true,
+        unfinished: false,
+        content: [{ type: 'cortex_insight' }, { type: 'harness_activity' }, { type: 'error' }],
+        attachments,
+      });
+      raw[1].metadata = { viventium: {} };
+      return raw;
+    };
+    const withoutFailedRow = (messages) => messages.filter((row) => row._getType?.() !== 'ai');
+    test('is omitted and the next turn keeps its accepted source', () => {
+      const raw = failed([receipt(), receipt({ toolCallId: 'synthetic-call-2' })]);
+      const before = JSON.stringify(raw);
+      const snapshot = capture(raw, withoutFailedRow);
+      expect(snapshot.visibleMessageChain.map((row) => row.id)).toEqual([
+        'prior-user',
+        'current-user',
+      ]);
+      expect(JSON.stringify(raw)).toBe(before);
+    });
+    test.each([
+      ['a stored file', [receipt(), receipt({ file_id: 'synthetic-file' })]],
+      ['a file path', [receipt({ filepath: '/synthetic/result.txt' })]],
+      ['another attachment type', [receipt(), receipt({ type: 'web_search' })]],
+      ['an untyped entry', [receipt(), 'synthetic-file']],
+    ])('keeps the fence for %s', (_name, attachments) => {
+      expect(() => capture(failed(attachments), withoutFailedRow)).toThrow(
+        expect.objectContaining({ code: 'source_context_unavailable' }),
+      );
+    });
+    test('keeps the fence when the turn did not fail', () => {
+      const raw = failed([receipt()]);
+      Object.assign(raw[1], { error: false, unfinished: true });
+      expect(() => capture(raw, withoutFailedRow)).toThrow(
+        expect.objectContaining({ code: 'source_context_unavailable' }),
+      );
+    });
+  });
   test('blank context does not excuse an unknown typed payload', () => {
     const raw = history('');
     raw[1].content.push({ type: 'unknown_payload' });
@@ -5178,8 +5228,11 @@ describe('native whole-source courier admission', () => {
         ts.isCallExpression(node) &&
         node.expression.getText(ast) === 'nativeMainContinuityAllocation' &&
         node.arguments.at(-1)?.getText(ast) === 'selectedCarrierBytes'
-      )
-        finalCall = node;
+      ) {
+        let owner = node.parent;
+        while (owner && !ts.isMethodDeclaration(owner)) owner = owner.parent;
+        if (owner?.name?.getText(ast) === 'prepareMainRuntimeInstructions') finalCall = node;
+      }
       ts.forEachChild(node, visit);
     };
     visit(ast);
@@ -5577,7 +5630,8 @@ describe('native whole-source courier admission', () => {
 
   test.each([
     { budget: 250000, native: true, fit: true, capacity: 185108, expected: 185108 },
-    { budget: 250000, native: true, fit: true, capacity: 100000, expected: 131072 },
+    { budget: 250000, native: true, fit: true, capacity: 100000, expected: 100000 },
+    { budget: 237500, native: true, fit: true, capacity: 40245, expected: 40245 },
     { budget: 250000, native: true, fit: false, capacity: 185108, expected: 131072 },
     { budget: 250000, native: true, fit: null, capacity: 185108, expected: 131072 },
     { budget: null, native: true, fit: true, capacity: 185108, expected: 131072 },

@@ -1,5 +1,6 @@
 /* === VIVENTIUM START === Persisted Main replies use their own admission evidence. === */
 import { createHash } from 'crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type {
   ScheduleDueAdmission,
   ScheduledConversationBinding,
@@ -44,8 +45,32 @@ export interface NativeCoordinatorMainPresentation {
   responseDigest: string;
 }
 
+export type NativeCoordinatorProgressSource = {
+  kind: 'native_coordinator_progress';
+  bindingRef: string;
+  nativeConversationId: string;
+  runId: string;
+  attemptId: string;
+  progressId: string;
+  progressDigest: string;
+  sourceTurnId: string;
+  sourceCallSessionId: string;
+} & (
+  | { goalId: string; turnId?: never; requestId?: never }
+  | { goalId?: never; turnId: string; requestId: string }
+);
+
+export interface NativeCoordinatorProgressMainPresentation {
+  version: 3;
+  nativeCoordinatorProgress: NativeCoordinatorProgressSource;
+  responseMessageId: string;
+  responseDigest: string;
+}
+
 export type MainGenerationPresentation =
-  ScheduledMainGenerationPresentation | NativeCoordinatorMainPresentation;
+  | ScheduledMainGenerationPresentation
+  | NativeCoordinatorMainPresentation
+  | NativeCoordinatorProgressMainPresentation;
 type NativeResultInput =
   | (Omit<NativeCoordinatorResultSource, 'kind'> & { kind?: 'native_coordinator_goal' })
   | NativeCoordinatorTurnResultSource;
@@ -58,6 +83,7 @@ export interface MainGenerationDelivery {
   event?: string;
   surface: string;
   text?: string;
+  attachments?: unknown[];
   telegramChatId?: string;
   telegramUserId?: string;
   telegramMessageThreadId?: string;
@@ -76,8 +102,64 @@ export interface MainGenerationMessage {
 }
 
 const textDigest = (text: string) => `sha256:${createHash('sha256').update(text).digest('hex')}`;
-const boundedId = (value: string) =>
+const boundedId = (value: unknown) =>
   typeof value === 'string' && value.length > 0 && value.length <= 512;
+
+function hasMatchingNativeFiles(message: MainGenerationMessage, row: MainGenerationDelivery) {
+  return (
+    Array.isArray(message.attachments) &&
+    message.attachments.length > 0 &&
+    isDeepStrictEqual(message.attachments, row.attachments) &&
+    message.attachments.every((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+      const attachment = value as Record<string, unknown>;
+      const native = attachment.nativeOutputFile as Record<string, unknown> | undefined;
+      return (
+        attachment.user === row.userId &&
+        boundedId(attachment.file_id) &&
+        native?.version === 1 &&
+        native.status === 'available' &&
+        native.messageId === message.messageId
+      );
+    })
+  );
+}
+
+function nativeCoordinatorProgressSource(value: unknown): NativeCoordinatorProgressSource | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as NativeCoordinatorProgressSource;
+  const goal = 'goalId' in source;
+  const fields = [
+    'kind',
+    'bindingRef',
+    'nativeConversationId',
+    'runId',
+    'attemptId',
+    'progressId',
+    'progressDigest',
+    'sourceTurnId',
+    'sourceCallSessionId',
+    ...(goal ? ['goalId'] : ['turnId', 'requestId']),
+  ];
+  if (
+    Object.keys(source).some((key) => !fields.includes(key)) ||
+    source.kind !== 'native_coordinator_progress' ||
+    ![
+      source.bindingRef,
+      source.nativeConversationId,
+      ...(goal ? [source.goalId] : [source.turnId, source.requestId]),
+      source.runId,
+      source.attemptId,
+      source.sourceTurnId,
+    ].every(boundedId) ||
+    typeof source.sourceCallSessionId !== 'string' ||
+    source.sourceCallSessionId.length > 512 ||
+    !/^[a-f0-9]{64}$/.test(source.progressId) ||
+    !/^sha256:[a-f0-9]{64}$/.test(source.progressDigest)
+  )
+    return null;
+  return source;
+}
 
 export function nativeCoordinatorResultSource(
   value: unknown,
@@ -161,6 +243,13 @@ export function mainGenerationPresentation(
     value.responseMessageId !== row.callbackMessageId
   )
     return null;
+  if (value.version === 3)
+    return Object.keys(value).every((key) =>
+      ['version', 'nativeCoordinatorProgress', 'responseMessageId', 'responseDigest'].includes(key),
+    ) && nativeCoordinatorProgressSource(value.nativeCoordinatorProgress)
+      ? value
+      : null;
+  if ('nativeCoordinatorProgress' in value) return null;
   if (value.version === 2)
     return nativeCoordinatorResultSource(value.nativeCoordinatorResult) ? value : null;
   if (value.version !== 1 || !boundedId(value.streamId) || !boundedId(value.admissionId))
@@ -170,28 +259,37 @@ export function mainGenerationPresentation(
 
 export function buildMainGenerationPresentation(
   context:
-    { streamId: string; admissionId: string } | { nativeCoordinatorResult: NativeResultInput },
+    | { streamId: string; admissionId: string }
+    | { nativeCoordinatorResult: NativeResultInput }
+    | { nativeCoordinatorProgress: NativeCoordinatorProgressSource },
   messageId: string,
   text: string,
 ): MainGenerationPresentation | null {
   const value: MainGenerationPresentation =
-    'nativeCoordinatorResult' in context
+    'nativeCoordinatorProgress' in context
       ? {
-          version: 2,
-          nativeCoordinatorResult:
-            context.nativeCoordinatorResult.kind === 'native_coordinator_turn'
-              ? { ...context.nativeCoordinatorResult }
-              : { ...context.nativeCoordinatorResult, kind: 'native_coordinator_goal' },
+          version: 3,
+          nativeCoordinatorProgress: { ...context.nativeCoordinatorProgress },
           responseMessageId: messageId,
           responseDigest: textDigest(text),
         }
-      : {
-          version: 1,
-          streamId: context.streamId,
-          admissionId: context.admissionId,
-          responseMessageId: messageId,
-          responseDigest: textDigest(text),
-        };
+      : 'nativeCoordinatorResult' in context
+        ? {
+            version: 2,
+            nativeCoordinatorResult:
+              context.nativeCoordinatorResult.kind === 'native_coordinator_turn'
+                ? { ...context.nativeCoordinatorResult }
+                : { ...context.nativeCoordinatorResult, kind: 'native_coordinator_goal' },
+            responseMessageId: messageId,
+            responseDigest: textDigest(text),
+          }
+        : {
+            version: 1,
+            streamId: context.streamId,
+            admissionId: context.admissionId,
+            responseMessageId: messageId,
+            responseDigest: textDigest(text),
+          };
   return mainGenerationPresentation({
     event: 'main.followup',
     surface: '',
@@ -229,6 +327,14 @@ export interface MainGenerationPresentationDependencies {
     destination: MainGenerationDelivery;
     session?: object;
   }): Promise<boolean>;
+  readNativeCoordinatorProgress?(input: {
+    source: NativeCoordinatorProgressSource;
+    ownerId: string;
+    conversationId: string;
+    message: MainGenerationMessage;
+    destination: MainGenerationDelivery;
+    session?: object;
+  }): Promise<boolean>;
 }
 
 export function createMainGenerationPresentationVerifier(
@@ -237,12 +343,17 @@ export function createMainGenerationPresentationVerifier(
   return async (row: MainGenerationDelivery, session?: object): Promise<boolean> => {
     const presentation = mainGenerationPresentation(row);
     if (!presentation || !row.userId || !row.conversationId || !row.originRef) return false;
-    if (presentation.version === 2) {
-      const source = presentation.nativeCoordinatorResult;
+    if (presentation.version === 2 || presentation.version === 3) {
+      const source =
+        presentation.version === 3
+          ? presentation.nativeCoordinatorProgress
+          : presentation.nativeCoordinatorResult;
       if (
         row.originRef !== source.bindingRef ||
         !['voice', 'telegram', 'librechat'].includes(row.surface) ||
-        !deps.readNativeCoordinatorResult
+        (presentation.version === 3
+          ? !deps.readNativeCoordinatorProgress
+          : !deps.readNativeCoordinatorResult)
       )
         return false;
       const [message, owner, conversation] = await Promise.all([
@@ -259,7 +370,12 @@ export function createMainGenerationPresentationVerifier(
         message.conversationId !== row.conversationId ||
         message.isCreatedByUser !== false ||
         typeof message.text !== 'string' ||
-        !message.text.trim() ||
+        (!message.text.trim() &&
+          !(
+            presentation.version === 2 &&
+            row.surface !== 'voice' &&
+            hasMatchingNativeFiles(message, row)
+          )) ||
         textDigest(message.text) !== presentation.responseDigest ||
         message.text.trim() !== row.text?.trim()
       )
@@ -293,14 +409,22 @@ export function createMainGenerationPresentationVerifier(
         )
           return false;
       }
-      return deps.readNativeCoordinatorResult({
-        source,
+      const input = {
         ownerId: row.userId,
         conversationId: row.conversationId,
         message,
         destination: row,
         session,
-      });
+      };
+      return presentation.version === 3
+        ? deps.readNativeCoordinatorProgress!({
+            ...input,
+            source: presentation.nativeCoordinatorProgress,
+          })
+        : deps.readNativeCoordinatorResult!({
+            ...input,
+            source: presentation.nativeCoordinatorResult,
+          });
     }
     const admission = await deps.readAdmission(presentation.admissionId, session);
     if (

@@ -4288,6 +4288,9 @@ describe('/api/viventium/telegram', () => {
       res,
     );
     expect(res.statusCode).toBe(415);
+    expect(res.body.error).toBe(
+      'This request did not start. Telegram attachment upload failed for "attachment.bin": Unsupported group member',
+    );
     expect(mockInputService.status).toHaveBeenCalledTimes(1);
     expect(mockInputService.status).toHaveBeenCalledWith(
       'user_1',
@@ -6738,6 +6741,34 @@ describe('/api/viventium/telegram', () => {
       dispatchPermit: { permitId: 'a'.repeat(32), permitGeneration: 2 },
     });
   });
+
+  test.each([undefined, { permitId: 'a'.repeat(32), permitGeneration: 2 }])(
+    'POST failed glasshive delivery preserves its exact optional dispatch permit %p',
+    async (dispatchPermit) => {
+      const telegramRouter = require('../telegram');
+      const app = createTestApp(telegramRouter);
+      const req = createMockReq({
+        method: 'POST',
+        url: '/api/viventium/telegram/glasshive/deliveries/ghcd_failed/status',
+        headers: { 'x-viventium-telegram-secret': 'telegram_secret' },
+        body: {
+          claimId: 'claim-failed',
+          status: 'failed',
+          error: 'Synthetic send rejected',
+          ...(dispatchPermit ? { dispatchPermit } : {}),
+        },
+      });
+      const res = createMockRes();
+      await dispatch(app, req, res);
+      expect(res.statusCode).toBe(200);
+      expect(mockMarkGlassHiveDeliveryFailed).toHaveBeenCalledWith({
+        deliveryId: 'ghcd_failed',
+        claimId: 'claim-failed',
+        error: 'Synthetic send rejected',
+        ...(dispatchPermit ? { dispatchPermit } : {}),
+      });
+    },
+  );
 
   test('POST glasshive delivery status reports lost claim as conflict', async () => {
     const telegramRouter = require('../telegram');

@@ -202,6 +202,71 @@ describe('captured Main root authority', () => {
   });
 });
 
+describe('Main continuity identity without a declared header', () => {
+  const build = (req, instructions) =>
+    new AgentClient({
+      req,
+      agent: Object.freeze({
+        id: 'agent',
+        instructions,
+        tools: [],
+        model_parameters: { model: 'synthetic', configuration: { defaultHeaders: {} } },
+      }),
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+
+  test('uses the stored declaration recorded for the request, not the rendered instructions', () => {
+    const declared = Object.freeze({ agentId: 'agent', stableAuthoritySha256: 'b'.repeat(64) });
+    const first = {
+      user: { id: 'owner' },
+      body: {},
+      _viventiumDeclaredStableAuthorityV1: declared,
+    };
+    const second = {
+      user: { id: 'owner' },
+      body: {},
+      _viventiumDeclaredStableAuthorityV1: declared,
+    };
+    build(first, 'Policy rendered at 10:01');
+    build(second, 'Policy rendered at 10:02');
+    expect(first._viventiumAcceptedMainCompactionIdentityV1.stableAuthoritySha256).toBe(
+      'b'.repeat(64),
+    );
+    expect(second._viventiumAcceptedMainCompactionIdentityV1.stableAuthoritySha256).toBe(
+      'b'.repeat(64),
+    );
+  });
+
+  test('ignores a recorded declaration of another agent or a malformed one', () => {
+    const other = {
+      user: { id: 'owner' },
+      body: {},
+      _viventiumDeclaredStableAuthorityV1: {
+        agentId: 'someone-else',
+        stableAuthoritySha256: 'b'.repeat(64),
+      },
+    };
+    const malformed = {
+      user: { id: 'owner' },
+      body: {},
+      _viventiumDeclaredStableAuthorityV1: {
+        agentId: 'agent',
+        stableAuthoritySha256: 'not-a-digest',
+      },
+    };
+    build(other, 'Policy');
+    build(malformed, 'Policy');
+    const rendered = other._viventiumAcceptedMainCompactionIdentityV1.stableAuthoritySha256;
+    expect(rendered).toMatch(/^[a-f0-9]{64}$/);
+    expect(rendered).not.toBe('b'.repeat(64));
+    expect(malformed._viventiumAcceptedMainCompactionIdentityV1.stableAuthoritySha256).toBe(
+      rendered,
+    );
+  });
+});
+
 describe('Untrusted ambient voice context', () => {
   test('carries guest facts as bounded data with an explicit zero-authority contract', () => {
     const instructions = buildUntrustedAmbientVoiceContextInstructions([
@@ -11780,6 +11845,12 @@ describe('ordinary Main result context preparation', () => {
       expect(Number.isSafeInteger(result.selectedCarrierBytes)).toBe(true);
       expect(result.selectedCarrierBytes).toBeGreaterThan(0);
       expect(result.messages.at(-1)._getType()).toBe('human');
+      const eventContent = result.messages.at(-1).content;
+      expect(
+        typeof eventContent === 'string'
+          ? eventContent
+          : eventContent.map((part) => part.text || '').join(''),
+      ).toBe('Verified evidence.');
       expect(result.instructions).toContain('SYNTHETIC MAIN IDENTITY.');
       expect(result.instructions).not.toContain('owner_layer:');
       expect(result.instructions).not.toMatch(/^---\n(?:id|version):/m);

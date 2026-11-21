@@ -1877,6 +1877,17 @@ describe('GlassHiveMissionAdjudicationService', () => {
         version: 1,
         base_instruction: 'Review without submitting.',
         guidance: ['Use the revised figures.'],
+        inherited_conversation: {
+          version: 1,
+          conversation_id: 'conversation-1',
+          sources: [
+            {
+              id: 'source-1',
+              role: 'user',
+              text: 'Complete original source.\nKeep the correction.',
+            },
+          ],
+        },
       },
     };
     const input = {

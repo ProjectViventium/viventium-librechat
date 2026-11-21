@@ -6,7 +6,7 @@
 
 const MAX_CAPSULE_BYTES = 16 * 1024;
 const MAX_SAFE_TEXT_CHARS = 600;
-const { normalizeWorkDeliveryScope, projectCurrentNativeWorkInput } = require('@librechat/api');
+const { projectWorkResultObservation, projectCurrentNativeWorkInput } = require('@librechat/api');
 const {
   consumeTrustedParallelWorkClaimState,
   effectiveOrchestrationMode,
@@ -57,14 +57,20 @@ function sortedWork(work) {
 
 function safeWorkItem(item) {
   const updatedAt = safeText(item?.updatedAt, 40);
-  const deliveryScope = normalizeWorkDeliveryScope(item?.deliveryScope);
+  const observation = projectWorkResultObservation({
+    ...item,
+    state: safeText(item?.state, 40),
+    ...(item?.statusSummary ? { statusSummary: safeText(item.statusSummary, 300) } : {}),
+  });
   return {
     workRef: safeText(item?.workRef, 160),
     title: safeText(item?.title, 240),
     state: safeText(item?.state, 40),
+    ...observation,
+    ...(observation.presentationReceipt.deliveryScope
+      ? { deliveryScope: observation.presentationReceipt.deliveryScope }
+      : {}),
     ...(updatedAt && Number.isFinite(Date.parse(updatedAt)) ? { updatedAt } : {}),
-    ...(deliveryScope ? { deliveryScope } : {}),
-    ...(item?.statusSummary ? { status: safeText(item.statusSummary, 300) } : {}),
     ...(item?.attention
       ? {
           attention: {
@@ -84,14 +90,6 @@ function safeWorkItem(item) {
             total: Number(item.nativeTeam.total) || 0,
             needsAttention: Number(item.nativeTeam.needsAttention) || 0,
             degraded: item.nativeTeam.degraded === true,
-          },
-        }
-      : {}),
-    ...(item?.delivery
-      ? {
-          delivery: {
-            state: safeText(item.delivery.state, 40),
-            unreadTerminal: item.delivery.unreadTerminal === true,
           },
         }
       : {}),

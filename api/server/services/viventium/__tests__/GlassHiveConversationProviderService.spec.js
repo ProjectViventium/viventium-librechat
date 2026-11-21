@@ -4248,3 +4248,70 @@ describe('signed text file body parity', () => {
     expect(await signed([])).toEqual([]);
   });
 });
+
+describe('one continuity identity per stored agent', () => {
+  const {
+    declareStableAuthorityDigest,
+    inheritDeclaredStableAuthorityDigest,
+    readDeclaredStableAuthorityDigest,
+  } = require('../GlassHiveConversationProviderService');
+  const stored = () => ({
+    id: 'agent_synthetic',
+    provider: 'synthetic',
+    model: 'synthetic-model',
+    instructions: 'Stored policy with {{current_datetime}}',
+    tools: ['file_search'],
+    tool_resources: {},
+  });
+  const runtimeCopy = (minute) => ({
+    ...stored(),
+    instructions: `Stored policy with 10:0${minute}`,
+    tools: [],
+    tool_resources: { file_search: { file_ids: [`file-${minute}`] } },
+  });
+
+  test('a request fingerprints the stored declaration and keeps it for a later runtime copy', () => {
+    const req = {};
+    const first = declareStableAuthorityDigest(req, stored());
+    expect(first).toBe(conversationProviderStableAuthorityDigest(stored()));
+    expect(declareStableAuthorityDigest(req, runtimeCopy(1))).toBe(first);
+    expect(declareStableAuthorityDigest(req, runtimeCopy(2))).toBe(first);
+  });
+
+  test('an author request inherits the source fingerprint, so every follow-up shares one identity', () => {
+    const source = {};
+    const declared = declareStableAuthorityDigest(source, stored());
+    const digests = [1, 2].map((minute) => {
+      const author = {};
+      expect(inheritDeclaredStableAuthorityDigest(source, author, 'agent_synthetic')).toBe(true);
+      return declareStableAuthorityDigest(author, runtimeCopy(minute));
+    });
+    expect(digests).toEqual([declared, declared]);
+    // Without the inheritance each runtime copy is its own identity: the defect this prevents.
+    expect(declareStableAuthorityDigest({}, runtimeCopy(1))).not.toBe(
+      declareStableAuthorityDigest({}, runtimeCopy(2)),
+    );
+  });
+
+  test('a fingerprint of another agent or a malformed one is never inherited or reused', () => {
+    const source = {};
+    declareStableAuthorityDigest(source, stored());
+    const author = {};
+    expect(inheritDeclaredStableAuthorityDigest(source, author, 'agent_other')).toBe(false);
+    expect(readDeclaredStableAuthorityDigest(author, 'agent_other')).toBe('');
+    const other = { ...stored(), id: 'agent_other' };
+    expect(declareStableAuthorityDigest(source, other)).toBe(
+      conversationProviderStableAuthorityDigest(other),
+    );
+    const malformed = {
+      _viventiumDeclaredStableAuthorityV1: {
+        agentId: 'agent_synthetic',
+        stableAuthoritySha256: 'not-a-digest',
+      },
+    };
+    expect(declareStableAuthorityDigest(malformed, stored())).toBe(
+      conversationProviderStableAuthorityDigest(stored()),
+    );
+    expect(inheritDeclaredStableAuthorityDigest({}, {}, 'agent_synthetic')).toBe(false);
+  });
+});

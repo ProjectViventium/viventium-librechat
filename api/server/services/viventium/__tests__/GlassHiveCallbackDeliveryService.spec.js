@@ -4027,6 +4027,202 @@ describe('GlassHiveCallbackDeliveryService', () => {
     );
   });
 
+  test('an unpermitted failure cannot reset a live dispatch permit', async () => {
+    mockFindOne.mockReturnValueOnce(
+      leanResult({
+        deliveryId: 'ghcd_busy',
+        claimId: 'claim_busy',
+        dispatchPermitId: 'active-permit',
+        dispatchPermitGeneration: 1,
+      }),
+    );
+    await expect(
+      markGlassHiveCallbackDeliveryFailed({
+        deliveryId: 'ghcd_busy',
+        claimId: 'claim_busy',
+        error: 'authorization denied',
+      }),
+    ).resolves.toBeNull();
+    expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+  });
+
+  const failurePermitFixture = () => {
+    const { createHash } = require('crypto');
+    const digest = 'sha256:' + createHash('sha256').update('Saved Main reply.').digest('hex');
+    const row = {
+      deliveryId: 'ghcd-failed-main',
+      claimId: 'claim-failed-main',
+      surface: 'telegram',
+      status: 'claimed',
+      userId: 'owner',
+      conversationId: 'conversation',
+      originRef: 'origin',
+      callbackMessageId: 'saved-reply',
+      event: 'main.followup',
+      text: 'Saved Main reply.',
+      mainGenerationPresentation: {
+        version: 1,
+        streamId: 'stream',
+        admissionId: 'admission',
+        responseMessageId: 'saved-reply',
+        responseDigest: digest,
+      },
+      retryCount: 0,
+      dispatchPermitId: 'a'.repeat(32),
+      dispatchPermitGeneration: 2,
+      dispatchPermitExpiresAt: new Date(Date.now() + 60_000),
+    };
+    const permit = {
+      deliveryId: row.deliveryId,
+      claimId: row.claimId,
+      surface: row.surface,
+      permitId: row.dispatchPermitId,
+      permitGeneration: row.dispatchPermitGeneration,
+      expiresAt: row.dispatchPermitExpiresAt.toISOString(),
+      resultRevision: 1,
+      resultDigest: digest,
+    };
+    return { row, permit };
+  };
+
+  test.each(['missing', 'empty', 'id', 'generation', 'digest', 'surface', 'claim', 'expired'])(
+    'failure cannot mutate an active dispatch with a %s permit',
+    async (change) => {
+      const { row, permit } = failurePermitFixture();
+      let supplied = permit;
+      if (change === 'missing') supplied = undefined;
+      if (change === 'empty') supplied = {};
+      if (change === 'id') supplied = { ...permit, permitId: 'b'.repeat(32) };
+      if (change === 'generation') supplied = { ...permit, permitGeneration: 1 };
+      if (change === 'digest') supplied = { ...permit, resultDigest: 'sha256:' + 'b'.repeat(64) };
+      if (change === 'surface') supplied = { ...permit, surface: 'voice' };
+      if (change === 'claim') supplied = { ...permit, claimId: 'foreign-claim' };
+      if (change === 'expired') row.dispatchPermitExpiresAt = new Date(Date.now() - 1_000);
+      mockFindOne.mockReturnValueOnce(leanResult(row));
+      await expect(
+        markGlassHiveCallbackDeliveryFailed({
+          deliveryId: row.deliveryId,
+          claimId: row.claimId,
+          dispatchPermit: supplied,
+          error: 'Synthetic send rejected',
+        }),
+      ).resolves.toBeNull();
+      expect(mockFindOneAndUpdate).not.toHaveBeenCalled();
+    },
+  );
+
+  test('an exact active failure permit settles once, releases that permit and schedules retry', async () => {
+    const { row, permit } = failurePermitFixture();
+    mockFindOne.mockReturnValueOnce(leanResult(row));
+    mockFindOneAndUpdate.mockImplementationOnce((_filter, update) =>
+      leanResult({ ...row, ...update.$set }),
+    );
+    const failed = await markGlassHiveCallbackDeliveryFailed({
+      deliveryId: row.deliveryId,
+      claimId: row.claimId,
+      dispatchPermit: permit,
+      error: 'Synthetic send rejected',
+    });
+    expect(failed).toMatchObject({ status: 'failed', retryCount: 1 });
+    expect(mockFindOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryId: row.deliveryId,
+        claimId: row.claimId,
+        status: 'claimed',
+        dispatchPermitId: row.dispatchPermitId,
+        dispatchPermitGeneration: row.dispatchPermitGeneration,
+        dispatchPermitExpiresAt: { $gt: expect.any(Date) },
+      }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          status: 'failed',
+          nextAttemptAt: expect.any(Date),
+          dispatchPermitId: '',
+          dispatchPermitGeneration: 0,
+          dispatchPermitExpiresAt: null,
+        }),
+      }),
+      { new: true },
+    );
+  });
+
+  test.each(['id', 'generation', 'newly-issued'])(
+    'a %s permit replacement cannot be settled between the owner read and atomic update',
+    async (change) => {
+      const { MongoMemoryServer } = require('mongodb-memory-server');
+      const { MongoClient } = require('mongodb');
+      const server = await MongoMemoryServer.create();
+      const client = new MongoClient(server.getUri());
+      try {
+        await client.connect();
+        const rows = client.db('failed_permit_contract').collection('deliveries');
+        const { row, permit } = failurePermitFixture();
+        const replacement = {
+          dispatchPermitId: change === 'generation' ? row.dispatchPermitId : 'b'.repeat(32),
+          dispatchPermitGeneration: change === 'id' ? row.dispatchPermitGeneration : 3,
+        };
+        if (change === 'newly-issued') {
+          row.dispatchPermitId = '';
+          row.dispatchPermitGeneration = 0;
+          row.dispatchPermitExpiresAt = null;
+        }
+        await rows.insertOne({ ...row });
+        mockFindOne.mockReturnValueOnce(leanResult(row));
+        mockFindOneAndUpdate.mockImplementationOnce((filter, update) => ({
+          lean: async () => {
+            await rows.updateOne(
+              { deliveryId: row.deliveryId },
+              {
+                $set: {
+                  ...replacement,
+                  dispatchPermitExpiresAt: new Date(Date.now() + 60_000),
+                },
+              },
+            );
+            return rows.findOneAndUpdate(filter, update, { returnDocument: 'after' });
+          },
+        }));
+        await expect(
+          markGlassHiveCallbackDeliveryFailed({
+            deliveryId: row.deliveryId,
+            claimId: row.claimId,
+            dispatchPermit: change === 'newly-issued' ? undefined : permit,
+            error: 'Old send rejected',
+          }),
+        ).resolves.toBeNull();
+        expect(await rows.findOne({ deliveryId: row.deliveryId })).toMatchObject({
+          status: 'claimed',
+          ...replacement,
+          retryCount: 0,
+        });
+      } finally {
+        await client.close();
+        await server.stop();
+      }
+    },
+  );
+
+  test('a pre-send failure without an issued permit still settles with a no-permit atomic fence', async () => {
+    const { row } = failurePermitFixture();
+    row.dispatchPermitId = '';
+    row.dispatchPermitGeneration = 0;
+    row.dispatchPermitExpiresAt = null;
+    mockFindOne.mockReturnValueOnce(leanResult(row));
+    mockFindOneAndUpdate.mockImplementationOnce((_filter, update) =>
+      leanResult({ ...row, ...update.$set }),
+    );
+    await expect(
+      markGlassHiveCallbackDeliveryFailed({
+        deliveryId: row.deliveryId,
+        claimId: row.claimId,
+        error: 'Authorization rejected before send',
+      }),
+    ).resolves.toMatchObject({ status: 'failed' });
+    expect(mockFindOneAndUpdate.mock.calls[0][0]).toMatchObject({
+      dispatchPermitId: { $in: ['', null] },
+    });
+  });
+
   test('delivery status failures redact tokens before persistence', async () => {
     mockFindOne.mockReturnValueOnce(
       leanResult({

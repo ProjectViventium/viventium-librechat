@@ -193,6 +193,12 @@ describe('GlassHiveOrchestrationReadinessService', () => {
       mockRequestAccountApi.mockResolvedValue(
         readyCapability({
           nativeParallelReady: nativeReady,
+          nativeStorage: {
+            version: 1,
+            healthy: true,
+            availableBytes: 10_000_000_000,
+            requiredBytes: 4_000_000_000,
+          },
           nativeParallelReason: nativeReady ? '' : 'native_parallel_not_authorized',
           isolatedParallelReady: true,
           hostMissionsAllowed: true,
@@ -202,6 +208,44 @@ describe('GlassHiveOrchestrationReadinessService', () => {
       await refreshOrchestrationReadiness({ ownerId: 'user-1' });
       expect(orchestrationReadinessSnapshot({ ownerId: 'user-1' }).available).toBe(nativeReady);
       expect(orchestrationReadinessSnapshot({ ownerId: 'unrelated-owner' }).available).toBe(false);
+    },
+  );
+
+  test.each([
+    { label: 'missing', nativeStorage: undefined, reason: 'storage_capability_invalid' },
+    {
+      label: 'unavailable',
+      nativeStorage: {
+        version: 1,
+        healthy: false,
+        availableBytes: null,
+        requiredBytes: 4_000_000_000,
+        errorCode: 'storage_probe_unavailable',
+      },
+      reason: 'storage_pressure_unavailable',
+    },
+    {
+      label: 'below reserve',
+      nativeStorage: {
+        version: 1,
+        healthy: false,
+        availableBytes: 1_000_000_000,
+        requiredBytes: 4_000_000_000,
+      },
+      reason: 'host_capacity',
+    },
+  ])(
+    'host readiness rejects $label native bytes despite healthy Docker storage',
+    async ({ nativeStorage, reason }) => {
+      process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'host';
+      mockRequestAccountApi.mockResolvedValue(
+        readyCapability({ nativeParallelReady: true, hostMissionsAllowed: true, nativeStorage }),
+      );
+      await refreshOrchestrationReadiness({ ownerId: 'user-1' });
+      expect(orchestrationReadinessSnapshot({ ownerId: 'user-1' })).toMatchObject({
+        available: false,
+        reason,
+      });
     },
   );
 

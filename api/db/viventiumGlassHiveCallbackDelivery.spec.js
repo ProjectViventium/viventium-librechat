@@ -212,3 +212,80 @@ test('legacy goal authority JSON stays byte-exact with no new turn field default
     'requestId',
   );
 });
+
+const progressSource = {
+  kind: 'native_coordinator_progress',
+  bindingRef: 'native-binding',
+  nativeConversationId: 'native-conversation',
+  goalId: 'goal',
+  runId: 'run',
+  attemptId: 'attempt',
+  progressId: 'c'.repeat(64),
+  progressDigest: 'sha256:' + 'd'.repeat(64),
+  sourceTurnId: 'source-turn',
+  sourceCallSessionId: '',
+};
+
+test('progress bridge preserves exact immutable goal or turn source through durable carrier roundtrip', async () => {
+  const { goalId: _goalId, ...common } = progressSource;
+  for (const source of [progressSource, { ...common, turnId: 'turn', requestId: 'request' }]) {
+    const doc = delivery(available);
+    const presentation = {
+      version: 3,
+      nativeCoordinatorProgress: source,
+      responseMessageId: 'synthetic-response',
+      responseDigest: 'sha256:' + 'a'.repeat(64),
+    };
+    doc.mainGenerationPresentation = presentation;
+    await expect(doc.validate()).resolves.toBeUndefined();
+    const loaded = Model.hydrate(JSON.parse(JSON.stringify(doc.toObject())));
+    await expect(loaded.validate()).resolves.toBeUndefined();
+    expect(loaded.toObject().mainGenerationPresentation).toEqual(presentation);
+    expect(loaded.toObject().mainGenerationPresentation).not.toHaveProperty(
+      'nativeCoordinatorResult',
+    );
+    expect(loaded.toObject().mainGenerationPresentation).not.toHaveProperty('streamId');
+    loaded.mainGenerationPresentation.nativeCoordinatorProgress.progressDigest =
+      'sha256:' + 'e'.repeat(64);
+    expect(loaded.mainGenerationPresentation.nativeCoordinatorProgress.progressDigest).toBe(
+      source.progressDigest,
+    );
+  }
+});
+
+test('progress bridge carrier rejects incomplete scope, invalid digest and mixed terminal or scheduled variants', async () => {
+  const presentation = {
+    version: 3,
+    nativeCoordinatorProgress: progressSource,
+    responseMessageId: 'synthetic-response',
+    responseDigest: 'sha256:' + 'a'.repeat(64),
+  };
+  for (const change of [
+    { kind: 'native_coordinator_goal' },
+    { attemptId: undefined },
+    { sourceTurnId: undefined },
+    { progressId: 'bad-id' },
+    { progressDigest: 'bad-digest' },
+    { turnId: 'mixed-turn' },
+    { resultRevision: 1 },
+    { outputFiles: [] },
+  ]) {
+    const doc = delivery(available);
+    doc.mainGenerationPresentation = {
+      ...presentation,
+      nativeCoordinatorProgress: { ...progressSource, ...change },
+    };
+    await expect(doc.validate()).rejects.toThrow();
+  }
+  for (const change of [
+    { nativeCoordinatorResult: nativeSource },
+    { streamId: 'fake-job' },
+    { admissionId: 'fake-admission' },
+    { version: 2, nativeCoordinatorResult: nativeSource },
+    { version: 1, streamId: 'fake-job', admissionId: 'fake-admission' },
+  ]) {
+    const doc = delivery(available);
+    doc.mainGenerationPresentation = { ...presentation, ...change };
+    await expect(doc.validate()).rejects.toThrow('main_generation_source_variant_invalid');
+  }
+});

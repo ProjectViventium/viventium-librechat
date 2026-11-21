@@ -1,5 +1,8 @@
 const crypto = require('crypto');
-const { buildCortexInsightDeliveryCandidates } = require('@librechat/api');
+const {
+  buildCortexInsightDeliveryCandidates,
+  createNativeCoordinatorResultPresenter,
+} = require('@librechat/api');
 const {
   createNativeCoordinatorPresentationService,
   bindNativeResultAuthority,
@@ -183,6 +186,43 @@ test('recovers a transport-dropped saved reply through the same channel identity
   await f.service.recover(f.parent);
   expect(f.deliveries.size).toBe(1);
   expect(f.ledger.resumeTransportFailure).toHaveBeenCalledTimes(1);
+});
+
+test('file-producing presentation retains the result hash required by send authorization', async () => {
+  const f = fixture();
+  const outputFiles = { version: 1, files: [{ filename: 'Report.html', bytes: 42 }] };
+  const readPresentation = jest.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(f.message());
+  await createNativeCoordinatorResultPresenter({
+    readPresentation,
+    createFollowUp: jest.fn(async ({ insights }) => {
+      const candidate = buildCortexInsightDeliveryCandidates({
+        ...f.parent,
+        surface: 'telegram',
+        insights,
+      })[0];
+      Object.assign(f.row, candidate, { insight: insights[0].insight });
+      expect(insights[0].outputFiles).toEqual(outputFiles);
+    }),
+    enqueue: jest.fn(async () => ({ configured: 1, enqueued: 1 })),
+  })({
+    binding: f.binding,
+    source: f.source,
+    text: 'The verified useful result.',
+    eventId: 'native-result:native-chat:goal:run:1',
+    outputFiles,
+    context: { presentationSurface: 'telegram', presentationContext: {} },
+    data: {
+      conversation_id: 'native-chat',
+      request_ref: f.binding._id,
+      goal_id: 'goal',
+      run_id: 'run',
+      result_revision: 1,
+      result_digest: `sha256:${f.result.sha256}`,
+    },
+  });
+  expect(f.row.insightHash).toBe(f.result.sha256);
+  await expect(f.service.recover(f.parent)).resolves.toBe(true);
+  expect(f.deps.enqueue).toHaveBeenCalledTimes(1);
 });
 
 test.each(['owner', 'conversation', 'parent', 'publisher', 'hash', 'source', 'batch', 'revision'])(

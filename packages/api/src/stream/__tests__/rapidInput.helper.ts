@@ -253,7 +253,7 @@ export function rapidInputContract(createStore: () => IJobStore) {
     ];
     return input;
   };
-  const owned = (committed: InteractionContext) =>
+  const owned = (committed: InteractionContext): [number, string, string | null][] =>
     ownedInteractionSources(committed, telegramCapabilities).map(({ sourceOrdinal, segment }) => [
       sourceOrdinal,
       segment.source_event_id,

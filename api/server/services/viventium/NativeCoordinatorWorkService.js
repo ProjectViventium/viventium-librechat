@@ -15,5 +15,6 @@ const adapter = createNativeCoordinatorWorkRequestAdapter({
 module.exports = {
   requestNativeCoordinatorWork: adapter.request,
   resolveNativeCoordinatorWorkIdentity: adapter.resolve,
+  readNativeCoordinatorWorkActionReceipt: adapter.readActionReceipt,
 };
 /* === VIVENTIUM END === */

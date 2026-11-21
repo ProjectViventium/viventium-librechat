@@ -15,6 +15,7 @@ import {
   nativeToolEvidenceUnavailableContent,
 } from './nativeToolEvidence';
 import { convertHarnessActivityParts } from '../utils/content';
+import { voiceTaskPublicFailure } from '../voice/taskFailure';
 import type { MainContinuityFetch } from '../continuity/mainContinuity';
 import type { NativeHistoryBudgetReceipt } from './nativeHistoryBudget';
 import type {
@@ -461,6 +462,11 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
       if (!result || ['queued', 'running'].includes(result.state)) return null;
       if (['failed', 'cancelled'].includes(result.state)) {
         const status = result.state === 'cancelled' ? 'cancelled' : 'failed';
+        const publicFailure = voiceTaskPublicFailure({ code: result.failure_class });
+        const nativeFailure =
+          status === 'failed' && publicFailure.code === result.failure_class
+            ? { error_class: publicFailure.code, error: publicFailure.message }
+            : undefined;
         const saved = await deps.db.materializeNativeResponseTerminal(
           identity,
           status,
@@ -478,6 +484,8 @@ export function createNativeResponseRecoveryService(deps: NativeResponseDependen
               : projected;
           },
           result.failure_class,
+          undefined,
+          nativeFailure,
         );
         if (saved?.nativeResponse?.terminalSnapshotStoredAt) onTerminal?.(status);
         return visible(saved);

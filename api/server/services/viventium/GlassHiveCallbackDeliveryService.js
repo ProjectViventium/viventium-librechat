@@ -200,6 +200,8 @@ const exactMainGenerationPresentation = createMainGenerationPresentationVerifier
     getActiveCallSessionForConversation({ userId, conversationId }),
   readNativeCoordinatorResult: (input) =>
     require('./NativeCoordinatorVoicePresentationService')(input),
+  readNativeCoordinatorProgress: (input) =>
+    require('./NativeCoordinatorProgressService').verify(input),
 });
 const mainGenerationDispatch = createGlassHiveCallbackDeliveryDispatchService({
   DeliveryModel: ViventiumGlassHiveCallbackDelivery,
@@ -1186,6 +1188,7 @@ async function publishPendingWorkerCompletionDelivery(delivery) {
       if (!((await exactCanonicalWorkerCompletionPresentation(current)) || question || main)) {
         if (
           nativeWorkInputPresentation(current, { allowExpired: true }) ||
+          mainGenerationPresentation(current)?.version === 3 ||
           plainWorkerCompletionPresentation(current)?.bindings.some(isWorkerAttentionBinding)
         )
           await markSupersededDelivery(current.deliveryId);
@@ -1388,7 +1391,7 @@ async function recordSurfaceOutcomeBestEffort(originRef, state, candidate = null
   const projectionStartedAt = nowDate();
   try {
     const project = async (session) => {
-      if (mainGenerationPresentation(candidate)?.version === 2) {
+      if ([2, 3].includes(mainGenerationPresentation(candidate)?.version)) {
         if (
           candidate.status === 'sent' &&
           !(await require('./NativeCoordinatorPresentationService').settle(candidate))
@@ -1608,7 +1611,7 @@ async function recordSurfaceOutcomeBestEffort(originRef, state, candidate = null
       await ViventiumGlassHiveCallbackDelivery.updateMany(
         plainWorkerCompletionPresentation(candidate) ||
           candidate?.workerCompletionBindings?.length ||
-          mainGenerationPresentation(candidate)?.version === 2
+          [2, 3].includes(mainGenerationPresentation(candidate)?.version)
           ? {
               deliveryId: candidate.deliveryId,
               userId: candidate.userId,
@@ -2410,7 +2413,7 @@ function claimFilter({
       filter.$and.push({
         $or: [
           { 'workerCompletionPresentation.version': 1 },
-          { event: 'main.followup', 'mainGenerationPresentation.version': { $in: [1, 2] } },
+          { event: 'main.followup', 'mainGenerationPresentation.version': { $in: [1, 2, 3] } },
           { event: 'run.needs_input', 'nativeInputBinding.version': 1 },
         ],
       });
@@ -2995,14 +2998,19 @@ async function authorizeGlassHiveCallbackDeliveryDispatch({
   });
   const initial = await ViventiumGlassHiveCallbackDelivery.findOne(constraint).lean();
   if (!initial) return null;
-  if (mainGenerationPresentation(initial))
-    return mainGenerationDispatch.authorizeGlassHiveCallbackDeliveryDispatch({
+  const main = mainGenerationPresentation(initial);
+  if (main) {
+    const permit = await mainGenerationDispatch.authorizeGlassHiveCallbackDeliveryDispatch({
       deliveryId,
       claimId,
       userId,
       voiceCallSessionId,
       leaseMs,
     });
+    if (!permit && main.version === 3 && !(await exactMainGenerationPresentation(initial)))
+      await markSupersededDelivery(initial.deliveryId);
+    return permit;
+  }
   if (plainWorkerCompletionPresentation(initial) || hasWorkerAttention(initial)) {
     try {
       return await authorizeWorkerCompletionDispatch({ constraint, initial, now, durationMs });
@@ -4151,6 +4159,17 @@ async function markGlassHiveCallbackDeliveryFailed({
     return null;
   }
   const now = nowDate();
+  const issuedPermit = Boolean(normalizeText(existing.dispatchPermitId));
+  if (issuedPermit || dispatchPermit) {
+    const expiresAt = new Date(existing.dispatchPermitExpiresAt).getTime();
+    if (
+      !issuedPermit ||
+      !(expiresAt > now.getTime()) ||
+      !presentedDispatchPermitMatches(existing, dispatchPermit)
+    ) {
+      return null;
+    }
+  }
   const retryCount = Math.max(0, Number(existing.retryCount) || 0) + 1;
   const exhausted = retryCount >= Math.max(1, Number(maxRetries) || DEFAULT_MAX_RETRIES);
   if (plainWorkerCompletionPresentation(existing) && workerCompletionEffectLeases(existing)) {
@@ -4174,7 +4193,18 @@ async function markGlassHiveCallbackDeliveryFailed({
     doc = await transactionallyFencePersistedDelivery(
       () =>
         ViventiumGlassHiveCallbackDelivery.findOneAndUpdate(
-          { deliveryId: existing.deliveryId, claimId: existing.claimId, status: 'claimed' },
+          {
+            deliveryId: existing.deliveryId,
+            claimId: existing.claimId,
+            status: 'claimed',
+            ...(issuedPermit
+              ? {
+                  dispatchPermitId: existing.dispatchPermitId,
+                  dispatchPermitGeneration: existing.dispatchPermitGeneration,
+                  dispatchPermitExpiresAt: { $gt: now },
+                }
+              : { dispatchPermitId: { $in: ['', null] } }),
+          },
           {
             $set: {
               status: 'failed',
@@ -4182,6 +4212,9 @@ async function markGlassHiveCallbackDeliveryFailed({
               projectionPendingAt: now,
               projectionNextAttemptAt: now,
               leaseExpiresAt: null,
+              dispatchPermitId: '',
+              dispatchPermitGeneration: 0,
+              dispatchPermitExpiresAt: null,
               retryCount,
               nextAttemptAt: exhausted ? null : new Date(now.getTime() + retryDelayMs(retryCount)),
               lastError: redactDeliveryError(error || 'delivery failed').slice(
@@ -4359,7 +4392,7 @@ async function reconcileGlassHiveSurfaceDeliveryProjections({ limit = 25 } = {})
         surface: 'voice',
         status: 'pending',
         event: 'main.followup',
-        'mainGenerationPresentation.version': { $in: [1, 2] },
+        'mainGenerationPresentation.version': { $in: [1, 2, 3] },
         $or: [{ projectionNextAttemptAt: null }, { projectionNextAttemptAt: { $lte: now } }],
       },
       {

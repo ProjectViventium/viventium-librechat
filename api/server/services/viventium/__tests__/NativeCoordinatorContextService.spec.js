@@ -1,3 +1,4 @@
+jest.mock('../NativeCoordinatorProgressService', () => ({ publish: jest.fn() }));
 const mockContextFactory = jest.fn((dependencies) => dependencies);
 const mockPresenterFactory = jest.fn((dependencies) => dependencies);
 jest.mock('@librechat/api', () => ({
@@ -56,6 +57,8 @@ jest.mock('../BackgroundCortexFollowUpService', () => ({
   publishCortexVoiceFollowUp: jest.fn(),
 }));
 jest.mock('../CortexInsightDeliveryService', () => ({
+  requireExactCortexInsightDeliverySettlement: (...args) =>
+    jest.requireActual('@librechat/api').requireExactCortexInsightDeliverySettlement(...args),
   getCortexInsightDeliveriesForParent: jest.fn(),
   claimPendingCortexInsightDeliveriesForParent: jest.fn(),
 }));
@@ -125,6 +128,37 @@ const nativeResultData = {
 };
 const agent = { id: 'main', provider: 'native', tools: [], model_parameters: {} };
 const inherited = { version: 1, conversation_id: 'core-chat', sources: [] };
+
+test('concurrent goal aliases atomically retain one original publication identity', async () => {
+  const { MongoMemoryServer } = require('mongodb-memory-server');
+  const { MongoClient } = require('mongodb');
+  const server = await MongoMemoryServer.create();
+  const client = new MongoClient(server.getUri());
+  try {
+    await client.connect();
+    const collection = client.db('publication_contract').collection('bindings');
+    require('mongoose').connection.collection.mockReturnValue(collection);
+    db.getMessages.mockResolvedValue([]);
+    const source = { turnId: 'source-turn', requestBody: original };
+    const data = { ...nativeResultData, conversation_id: 'native-chat', request_ref: 'binding' };
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        service.resultPublication({
+          binding,
+          source,
+          data: { ...data, goal_id: 'alias-' + index },
+        }),
+      ),
+    );
+    expect(new Set(results.map((result) => result.goal_id)).size).toBe(1);
+    expect(await collection.countDocuments()).toBe(1);
+    await service.resultPublication({ binding, source: { ...source, turnId: 'new-source' }, data });
+    expect(await collection.countDocuments()).toBe(2);
+  } finally {
+    await client.close();
+    await server.stop();
+  }
+});
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -1212,4 +1246,226 @@ test('missing original mission scope cannot mint a fresh broader Core grant or N
     }),
   ).rejects.toMatchObject({ code: 'coordinator_worker_capabilities_unavailable' });
   expect(buildConversationProviderBootstrapBundle).not.toHaveBeenCalled();
+});
+
+test('a deferred progress author rejoins its exact publication after the saved ledger receipt', async () => {
+  const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+  const { publish } = require('../NativeCoordinatorProgressService');
+  require('../CortexInsightDeliveryService').getCortexInsightDeliveriesForParent.mockResolvedValue(
+    [],
+  );
+  let finishDeferredAuthor;
+  createCortexFollowUpMessage.mockImplementationOnce(async ({ dependencies }) => {
+    finishDeferredAuthor = async () => {
+      const { persistCortexFollowUpMessageWithLedger } = jest.requireActual(
+        '../BackgroundCortexFollowUpService',
+      );
+      const order = [];
+      publish.mockImplementationOnce(async () => {
+        expect(order).toEqual(['saved', 'ledger-persisted']);
+      });
+      await persistCortexFollowUpMessageWithLedger({
+        req: { user: { id: 'owner' } },
+        parentMessageId: original.messageId,
+        followUpMessage: { messageId: 'saved-progress', metadata: {} },
+        decisionRecord: {},
+        deliveryBatch: {
+          claimed: [{ deliveryId: 'delivery', claimToken: 'claim', claimGeneration: 1 }],
+        },
+        dependencies: {
+          ...dependencies,
+          saveMessage: async (_req, message) => {
+            order.push('saved');
+            return message;
+          },
+          markPersisted: async () => {
+            order.push('ledger-persisted');
+            return [{ deliveryId: 'delivery', claimGeneration: 1 }];
+          },
+          persistDecision: async () => {},
+        },
+      });
+    };
+    return { currentMainPending: true };
+  });
+  const source = { turnId: 'original-native-turn', requestBody: original };
+  const data = { goal_id: 'goal', run_id: 'run', progress_id: 'a'.repeat(64) };
+  await service.presentResult.createFollowUp({
+    context: { req: { user: { id: 'owner' } }, agent: {} },
+    binding,
+    source,
+    parentMessageId: original.messageId,
+    eventId: 'native-progress',
+    insights: [],
+    data,
+  });
+  expect(publish).not.toHaveBeenCalled();
+  await finishDeferredAuthor();
+  expect(publish).toHaveBeenCalledTimes(1);
+  expect(publish).toHaveBeenCalledWith({ binding, data, eventId: 'native-progress' });
+  // A duplicate lifecycle notice uses the same idempotent publication, never a new author/key.
+  await finishDeferredAuthor();
+  expect(publish.mock.calls[1][0]).toEqual(publish.mock.calls[0][0]);
+});
+
+describe('result files owed on a silent Main decision', () => {
+  const publisher = {
+    owner_id: 'owner',
+    conversation_id: 'native-chat',
+    agent_id: 'coordinator',
+    request_id: 'request',
+    message_id: 'native-message',
+    stream_id: 'native-stream',
+    run_id: 'run',
+  };
+  const files = (list) => ({
+    version: 1,
+    ...publisher,
+    logical_turn_id: 'turn',
+    logical_turn_revision: 1,
+    attempt_id: 'attempt',
+    invocation_id: 'invocation',
+    files: list,
+  });
+  const image = {
+    filename: 'synthetic.png',
+    mime_type: 'image/png',
+    bytes: 3,
+    sha256: 'c'.repeat(64),
+    download_url: 'artifact_sha256:' + 'c'.repeat(64),
+  };
+  const source = { turnId: 'original-native-turn', requestBody: original };
+  const result = {
+    goal_id: 'goal',
+    run_id: 'run',
+    result_revision: 1,
+    result_digest: `sha256:${'a'.repeat(64)}`,
+  };
+  const follow = async ({ data = result, outputFiles, presented = [] }) => {
+    const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+    require('../CortexInsightDeliveryService').getCortexInsightDeliveriesForParent.mockResolvedValue(
+      [],
+    );
+    createCortexFollowUpMessage.mockClear();
+    db.getMessages.mockReset();
+    db.getMessages.mockResolvedValue(presented);
+    await service.presentResult.createFollowUp({
+      context: { req: { user: { id: 'owner' } }, agent: {} },
+      binding,
+      source,
+      parentMessageId: original.messageId,
+      eventId: 'native-result',
+      insights: [],
+      ...(outputFiles ? { outputFiles, publisher } : {}),
+      data,
+    });
+    return createCortexFollowUpMessage.mock.calls.at(-1)[0];
+  };
+
+  test('a finished result with files declares them owed, whatever Main then says', async () => {
+    const input = await follow({ outputFiles: files([image]) });
+    expect(input.attachmentsRequired).toBe(true);
+    expect(typeof input.dependencies.prepareAttachments).toBe('function');
+    expect(db.getMessages).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user: 'owner',
+        conversationId: 'core-chat',
+        isCreatedByUser: false,
+        'metadata.viventium.mainGenerationPresentation.nativeCoordinatorResult.runId': 'run',
+        'attachments.0': { $exists: true },
+      }),
+      'messageId',
+    );
+  });
+
+  test('files already presented for the same run are not owed a second time', async () => {
+    const input = await follow({
+      outputFiles: files([image]),
+      presented: [{ messageId: 'saved-with-files' }],
+    });
+    expect(input.attachmentsRequired).toBeUndefined();
+  });
+
+  test('a result without files and a progress note stay free to be silent', async () => {
+    expect((await follow({})).attachmentsRequired).toBeUndefined();
+    expect((await follow({ outputFiles: files([]) })).attachmentsRequired).toBeUndefined();
+    expect(
+      (
+        await follow({
+          outputFiles: files([image]),
+          data: { goal_id: 'goal', run_id: 'run', progress_id: 'a'.repeat(64) },
+        })
+      ).attachmentsRequired,
+    ).toBeUndefined();
+  });
+
+  test('a result without new files still uses the existing retained-file attachment owner', async () => {
+    const input = await follow({});
+    expect(typeof input.dependencies.prepareAttachments).toBe('function');
+    const files = require('../nativeOutputFiles');
+    const retained = [{ file_id: 'retained-file' }];
+    const prepare = jest.spyOn(files, 'prepareMissionOutputFiles').mockResolvedValueOnce(retained);
+    const importNew = jest.spyOn(files, 'prepareNativeOutputFiles');
+    const message = {
+      messageId: 'new-result',
+      conversationId: 'core-chat',
+      agent_id: 'main',
+      text: '[Saved](https://example.invalid/retained)',
+    };
+    try {
+      await expect(input.dependencies.prepareAttachments(message)).resolves.toEqual(retained);
+      expect(prepare).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message,
+          rows: [],
+          initialImports: [],
+          sourceMessageId: original.messageId,
+        }),
+      );
+      expect(importNew).not.toHaveBeenCalled();
+    } finally {
+      prepare.mockRestore();
+      importNew.mockRestore();
+    }
+  });
+
+  test('a silent Main response still delivers the Native author selected retained files', async () => {
+    const files = require('../nativeOutputFiles');
+    const hasFiles = jest.spyOn(files, 'hasRetainedNativeOutputFiles').mockResolvedValueOnce(true);
+    const prepare = jest
+      .spyOn(files, 'prepareMissionOutputFiles')
+      .mockResolvedValueOnce([{ file_id: 'saved' }]);
+    const text = '[Saved](https://example.invalid/retained)';
+    const { createCortexFollowUpMessage } = require('../BackgroundCortexFollowUpService');
+    require('../CortexInsightDeliveryService').getCortexInsightDeliveriesForParent.mockResolvedValue(
+      [],
+    );
+    try {
+      await service.presentResult.createFollowUp({
+        context: { req: { user: { id: 'owner' } }, agent: {} },
+        binding,
+        source,
+        parentMessageId: original.messageId,
+        eventId: 'native-result',
+        insights: [{ insight: text }],
+        data: result,
+      });
+      const input = createCortexFollowUpMessage.mock.calls.at(-1)[0];
+      expect(input.attachmentsRequired).toBe(true);
+      await input.dependencies.prepareAttachments({
+        messageId: 'new-result',
+        conversationId: 'core-chat',
+        agent_id: 'main',
+        text: '',
+      });
+      expect(prepare).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.objectContaining({ text: '\n' + text }),
+        }),
+      );
+    } finally {
+      hasFiles.mockRestore();
+      prepare.mockRestore();
+    }
+  });
 });

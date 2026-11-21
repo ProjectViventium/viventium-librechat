@@ -1233,7 +1233,12 @@ describe('processAgentFileUpload', () => {
             message_file: true,
           }),
         }),
-      ).rejects.toThrow(/Unsupported message attachment type application\/zip/);
+      ).rejects.toMatchObject({
+        message: expect.stringMatching(/Unsupported message attachment type application\/zip/),
+        code: 'unsupported_file_type',
+        status: 415,
+        retryable: false,
+      });
 
       expect(getStrategyFunctions).not.toHaveBeenCalledWith('local');
     });
@@ -1268,12 +1273,78 @@ describe('canonical file admission', () => {
       expect(() => filterFile({ req: request(mime) })).not.toThrow();
     },
   );
-  test('keeps unsupported admission typed and permanent', () => {
-    expect.assertions(1);
+  test('explicit intake policy rejects opaque files while valid siblings retain admission', () => {
+    const restricted = (mimetype) => {
+      const req = request(mimetype);
+      req.config.fileConfig = {
+        ...source.fileConfig,
+        endpoints: {
+          ...source.fileConfig.endpoints,
+          agents: { ...source.fileConfig.endpoints.agents, supportedMimeTypes: ['^text/plain$'] },
+        },
+      };
+      return req;
+    };
+    expect.assertions(2);
     try {
-      filterFile({ req: request('application/x-unrecognized') });
+      filterFile({ req: restricted('application/octet-stream') });
     } catch (error) {
       expect(error).toMatchObject({ code: 'unsupported_file_type', status: 415, retryable: false });
     }
+    expect(() => filterFile({ req: restricted('text/plain') })).not.toThrow();
+  });
+  test('generic native workspace intake retains opaque source through existing storage without parsing', async () => {
+    const { createFile } = require('~/models');
+    const { parseText, processAudioFile } = require('@librechat/api');
+    parseText.mockClear();
+    processAudioFile.mockClear();
+    const req = request('application/octet-stream');
+    req.user = { id: 'synthetic-owner' };
+    req.file = {
+      ...req.file,
+      size: 4,
+      originalname: 'attachment.bin',
+      path: '/synthetic/attachment.bin',
+    };
+    req.body.agent_id = 'synthetic-agent';
+    req.config.endpoints = {
+      agents: {
+        providerCapabilities: {
+          'synthetic-native': { workspace_binding: true, worker_native_tools: true },
+        },
+      },
+    };
+    getAgent.mockResolvedValue({ provider: 'synthetic-native', model_parameters: {} });
+    const upload = jest.fn(async ({ file }) => ({
+      bytes: file.size,
+      filename: file.originalname,
+      filepath: '/uploads/attachment.bin',
+    }));
+    getStrategyFunctions.mockReturnValue({ handleFileUpload: upload });
+    createFile.mockImplementation(async (file) => file);
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+    filterFile({ req });
+    await processAgentFileUpload({
+      req,
+      res,
+      metadata: { file_id: req.body.file_id, agent_id: req.body.agent_id, message_file: true },
+    });
+    expect(upload).toHaveBeenCalledWith(
+      expect.objectContaining({ file: req.file, basePath: 'uploads' }),
+    );
+    expect(createFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user: req.user.id,
+        file_id: req.body.file_id,
+        type: 'application/octet-stream',
+        bytes: 4,
+        filename: 'attachment.bin',
+        source: 'local',
+        context: 'message_attachment',
+      }),
+      true,
+    );
+    expect(parseText).not.toHaveBeenCalled();
+    expect(processAudioFile).not.toHaveBeenCalled();
   });
 });

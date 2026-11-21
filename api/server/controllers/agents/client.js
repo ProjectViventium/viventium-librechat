@@ -514,7 +514,7 @@ function nativeMainContinuityAllocation(
   const capacity = sizingReceipt.contextBudgetBytes;
   return {
     carrierMaxUtf8Bytes:
-      fits === true && Number.isSafeInteger(capacity) && capacity > defaultCarrierBytes
+      fits === true && Number.isSafeInteger(capacity) && capacity > 0
         ? capacity
         : defaultCarrierBytes,
     fits,
@@ -4783,12 +4783,22 @@ async function requireCurrentMemoryWriterAuthority(writerContext) {
   }
 }
 
-function stableMainAuthorityDigest(agent) {
+function stableMainAuthorityDigest(agent, req) {
   const headers = agent?.model_parameters?.configuration?.defaultHeaders;
   const declared = String(headers?.['X-GlassHive-Stable-Authority-SHA256'] || '')
     .trim()
     .toLowerCase();
   if (/^[a-f0-9]{64}$/.test(declared)) return declared;
+  // The stored declaration's fingerprint, taken when this request loaded the agent.
+  const loaded = req?._viventiumDeclaredStableAuthorityV1;
+  if (
+    loaded &&
+    loaded.agentId &&
+    loaded.agentId === String(agent?.id || '') &&
+    /^[a-f0-9]{64}$/.test(String(loaded.stableAuthoritySha256 || ''))
+  ) {
+    return loaded.stableAuthoritySha256;
+  }
   return crypto
     .createHash('sha256')
     .update(
@@ -4856,7 +4866,7 @@ class AgentClient extends BaseClient {
           options.req,
         )
       : cloneAgentConfigForRuntime(this.options.agent);
-    this.mainContinuityStableAuthority = stableMainAuthorityDigest(this.options.agent);
+    this.mainContinuityStableAuthority = stableMainAuthorityDigest(this.options.agent, options.req);
     const mainRequest = this.options.req;
     if (
       mainRequest?.user?.id &&
@@ -5186,7 +5196,7 @@ class AgentClient extends BaseClient {
       : this.options.req?._viventiumAcceptedMainCompactionIdentityV1 || {
           ownerId: String(this.options.req?.user?.id || ''),
           agentId: String(this.options.agent?.id || ''),
-          stableAuthoritySha256: stableAuthorityDigest(this.options.agent),
+          stableAuthoritySha256: stableAuthorityDigest(this.options.agent, this.options.req),
         };
     if (
       acceptedMainIdentity &&
@@ -5282,6 +5292,38 @@ class AgentClient extends BaseClient {
       }
     }
     const authorityReserveBytes = mainAttemptFactsAuthorityReserveBytes(req, this.options.agent);
+    /* === VIVENTIUM START ===
+     * Native replay capacity can shrink below the default context allocation. Keep the exact
+     * newer history and use the existing explicit availability policy for an older reviewed
+     * prefix that no longer fits. Its original sources and idle repair owner remain unchanged.
+     * === VIVENTIUM END === */
+    if (!replaysPinnedMainContext && this._viventiumConversationContinuityCapsule) {
+      const legacyCarrier = mainContinuityOutputCarrier(
+        mainContinuityCarrierPeerParts({
+          currentCallContext: currentCallContextInstructions,
+          optionalContexts: [
+            telegramReplyContext,
+            savedMemoryWriterTurnContext,
+            recurrenceStateInstructions,
+            timeContextInstructions,
+            activeWorkContextInstructions,
+            sourceSelectionContextInstructions,
+          ],
+          carrierMaxUtf8Bytes: selectedCarrierBytes,
+        }),
+        authorityReserveBytes,
+        selectedCarrierBytes,
+      );
+      this._viventiumConversationContinuityCapsule =
+        require('@librechat/api').fitConversationContinuityForCarrier(
+          this._viventiumConversationContinuityCapsule,
+          legacyCarrier,
+          () =>
+            require('~/server/services/viventium/promptRegistry').getRequiredPromptText(
+              'main.continuity_availability',
+            ),
+        );
+    }
     const coreOutputCarrier = mainContinuityOutputCarrier(
       mainContinuityCarrierPeerParts({
         currentCallContext: currentCallContextInstructions,
@@ -5611,7 +5653,7 @@ class AgentClient extends BaseClient {
       const identity = req._viventiumAcceptedMainCompactionIdentityV1 || {
         ownerId: String(req?.user?.id || ''),
         agentId: String(agent?.id || ''),
-        stableAuthoritySha256: stableAuthorityDigest(agent),
+        stableAuthoritySha256: stableAuthorityDigest(agent, req),
       };
       const context = await loadAcceptedMainContext({
         ...identity,
@@ -5647,10 +5689,11 @@ class AgentClient extends BaseClient {
           ownerId: String(req?.user?.id || ''),
           conversationId: String(this.conversationId || req?.body?.conversationId || ''),
           agentId: String(this.options.agent?.id || ''),
-          contextEpoch: stableAuthorityDigest(this.options.agent),
+          contextEpoch: stableAuthorityDigest(this.options.agent, req),
           modelId: String(
             this.options.agent?.model || this.options.agent?.model_parameters?.model || '',
           ),
+          alternateModelIds: nativeHistoryRoutes.slice(1).map((route) => String(route.model || '')),
           messages: orderedMessages,
           signal: opts?.abortController?.signal,
           readAdmission: async (ownerId, messageId) =>

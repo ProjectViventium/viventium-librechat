@@ -42,15 +42,10 @@ function nativeOutputFileLimits(req) {
     limits.push(TELEGRAM_ATTACHMENT_MAX_BYTES);
   if (limits.some((limit) => !Number.isSafeInteger(limit) || limit < 0))
     throw new Error('native_output_file_limit_unavailable');
-  if (
-    [endpoint.fileLimit, endpoint.totalSizeLimit].some(
-      (limit) => !Number.isSafeInteger(limit) || limit < 0,
-    )
-  )
+  if (!Number.isSafeInteger(endpoint.totalSizeLimit) || endpoint.totalSizeLimit < 0)
     throw new Error('native_output_file_limit_unavailable');
   return {
     maxBytes: Math.min(...limits),
-    maxFiles: endpoint.fileLimit,
     maxTotalBytes: endpoint.totalSizeLimit,
   };
 }
@@ -155,13 +150,11 @@ async function prepareMissionOutputFiles({
   const attachments = [];
   const importedProofs = [];
   const seen = new Set();
-  let remainingFiles = limits.maxFiles;
   let remainingBytes = limits.maxTotalBytes;
   const appendImported = (envelope, identity, imported) => {
     const merged = mergeVerifiedNativeOutputFileImports(envelope, identity, imported, seen);
     attachments.push(...merged.attachments);
     importedProofs.push({ envelope, identity, attachments: merged.attachments });
-    remainingFiles -= merged.count;
     remainingBytes -= merged.bytes;
   };
   for (const imported of initialImports) {
@@ -187,7 +180,7 @@ async function prepareMissionOutputFiles({
         selected.identity,
         {
           route: nativeRoute,
-          limits: { ...limits, maxFiles: remainingFiles, maxTotalBytes: remainingBytes },
+          limits: { ...limits, maxTotalBytes: remainingBytes },
         },
       );
       appendImported(selected.envelope, selected.identity, imported);
@@ -266,7 +259,7 @@ async function prepareMissionOutputFiles({
     route ||= createAccountApiRoute({ ownerId });
     const imported = await prepareNativeOutputFiles(fileRequest, envelope, identity, {
       route,
-      limits: { ...limits, maxFiles: remainingFiles, maxTotalBytes: remainingBytes },
+      limits: { ...limits, maxTotalBytes: remainingBytes },
     });
     appendImported(envelope, identity, imported);
   }
@@ -380,9 +373,60 @@ async function retainedCallbackOutputSource(row, references, destination, sessio
   }
   return undefined;
 }
-async function prepareRetainedNativeOutputFiles(req, identity, text, initialImports = []) {
+async function retainedCoordinatorOutputSource(row, destination) {
+  const metadata = row.metadata?.viventium;
+  if (
+    row.nativeResponse ||
+    metadata?.mainGenerationPresentation?.version !== 2 ||
+    !metadata.mainGenerationPresentation.nativeCoordinatorResult
+  )
+    return undefined;
+  const parent = {
+    ownerId: destination.userId,
+    conversationId: destination.conversationId,
+    parentMessageId: metadata.cortexPresentationParentMessageId || row.parentMessageId,
+    deliveryIds: metadata.cortexInsightDeliveryIds,
+  };
+  const owned = await require('./NativeCoordinatorPresentationService').resolve(parent);
+  if (!owned?.eligible || owned.message?.messageId !== row.messageId || !owned.result?.output_files)
+    return undefined;
+  let selected;
+  try {
+    selected = nativeCoordinatorOutputFilesForMessage(
+      owned.result.output_files,
+      {
+        ownerId: destination.userId,
+        conversationId: owned.binding.nativeConversationId,
+        runId: owned.data.run_id,
+        publisher: owned.result.publisher,
+      },
+      {
+        userId: destination.userId,
+        conversationId: destination.conversationId,
+        responseMessageId: row.messageId,
+        agentId: owned.binding.agentId,
+      },
+    );
+  } catch {
+    return undefined;
+  }
+  return {
+    envelope: selected.envelope,
+    identity: selected.identity,
+    sourceDigest: createHash('sha256')
+      .update(
+        JSON.stringify({
+          data: owned.data,
+          envelope: selected.envelope,
+        }),
+      )
+      .digest('hex'),
+    coordinatorReference: parent,
+  };
+}
+async function retainedNativeOutputSelections(identity, text) {
   const references = collectGlassHiveNativeMediaReferences(text);
-  if (!references.length) return { imports: [] };
+  if (!references.length) return { references, selections: [] };
   const Message = require('~/db/models').Message;
   const destination = {
     userId: identity.userId,
@@ -399,25 +443,10 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
   };
   const rows = await Message.find(selector)
     .select(
-      'user conversationId messageId streamId agent_id isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
+      'user conversationId messageId streamId agent_id parentMessageId metadata isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
     )
     .lean();
-  const limits = nativeOutputFileLimits(req);
-  const seen = new Set();
-  let count = 0,
-    bytes = 0;
-  for (const imported of initialImports) {
-    const merged = mergeVerifiedNativeOutputFileImports(
-      imported.envelope,
-      imported.identity,
-      imported.attachments,
-      seen,
-    );
-    count += merged.count;
-    bytes += merged.bytes;
-  }
-  const imports = [],
-    proofs = [];
+  const selections = [];
   for (const row of rows) {
     const stored = await Promise.all(
       (row.attachments || [])
@@ -425,9 +454,12 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
         .map((item) => findFileById(item.file_id)),
     );
     let selected;
-    let callback;
+    // Source lookup failures must retry as failures, not become an empty file selection.
+    // The validation below can still reject an absent, revoked or changed source normally.
+    const callback =
+      (await retainedCoordinatorOutputSource(row, destination)) ||
+      (await retainedCallbackOutputSource(row, references, destination));
     try {
-      callback = await retainedCallbackOutputSource(row, references, destination);
       selected = retainedNativeOutputFilesForMessage(
         row,
         stored.filter(Boolean),
@@ -439,6 +471,37 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
       continue;
     }
     if (!selected) continue;
+    selections.push({ selected, callback });
+  }
+  return { references, destination, selections };
+}
+
+async function hasRetainedNativeOutputFiles(identity, text) {
+  return (await retainedNativeOutputSelections(identity, text)).selections.length > 0;
+}
+
+async function prepareRetainedNativeOutputFiles(req, identity, text, initialImports = []) {
+  const { references, destination, selections } = await retainedNativeOutputSelections(
+    identity,
+    text,
+  );
+  if (!selections.length) return { imports: [] };
+  const Message = require('~/db/models').Message;
+  const limits = nativeOutputFileLimits(req);
+  const seen = new Set();
+  let bytes = 0;
+  for (const imported of initialImports) {
+    const merged = mergeVerifiedNativeOutputFileImports(
+      imported.envelope,
+      imported.identity,
+      imported.attachments,
+      seen,
+    );
+    bytes += merged.bytes;
+  }
+  const imports = [],
+    proofs = [];
+  for (const { selected, callback } of selections) {
     const byUrl = new Map(
       selected.envelope.files.map((file, index) => [
         file.download_url,
@@ -467,7 +530,6 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
       fetchFile,
       limits: {
         ...limits,
-        maxFiles: limits.maxFiles - count,
         maxTotalBytes: limits.maxTotalBytes - bytes,
       },
     });
@@ -477,7 +539,6 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
       attachments,
       seen,
     );
-    count += merged.count;
     bytes += merged.bytes;
     imports.push({
       envelope: importEnvelope,
@@ -487,7 +548,11 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
     proofs.push({
       sourceMessageId: selected.sourceMessageId,
       candidateSha256: selected.candidateSha256,
-      ...(callback ? { callbackReference: callback.reference } : {}),
+      ...(callback?.coordinatorReference
+        ? { coordinatorReference: callback.coordinatorReference }
+        : callback
+          ? { callbackReference: callback.reference }
+          : {}),
       fileIds: selected.sourceFiles.map((file) => file.file_id),
       envelope: selected.envelope,
       fileSources: selected.sourceFiles.map((file) => ({
@@ -510,19 +575,30 @@ async function prepareRetainedNativeOutputFiles(req, identity, text, initialImpo
                 deletedAt: null,
               })
                 .select(
-                  'user conversationId messageId streamId agent_id isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
+                  'user conversationId messageId streamId agent_id parentMessageId metadata isCreatedByUser unfinished error deletedAt expiredAt attachments +nativeResponse',
                 )
                 .session(session)
                 .lean();
               if (
                 !row ||
                 (!proof.callbackReference &&
+                  !proof.coordinatorReference &&
                   row.nativeResponse?.candidateSha256 !== proof.candidateSha256)
               )
                 throw new Error('native_output_files_retained_source_invalid');
-              const callback = proof.callbackReference
-                ? await retainedCallbackOutputSource(row, references, destination, session)
-                : undefined;
+              const callback = proof.coordinatorReference
+                ? await retainedCoordinatorOutputSource(row, destination)
+                : proof.callbackReference
+                  ? await retainedCallbackOutputSource(row, references, destination, session)
+                  : undefined;
+              if (
+                proof.coordinatorReference &&
+                (!callback ||
+                  callback.sourceDigest !== proof.candidateSha256 ||
+                  JSON.stringify(callback.coordinatorReference) !==
+                    JSON.stringify(proof.coordinatorReference))
+              )
+                throw new Error('native_output_files_retained_source_invalid');
               if (
                 proof.callbackReference &&
                 (!callback ||
@@ -797,6 +873,7 @@ module.exports = {
   prepareNativeOutputFiles,
   prepareNativeResponseOutputFiles,
   prepareRetainedNativeOutputFiles,
+  hasRetainedNativeOutputFiles,
   prepareCurrentNativeOutputFiles,
   prepareMissionOutputFiles,
 };

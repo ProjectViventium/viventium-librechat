@@ -6,6 +6,7 @@ import {
   resetOrchestrationReadinessForTests,
   authoringOrchestrationReadiness,
   waitForOrchestrationReadiness,
+  refreshStartupOrchestrationReadiness,
 } from './orchestrationReadiness';
 
 const originalEnv = { ...process.env };
@@ -340,6 +341,103 @@ describe('per-turn owner readiness', () => {
     });
     expect(requestAccountApi).not.toHaveBeenCalled();
     expect(getAgent).not.toHaveBeenCalled();
+  });
+
+  test('native byte readiness accepts current capacity for owner and deployment while percent telemetry stays critical', async () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'host';
+    requestAccountApi.mockResolvedValue({
+      ...readyCapability(),
+      nativeParallelReady: true,
+      hostMissionsAllowed: true,
+      readinessScope: {
+        contractVersion: 1,
+        scope: 'deployment',
+        ownerCredentialRole: 'transport_auth',
+      },
+      nativeStorage: {
+        version: 1,
+        healthy: true,
+        availableBytes: 17 * 1024 ** 3,
+        requiredBytes: 4 * 1024 ** 3,
+      },
+      storagePressure: {
+        version: 1,
+        status: 'critical',
+        usedPercent: 99.2,
+        availableBytes: 17 * 1024 ** 3,
+        thresholdPercent: 99,
+      },
+    });
+    expect(await refreshOrchestrationReadiness({ ownerId })).toMatchObject({
+      available: true,
+      storagePressure: { status: 'critical', usedPercent: 99.2 },
+    });
+    expect(await refreshStartupOrchestrationReadiness()).toMatchObject({
+      available: true,
+      storagePressure: { status: 'critical', usedPercent: 99.2 },
+    });
+  });
+
+  test('native byte readiness rejects below-floor, unavailable and malformed capacity facts', async () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'host';
+    for (const fact of [
+      undefined,
+      {
+        version: 1,
+        healthy: false,
+        availableBytes: null,
+        requiredBytes: 0,
+        errorCode: 'storage_probe_unavailable',
+      },
+      { version: 1, healthy: false, availableBytes: 3 * 1024 ** 3, requiredBytes: 4 * 1024 ** 3 },
+      { version: 1, healthy: true, availableBytes: 3 * 1024 ** 3, requiredBytes: 4 * 1024 ** 3 },
+      { version: 1, healthy: true, availableBytes: -1, requiredBytes: 0 },
+    ]) {
+      requestAccountApi.mockResolvedValue({
+        ...readyCapability(),
+        nativeParallelReady: true,
+        hostMissionsAllowed: true,
+        nativeStorage: fact,
+      });
+      expect(await refreshOrchestrationReadiness({ ownerId })).toMatchObject({ available: false });
+    }
+  });
+
+  test('native byte readiness permits a configured zero floor without treating unknown bytes as zero', async () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'host';
+    requestAccountApi.mockResolvedValue({
+      ...readyCapability(),
+      nativeParallelReady: true,
+      hostMissionsAllowed: true,
+      nativeStorage: { version: 1, healthy: true, availableBytes: 0, requiredBytes: 0 },
+    });
+    expect(await refreshOrchestrationReadiness({ ownerId })).toMatchObject({ available: true });
+  });
+
+  test('native byte readiness leaves Docker percentage admission unchanged', async () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'docker';
+    requestAccountApi.mockResolvedValue({
+      ...readyCapability(),
+      nativeStorage: {
+        version: 1,
+        healthy: true,
+        availableBytes: 17 * 1024 ** 3,
+        requiredBytes: 4 * 1024 ** 3,
+      },
+      storagePressure: {
+        version: 1,
+        status: 'critical',
+        usedPercent: 99.2,
+        availableBytes: 17 * 1024 ** 3,
+        thresholdPercent: 99,
+      },
+    });
+    expect(await refreshOrchestrationReadiness({ ownerId })).toMatchObject({
+      available: false,
+      reason: 'storage_pressure',
+    });
+    requestAccountApi.mockResolvedValue(readyCapability());
+    expect(await refreshOrchestrationReadiness({ ownerId })).toMatchObject({ available: true });
   });
 
   test('logs content-free wait and probe measurements as retained structured messages', async () => {

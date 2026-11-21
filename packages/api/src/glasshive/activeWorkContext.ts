@@ -1,5 +1,5 @@
 import { isDeclaredConversationOrchestrator } from './conversationOrchestration';
-import { normalizeWorkDeliveryScope } from './workDeliveryScope';
+import { projectWorkResultObservation } from './workDeliveryScope';
 import type { WorkDeliveryScope } from './workDeliveryScope';
 import { nativeQuestionForm, nativeWorkInputBinding, nativeWorkInputQuestionText } from './nativeWorkInput';
 import { sanitizeGlassHiveCallbackText } from './callbackSanitizer';
@@ -95,26 +95,41 @@ export function projectCurrentNativeWorkInput(item: WorkItem, snapshot: string |
 
 function projectWorkRows(rows: WorkItem[], observationMetadata = true) {
   return rows.map((item) => {
-    const deliveryScope = normalizeWorkDeliveryScope(item.deliveryScope);
+    const observation = projectWorkResultObservation({ ...item, state: text(item.state, 40) });
     return {
       workRef: item.workRef,
       title: text(item.title, 256),
       state: text(item.state, 40),
+      ...observation,
+      ...(observation.presentationReceipt.deliveryScope
+        ? { deliveryScope: observation.presentationReceipt.deliveryScope }
+        : {}),
       ...(observationMetadata ? { updatedAt: text(item.updatedAt, 64) } : {}),
       actions: Array.isArray(item.actions)
         ? item.actions
             .filter((action) => typeof action === 'string')
         : [],
-      ...(item.delivery ? { deliveryState: text(item.delivery.state, 40) } : {}),
-      ...(deliveryScope ? { deliveryScope } : {}),
-      ...(item.attention ? { attention: {
-        kind: text(item.attention.kind, 40),
-        ...(typeof item.attention.code === 'string' ? { code: text(item.attention.code, 120) } : {}),
-      } } : {}),
-      ...(item.state === 'needs_input' && item.pendingNativeInput != null ? { nativeInputOmitted: true } : {}),
-    } as {
-      workRef: string; title: string; state: string; updatedAt?: string; actions: string[];
-      deliveryState?: string; deliveryScope?: WorkDeliveryScope; nativeInputOmitted?: boolean;
+      ...(item.attention
+        ? {
+            attention: {
+              kind: text(item.attention.kind, 40),
+              ...(typeof item.attention.code === 'string'
+                ? { code: text(item.attention.code, 120) }
+                : {}),
+            },
+          }
+        : {}),
+      ...(item.state === 'needs_input' && item.pendingNativeInput != null
+        ? { nativeInputOmitted: true }
+        : {}),
+    } as ReturnType<typeof projectWorkResultObservation> & {
+      workRef: string;
+      title: string;
+      state: string;
+      updatedAt?: string;
+      actions: string[];
+      deliveryScope?: WorkDeliveryScope;
+      nativeInputOmitted?: boolean;
       attention?: { kind: string; code?: string };
       pendingNativeInput?: NonNullable<ReturnType<typeof projectCurrentNativeWorkInput>>;
     };

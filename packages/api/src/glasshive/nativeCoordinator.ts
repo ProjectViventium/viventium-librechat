@@ -7,8 +7,16 @@ import type { NativeCoordinatorOwnedSnapshot } from './nativeCoordinatorWork';
 
 type RecordValue = Record<string, unknown>;
 const id = z.string().min(1).max(200);
-const eventSchema = z
+const eventEnvelope = z
   .object({
+    event_id: id,
+    principal: z.object({ tenant_id: id, owner_id: id }).strict(),
+    created_at: z.string().datetime({ offset: true }),
+    expires_at: z.string().datetime({ offset: true }),
+  })
+  .strict();
+const eventSchema = z.discriminatedUnion('type', [
+  eventEnvelope.extend({
     type: z.enum([
       'coordinator.turn_due',
       'coordinator.dispatch_due',
@@ -16,10 +24,6 @@ const eventSchema = z
       'coordinator.result_ready',
       'coordinator.turn_result_ready',
     ]),
-    event_id: id,
-    principal: z.object({ tenant_id: id, owner_id: id }).strict(),
-    created_at: z.string().datetime({ offset: true }),
-    expires_at: z.string().datetime({ offset: true }),
     data: z
       .object({
         conversation_id: id,
@@ -36,8 +40,31 @@ const eventSchema = z
         result_digest: z.string().min(1).max(200).optional(),
       })
       .strict(),
-  })
-  .strict();
+  }),
+  eventEnvelope.extend({
+    type: z.literal('coordinator.progress_ready'),
+    data: z
+      .object({
+        conversation_id: id,
+        request_ref: id,
+        source_turn_id: id,
+        goal_id: id.optional(),
+        turn_id: id.optional(),
+        request_id: id.optional(),
+        run_id: id,
+        attempt_id: id,
+        progress_id: z.string().regex(/^[a-f0-9]{64}$/),
+        progress_digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+        progress_text: z.string().min(1),
+      })
+      .strict()
+      .refine((value) =>
+        value.goal_id !== undefined
+          ? value.turn_id === undefined && value.request_id === undefined
+          : value.turn_id !== undefined && value.request_id !== undefined,
+      ),
+  }),
+]);
 
 export interface NativeCoordinatorBinding {
   _id: string;
@@ -100,6 +127,11 @@ export interface NativeCoordinatorDependencies {
     context: unknown;
   }): Promise<void>;
   publishResult(input: { binding: NativeCoordinatorBinding; data: RecordValue }): Promise<void>;
+  publishProgress?(input: {
+    binding: NativeCoordinatorBinding;
+    data: RecordValue;
+    eventId: string;
+  }): Promise<void>;
   now?(): number;
 }
 
@@ -135,6 +167,9 @@ export function nativeCoordinatorSourceBody(value: RecordValue): RecordValue {
     'viventiumCallSessionId',
     'viventiumVoiceTaskId',
     'viventiumVoiceRequestId',
+    // A scheduled turn has no origin surface: its trusted, scheduler-owned channel list is the
+    // only record of where results return. Without it every later result resolves to web only.
+    'viventiumSchedulerDeliveryChannels',
   ];
   return Object.fromEntries(
     fields.flatMap((key) => (value[key] === undefined ? [] : [[key, structuredClone(value[key])]])),
@@ -280,6 +315,11 @@ export function createNativeCoordinatorHost(deps: NativeCoordinatorDependencies)
       event.data.conversation_id,
     );
     const path = conversationPath(event.data.conversation_id);
+    if (event.type === 'coordinator.progress_ready') {
+      if (!deps.publishProgress) throw new Error('coordinator_progress_unavailable');
+      await deps.publishProgress({ binding, data: event.data, eventId: event.event_id });
+      return { accepted: true };
+    }
     if (
       event.type === 'coordinator.result_ready' ||
       event.type === 'coordinator.turn_result_ready'

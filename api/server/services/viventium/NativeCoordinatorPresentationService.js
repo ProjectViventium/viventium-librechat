@@ -83,6 +83,34 @@ async function bindMessage(message, fence) {
   return saved;
 }
 
+async function readPublications(binding) {
+  const publications = [];
+  const seen = new Set();
+  let cursor = null;
+  do {
+    const page = await requestAccountApi({
+      ownerId: binding.ownerId,
+      path: `/v1/coordinator/conversations/${encodeURIComponent(binding.nativeConversationId)}/publications${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`,
+    });
+    if (
+      page?.conversation_id !== binding.nativeConversationId ||
+      !Array.isArray(page.publications) ||
+      (page.next_cursor !== null && typeof page.next_cursor !== 'string')
+    )
+      throw Object.assign(new Error('coordinator_publication_metadata_invalid'), {
+        code: 'coordinator_publication_metadata_invalid',
+      });
+    publications.push(...page.publications);
+    cursor = page.next_cursor;
+    if (cursor && seen.has(cursor))
+      throw Object.assign(new Error('coordinator_publication_cursor_repeated'), {
+        code: 'coordinator_publication_cursor_repeated',
+      });
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return publications;
+}
+
 const service = createNativeCoordinatorPresentationService({
   tenantId,
   ledger: cortexInsightDeliveryService,
@@ -159,33 +187,7 @@ const service = createNativeCoordinatorPresentationService({
       path: `/v1/coordinator/conversations/${encodeURIComponent(binding.nativeConversationId)}?include_history=false`,
       maxResponseBytes: null,
     }),
-  async readPublications(binding) {
-    const publications = [];
-    const seen = new Set();
-    let cursor = null;
-    do {
-      const page = await requestAccountApi({
-        ownerId: binding.ownerId,
-        path: `/v1/coordinator/conversations/${encodeURIComponent(binding.nativeConversationId)}/publications${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`,
-      });
-      if (
-        page?.conversation_id !== binding.nativeConversationId ||
-        !Array.isArray(page.publications) ||
-        (page.next_cursor !== null && typeof page.next_cursor !== 'string')
-      )
-        throw Object.assign(new Error('coordinator_publication_metadata_invalid'), {
-          code: 'coordinator_publication_metadata_invalid',
-        });
-      publications.push(...page.publications);
-      cursor = page.next_cursor;
-      if (cursor && seen.has(cursor))
-        throw Object.assign(new Error('coordinator_publication_cursor_repeated'), {
-          code: 'coordinator_publication_cursor_repeated',
-        });
-      if (cursor) seen.add(cursor);
-    } while (cursor);
-    return publications;
-  },
+  readPublications,
   readTurnResult: (binding, turn) =>
     requestAccountApi({
       ownerId: binding.ownerId,
@@ -218,5 +220,12 @@ async function persistAuthority(message, binding, source, data) {
   });
 }
 
-module.exports = { ...service, persistAuthority };
+module.exports = {
+  ...service,
+  persistAuthority,
+  readPublications,
+  recover: async (parent) =>
+    (await require('./NativeCoordinatorProgressService').recover(parent)) ||
+    service.recover(parent),
+};
 /* === VIVENTIUM END === */

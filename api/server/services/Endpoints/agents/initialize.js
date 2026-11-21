@@ -111,6 +111,7 @@ const {
   bindHarnessCancellation,
   prepareRestrictedVoiceCancellation,
   conversationProviderStableAuthorityDigest,
+  declareStableAuthorityDigest,
   installConversationProviderCapabilityRefresher,
   resolveConversationProviderId,
   setConversationProviderCapability,
@@ -602,8 +603,15 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
    * Purpose: Fingerprint the persisted declaration before voice routing, special-variable
    * rendering, recall/tool health, or request-local tool loading can mutate the runtime agent.
    * === VIVENTIUM END === */
-  const primaryStableAuthoritySha256 =
-    conversationProviderStableAuthorityDigest(loadedPrimaryAgent);
+  /* === VIVENTIUM START ===
+   * Feature: One continuity identity per stored agent.
+   * Purpose: Every continuity read and write of this request uses the fingerprint of the stored
+   * declaration, also on a route whose configuration does not carry it (a lazily built fallback)
+   * and on an author request that hands this function a runtime copy of the same agent (an insight
+   * follow-up). Without it those turns were keyed by rendered, request-local state and each one
+   * started a new context epoch with a full re-compaction.
+   * === VIVENTIUM END === */
+  const primaryStableAuthoritySha256 = declareStableAuthorityDigest(req, loadedPrimaryAgent);
   const primaryAgent = sideEffectsRestricted
     ? sanitizeAgentForRestrictedVoiceTurn(loadedPrimaryAgent)
     : loadedPrimaryAgent;

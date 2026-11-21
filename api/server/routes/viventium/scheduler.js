@@ -548,6 +548,7 @@ router.post('/due', async (req, res) => {
       'coordinator.action_due',
       'coordinator.result_ready',
       'coordinator.turn_result_ready',
+      'coordinator.progress_ready',
     ].includes(req.body?.type)
   ) {
     return require('~/server/services/viventium/NativeCoordinatorService').receive(req, res);

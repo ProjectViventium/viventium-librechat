@@ -1,16 +1,22 @@
 /* === VIVENTIUM START === Accepted run input carried with terminal evidence. === */
 import { z } from 'zod';
 
-const runInputSchema = z.object({
-  version: z.literal(1),
-  run_id: z.string().min(1).max(160),
-  instruction: z.string().min(1),
-  continuation_context: z.object({
+const runInputSchema = z
+  .object({
     version: z.literal(1),
-    base_instruction: z.string().min(1),
-    guidance: z.array(z.string().min(1)),
-  }).strict().optional(),
-}).strict();
+    run_id: z.string().min(1).max(160),
+    instruction: z.string().min(1),
+    continuation_context: z
+      .object({
+        version: z.literal(1),
+        base_instruction: z.string().min(1),
+        guidance: z.array(z.string().min(1)),
+        inherited_conversation: z.record(z.unknown()).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
 
 export type GlassHiveRunInput = z.infer<typeof runInputSchema>;
 

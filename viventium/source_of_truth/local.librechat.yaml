@@ -548,55 +548,7 @@ fileConfig:
       fileSizeLimit: 50
       totalSizeLimit: 100
       supportedMimeTypes:
-        - application/pdf
-        - text/plain
-        - text/markdown
-        - text/csv
-        - text/tab-separated-values
-        - text/html
-        - text/xml
-        - application/xml
-        - application/json
-        - text/rtf
-        - application/msword
-        - application/vnd.ms-excel
-        - application/vnd.ms-powerpoint
-        - application/vnd.visio
-        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
-        - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-        - application/vnd.openxmlformats-officedocument.presentationml.presentation
-        - application/vnd.ms-excel.sheet.macroEnabled.12
-        - application/vnd.ms-powerpoint.presentation.macroEnabled.12
-        - application/vnd.oasis.opendocument.text
-        - application/vnd.oasis.opendocument.spreadsheet
-        - application/vnd.oasis.opendocument.presentation
-        - text/x-python
-        - text/javascript
-        - application/javascript
-        - application/typescript
-        - text/x-java-source
-        - text/x-c
-        - text/x-cpp
-        - text/x-csharp
-        - application/x-yaml
-        - application/toml
-        - text/x-sql
-        - text/x-shellscript
-        - application/x-powershell
-        - application/zip
-        - application/x-rar-compressed
-        - application/x-tar
-        - application/gzip
-        - application/x-7z-compressed
-        - image/jpeg
-        - image/png
-        - image/gif
-        - image/webp
-        - ^image/svg\+xml$
-        - image/bmp
-        - image/tiff
-        - ^audio/
-        - ^video/
+        - '.*'
     default:
       fileLimit: 100
       fileSizeLimit: 50

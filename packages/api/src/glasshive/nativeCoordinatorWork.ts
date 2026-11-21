@@ -1,6 +1,9 @@
 /* === VIVENTIUM START === Native goal ownership in the existing Active Work projection. === */
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import type { requestAccountApi } from './accountClient';
+import type { NativeCoordinatorSource } from './nativeCoordinator';
+import type { IMessage } from '@librechat/data-schemas';
 
 type RecordValue = Record<string, unknown>;
 type Freshness = 'fresh' | 'stale' | 'unavailable';
@@ -91,6 +94,7 @@ export interface NativeCoordinatorWorkItem extends RecordValue {
   managementKind: 'native_coordinator';
   nativeConversationId: string;
   nativeGoalId: string;
+  nativeRunId: string;
   nativeState: string;
   conversationId: string;
   title: string;
@@ -474,6 +478,7 @@ export function createNativeCoordinatorWorkRequestAdapter(
         managementKind: 'native_coordinator',
         nativeGoalId: target.nativeGoalId,
         nativeConversationId: target.nativeConversationId,
+        nativeRunId: target.runId,
         actions: target.actions,
       };
     }
@@ -589,7 +594,130 @@ export function createNativeCoordinatorWorkRequestAdapter(
     });
   }
 
-  return { request, resolve };
+  async function readActionReceipt(input: {
+    ownerId: string;
+    workRef: string;
+    body: RecordValue;
+    fileIds?: string[];
+  }): Promise<unknown> {
+    const unknownOutcome = () =>
+      Object.assign(failure('work_action_outcome_unconfirmed', 503), {
+        code: 'work_action_outcome_unconfirmed',
+        outcomeUnknown: true,
+        retryable: false,
+      });
+    let target: Awaited<ReturnType<typeof resolve>>;
+    try {
+      target = await resolve(input);
+    } catch {
+      throw unknownOutcome();
+    }
+    const body = record(input.body);
+    const key = body.idempotencyKey;
+    if (
+      !target ||
+      target.kind !== 'goal' ||
+      typeof key !== 'string' ||
+      !key ||
+      typeof body.action !== 'string' ||
+      !ACTIONS.includes(body.action as Action) ||
+      !target.binding._id ||
+      !target.goal.source_turn_id ||
+      (body.instruction !== undefined && typeof body.instruction !== 'string')
+    )
+      throw unknownOutcome();
+    const path =
+      `/v1/coordinator/conversations/${encodeURIComponent(target.nativeConversationId)}` +
+      `/goals/${encodeURIComponent(target.nativeGoalId)}`;
+    let saved: RecordValue;
+    try {
+      saved = record(
+        await deps.request({
+          ownerId: input.ownerId,
+          method: 'GET',
+          path: `${path}/actions/${encodeURIComponent(key)}/preparation`,
+        }),
+      );
+    } catch {
+      throw unknownOutcome();
+    }
+    const retained = record(saved.action_request);
+    const control = record(saved.control);
+    const controlBody = {
+      action: control.action,
+      idempotency_key: control.idempotency_key,
+      message: control.message,
+      run_id: control.run_id,
+    };
+    const controlDigest = createHash('sha256').update(JSON.stringify(controlBody)).digest('hex');
+    if (
+      saved.conversation_id !== target.nativeConversationId ||
+      saved.goal_id !== target.nativeGoalId ||
+      saved.request_ref !== target.binding._id ||
+      saved.source_turn_id !== target.goal.source_turn_id ||
+      saved.action_key !== key ||
+      typeof saved.run_id !== 'string' ||
+      !saved.run_id ||
+      !['preparing', 'completed'].includes(String(saved.state)) ||
+      saved.action_digest !== controlDigest ||
+      control.idempotency_key !== key ||
+      control.run_id !== saved.run_id ||
+      control.action !== body.action ||
+      control.message !== (body.instruction || '') ||
+      retained.idempotencyKey !== key ||
+      retained.action !== body.action ||
+      Object.prototype.hasOwnProperty.call(retained, 'application_bootstrap_bundle_b64')
+    )
+      throw unknownOutcome();
+    if ((body.instruction || '') !== (retained.instruction || '')) throw unknownOutcome();
+    for (const field of ['nativeInput', 'inheritedConversation']) {
+      if (!isDeepStrictEqual(body[field], retained[field])) throw unknownOutcome();
+    }
+    for (const [field, value] of Object.entries(body)) {
+      if (field === 'instruction') continue;
+      if (!isDeepStrictEqual(value, retained[field])) throw unknownOutcome();
+    }
+    const files = retained.fileInputs === undefined ? [] : retained.fileInputs;
+    const selectedFiles = input.fileIds || [];
+    if (
+      !Array.isArray(files) ||
+      !Array.isArray(selectedFiles) ||
+      selectedFiles.some((id) => typeof id !== 'string' || !id) ||
+      !isDeepStrictEqual(
+        files.map((file) => record(file).sourceFileId),
+        selectedFiles,
+      )
+    )
+      throw unknownOutcome();
+    // Native owns the retained body/source run and performs the exact immutable receipt check.
+    // This route cannot prepare authority, reserve, retry or execute a control.
+    try {
+      const result = await deps.request({
+        ownerId: input.ownerId,
+        method: 'POST',
+        path: `${path}/actions/receipt?${new URLSearchParams({ run_id: saved.run_id }).toString()}`,
+        body: retained,
+      });
+      return { result, receiptRef: saved.action_key };
+    } catch (error) {
+      const receipt = record(error);
+      if (receipt.actionReceipt === 'immutable_failure') {
+        return {
+          receiptRef: saved.action_key,
+          failure: {
+            code:
+              typeof receipt.code === 'string' && receipt.code
+                ? receipt.code
+                : 'native_action_failed',
+            status: Number.isInteger(receipt.status) ? receipt.status : 409,
+          },
+        };
+      }
+      throw unknownOutcome();
+    }
+  }
+
+  return { request, resolve, readActionReceipt };
 }
 
 /** Native remains the manager; never send a goal control to its raw worker work_ref. */
@@ -646,6 +774,103 @@ export function nativeCoordinatorControlRequest(
   };
 }
 
+/** Retained originals determine default visibility; Native audit state remains untouched. */
+export async function nativeCoordinatorCleanedSourceWorkRefs(
+  input: Owner & {
+    snapshots: NativeCoordinatorOwnedSnapshot[];
+    scope: 'active' | 'history';
+    readSource(bindingRef: string, turnId: string): Promise<NativeCoordinatorSource | null>;
+    readMessages(
+      ownerId: string,
+      conversationId: string,
+      messageIds: string[],
+    ): Promise<
+      Pick<IMessage, 'user' | 'messageId' | 'conversationId' | 'deletedAt' | 'cleanupTombstone'>[]
+    >;
+  },
+): Promise<string[]> {
+  if (input.scope !== 'active') return [];
+  const sources = new Map<string, Promise<boolean>>();
+  const cleaned = (binding: NativeCoordinatorWorkBinding, turnId?: string) => {
+    if (!binding._id || !turnId) return Promise.resolve(false);
+    const key = JSON.stringify([binding._id, turnId]);
+    if (!sources.has(key)) {
+      sources.set(
+        key,
+        (async () => {
+          const source = await input.readSource(binding._id!, turnId);
+          if (
+            !source ||
+            source._id !== `${binding._id}:${turnId}` ||
+            source.kind !== 'native_coordinator_source' ||
+            source.bindingRef !== binding._id ||
+            source.turnId !== turnId ||
+            source.requestBody.conversationId !== binding.conversationId
+          )
+            return false;
+          const segments = source.requestBody.viventiumTriggeringSourceSegments;
+          if (
+            !Array.isArray(segments) ||
+            !segments.length ||
+            Number(source.requestBody.viventiumTriggeringSourceSegmentsOverflowCount || 0) > 0
+          )
+            return false;
+          const messageIds: string[] = [];
+          for (const value of segments) {
+            const segment = record(value);
+            if (
+              segment.source_persisted !== true ||
+              typeof segment.source_message_id !== 'string' ||
+              !segment.source_message_id
+            )
+              return false;
+            messageIds.push(segment.source_message_id);
+          }
+          const uniqueIds = [...new Set(messageIds)];
+          const messages = await input.readMessages(
+            input.ownerId,
+            binding.conversationId,
+            uniqueIds,
+          );
+          return uniqueIds.every((messageId) =>
+            messages.some(
+              (message) =>
+                message.messageId === messageId &&
+                message.user === input.ownerId &&
+                message.conversationId === binding.conversationId &&
+                message.deletedAt != null &&
+                message.cleanupTombstone?.contractVersion === 1,
+            ),
+          );
+        })(),
+      );
+    }
+    return sources.get(key)!;
+  };
+  const refs = await Promise.all(
+    input.snapshots.flatMap(({ binding, snapshot }) => {
+      if (!owned(input, binding) || snapshot.conversation_id !== binding.nativeConversationId)
+        return [];
+      return [
+        ...snapshot.goals.map(async (goal) =>
+          (await cleaned(binding, goal.source_turn_id))
+            ? [
+                nativeCoordinatorWorkRef(binding.nativeConversationId!, goal.goal_id),
+                ...(goal.work_ref ? [goal.work_ref] : []),
+              ]
+            : [],
+        ),
+        ...(snapshot.turns || []).map(async (turn) =>
+          (await cleaned(binding, turn.source_turn_id || turn.turn_id))
+            ? [nativeCoordinatorTurnRef(binding.nativeConversationId!, turn.turn_id)]
+            : [],
+        ),
+      ];
+    }),
+  );
+  return [...new Set(refs.flat())].sort();
+}
+
 /** Ephemeral join only. Existing hosted pagination, delivery and artifact metadata stay owned there. */
 export function mergeHostedAndNativeRoster(
   input: Owner & {
@@ -653,15 +878,19 @@ export function mergeHostedAndNativeRoster(
     native: { snapshot: Freshness; snapshots: NativeCoordinatorOwnedSnapshot[] };
     scope: 'active' | 'history';
     includeNativeOnly?: boolean;
+    cleanedSourceWorkRefs?: readonly string[];
   },
 ): RecordValue {
   const hosted = record(input.hosted);
+  const cleanedRefs = new Set(input.scope === 'active' ? input.cleanedSourceWorkRefs : []);
   const raw = Array.isArray(hosted.work) ? (hosted.work as RecordValue[]) : [];
   const goals = currentGoals({ ...input, snapshots: input.native.snapshots });
   const turns = currentTurns({ ...input, snapshots: input.native.snapshots });
   const turnsByRef = new Map(turns.map((target) => [target.workRef, target]));
   const eligible = goals.filter(({ goal, work }) =>
-    input.scope === 'history' ? TERMINAL.has(work.state) : goal.dismissed !== true,
+    input.scope === 'history'
+      ? TERMINAL.has(work.state)
+      : goal.dismissed !== true && !cleanedRefs.has(work.workRef),
   );
   const byRef = new Map<string, (typeof goals)[number]>();
   for (const target of goals) {
@@ -674,6 +903,7 @@ export function mergeHostedAndNativeRoster(
   }
   const seen = new Set<string>();
   const work = raw.flatMap((row) => {
+    if (cleanedRefs.has(String(row.workRef || ''))) return [];
     const turn = turnsByRef.get(String(row.workRef || ''));
     if (turn) {
       if (
@@ -710,6 +940,7 @@ export function mergeHostedAndNativeRoster(
     for (const { workRef, work: turnWork } of turns) {
       if (
         !turnWork ||
+        cleanedRefs.has(workRef) ||
         seen.has(workRef) ||
         (input.scope === 'history' && turnWork.state !== 'failed')
       )

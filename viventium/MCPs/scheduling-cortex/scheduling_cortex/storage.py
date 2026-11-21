@@ -1689,6 +1689,21 @@ class ScheduleStorage:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(sql, params)
+            # === VIVENTIUM START === Keep Workbench timing on the clock's owner-scoped edit. ===
+            if cursor.rowcount and schedule is not None:
+                conn.execute(
+                    """UPDATE scheduled_prompt_definitions
+                       SET schedule_json = ?, timezone = ?, updated_at = ?
+                       WHERE task_id = ? AND user_id = ?""",
+                    (
+                        payload["schedule_json"],
+                        str(schedule.get("timezone") or "UTC"),
+                        updates.get("updated_at") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        task_id,
+                        user_id,
+                    ),
+                )
+            # === VIVENTIUM END ===
         # === VIVENTIUM NOTE ===
         # Feature: Mirror updated DB after writes.
         if cursor.rowcount:

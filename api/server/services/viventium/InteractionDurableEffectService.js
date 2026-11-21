@@ -454,6 +454,17 @@ function createInteractionDurableEffectService({
     if (!rowMatchesIdentity(existing, identity)) {
       throw durableEffectError('durable_effect_conflict', 409, false);
     }
+    return claimExistingEffect(identity, existing, { claimToken, observedAt });
+  }
+
+  // Reuse the reservation CAS for live dispatch and retained-identity receipt reconciliation.
+  async function claimExistingEffect(
+    identity,
+    existing,
+    { claimToken = createClaimToken(), observedAt = now(), reconciliationOnly = false } = {},
+  ) {
+    const claimTokenHash = sha256(claimToken);
+    const claimExpiresAt = new Date(observedAt.getTime() + claimDurationMs);
     const persistedEffectKey = existing.effectKey;
     if (existing.status === 'committed') {
       return {
@@ -473,6 +484,9 @@ function createInteractionDurableEffectService({
       };
     }
     const priorStatus = existing.status;
+    if (reconciliationOnly && priorStatus === 'failed_without_effect') {
+      throw durableEffectError('durable_effect_reconciliation_unavailable', 409, false);
+    }
     const reclaimed = await EffectModel.findOneAndUpdate(
       {
         effectKey: persistedEffectKey,
@@ -503,11 +517,80 @@ function createInteractionDurableEffectService({
       };
     }
     return {
-      decision: priorStatus === 'failed_without_effect' ? 'dispatch' : 'reconcile',
+      decision:
+        !reconciliationOnly && priorStatus === 'failed_without_effect' ? 'dispatch' : 'reconcile',
       effectKey: persistedEffectKey,
       claimToken,
       providerIdempotencyKey: identity.providerIdempotencyKey,
     };
+  }
+
+  /** Trusted server scope only: retained admission permits receipt reads, never a new dispatch. */
+  async function prepareDurableEffectReconciliation(input) {
+    const identity = {
+      ownerId: boundedText(input?.userId, 160),
+      conversationId: boundedText(input?.conversationId, 256),
+      logicalTurnId: boundedText(input?.logicalTurnId, 256),
+      logicalTurnRevision: input?.logicalTurnRevision,
+      sourceEventId: boundedText(input?.sourceEventId, 512),
+      sourceRevision: input?.sourceRevision,
+      responseMessageId: boundedText(input?.responseMessageId, 256),
+      presentationRevision: input?.presentationRevision,
+      surface: boundedText(input?.surface, 32),
+      effectOrdinal: input?.effectOrdinal,
+      effectOccurrenceRef: boundedText(input?.effectOccurrenceRef, 256),
+      adapterId: boundedText(input?.adapterId, 120),
+      routeId: boundedText(input?.routeId, 120),
+      operation: boundedText(input?.operation, 120),
+      canonicalArgsSha256: sha256(canonicalJson(input?.canonicalArgs)),
+      effectKey: boundedText(input?.effectKey, 80),
+      effectKind: input?.effectKind,
+      providerIdempotencyKey: boundedText(input?.providerIdempotencyKey, 256),
+      providerIdempotencyMode: input?.providerIdempotencyMode,
+      ...(input?.voiceAuthorityRef
+        ? { voiceAuthorityRef: boundedText(input.voiceAuthorityRef, 256) }
+        : {}),
+    };
+    if (
+      !identity.ownerId ||
+      !identity.conversationId ||
+      !identity.logicalTurnId ||
+      !identity.sourceEventId ||
+      !identity.responseMessageId ||
+      !identity.effectOccurrenceRef ||
+      !identity.routeId ||
+      !identity.operation ||
+      !identity.providerIdempotencyKey ||
+      !/^effect_[a-f0-9]{64}$/.test(identity.effectKey) ||
+      !Number.isSafeInteger(identity.logicalTurnRevision) ||
+      identity.logicalTurnRevision < 1 ||
+      identity.sourceRevision !== identity.logicalTurnRevision ||
+      identity.presentationRevision !== identity.logicalTurnRevision ||
+      identity.effectOrdinal !== 0 ||
+      !SUPPORTED_SURFACES.has(identity.surface) ||
+      !SUPPORTED_ADAPTERS.has(identity.adapterId) ||
+      !SUPPORTED_EFFECT_KINDS.has(identity.effectKind) ||
+      !['native_key', 'deterministic_reconciliation', 'none'].includes(
+        identity.providerIdempotencyMode,
+      ) ||
+      !input?.canonicalArgs ||
+      typeof input.canonicalArgs !== 'object'
+    ) {
+      throw durableEffectError('durable_effect_invalid_input', 400, false);
+    }
+    const existing = plainRow(
+      await EffectModel.findOne({
+        effectKey: identity.effectKey,
+        ownerId: identity.ownerId,
+      }).lean(),
+    );
+    if (
+      !rowMatchesIdentity(existing, identity) ||
+      existing.presentationRevision !== identity.presentationRevision
+    ) {
+      throw durableEffectError('durable_effect_conflict', 409, false);
+    }
+    return claimExistingEffect(identity, existing, { reconciliationOnly: true });
   }
 
   async function commitDurableEffect({
@@ -658,6 +741,7 @@ function createInteractionDurableEffectService({
     readSourceEffectFacts: (scope) => readSourceEffectFacts(scope, EffectModel),
     acknowledgeDurableEffectDelivery,
     prepareDurableEffect,
+    prepareDurableEffectReconciliation,
     commitDurableEffect,
     settleDurableEffectFailure,
   };
@@ -682,6 +766,10 @@ function getDefaultService() {
 
 async function prepareDurableEffect(input) {
   return getDefaultService().prepareDurableEffect(input);
+}
+
+async function prepareDurableEffectReconciliation(input) {
+  return getDefaultService().prepareDurableEffectReconciliation(input);
 }
 
 async function commitDurableEffect(input) {
@@ -718,5 +806,6 @@ module.exports = {
   createVoiceDurableEffectAuthorityBinding,
   ensureInteractionDurableEffectIndexes,
   prepareDurableEffect,
+  prepareDurableEffectReconciliation,
   settleDurableEffectFailure,
 };

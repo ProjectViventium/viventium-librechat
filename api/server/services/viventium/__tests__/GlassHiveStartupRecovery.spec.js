@@ -57,5 +57,7 @@ test.each([false, true])('launch reconciliation startup respects quiesced=%s', a
   expect(recoverScheduled).toHaveBeenCalledTimes(quiesced ? 0 : 1);
   if (quiesced) expect(required).not.toHaveBeenCalled();
   else expect(context.upgradeFinalization.markReady).toHaveBeenCalledTimes(1);
+  expect(context.process.exit).not.toHaveBeenCalled();
+  expect(context.logger.error).not.toHaveBeenCalled();
 });
 /* === VIVENTIUM END === */

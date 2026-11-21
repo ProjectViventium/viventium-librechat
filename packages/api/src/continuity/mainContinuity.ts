@@ -975,7 +975,7 @@ export const NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES = 128 * 1024;
 /** Internal compiler-owned courier field; consumed and removed before native dispatch. */
 export const MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER = 'X-Viventium-Turn-Context-Max-Bytes';
 function isNativeBodyContextAllocation(bytes: number): boolean {
-  return Number.isSafeInteger(bytes) && bytes > NATIVE_MAIN_TURN_CONTEXT_MAX_BYTES;
+  return Number.isSafeInteger(bytes) && bytes > 0;
 }
 const MAIN_CONTINUITY_AUTHORITY_HEADERS = new Set([
   MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER.toLowerCase(),
@@ -1614,6 +1614,43 @@ export function renderAcceptedMainContextForCarrier(context: UnknownRecord,
     }
     return unavailable;
   }
+}
+
+/** An older reviewed prefix may become unavailable; never slice it or alter its saved sources. */
+export function fitConversationContinuityForCarrier(
+  capsule: string,
+  outputCarrier: MainContinuityOutputCarrier,
+  unavailableInstructions: () => string,
+): string {
+  const carrier = acceptedMainCarrier(outputCarrier);
+  if (
+    Buffer.byteLength(capsule, 'utf8') <=
+    carrier.carrierMaxUtf8Bytes - carrier.reservedContextUtf8Bytes
+  )
+    return capsule;
+  const view = renderAcceptedMainContextForCarrier(
+    {
+      status: 'unavailable',
+      messageCapsule: buildAcceptedMainContextCapsule({
+        compactionAllocation: true,
+        continuityUnavailable: true,
+      }),
+    },
+    outputCarrier,
+    {
+      allowDegraded: true,
+      unavailableInstructions: unavailableInstructions(),
+    },
+  );
+  if (view.status === 'context_budget')
+    throw Object.assign(
+      new Error('Required continuity disclosure cannot fit the selected carrier'),
+      {
+        code: 'source_context_unavailable',
+        status: 413,
+      },
+    );
+  return String(view.capsule);
 }
 
 function turnKey(turn: AcceptedMainTurn): string {

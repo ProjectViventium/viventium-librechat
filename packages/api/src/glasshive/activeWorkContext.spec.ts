@@ -152,7 +152,7 @@ it('keeps owner-wide original delivery scope on both Voice and text contexts', (
     ).toMatchObject({
       workRef: 'work-a',
       state: 'running',
-      deliveryState: 'delivered',
+      presentationReceipt: { scope: 'result_message', state: 'delivered' },
       deliveryScope,
     });
   }
@@ -427,21 +427,29 @@ describe('compact native tool roster projection', () => {
   });
 });
 
-
-test.each(['active', 'history'] as const)('compact %s work retains delivery uncertainty as a fact, not an action', (scope) => {
-  const work = ['unknown', 'failed', 'delivered', 'pending'].map((state, index) => ({
-    workRef: `work-${index}`, title: 'Work item', state: 'completed', actions: ['message'],
-    delivery: { state, unreadTerminal: state !== 'delivered' }, updatedAt: '2026-01-01T00:00:00Z',
-  }));
-  const result = projectActiveWorkRoster({ snapshot: 'fresh', work }, scope);
-  expect(result.work.map((item: { deliveryState: string }) => item.deliveryState))
-    .toEqual(work.map((item) => item.delivery.state));
-  for (const item of result.work) {
-    expect(item.actions).toEqual(['message']);
-    expect(item).not.toHaveProperty('updatedAt');
-  }
-});
-
+test.each(['active', 'history'] as const)(
+  'compact %s work retains delivery uncertainty as a fact, not an action',
+  (scope) => {
+    const work = ['unknown', 'failed', 'delivered', 'pending'].map((state, index) => ({
+      workRef: `work-${index}`,
+      title: 'Work item',
+      state: 'completed',
+      actions: ['message'],
+      delivery: { state, unreadTerminal: state !== 'delivered' },
+      updatedAt: '2026-01-01T00:00:00Z',
+    }));
+    const result = projectActiveWorkRoster({ snapshot: 'fresh', work }, scope);
+    expect(
+      result.work.map(
+        (item: { presentationReceipt: { state: string } }) => item.presentationReceipt.state,
+      ),
+    ).toEqual(work.map((item) => item.delivery.state));
+    for (const item of result.work) {
+      expect(item.actions).toEqual(['message']);
+      expect(item).not.toHaveProperty('updatedAt');
+    }
+  },
+);
 
 test('coordination roster names match actual tools without changing full defaults', () => {
   const input = { snapshot: { snapshot: 'fresh', work: [] }, preferredMode: 'parallel' as const, available: true };

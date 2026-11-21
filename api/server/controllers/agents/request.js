@@ -731,41 +731,19 @@ function getExactDurableEffectReceipt(job, req, messageId, { requireSuperseded =
   const normalizedMessageId = String(messageId || '').trim();
   const jobContract = job?.metadata ?? job ?? {};
   const receipt = job?.durableEffectReceipt ?? jobContract.durableEffectReceipt;
-  const checks = [
-    ['message_missing', Boolean(normalizedMessageId)],
-    ['status_mismatch', !requireSuperseded || job?.status === 'superseded'],
-    [
-      'supersede_scope_mismatch',
-      jobContract.adapterCapabilities?.supersede_scope === 'response_only',
-    ],
-    [
-      'delivery_policy_mismatch',
-      jobContract.deliveryPolicy?.commit_authority === 'external_adapter',
-    ],
-    [
-      'effect_kind_mismatch',
-      ['durable_work_accepted', 'durable_work_action_accepted'].includes(receipt?.effect_kind),
-    ],
-    ['effect_ref_missing', Boolean(String(receipt?.effect_ref || '').trim())],
-    [
-      'commit_time_invalid',
-      Number.isFinite(Number(receipt?.committed_at)) && Number(receipt?.committed_at) > 0,
-    ],
-    ['job_response_mismatch', jobContract.responseMessageId === normalizedMessageId],
-    ['receipt_response_mismatch', receipt?.response_message_id === normalizedMessageId],
-    [
-      'job_source_mismatch',
-      jobContract.interactionContext?.source_event_id === trustedContext?.source_event_id,
-    ],
-    ['receipt_source_mismatch', receipt?.source_event_id === trustedContext?.source_event_id],
-  ];
-  const rejected = checks.find(([, accepted]) => !accepted);
-  if (rejected && job?.status === 'superseded' && receipt?.effect_kind) {
+  const { receipt: verified, rejectionReason } =
+    require('@librechat/api').resolveCurrentDurableWorkReceipt({
+      job,
+      responseMessageId: normalizedMessageId,
+      sourceEventId: trustedContext?.source_event_id,
+      requireSuperseded,
+    });
+  if (rejectionReason && job?.status === 'superseded' && receipt?.effect_kind) {
     logger.warn('[ResumableAgentController] Durable effect receipt presentation rejected', {
-      reason: rejected[0],
+      reason: rejectionReason,
     });
   }
-  return rejected ? null : receipt;
+  return verified;
 }
 
 async function isSupersededRequest(req) {
@@ -2589,9 +2567,9 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               : {}),
             ...(transmittableDurableEffectReceipt
               ? {
-                  durableEffectReceipt: {
-                    effect_ref: transmittableDurableEffectReceipt.effect_ref,
-                  },
+                  durableEffectReceipt: require('@librechat/api').publicDurableWorkReceipt(
+                    transmittableDurableEffectReceipt,
+                  ),
                 }
               : {}),
           };

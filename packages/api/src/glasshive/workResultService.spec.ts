@@ -41,8 +41,20 @@ describe('retained work result read', () => {
   it('retains complete accepted continuation input beyond old courier bounds', async () => {
     const text = 'x'.repeat(140000) + '\nKeep the final condition.';
     const guidance = Array.from({ length: 130 }, (_, n) => `${n}: ${text}`);
-    const runInput = { ...row.runInput, instruction: text,
-      continuation_context: { version: 1, base_instruction: text, guidance } };
+    const runInput = {
+      ...row.runInput,
+      instruction: text,
+      continuation_context: {
+        version: 1,
+        base_instruction: text,
+        guidance,
+        inherited_conversation: {
+          version: 1,
+          conversation_id: 'conversation-a',
+          sources: [{ id: 'source-a', role: 'user', text: 'Original quoted source.\n' + text }],
+        },
+      },
+    };
     missionEvidence.findOne.mockResolvedValue({ ...row, runInput });
     const result = await service.getGlassHiveWorkResult({ ownerId: 'owner-a', runId: 'run-a' });
     expect(result.runInput).toEqual(runInput);
@@ -94,6 +106,26 @@ describe('retained work result read', () => {
       service.getGlassHiveWorkResult({ ownerId: 'owner-a', runId: 'run-a' }),
     ).rejects.toMatchObject({ code: 'mission_input_identity_invalid' });
   });
+  it.each([null, [], 'quoted source', 7])(
+    'rejects malformed inherited context %j',
+    async (inherited) => {
+      missionEvidence.findOne.mockResolvedValue({
+        ...row,
+        runInput: {
+          ...row.runInput,
+          continuation_context: {
+            version: 1,
+            base_instruction: original,
+            guidance: [],
+            inherited_conversation: inherited,
+          },
+        },
+      });
+      await expect(
+        service.getGlassHiveWorkResult({ ownerId: 'owner-a', runId: 'run-a' }),
+      ).rejects.toMatchObject({ code: 'mission_input_identity_invalid' });
+    },
+  );
   it('preserves verified artifact references without exposing raw row fields', async () => {
     const sha = 'a'.repeat(64);
     const media = {

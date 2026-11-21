@@ -54,6 +54,25 @@ export interface SourceMutationService {
   }): Promise<IInteractionDurableEffect>;
 }
 
+/** Constructed only around a trusted local read before any provider action request. */
+export class SourceMutationPreDispatchFailure extends Error {
+  readonly code: string;
+  readonly status?: number;
+  readonly retryable?: boolean;
+  readonly outcomeUnknown = false;
+  constructor(readonly cause: unknown) {
+    super(cause instanceof Error ? cause.message : 'source_mutation_preparation_failed');
+    this.name = 'SourceMutationPreDispatchFailure';
+    const code = cause && typeof cause === 'object' && 'code' in cause ? cause.code : undefined;
+    this.code = typeof code === 'string' ? code : 'source_mutation_preparation_failed';
+    if (cause && typeof cause === 'object') {
+      if ('status' in cause && typeof cause.status === 'number') this.status = cause.status;
+      if ('retryable' in cause && typeof cause.retryable === 'boolean')
+        this.retryable = cause.retryable;
+    }
+  }
+}
+
 function mutationError(code: string): Error & { code: string; retryable: false } {
   return Object.assign(new Error(code), { code, retryable: false as const });
 }
@@ -71,12 +90,15 @@ export async function executeSourceMutation({
   service,
   assertAuthor,
   dispatch,
+  reconcile,
   recordReceipt,
 }: {
   input: SourceMutationPrepareInput;
   service: SourceMutationService;
   assertAuthor(): Promise<void>;
   dispatch(): Promise<SourceMutationResult>;
+  /** Reads only the exact original provider receipt; it must never execute the mutation. */
+  reconcile?(): Promise<SourceMutationResult>;
   recordReceipt?(row: IInteractionDurableEffect): Promise<void>;
 }): Promise<InteractionDurableEffectJsonValue> {
   const claim = await service.prepareDurableEffect(input);
@@ -84,7 +106,12 @@ export async function executeSourceMutation({
     if (claim.replayResult === undefined) throw mutationError('source_mutation_result_unavailable');
     return claim.replayResult;
   }
-  if (claim.decision !== 'dispatch' || !claim.claimToken) {
+  const reconciling = claim.decision === 'reconcile';
+  if (
+    (claim.decision !== 'dispatch' && !reconciling) ||
+    !claim.claimToken ||
+    (reconciling && !reconcile)
+  ) {
     throw mutationError('source_mutation_outcome_pending');
   }
   const settlement = (
@@ -97,23 +124,31 @@ export async function executeSourceMutation({
       outcome,
       failureCode: code,
     });
-  try {
-    await assertAuthor();
-  } catch (error) {
-    await settlement('failed_without_effect', 'source_authority_rejected_before_dispatch');
-    throw error;
+  if (!reconciling) {
+    try {
+      await assertAuthor();
+    } catch (error) {
+      await settlement('failed_without_effect', 'source_authority_rejected_before_dispatch');
+      throw error;
+    }
   }
   let outcome: SourceMutationResult;
   try {
-    outcome = await dispatch();
+    outcome = reconciling ? await reconcile!() : await dispatch();
   } catch (error) {
-    await settlement('provider_outcome_unknown', 'source_mutation_dispatch_unconfirmed');
+    const noEffect = !reconciling && error instanceof SourceMutationPreDispatchFailure;
+    await settlement(
+      noEffect ? 'failed_without_effect' : 'provider_outcome_unknown',
+      noEffect ? 'source_mutation_preparation_failed' : 'source_mutation_dispatch_unconfirmed',
+    );
     throw error;
   }
   if (!outcome.receiptRef) {
     await settlement(
-      outcome.noEffect === true ? 'failed_without_effect' : 'provider_outcome_unknown',
-      outcome.noEffect === true
+      !reconciling && outcome.noEffect === true
+        ? 'failed_without_effect'
+        : 'provider_outcome_unknown',
+      !reconciling && outcome.noEffect === true
         ? 'source_mutation_rejected'
         : 'source_mutation_receipt_unconfirmed',
     );
@@ -152,6 +187,7 @@ export async function executeManagedSourceMutation(options: {
   service: SourceMutationService;
   getJob: Parameters<typeof assertCurrentGlassHiveSourceAuthor>[0]['getJob'];
   dispatch(): Promise<SourceMutationResult>;
+  reconcile?(): Promise<SourceMutationResult>;
   recordReceipt?(row: IInteractionDurableEffect): Promise<void>;
   signal?: AbortSignal;
   rejectDispatch?(error: unknown): Promise<void>;
@@ -183,6 +219,7 @@ export async function executeManagedSourceMutation(options: {
       }
     },
     dispatch: options.dispatch,
+    reconcile: options.reconcile,
     recordReceipt: options.recordReceipt,
   });
 }
@@ -198,7 +235,7 @@ export type SourceEffectFact = Pick<
   | 'routeId'
   | 'operation'
   | 'providerReceiptRef'
->;
+> & { resultStatus?: 'blocked'; resultReason?: string };
 
 export interface SourceWorkFact {
   sourceEventId: string;
@@ -223,6 +260,17 @@ export function sourceEffectFacts(rows: readonly IInteractionDurableEffect[]): S
     routeId: row.routeId,
     operation: row.operation,
     ...(row.providerReceiptRef ? { providerReceiptRef: row.providerReceiptRef } : {}),
+    ...(row.replayResult &&
+    typeof row.replayResult === 'object' &&
+    !Array.isArray(row.replayResult) &&
+    row.replayResult.status === 'blocked'
+      ? {
+          resultStatus: 'blocked' as const,
+          ...(typeof row.replayResult.reason === 'string'
+            ? { resultReason: row.replayResult.reason }
+            : {}),
+        }
+      : {}),
   }));
 }
 

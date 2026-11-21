@@ -11,6 +11,7 @@ const {
   isConversationOrchestrationTool,
   nativeCoordinatorOutputFilesForMessage,
   nativeCoordinatorResultVoiceTurnId,
+  nativeCoordinatorResultPublicationKey,
   buildCortexInsightDeliveryCandidates,
   normalizeInteractionSourceSegments,
   prepareMainAuthorContext,
@@ -65,6 +66,77 @@ const {
 
 const bindings = () => mongoose.connection.collection('viventium_glasshive_callback_bindings');
 const failure = (code) => Object.assign(new Error(code), { code, status: 503 });
+
+async function resultPublication({ binding, source, data }) {
+  const parentMessageId = source.requestBody.messageId || source.requestBody.parentMessageId;
+  const native = {
+    bindingRef: binding._id,
+    nativeConversationId: data.conversation_id,
+    sourceTurnId: source.turnId,
+    runId: data.run_id,
+    resultRevision: data.result_revision,
+    resultDigest: data.result_digest,
+  };
+  const selector = {
+    user: binding.ownerId,
+    conversationId: binding.conversationId,
+    isCreatedByUser: false,
+    'metadata.viventium.cortexPresentationParentMessageId': parentMessageId,
+    'metadata.viventium.mainGenerationPresentation.version': 2,
+    ...Object.fromEntries(
+      Object.entries(native).map(([key, value]) => [
+        'metadata.viventium.mainGenerationPresentation.nativeCoordinatorResult.' + key,
+        value,
+      ]),
+    ),
+  };
+  let first = data;
+  for (const message of await db.getMessages(selector)) {
+    const stored = message.metadata?.viventium?.mainGenerationPresentation?.nativeCoordinatorResult;
+    if (
+      !stored ||
+      Object.entries(native).some(([key, value]) => stored[key] !== value) ||
+      String(message.user) !== binding.ownerId ||
+      message.conversationId !== binding.conversationId ||
+      presentationParent(message) !== parentMessageId
+    )
+      continue;
+    const owned = await require('./NativeCoordinatorPresentationService').resolve({
+      ownerId: binding.ownerId,
+      conversationId: binding.conversationId,
+      parentMessageId,
+      deliveryIds: message.metadata.viventium.cortexInsightDeliveryIds,
+    });
+    if (owned?.eligible && owned.message?.messageId === message.messageId) {
+      first = owned.data;
+      break;
+    }
+  }
+  const filter = {
+    _id: nativeCoordinatorResultPublicationKey({ binding, source, data }),
+    kind: 'native_coordinator_result_publication',
+    ownerId: binding.ownerId,
+    bindingRef: binding._id,
+    conversationId: binding.conversationId,
+    parentMessageId,
+    sourceTurnId: source.turnId,
+    runId: data.run_id,
+    resultRevision: data.result_revision,
+    resultDigest: data.result_digest,
+  };
+  try {
+    await bindings().updateOne(
+      filter,
+      { $setOnInsert: { ...filter, data: first } },
+      { upsert: true },
+    );
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+  }
+  const publication = await bindings().findOne(filter);
+  if (!publication?.data) throw failure('coordinator_publication_unavailable');
+  return publication.data;
+}
 
 async function prepareContext({ binding, source, eventId, purpose, workerWorkRef }) {
   const missionServerScope = workerWorkRef
@@ -332,6 +404,7 @@ const presentationDependencies = {
     publisher,
     data,
   }) => {
+    const progress = Boolean(data.progress_id);
     const currentOutputFiles = outputFiles
       ? nativeCoordinatorOutputFilesForMessage(
           outputFiles,
@@ -355,6 +428,44 @@ const presentationDependencies = {
         attempt_id: currentOutputFiles.attempt_id,
         sha256: file.sha256,
       })) || [];
+    /* === VIVENTIUM START ===
+     * A finished result's files are owed to the owner even when Main has nothing to add. They are
+     * owed once: a saved presentation of the same run that already carries files settles them
+     * (one run can settle more than one goal).
+     * === VIVENTIUM END === */
+    const retainedSelectionText = !progress
+      ? insights
+          .map((insight) => (typeof insight.insight === 'string' ? insight.insight : ''))
+          .join('\n')
+      : '';
+    const retainedFilesOwed =
+      Boolean(retainedSelectionText) &&
+      (await require('./nativeOutputFiles').hasRetainedNativeOutputFiles(
+        {
+          userId: binding.ownerId,
+          conversationId: binding.conversationId,
+          responseMessageId: parentMessageId,
+          agentId: binding.agentId,
+        },
+        retainedSelectionText,
+      ));
+    const resultFilesOwed =
+      retainedFilesOwed ||
+      (!progress &&
+        Boolean(currentOutputFiles?.files?.length) &&
+        !(
+          await db.getMessages(
+            {
+              user: binding.ownerId,
+              conversationId: binding.conversationId,
+              isCreatedByUser: false,
+              'metadata.viventium.mainGenerationPresentation.nativeCoordinatorResult.runId':
+                data.run_id,
+              'attachments.0': { $exists: true },
+            },
+            'messageId',
+          )
+        ).length);
     const candidates = buildCortexInsightDeliveryCandidates({
       ownerId: binding.ownerId,
       conversationId: binding.conversationId,
@@ -392,66 +503,88 @@ const presentationDependencies = {
       runId: eventId,
       insightsData: { insights, errors: [], cortexCount: insights.length },
       recentResponse: '',
-      forceVisibleFollowUp: true,
+      forceVisibleFollowUp: !progress,
       allowMovedOnUsefulFollowUp: true,
       authorizedResultFiles,
+      ...(resultFilesOwed ? { attachmentsRequired: true } : {}),
       dependencies: {
-        saveMessage: (req, message, options) =>
-          db.saveMessage(req, bindNativeResultAuthority(message, binding, source, data), options),
-        ...(currentOutputFiles
+        ...(progress
           ? {
-              prepareAttachments: async (message) => {
-                const {
-                  prepareNativeOutputFiles,
-                  prepareMissionOutputFiles,
-                } = require('./nativeOutputFiles');
-                const selected = nativeCoordinatorOutputFilesForMessage(
-                  currentOutputFiles,
-                  {
-                    ownerId: binding.ownerId,
-                    conversationId: binding.nativeConversationId,
-                    runId: data.run_id,
-                    publisher,
-                  },
-                  {
-                    userId: binding.ownerId,
-                    conversationId: binding.conversationId,
-                    responseMessageId: message.messageId,
-                    agentId: message.agent_id,
-                  },
-                );
-                const attachments = await prepareNativeOutputFiles(
-                  context.req,
-                  selected.envelope,
-                  selected.identity,
-                  { route: createAccountApiRoute({ ownerId: binding.ownerId }) },
-                );
-                return prepareMissionOutputFiles({
-                  req: context.req,
-                  rows: [],
-                  message,
-                  sourceMessageId: parentMessageId,
-                  initialImports: [
-                    {
-                      envelope: selected.envelope,
-                      identity: selected.identity,
-                      attachments,
-                    },
-                  ],
-                });
-              },
+              // Deferred Main authors finish after the initial callback returns. Rejoin only
+              // after the existing ledger records the saved message, using the same publisher.
+              afterSave: () =>
+                require('./NativeCoordinatorProgressService').publish({
+                  binding,
+                  data,
+                  eventId,
+                }),
             }
           : {}),
+        saveMessage: async (req, message, options) =>
+          db.saveMessage(
+            req,
+            progress
+              ? await require('./NativeCoordinatorProgressService').bindForSave(
+                  message,
+                  binding,
+                  source,
+                  data,
+                )
+              : bindNativeResultAuthority(message, binding, source, data),
+            options,
+          ),
+        prepareAttachments: async (message) => {
+          const {
+            prepareNativeOutputFiles,
+            prepareMissionOutputFiles,
+          } = require('./nativeOutputFiles');
+          const initialImports = [];
+          if (currentOutputFiles) {
+            const selected = nativeCoordinatorOutputFilesForMessage(
+              currentOutputFiles,
+              {
+                ownerId: binding.ownerId,
+                conversationId: binding.nativeConversationId,
+                runId: data.run_id,
+                publisher,
+              },
+              {
+                userId: binding.ownerId,
+                conversationId: binding.conversationId,
+                responseMessageId: message.messageId,
+                agentId: message.agent_id,
+              },
+            );
+            const attachments = await prepareNativeOutputFiles(
+              context.req,
+              selected.envelope,
+              selected.identity,
+              { route: createAccountApiRoute({ ownerId: binding.ownerId }) },
+            );
+            initialImports.push({
+              envelope: selected.envelope,
+              identity: selected.identity,
+              attachments,
+            });
+          }
+          return prepareMissionOutputFiles({
+            req: context.req,
+            rows: [],
+            message: retainedFilesOwed
+              ? { ...message, text: [message.text || '', retainedSelectionText].join('\n') }
+              : message,
+            sourceMessageId: parentMessageId,
+            initialImports,
+          });
+        },
       },
     });
   },
   async enqueue({ binding, source, eventId, message, data }) {
-    message = await require('./NativeCoordinatorPresentationService').persistAuthority(
-      message,
-      binding,
-      source,
-      data,
-    );
+    const progress = Boolean(data.progress_id);
+    message = await require(
+      progress ? './NativeCoordinatorProgressService' : './NativeCoordinatorPresentationService',
+    ).persistAuthority(message, binding, source, data);
     const destinations = await resolveConfiguredGlassHiveDestinations({
       ownerId: binding.ownerId,
       requestBody: source.requestBody,
@@ -463,8 +596,12 @@ const presentationDependencies = {
       source.requestBody.viventiumCallSessionId ||
       source.requestBody.viventiumVoiceCallSessionId ||
       '';
-    const nativeCoordinatorResult = nativeResultSource(binding, source, data);
-    const mainGenerationPresentation = { nativeCoordinatorResult };
+    const nativeCoordinatorResult = progress
+      ? require('./NativeCoordinatorProgressService').source(binding, source, data)
+      : nativeResultSource(binding, source, data);
+    const mainGenerationPresentation = progress
+      ? { nativeCoordinatorProgress: nativeCoordinatorResult }
+      : { nativeCoordinatorResult };
     if (
       source.requestBody.viventiumSurface === 'voice' &&
       sourceCallSessionId &&
@@ -482,10 +619,12 @@ const presentationDependencies = {
         linkedDestinations.push({
           surface: 'voice',
           voiceCallSessionId: sourceCallSessionId,
-          voiceRequestId: nativeCoordinatorResultVoiceTurnId(
-            nativeCoordinatorResult,
-            message.messageId,
-          ),
+          voiceRequestId: progress
+            ? require('./NativeCoordinatorProgressService').voiceTurnId(
+                nativeCoordinatorResult,
+                message.messageId,
+              )
+            : nativeCoordinatorResultVoiceTurnId(nativeCoordinatorResult, message.messageId),
         });
       }
     }
@@ -496,11 +635,16 @@ const presentationDependencies = {
         ['librechat', 'workbench'].includes(destination.surface),
       );
       if (linkedWebCommitted) {
-        await require('./NativeCoordinatorPresentationService').settleLinkedWeb({
+        await require(
+          progress
+            ? './NativeCoordinatorProgressService'
+            : './NativeCoordinatorPresentationService',
+        ).settleLinkedWeb({
           ownerId: binding.ownerId,
           conversationId: binding.conversationId,
           parentMessageId: presentationParent(message),
           deliveryIds: message.metadata?.viventium?.cortexInsightDeliveryIds,
+          ...(progress ? { message } : {}),
         });
       }
       return {
@@ -531,6 +675,7 @@ const presentationDependencies = {
 const presentResult = createNativeCoordinatorResultPresenter(presentationDependencies);
 
 module.exports = createNativeCoordinatorContextAdapter({
+  resultPublication,
   readBinding: (ownerId, nativeConversationId) =>
     bindings().findOne({
       kind: 'native_coordinator_binding',
@@ -633,4 +778,7 @@ module.exports = createNativeCoordinatorContextAdapter({
   presentResult,
 });
 module.exports.enqueueSavedNativeCoordinatorPresentation = presentationDependencies.enqueue;
+module.exports.createNativeCoordinatorFollowUp = presentationDependencies.createFollowUp;
+module.exports.prepareNativeCoordinatorProgressContext = (input) =>
+  prepareContext({ ...input, purpose: 'callback' });
 /* === VIVENTIUM END === */

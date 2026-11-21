@@ -22,6 +22,7 @@ export async function readNativeConversationHistoryBudget(input: {
   agentId: string;
   contextEpoch: string;
   modelId: string;
+  alternateModelIds?: readonly string[];
   messages: ReadonlyArray<{
     messageId?: string;
     isCreatedByUser?: boolean;
@@ -79,7 +80,7 @@ export async function readNativeConversationHistoryBudget(input: {
         result.conversation_id !== identity.conversationId ||
         receipt?.version !== 1 ||
         receipt.stable_authority_sha256 !== input.contextEpoch ||
-        receipt.model_id !== input.modelId ||
+        ![input.modelId, ...(input.alternateModelIds || [])].includes(receipt.model_id) ||
         !Number.isSafeInteger(receipt.replay_budget_bytes) ||
         receipt.replay_budget_bytes <= 0
       ) {

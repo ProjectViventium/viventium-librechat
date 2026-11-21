@@ -27,6 +27,7 @@ const {
   GenerationJobManager,
   executeManagedSourceMutation,
   isManagedSourceMutation,
+  buildGlassHiveWorkActionRequest,
   nativeCoordinatorHandoffTurnId,
 } = require('@librechat/api');
 const durableEffects = require('./InteractionDurableEffectService');
@@ -121,6 +122,8 @@ const { activeMemoryWriterTool } = require('./memoryWriterCoordinator');
 
 /* === VIVENTIUM START === Mongo acceptance precedes the optional presentation projection. === */
 async function recordManagedDurableReceipt(row, streamId) {
+  // A retained failed action is a known outcome, not an accepted-work presentation grant.
+  if (row.replayResult?.status === 'blocked') return;
   try {
     await GenerationJobManager.markDurableEffectReceipt({
       streamId,
@@ -1446,6 +1449,13 @@ async function invokeConversationOrchestrationTool({
               selectTrustedLaunchRequestBody(requestBody, args.sourceOrdinals).sourceOrdinals,
             )
           : undefined;
+      const providerIdempotencyKey = isManagedSourceMutation(requestBody)
+        ? require('./GlassHiveAccountService').buildTrustedActionIdempotencyKey({
+            ownerId: catalog.user.id,
+            ...input,
+            operationId: stableInvocationId,
+          })
+        : stableInvocationId;
       return await executeManagedSourceMutation({
         userId: catalog.user.id,
         requestBody,
@@ -1454,19 +1464,39 @@ async function invokeConversationOrchestrationTool({
         operation: input.action,
         effectKind: 'durable_work_action_accepted',
         occurrenceId: stableInvocationId,
-        providerIdempotencyKey: isManagedSourceMutation(requestBody)
-          ? require('./GlassHiveAccountService').buildTrustedActionIdempotencyKey({
-              ownerId: catalog.user.id,
-              ...input,
-              operationId: stableInvocationId,
-            })
-          : stableInvocationId,
+        providerIdempotencyKey,
         providerIdempotencyMode: 'native_key',
         canonicalArgs: input,
         service: durableEffects,
         getJob: (streamId) => GenerationJobManager.getJobStore().getJob(streamId),
         signal,
         recordReceipt: (row) => recordManagedDurableReceipt(row, requestBody?.viventiumStreamId),
+        reconcile: async () => {
+          const receipt =
+            await require('./NativeCoordinatorWorkService').readNativeCoordinatorWorkActionReceipt({
+              ownerId: catalog.user.id,
+              workRef: input.workRef,
+              ...(input.fileIds ? { fileIds: input.fileIds } : {}),
+              body: buildGlassHiveWorkActionRequest({
+                action: input.action,
+                idempotencyKey: providerIdempotencyKey,
+                instruction: input.instruction,
+                nativeInput: input.nativeInput,
+                inheritedConversation,
+              }),
+            });
+          return {
+            receiptRef: receipt.receiptRef,
+            result: receipt.failure
+              ? {
+                  status: 'blocked',
+                  tool: hostTool.toolName,
+                  reason: receipt.failure.code,
+                  retryable: false,
+                }
+              : { status: 'ok', tool: hostTool.toolName, result: receipt.result },
+          };
+        },
         dispatch: async () => {
           if (requestBody?.viventiumResultAuthor !== undefined)
             await assertCurrentGlassHiveResultAuthor({

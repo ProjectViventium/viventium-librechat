@@ -16,6 +16,7 @@ import type {
   NativeCoordinatorTurn,
   NativeCoordinatorWorkRequestDependencies,
 } from './nativeCoordinatorWork';
+import { createHash } from 'node:crypto';
 
 const owner = { ownerId: 'owner-one', tenantId: 'tenant-one' };
 const binding = {
@@ -585,6 +586,144 @@ function requestFixture(prepareAction?: NativeCoordinatorWorkRequestDependencies
   return { ...adapter, rawRequest: request, read };
 }
 
+function retainedActionFixture() {
+  const prepare = jest.fn();
+  const f = requestFixture(prepare);
+  f.read.mockResolvedValue({
+    snapshot: 'fresh',
+    snapshots: [
+      {
+        binding: { ...binding, _id: 'binding-one' },
+        snapshot: {
+          conversation_id: 'native-one',
+          goals: [
+            {
+              ...goal(),
+              source_turn_id: 'source-one',
+              run_id: 'replacement-run',
+              control_run_id: 'replacement-run',
+              actions: [],
+              state: 'completed',
+            },
+          ],
+        },
+      },
+    ],
+  });
+  const body = {
+    action: 'queue',
+    idempotencyKey: 'retained-action-key',
+    instruction: 'Exact original.',
+    inheritedConversation: {
+      version: 1,
+      conversation_id: 'chat-one',
+      sources: [{ id: 'source', text: 'Original' }],
+    },
+  };
+  const retained = {
+    ...body,
+    sourceContext: { sourceEventId: 'retained-event' },
+    runtimeBundle: { schedule_access: { destinations: [] } },
+    fileInputs: [{ sourceFileId: 'file-one', uploadId: 'upload-one', revision: 'revision-one' }],
+  };
+  const control = {
+    action: 'queue',
+    idempotency_key: body.idempotencyKey,
+    message: body.instruction,
+    run_id: 'original-source-run',
+  };
+  const saved = {
+    conversation_id: 'native-one',
+    request_ref: 'binding-one',
+    goal_id: 'goal-one',
+    source_turn_id: 'source-one',
+    run_id: 'original-source-run',
+    action_key: body.idempotencyKey,
+    action_digest: createHash('sha256').update(JSON.stringify(control)).digest('hex'),
+    control,
+    action_request: retained,
+    state: 'completed',
+  };
+  f.rawRequest.mockImplementation(async (input) =>
+    input.method === 'GET' ? saved : { status: 'queued', runId: 'replacement-run' },
+  );
+  return {
+    ...f,
+    prepare,
+    body,
+    retained,
+    saved,
+    input: {
+      ownerId: owner.ownerId,
+      workRef: nativeCoordinatorWorkRef('native-one', 'goal-one'),
+      body,
+      fileIds: ['file-one'],
+    },
+  };
+}
+
+it('reconciles the retained Native action receipt without preparing authority or repeating a control', async () => {
+  const f = retainedActionFixture();
+  await expect(f.readActionReceipt(f.input)).resolves.toEqual({
+    result: { status: 'queued', runId: 'replacement-run' },
+    receiptRef: 'retained-action-key',
+  });
+  expect(f.rawRequest.mock.calls.map(([input]) => [input.method, input.path])).toEqual([
+    [
+      'GET',
+      '/v1/coordinator/conversations/native-one/goals/goal-one/actions/retained-action-key/preparation',
+    ],
+    [
+      'POST',
+      '/v1/coordinator/conversations/native-one/goals/goal-one/actions/receipt?run_id=original-source-run',
+    ],
+  ]);
+  expect(f.rawRequest.mock.calls[1][0].body).toBe(f.retained);
+  expect(f.prepare).not.toHaveBeenCalled();
+  const failed = retainedActionFixture();
+  failed.rawRequest.mockImplementation(async (input) => {
+    if (input.method === 'GET') return failed.saved;
+    throw Object.assign(new Error('native_action_failed'), {
+      code: 'native_action_failed',
+      status: 409,
+      actionReceipt: 'immutable_failure',
+    });
+  });
+  await expect(failed.readActionReceipt(failed.input)).resolves.toEqual({
+    receiptRef: 'retained-action-key',
+    failure: { code: 'native_action_failed', status: 409 },
+  });
+  expect(failed.rawRequest.mock.calls[1][0].body).toBe(failed.retained);
+  expect(failed.prepare).not.toHaveBeenCalled();
+  const noFiles = retainedActionFixture();
+  delete (noFiles.retained as Record<string, unknown>).fileInputs;
+  noFiles.input.fileIds = [];
+  await expect(noFiles.readActionReceipt(noFiles.input)).resolves.toMatchObject({
+    result: { status: 'queued' },
+    receiptRef: 'retained-action-key',
+  });
+  expect(noFiles.rawRequest.mock.calls[1][0].body).toBe(noFiles.retained);
+  expect(noFiles.prepare).not.toHaveBeenCalled();
+});
+
+it.each(['missing', 'identity', 'canonical', 'files', 'revoked'])(
+  'keeps %s retained Native receipt recovery unknown without dispatch',
+  async (kind) => {
+    const f = retainedActionFixture();
+    if (kind === 'missing') f.rawRequest.mockRejectedValueOnce(new Error('unavailable'));
+    if (kind === 'identity') f.saved.source_turn_id = 'foreign-source';
+    if (kind === 'canonical') f.retained.instruction = 'Changed original.';
+    if (kind === 'files') f.input.fileIds = ['different-file'];
+    if (kind === 'revoked') f.read.mockResolvedValue({ snapshot: 'fresh', snapshots: [] });
+    await expect(f.readActionReceipt(f.input)).rejects.toMatchObject({
+      code: 'work_action_outcome_unconfirmed',
+      outcomeUnknown: true,
+    });
+    expect(f.rawRequest.mock.calls.every(([input]) => input.method === 'GET')).toBe(true);
+    expect(f.prepare).not.toHaveBeenCalled();
+  },
+);
+
 it('resolves the stable alias into current owned Native location without persisting another ledger', () => {
   expect(
     resolveNativeCoordinatorAlias({
@@ -637,6 +776,7 @@ it('maps current detail back to the logical alias while preserving exact pending
   const fetchImpl = jest.fn();
   f.rawRequest.mockResolvedValue({
     workRef: 'ghr_goal-one',
+    nativeRunId: 'stale-raw-run',
     pendingNativeInput,
     actions: ['pause'],
     failureClass: 'synthetic_failure',
@@ -659,6 +799,7 @@ it('maps current detail back to the logical alias while preserving exact pending
   expect(result).toMatchObject({
     workRef,
     nativeWorkRef: 'ghr_goal-one',
+    nativeRunId: 'current_goal-one',
     actions: ['steer', 'stop'],
     pendingNativeInput,
     failureClass: 'synthetic_failure',

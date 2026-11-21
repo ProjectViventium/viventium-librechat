@@ -1109,6 +1109,27 @@ describe('formatFollowUpPrompt', () => {
       expect(prompt).not.toContain('"runInput"');
     },
   );
+  test('passes verified native files beside the byte-exact report', () => {
+    const insight = {
+      insight: 'Exact native result.\n',
+      authority: {
+        kind: 'native_coordinator_result',
+        runId: 'run',
+        resultRevision: 1,
+        resultDigest: `sha256:${'a'.repeat(64)}`,
+      },
+      outputFiles: { version: 1, files: [{ filename: 'Report.html', bytes: 42 }] },
+    };
+    const prompt = formatFollowUpPrompt({ insights: [insight], surface: 'telegram' });
+    expect(prompt).toContain(
+      JSON.stringify({
+        report: insight.insight,
+        authority: insight.authority,
+        outputFiles: insight.outputFiles,
+      }),
+    );
+    expect(insight.insight).toBe('Exact native result.\n');
+  });
   const missionReports = (prompt) =>
     prompt
       .split('\n')
@@ -3638,7 +3659,49 @@ describe('Main follow-up preserves full admitted context', () => {
 });
 
 describe('prepared result event integrity', () => {
-  test.each(['wrong_role', 'changed_text', 'attached_media'])(
+  test.each([
+    { type: 'file', file: { filename: 'Source.pdf', file_data: 'synthetic-pdf' } },
+    { type: 'image_url', image_url: { url: 'https://example.invalid/source.png' } },
+  ])('preserves prepared $type context with exact result text', async (media) => {
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
+    const priorKey = process.env.XAI_API_KEY;
+    process.env.XAI_API_KEY = 'synthetic-key';
+    const processStream = jest.fn().mockResolvedValue('The grounded answer.');
+    const create = jest.spyOn(Run, 'create').mockResolvedValue({ processStream });
+    let exactPrompt;
+    mockMainAuthorPreparation.mockImplementationOnce(async (promise) => {
+      const prepared = await promise;
+      exactPrompt = prepared.messages.at(-1).content;
+      prepared.messages[prepared.messages.length - 1] = new HumanMessage([
+        { type: 'text', text: exactPrompt },
+        media,
+      ]);
+      return prepared;
+    });
+    try {
+      await expect(
+        generateFollowUpText({
+          req: { user: { id: 'owner' }, body: {} },
+          agent: { id: 'main', provider: 'xai', model: 'synthetic', model_parameters: {} },
+          insightsData: { insights: [{ cortexName: 'Synthetic', insight: 'Verified evidence.' }] },
+        }),
+      ).resolves.toBe('The grounded answer.');
+      const content = processStream.mock.calls[0][0].messages.at(-1).content;
+      expect(content).toContainEqual(media);
+      expect(
+        content
+          .filter((part) => part.type === 'text')
+          .map((part) => part.text)
+          .join(''),
+      ).toBe(exactPrompt);
+    } finally {
+      create.mockRestore();
+      mockMainAuthorPreparation.mockReset();
+      if (priorKey === undefined) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = priorKey;
+    }
+  });
+  test.each(['wrong_role', 'changed_text'])(
     'fails before generation instead of discarding an unexpected final event (%s)',
     async (shape) => {
       const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
@@ -3650,16 +3713,7 @@ describe('prepared result event integrity', () => {
         const prepared = await promise;
         const original = prepared.messages.at(-1).content;
         prepared.messages[prepared.messages.length - 1] =
-          shape === 'wrong_role'
-            ? new AIMessage(original)
-            : new HumanMessage(
-                shape === 'changed_text'
-                  ? 'Changed evidence.'
-                  : [
-                      { type: 'text', text: original },
-                      { type: 'image_url', image_url: 'synthetic' },
-                    ],
-              );
+          shape === 'wrong_role' ? new AIMessage(original) : new HumanMessage('Changed evidence.');
         return prepared;
       });
       try {
@@ -3733,5 +3787,40 @@ describe('typed durable synthesis failures', () => {
       if (prior == null) delete process.env.XAI_API_KEY;
       else process.env.XAI_API_KEY = prior;
     }
+  });
+});
+
+describe('the accepted turn as the request a result author sees', () => {
+  const { resolveAcceptedTurnRequestText } = require('../BackgroundCortexFollowUpService');
+  const { setTrustedInteractionContext: bindInteraction } = require('../interactionContext');
+  const request = (texts) => {
+    const req = { user: { id: 'owner' }, body: {} };
+    bindInteraction(req, {
+      actor_kind: 'system',
+      origin: 'callback',
+      surface: 'telegram',
+      conversation_id: 'conversation',
+      source_event_id: 'event',
+      source_segments: texts.map((text, index) => ({
+        source_event_id: `source-${index}`,
+        source_index: 0,
+        text,
+      })),
+    });
+    return req;
+  };
+
+  test('a burst of several messages is carried whole and in order', () => {
+    expect(
+      resolveAcceptedTurnRequestText(
+        request(['Send the picture.', 'Two of them.', 'And one line on the contract.']),
+      ),
+    ).toBe('Send the picture.\n\nTwo of them.\n\nAnd one line on the contract.');
+  });
+
+  test('a single message, or a request without typed sources, keeps the stored-message path', () => {
+    expect(resolveAcceptedTurnRequestText(request(['Only one message.']))).toBe('');
+    expect(resolveAcceptedTurnRequestText({ user: { id: 'owner' }, body: {} })).toBe('');
+    expect(resolveAcceptedTurnRequestText(undefined)).toBe('');
   });
 });

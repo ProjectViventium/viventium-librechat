@@ -774,6 +774,48 @@ function conversationProviderStableAuthorityDigest(agent) {
     .digest('hex');
 }
 
+/* === VIVENTIUM START ===
+ * Feature: One continuity identity per stored agent.
+ * Purpose: A request fingerprints the stored declaration once. A later initialization on the same
+ * request, or on an author request derived from it, receives a runtime copy (rendered instructions,
+ * request-local tools and resources) whose hash would differ on every turn and start a new context
+ * epoch each time. Such an initialization reuses the recorded fingerprint of the same agent.
+ * === VIVENTIUM END === */
+const DECLARED_STABLE_AUTHORITY_KEY = '_viventiumDeclaredStableAuthorityV1';
+
+function readDeclaredStableAuthorityDigest(req, agentId) {
+  const declared = req?.[DECLARED_STABLE_AUTHORITY_KEY];
+  const id = String(agentId || '');
+  if (!declared || !id || declared.agentId !== id) {
+    return '';
+  }
+  const digest = String(declared.stableAuthoritySha256 || '');
+  return /^[a-f0-9]{64}$/.test(digest) ? digest : '';
+}
+
+function declareStableAuthorityDigest(req, agent) {
+  const agentId = String(agent?.id || '');
+  const stableAuthoritySha256 =
+    readDeclaredStableAuthorityDigest(req, agentId) ||
+    conversationProviderStableAuthorityDigest(agent);
+  if (req && typeof req === 'object') {
+    req[DECLARED_STABLE_AUTHORITY_KEY] = Object.freeze({ agentId, stableAuthoritySha256 });
+  }
+  return stableAuthoritySha256;
+}
+
+function inheritDeclaredStableAuthorityDigest(sourceReq, targetReq, agentId) {
+  const digest = readDeclaredStableAuthorityDigest(sourceReq, agentId);
+  if (!digest || !targetReq || typeof targetReq !== 'object') {
+    return false;
+  }
+  targetReq[DECLARED_STABLE_AUTHORITY_KEY] = Object.freeze({
+    agentId: String(agentId),
+    stableAuthoritySha256: digest,
+  });
+  return true;
+}
+
 function bindConversationProviderStableAuthorityDigest(targetAgent, stableAuthoritySha256) {
   const digest = String(stableAuthoritySha256 || '')
     .trim()
@@ -2355,6 +2397,9 @@ module.exports = {
   conversationProviderUsesInvocationLocalTime,
   conversationProviderUsesNativeBody,
   conversationProviderStableAuthorityDigest,
+  readDeclaredStableAuthorityDigest,
+  declareStableAuthorityDigest,
+  inheritDeclaredStableAuthorityDigest,
   buildHarnessIdempotencyKey,
   clearConversationProviderCapabilityBundle,
   declaredMcpServerNames,

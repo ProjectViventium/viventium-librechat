@@ -486,6 +486,9 @@ test('overlapping recovery passes share one scan and close after a handler failu
 });
 
 test.each([
+  ['provider_rate_limited', 'The model is busy. Please try again shortly.'],
+  ['provider_quota_exhausted', 'The model quota is exhausted. Please check its connection.'],
+  ['provider_unauthorized', 'The model connection needs attention. Please check its connection.'],
   ['native_input_declined', 'You declined that action. It was stopped.'],
   [
     'native_input_expired',
@@ -534,3 +537,47 @@ test.each([
     expect(mockDependencies.fetch).toHaveBeenCalledTimes(1);
   },
 );
+
+test('a failed Native reply keeps the exact committed work receipt in its final event', async () => {
+  await store.updateJob('stream', {
+    adapterCapabilities: { segment_stability: 'immediate', supersede_scope: 'response_only' },
+    deliveryPolicy: { commit_authority: 'external_adapter' },
+  });
+  expect(
+    await mockManager.markDurableEffectReceipt({
+      streamId: 'stream',
+      userId: user,
+      sourceEventId: 'request',
+      responseMessageId: 'answer',
+      effectKind: 'durable_work_accepted',
+      effectRef: 'accepted-work',
+    }),
+  ).toBe(true);
+  await admit();
+  mockDependencies.fetch = jest.fn(
+    async () =>
+      new Response(
+        JSON.stringify({
+          version: 1,
+          object: 'glasshive.request.result',
+          state: 'failed',
+          invocation_id: identity.invocationId,
+          stream_id: identity.streamId,
+          message_id: identity.responseMessageId,
+          body_sha256: identity.bodySha256,
+          agent_id: identity.agentId,
+          conversation_id: identity.conversationId,
+          request_id: 'request',
+          run_id: 'run',
+          failure_class: 'provider_rate_limited',
+        }),
+      ),
+  );
+  const done = jest.spyOn(transport, 'emitDone');
+  expect(await recoverNativeResponse(identity)).toBe(true);
+  expect(done.mock.calls[0][1].durableEffectReceipt).toEqual({
+    effect_ref: 'accepted-work',
+    effect_kind: 'durable_work_accepted',
+  });
+  expect(done.mock.calls[0][1]).not.toHaveProperty('superseded');
+});

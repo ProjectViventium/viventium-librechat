@@ -559,13 +559,17 @@ function createNativeCoordinatorPresentationService(deps) {
 
   async function settle(candidate) {
     const authority = mainGenerationPresentation(candidate);
-    if (authority?.version !== 2 || candidate.status !== 'sent') return false;
+    if (![2, 3].includes(authority?.version) || candidate.status !== 'sent') return false;
+    const nativeSource =
+      authority.version === 3
+        ? authority.nativeCoordinatorProgress
+        : authority.nativeCoordinatorResult;
     const delivery = await deps.readDelivery(candidate);
     if (
       !delivery ||
       delivery.status !== 'sent' ||
       !delivery.sentAt ||
-      delivery.originRef !== authority.nativeCoordinatorResult.bindingRef ||
+      delivery.originRef !== nativeSource.bindingRef ||
       (delivery.surface === 'telegram' &&
         !delivery.telegramSentMessageIds?.length &&
         !delivery.telegramMessageId) ||
@@ -579,7 +583,9 @@ function createNativeCoordinatorPresentationService(deps) {
       !isEqual(message.metadata?.viventium?.mainGenerationPresentation, authority) ||
       !isEqual(
         buildMainGenerationPresentation(
-          { nativeCoordinatorResult: authority.nativeCoordinatorResult },
+          authority.version === 3
+            ? { nativeCoordinatorProgress: nativeSource }
+            : { nativeCoordinatorResult: nativeSource },
           message.messageId,
           message.text || '',
         ),
@@ -596,7 +602,7 @@ function createNativeCoordinatorPresentationService(deps) {
     if (!owned?.eligible || owned.rows.some(intentionalDrop)) return false;
     return settleRows(parent, owned.message, 'web', `message:${owned.message.messageId}`);
   }
-  return { resolve, recover, settle, settleLinkedWeb };
+  return { resolve, recover, settle, settleLinkedWeb, settleRows };
 }
 
 module.exports = {

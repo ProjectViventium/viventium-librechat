@@ -1,3 +1,4 @@
+import { SourceMutationPreDispatchFailure } from './sourceMutation';
 import { createGlassHiveWorkActionService } from './workActionService';
 
 const nativeQuestion = () => ({
@@ -1570,4 +1571,39 @@ test('a real delegated Native Retry retains current run source and runtime prepa
       }),
     }),
   );
+});
+
+test('origin-read failure is a trusted pre-action failure, while action timeout remains uncertain', async () => {
+  const deps = dependencies();
+  const error = Object.assign(new Error('origin read timed out'), {
+    code: 'glasshive_account_request_timeout',
+  });
+  deps.getCoreWorkOriginRef.mockRejectedValueOnce(error);
+  await expect(
+    createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+      ownerId: 'owner-1',
+      workRef: 'work-1',
+      action: 'queue',
+      operationId: 'same-action',
+      instruction: 'Synthetic original',
+    }),
+  ).rejects.toBeInstanceOf(SourceMutationPreDispatchFailure);
+  expect(deps.requestAccountApi).not.toHaveBeenCalled();
+  deps.requestAccountApi.mockRejectedValue(
+    Object.assign(new Error('action timeout'), {
+      code: 'glasshive_account_request_timeout',
+    }),
+  );
+  await expect(
+    createGlassHiveWorkActionService(deps).executeGlassHiveWorkAction({
+      ownerId: 'owner-1',
+      workRef: 'work-1',
+      action: 'queue',
+      operationId: 'same-action',
+      instruction: 'Synthetic original',
+    }),
+  ).rejects.toMatchObject({
+    code: 'work_action_outcome_unconfirmed',
+    outcomeUnknown: true,
+  });
 });

@@ -3,6 +3,8 @@ import {
   createNativeCoordinatorContextAdapter,
   createNativeCoordinatorResultPresenter,
   readNativeCoordinatorGoalSnapshot,
+  nativeCoordinatorResultEvidence,
+  nativeCoordinatorResultPublicationKey,
 } from './nativeCoordinatorContext';
 import type {
   NativeCoordinatorContextDependencies,
@@ -735,6 +737,230 @@ test('result retries reuse the existing Main message and delivery ledger', async
   expect(deps.enqueue).toHaveBeenLastCalledWith(
     expect.objectContaining({ message, eventId: input.eventId }),
   );
+});
+
+test('a saved result can recover delivery while fresh cognition preparation is unavailable', async () => {
+  const text = 'Already saved result.';
+  const digest = createHash('sha256').update(text).digest('hex');
+  const delivery = {
+    readPresentation: jest.fn(async () => ({ messageId: 'saved-result', text })),
+    createFollowUp: jest.fn(async () => null),
+    enqueue: jest.fn(async () => ({ configured: 1, enqueued: 1 })),
+  };
+  const deps = {
+    ...dependencies(),
+    presentResult: createNativeCoordinatorResultPresenter(delivery),
+  };
+  deps.prepareContext.mockRejectedValue(new Error('fresh_cognition_unavailable'));
+  deps.request.mockImplementation(async (_owner, path) =>
+    path.includes('/result?')
+      ? {
+          goal_id: 'goal',
+          run_id: 'run',
+          result_revision: 1,
+          offset: 0,
+          output_text: text,
+          next_offset: null,
+          sha256: digest,
+        }
+      : snapshot(),
+  );
+  await expect(
+    createNativeCoordinatorContextAdapter(deps).publishNativeCoordinatorResult({
+      binding,
+      data: {
+        conversation_id: 'native-chat',
+        request_ref: 'binding',
+        goal_id: 'goal',
+        run_id: 'run',
+        result_revision: 1,
+        result_digest: `sha256:${digest}`,
+      },
+    }),
+  ).resolves.toBeUndefined();
+  expect(deps.prepareContext).not.toHaveBeenCalled();
+  expect(delivery.createFollowUp).not.toHaveBeenCalled();
+  expect(delivery.enqueue).toHaveBeenCalledTimes(1);
+});
+
+test('file metadata reaches Main without changing the native result identity', async () => {
+  const input = {
+    text: 'Original result.\nQuoted source: café.',
+    state: 'completed',
+    runId: 'run',
+    resultRevision: 1,
+    resultDigest: `sha256:${'a'.repeat(64)}`,
+  };
+  expect(nativeCoordinatorResultEvidence(input)).toBe(input.text);
+  const outputFiles = {
+    version: 1,
+    run_id: 'run',
+    files: [
+      {
+        filename: 'Report.html',
+        mime_type: 'text/html',
+        bytes: 42,
+        sha256: 'b'.repeat(64),
+        download_url: 'https://example.test/v1/link-refs/ghr_synthetic_reference',
+      },
+    ],
+  };
+  const digest = createHash('sha256').update(input.text).digest('hex');
+  const delivery = {
+    readPresentation: jest
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ messageId: 'saved-result' }),
+    createFollowUp: jest.fn(async () => null),
+    enqueue: jest.fn(async () => ({ configured: 1, enqueued: 1 })),
+  };
+  await createNativeCoordinatorResultPresenter(delivery)({
+    binding,
+    source,
+    text: input.text,
+    outputFiles,
+    context: prepared,
+    eventId: 'native-result:native-chat:goal:run:1',
+    data: {
+      conversation_id: 'native-chat',
+      request_ref: 'binding',
+      goal_id: 'goal',
+      run_id: 'run',
+      result_revision: 1,
+      result_digest: `sha256:${digest}`,
+    },
+  });
+  const insight = delivery.createFollowUp.mock.calls[0][0].insights[0];
+  expect(insight.insight).toBe(input.text);
+  expect(insight.outputFiles).toEqual(outputFiles);
+  expect(createHash('sha256').update(insight.insight).digest('hex')).toBe(digest);
+  expect(delivery.readPresentation.mock.calls[0][0].deliveryIds).toEqual(
+    delivery.readPresentation.mock.calls[1][0].deliveryIds,
+  );
+  expect(
+    JSON.parse(
+      nativeCoordinatorResultEvidence({
+        ...input,
+        text: '',
+        state: 'failed',
+        failureClass: 'provider_unavailable',
+      }),
+    ).native_result,
+  ).toMatchObject({
+    state: 'failed',
+    failure_class: 'provider_unavailable',
+    output_text: '',
+  });
+});
+
+test('goal aliases share a publication while distinct source and result identities stay separate', () => {
+  const data = {
+    conversation_id: 'native-chat',
+    request_ref: 'binding',
+    goal_id: 'goal',
+    run_id: 'run',
+    result_revision: 1,
+    result_digest: `sha256:${'a'.repeat(64)}`,
+  };
+  const key = nativeCoordinatorResultPublicationKey({ binding, source, data });
+  expect(
+    nativeCoordinatorResultPublicationKey({
+      binding,
+      source,
+      data: { ...data, goal_id: 'another-goal' },
+    }),
+  ).toBe(key);
+  for (const changed of [
+    { binding: { ...binding, ownerId: 'foreign' }, source, data },
+    { binding, source: { ...source, turnId: 'new-source' }, data },
+    { binding, source, data: { ...data, run_id: 'new-run' } },
+    { binding, source, data: { ...data, result_revision: 2 } },
+    { binding, source, data: { ...data, result_digest: `sha256:${'b'.repeat(64)}` } },
+  ])
+    expect(nativeCoordinatorResultPublicationKey(changed)).not.toBe(key);
+});
+
+test.each(['alias', 'changed_run', 'foreign_binding'])(
+  'uses only the canonical publication of the validated result (%s)',
+  async (change) => {
+    const text = 'Verified result.';
+    const digest = createHash('sha256').update(text).digest('hex');
+    const data = {
+      conversation_id: 'native-chat',
+      request_ref: 'binding',
+      goal_id: 'goal',
+      run_id: 'run',
+      result_revision: 1,
+      result_digest: `sha256:${digest}`,
+    };
+    const canonical = {
+      ...data,
+      goal_id: 'first-goal',
+      ...(change === 'changed_run' ? { run_id: 'foreign-run' } : {}),
+      ...(change === 'foreign_binding' ? { request_ref: 'foreign-binding' } : {}),
+    };
+    const deps = { ...dependencies(), resultPublication: jest.fn(async () => canonical) };
+    deps.request.mockImplementation(async (_owner, path) =>
+      path.includes('/result?')
+        ? {
+            goal_id: 'goal',
+            run_id: 'run',
+            result_revision: 1,
+            offset: 0,
+            output_text: text,
+            next_offset: null,
+            sha256: digest,
+          }
+        : snapshot(),
+    );
+    const run = createNativeCoordinatorContextAdapter(deps).publishNativeCoordinatorResult({
+      binding,
+      data,
+    });
+    if (change === 'alias') {
+      await expect(run).resolves.toBeUndefined();
+      expect(deps.presentResult).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: canonical,
+          eventId: 'native-result:native-chat:first-goal:run:1',
+        }),
+      );
+    } else {
+      await expect(run).rejects.toThrow();
+      expect(deps.presentResult).not.toHaveBeenCalled();
+    }
+  },
+);
+
+test('an unpublished result still requires fresh cognition and cannot enqueue on preparation failure', async () => {
+  const prepare = jest.fn(async () => {
+    throw new Error('fresh_cognition_unavailable');
+  });
+  const deps = {
+    readPresentation: jest.fn(async () => null),
+    createFollowUp: jest.fn(async () => null),
+    enqueue: jest.fn(async () => ({ configured: 1, enqueued: 1 })),
+  };
+  await expect(
+    createNativeCoordinatorResultPresenter(deps)({
+      binding,
+      source,
+      text: 'Result.',
+      eventId: 'native-result',
+      context: prepare,
+      data: {
+        conversation_id: 'native-chat',
+        request_ref: 'binding',
+        goal_id: 'goal',
+        run_id: 'run',
+        result_revision: 1,
+        result_digest: `sha256:${'a'.repeat(64)}`,
+      },
+    }),
+  ).rejects.toThrow('fresh_cognition_unavailable');
+  expect(prepare).toHaveBeenCalledTimes(1);
+  expect(deps.createFollowUp).not.toHaveBeenCalled();
+  expect(deps.enqueue).not.toHaveBeenCalled();
 });
 
 test('does not ACK missing persisted presentation or unresolved delivery', async () => {

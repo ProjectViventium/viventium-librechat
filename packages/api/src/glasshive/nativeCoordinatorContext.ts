@@ -59,6 +59,30 @@ export function nativeCoordinatorResultEventId(data: NativeCoordinatorResultData
     ? `native-turn-result:${data.conversation_id}:${data.turn_id}:${data.request_id}:${data.run_id}:${data.result_revision}`
     : `native-result:${data.conversation_id}:${data.goal_id}:${data.run_id}:${data.result_revision}`;
 }
+export function nativeCoordinatorResultPublicationKey(input: {
+  binding: NativeCoordinatorBinding;
+  source: NativeCoordinatorSource;
+  data: NativeCoordinatorResultData;
+}): string {
+  return (
+    'ncrp_' +
+    createHash('sha256')
+      .update(
+        JSON.stringify([
+          input.binding.ownerId,
+          input.binding._id,
+          input.binding.conversationId,
+          input.source.turnId,
+          input.source.requestBody.messageId || input.source.requestBody.parentMessageId,
+          input.data.conversation_id,
+          input.data.run_id,
+          input.data.result_revision,
+          input.data.result_digest,
+        ]),
+      )
+      .digest('hex')
+  );
+}
 const actionSchema = z.object({
   conversation_id: identifier,
   request_ref: identifier,
@@ -139,8 +163,13 @@ export interface NativeCoordinatorContextDependencies {
     publisher?: ObjectValue;
     state?: string;
     failureClass?: string;
-    context: NativeCoordinatorPreparedContext;
+    context: NativeCoordinatorPreparedContext | (() => Promise<NativeCoordinatorPreparedContext>);
   }): Promise<void>;
+  resultPublication?(input: {
+    binding: NativeCoordinatorBinding;
+    source: NativeCoordinatorSource;
+    data: NativeCoordinatorResultData;
+  }): Promise<ObjectValue>;
 }
 
 function unavailable(code: string): Error & { code: string; status: number } {
@@ -717,19 +746,31 @@ export function createNativeCoordinatorContextAdapter(deps: NativeCoordinatorCon
             deps.request,
           );
     const source = await ownedSource(binding, result.sourceTurnId);
-    const eventId = nativeCoordinatorResultEventId(data);
-    const context = await deps.prepareContext({ binding, source, eventId, purpose: 'callback' });
+    const publication = deps.resultPublication
+      ? await deps.resultPublication({ binding, source, data })
+      : data;
+    const canonical =
+      'goal_id' in publication
+        ? resultSchema.parse(publication)
+        : turnResultSchema.parse(publication);
+    assertNativeScope(binding, canonical);
+    if (
+      nativeCoordinatorResultPublicationKey({ binding, source, data }) !==
+      nativeCoordinatorResultPublicationKey({ binding, source, data: canonical })
+    )
+      throw unavailable('coordinator_publication_identity_changed');
+    const eventId = nativeCoordinatorResultEventId(canonical);
     await deps.presentResult({
       binding,
       source,
-      data,
+      data: canonical,
       text: result.outputText,
       state: result.state,
       failureClass: result.failureClass,
       outputFiles: result.outputFiles,
       publisher: result.publisher,
       eventId,
-      context,
+      context: () => deps.prepareContext({ binding, source, eventId, purpose: 'callback' }),
     });
   }
 
@@ -810,6 +851,7 @@ export function createNativeCoordinatorResultPresenter(deps: NativeCoordinatorRe
         cortexId: eventId,
         status: 'completed',
         insight: evidence,
+        ...(input.outputFiles ? { outputFiles: input.outputFiles } : {}),
         authority: {
           kind: 'turn_id' in data ? 'native_coordinator_turn_result' : 'native_coordinator_result',
           conversationId: binding.nativeConversationId,
@@ -828,7 +870,11 @@ export function createNativeCoordinatorResultPresenter(deps: NativeCoordinatorRe
       ownerId: binding.ownerId,
       conversationId: binding.conversationId,
       parentMessageId,
-      surface: context.presentationSurface || source.requestBody.viventiumSurface || 'web',
+      surface:
+        (typeof context === 'function' ? undefined : context.presentationSurface) ||
+        (source.requestBody.viventiumSurface === 'voice'
+          ? 'web'
+          : source.requestBody.viventiumSurface || 'web'),
       insights,
     });
     if (candidates.length !== 1) throw unavailable('coordinator_result_empty');
@@ -840,8 +886,9 @@ export function createNativeCoordinatorResultPresenter(deps: NativeCoordinatorRe
     };
     let message = await deps.readPresentation(receiptInput);
     if (!message) {
+      const preparedContext = typeof context === 'function' ? await context() : context;
       await deps.createFollowUp({
-        context: context.presentationContext,
+        context: preparedContext.presentationContext,
         binding,
         source,
         parentMessageId,

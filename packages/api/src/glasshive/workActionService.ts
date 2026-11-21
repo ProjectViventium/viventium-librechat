@@ -10,6 +10,7 @@ import { createAccountApiRoute } from './accountClient';
 import type { VoiceWorkAuthorityBinding } from '../voice/engagementAuthority';
 import type { NativeWorkInputResponse } from 'librechat-data-provider';
 import { safeErrorCode } from '../logging/safeError';
+import { SourceMutationPreDispatchFailure } from './sourceMutation';
 import {
   nativeQuestionForm,
   nativeQuestionContent,
@@ -341,9 +342,23 @@ export function createGlassHiveWorkActionService(deps: GlassHiveWorkActionDepend
     durableEffectContext,
   }: GlassHiveWorkActionInput): Promise<UnknownRecord | null> {
     if (!RUN_PRODUCING_ACTIONS.has(normalizedText(action).toLowerCase())) return null;
+    let originRef: unknown;
+    try {
+      originRef = await deps.getCoreWorkOriginRef({ ownerId, workRef });
+    } catch (error) {
+      // This owner read precedes the action request. Remote flags cannot certify no effect.
+      throw new SourceMutationPreDispatchFailure(error);
+    }
     return buildGlassHiveWorkActionSourceContext(
-      { ownerId, workRef, action, operationId, sourceSurface, durableEffectContext },
-      await deps.getCoreWorkOriginRef({ ownerId, workRef }),
+      {
+        ownerId,
+        workRef,
+        action,
+        operationId,
+        sourceSurface,
+        durableEffectContext,
+      },
+      originRef,
     );
   }
 

@@ -11,6 +11,7 @@ const { Worker, isMainThread, parentPort, workerData } = require('worker_threads
 
 import type { Document } from 'mongodb';
 import type { Worker as WorkerThread } from 'worker_threads';
+import { nativeStorageReadiness } from './nativeStorageReadiness';
 
 type ValueRecord = Document;
 
@@ -1065,8 +1066,22 @@ function readinessFacts(snapshot: ValueRecord): ReadinessFactsResult {
         ? 'warning'
         : 'healthy';
   const storageConsistent = storageShapeValid && storage.status === measuredStorageStatus;
+  if (process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE === 'host') {
+    const native = nativeStorageReadiness(facts?.nativeStorage);
+    return {
+      shapeValid: promptShapeValid && facts?.executionMode === 'host' && native.valid,
+      promptPass:
+        promptShapeValid && prompt.status === 'verified' && prompt.unknownLayerCount === 0,
+      storagePass: native.ready,
+      prompt: isRecord(prompt) ? prompt : {},
+    };
+  }
   return {
-    shapeValid: promptShapeValid && storageShapeValid && storageConsistent,
+    shapeValid:
+      promptShapeValid &&
+      storageShapeValid &&
+      storageConsistent &&
+      (facts?.executionMode === undefined || facts.executionMode === 'docker'),
     promptPass: promptShapeValid && prompt.status === 'verified' && prompt.unknownLayerCount === 0,
     storagePass: storageConsistent && storage.status === 'healthy',
     prompt: isRecord(prompt) ? prompt : {},

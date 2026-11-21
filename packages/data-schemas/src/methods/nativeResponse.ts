@@ -799,8 +799,14 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
     project: (message: NativeResponseMessageProjection) => NativeResponseMessageProjection,
     failureClass?: string,
     hostFailure?: { error_class: string; error: string },
+    nativeFailure?: { error_class: string; error: string },
   ): Promise<NativeResponseRow | null> {
     if (hostFailure && (status !== 'failed' || !hostFailure.error_class || !hostFailure.error))
+      throw new Error('native_response_failure_snapshot_invalid');
+    if (
+      nativeFailure &&
+      (status !== 'failed' || nativeFailure.error_class !== failureClass || !nativeFailure.error)
+    )
       throw new Error('native_response_failure_snapshot_invalid');
     const nativeStopMessages: Record<string, string> = {
       native_input_declined: 'You declined that action. It was stopped.',
@@ -858,9 +864,11 @@ export function createNativeResponseMethods(mongoose: NativeResponseMongoose) {
                   type: 'error',
                   error_class:
                     hostFailure?.error_class ||
+                    nativeFailure?.error_class ||
                     (nativeStopMessage ? failureClass : `native_response_${status}`),
                   error:
                     hostFailure?.error ||
+                    nativeFailure?.error ||
                     nativeStopMessage ||
                     (status === 'cancelled'
                       ? 'The response was cancelled before completion.'

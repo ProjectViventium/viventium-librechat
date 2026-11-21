@@ -218,9 +218,62 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
         this.invalidate(field, 'native_coordinator_result_source_variant_invalid');
     next();
   });
+  const nativeCoordinatorProgressSchema = new mongoose.Schema(
+    {
+      kind: {
+        type: String,
+        enum: ['native_coordinator_progress'],
+        required: true,
+        immutable: true,
+      },
+      bindingRef: { type: String, required: true, maxlength: 512, immutable: true },
+      nativeConversationId: { type: String, required: true, maxlength: 512, immutable: true },
+      goalId: {
+        type: String,
+        required: function () {
+          return this.turnId === undefined && this.requestId === undefined;
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      turnId: {
+        type: String,
+        required: function () {
+          return this.goalId === undefined;
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      requestId: {
+        type: String,
+        required: function () {
+          return this.goalId === undefined;
+        },
+        maxlength: 512,
+        immutable: true,
+      },
+      runId: { type: String, required: true, maxlength: 512, immutable: true },
+      attemptId: { type: String, required: true, maxlength: 512, immutable: true },
+      progressId: { type: String, required: true, match: /^[a-f0-9]{64}$/, immutable: true },
+      progressDigest: {
+        type: String,
+        required: true,
+        match: /^sha256:[a-f0-9]{64}$/,
+        immutable: true,
+      },
+      sourceTurnId: { type: String, required: true, maxlength: 512, immutable: true },
+      sourceCallSessionId: { type: String, default: '', maxlength: 512, immutable: true },
+    },
+    { _id: false, strict: 'throw' },
+  );
+  nativeCoordinatorProgressSchema.pre('validate', function (next) {
+    if (this.goalId !== undefined && (this.turnId !== undefined || this.requestId !== undefined))
+      this.invalidate('goalId', 'native_coordinator_progress_source_variant_invalid');
+    next();
+  });
   const mainGenerationPresentationSchema = new mongoose.Schema(
     {
-      version: { type: Number, enum: [1, 2], required: true, immutable: true },
+      version: { type: Number, enum: [1, 2, 3], required: true, immutable: true },
       streamId: {
         type: String,
         required: function () {
@@ -244,6 +297,13 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
         },
         immutable: true,
       },
+      nativeCoordinatorProgress: {
+        type: nativeCoordinatorProgressSchema,
+        required: function () {
+          return this.version === 3;
+        },
+        immutable: true,
+      },
       responseMessageId: { type: String, required: true, maxlength: 512, immutable: true },
       responseDigest: {
         type: String,
@@ -257,8 +317,12 @@ module.exports = function createViventiumGlassHiveCallbackDelivery(db) {
   mainGenerationPresentationSchema.pre('validate', function (next) {
     const invalid =
       this.version === 1
-        ? this.nativeCoordinatorResult !== undefined
-        : this.streamId !== undefined || this.admissionId !== undefined;
+        ? this.nativeCoordinatorResult !== undefined || this.nativeCoordinatorProgress !== undefined
+        : this.streamId !== undefined ||
+          this.admissionId !== undefined ||
+          (this.version === 2
+            ? this.nativeCoordinatorProgress !== undefined
+            : this.nativeCoordinatorResult !== undefined);
     if (invalid) this.invalidate('version', 'main_generation_source_variant_invalid');
     next();
   });

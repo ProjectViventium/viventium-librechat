@@ -399,6 +399,34 @@ it('keeps complete original files/text but never stores live grants or old gener
   expect(body).not.toHaveProperty('bootstrap_bundle');
 });
 
+it("keeps a scheduled turn's delivery channels and topic in the saved source", async () => {
+  const scheduled = {
+    ...admission.requestBody,
+    viventiumSourceEventId: 'schedule:occurrence-a',
+    viventiumSchedulerDeliveryChannels: ['telegram', 'librechat'],
+    viventiumTelegramMessageThreadId: '42',
+    viventiumSchedulerDispatchDocumentId: 'must-not-persist',
+    viventiumSchedulerExternalWorkRequired: true,
+  };
+  const body = nativeCoordinatorSourceBody(scheduled);
+  expect(body.viventiumSchedulerDeliveryChannels).toEqual(['telegram', 'librechat']);
+  expect(body.viventiumTelegramMessageThreadId).toBe('42');
+  expect(body.viventiumSchedulerDeliveryChannels).not.toBe(
+    scheduled.viventiumSchedulerDeliveryChannels,
+  );
+  expect(body).not.toHaveProperty('viventiumSchedulerDispatchDocumentId');
+  expect(body).not.toHaveProperty('viventiumSchedulerExternalWorkRequired');
+  expect(nativeCoordinatorSourceBody(admission.requestBody)).not.toHaveProperty(
+    'viventiumSchedulerDeliveryChannels',
+  );
+
+  const { host, sources } = fixture();
+  await host.accept({ ...admission, requestBody: scheduled });
+  const [saved] = [...sources.values()];
+  expect(saved.requestBody.viventiumSchedulerDeliveryChannels).toEqual(['telegram', 'librechat']);
+  expect(saved.requestBody.viventiumTelegramMessageThreadId).toBe('42');
+});
+
 it('routes genuine turn completion through the same signed Native result owner without preparing a Worker', async () => {
   const { host, deps, bindings } = fixture();
   await host.accept(admission);
@@ -435,4 +463,88 @@ it.each([
     host.receive(signedEvent([...bindings.values()][0], 'coordinator.turn_result_ready', data)),
   ).rejects.toThrow();
   expect(deps.publishResult).not.toHaveBeenCalled();
+});
+
+it('progress bridge couriers genuine goal and turn progress without terminal work and retains retry ownership', async () => {
+  const f = fixture();
+  const publishProgress = jest.fn(async () => {});
+  const host = createNativeCoordinatorHost({ ...f.deps, publishProgress });
+  await host.accept(admission);
+  const binding = [...f.bindings.values()][0];
+  const common = {
+    source_turn_id: 'source-turn',
+    run_id: 'run',
+    attempt_id: 'attempt',
+    progress_id: 'a'.repeat(64),
+    progress_digest: `sha256:${'b'.repeat(64)}`,
+    progress_text: 'Two artifacts are ready; the remaining work is running.',
+  };
+  for (const identity of [
+    { goal_id: 'goal', turn_id: undefined },
+    { turn_id: 'turn', request_id: 'request' },
+  ]) {
+    const event = signedEvent(binding, 'coordinator.progress_ready', { ...common, ...identity });
+    await expect(host.receive(event)).resolves.toEqual({ accepted: true });
+    expect(publishProgress).toHaveBeenLastCalledWith({
+      binding,
+      data: JSON.parse(event.rawBody.toString()).data,
+      eventId: event.eventId,
+    });
+  }
+  expect(f.deps.publishResult).not.toHaveBeenCalled();
+  expect(f.deps.prepareTurn).not.toHaveBeenCalled();
+  expect(f.deps.prepareDispatch).not.toHaveBeenCalled();
+  const event = signedEvent(binding, 'coordinator.progress_ready', {
+    ...common,
+    goal_id: 'goal',
+    turn_id: undefined,
+  });
+  publishProgress.mockRejectedValueOnce(new Error('durable_progress_unavailable'));
+  await expect(host.receive(event)).rejects.toThrow('durable_progress_unavailable');
+  await expect(f.host.receive(event)).rejects.toThrow('coordinator_progress_unavailable');
+});
+
+it('progress bridge rejects forged scope, invalid digest, missing fields and terminal payloads before publication', async () => {
+  const f = fixture();
+  const publishProgress = jest.fn(async () => {});
+  const host = createNativeCoordinatorHost({ ...f.deps, publishProgress });
+  await host.accept(admission);
+  const binding = [...f.bindings.values()][0];
+  const data = {
+    source_turn_id: 'source',
+    turn_id: 'turn',
+    request_id: 'request',
+    run_id: 'run',
+    attempt_id: 'attempt',
+    progress_id: 'a'.repeat(64),
+    progress_digest: `sha256:${'b'.repeat(64)}`,
+    progress_text: 'Still working.',
+  };
+  for (const change of [
+    { goal_id: 'mixed-goal' },
+    { request_id: undefined },
+    { source_turn_id: undefined },
+    { attempt_id: undefined },
+    { progress_id: 'not-a-hash' },
+    { progress_digest: 'wrong-digest' },
+    { result_revision: 1 },
+    { output_files: [] },
+    { progress_text: '' },
+  ])
+    await expect(
+      host.receive(signedEvent(binding, 'coordinator.progress_ready', { ...data, ...change })),
+    ).rejects.toThrow();
+  await expect(
+    host.receive(
+      signedEvent({ ...binding, ownerId: 'foreign-owner' }, 'coordinator.progress_ready', data),
+    ),
+  ).rejects.toThrow('coordinator_binding_unavailable');
+  await expect(
+    host.receive({
+      ...signedEvent(binding, 'coordinator.progress_ready', data),
+      signature: 'v1,invalid',
+    }),
+  ).rejects.toThrow();
+  expect(publishProgress).not.toHaveBeenCalled();
+  expect(f.deps.publishResult).not.toHaveBeenCalled();
 });

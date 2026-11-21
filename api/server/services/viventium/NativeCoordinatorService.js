@@ -4,15 +4,26 @@ const { logger } = require('@librechat/data-schemas');
 const {
   createNativeCoordinatorHost,
   mergeHostedAndNativeRoster,
+  nativeCoordinatorCleanedSourceWorkRefs,
   nativeCoordinatorConfiguration,
 } = require('@librechat/api');
+const { Message } = require('~/db/models');
 const { requestAccountApi } = require('./GlassHiveAccountService');
 const {
   attachConversationProviderBootstrapBundle,
 } = require('./GlassHiveConversationProviderService');
 
 const bindings = () => mongoose.connection.collection('viventium_glasshive_callback_bindings');
+const CONVERSATION_SESSION_BUSY = 'conversation_session_authority_conflict';
+const CONVERSATION_SESSION_BUSY_RETRY_SECONDS = 5;
 const tenantId = () => process.env.VIVENTIUM_TENANT_ID || 'local';
+const readSource = (bindingRef, turnId) =>
+  bindings().findOne({
+    _id: `${bindingRef}:${turnId}`,
+    kind: 'native_coordinator_source',
+    bindingRef,
+    turnId,
+  });
 
 function signBundle(bundle) {
   const targetAgent = { model_parameters: {} };
@@ -51,13 +62,7 @@ const host = createNativeCoordinatorHost({
   saveSource: async (source) => {
     await bindings().updateOne({ _id: source._id }, { $setOnInsert: source }, { upsert: true });
   },
-  readSource: (bindingRef, turnId) =>
-    bindings().findOne({
-      _id: `${bindingRef}:${turnId}`,
-      kind: 'native_coordinator_source',
-      bindingRef,
-      turnId,
-    }),
+  readSource,
   readBindings: (ownerId) =>
     bindings()
       .find({
@@ -96,6 +101,7 @@ const host = createNativeCoordinatorHost({
     require('./NativeCoordinatorContextService').recordNativeCoordinatorDispatch(input),
   publishResult: (input) =>
     require('./NativeCoordinatorContextService').publishNativeCoordinatorResult(input),
+  publishProgress: (input) => require('./NativeCoordinatorProgressService').publish(input),
 });
 
 async function accept({ ownerId, resources, requestBody, instruction, invocationId }) {
@@ -128,6 +134,15 @@ async function receive(req, res) {
     });
     return res.status(202).json(result);
   } catch (error) {
+    /* === VIVENTIUM START ===
+     * A conversation that is still answering an earlier turn is "not yet", not a refusal. The
+     * sender retries a 5xx within the notification's lifetime and treats a 4xx as final, so a
+     * final answer here dropped a turn the user had already been told was accepted.
+     * === VIVENTIUM END === */
+    if (error?.code === CONVERSATION_SESSION_BUSY) {
+      res.set('Retry-After', String(CONVERSATION_SESSION_BUSY_RETRY_SECONDS));
+      return res.status(503).json({ error: 'coordinator_continuation_unavailable' });
+    }
     const status = Number(error?.status);
     const responseStatus =
       Number.isInteger(status) && status >= 400 && status <= 599 ? status : 503;
@@ -142,6 +157,24 @@ async function receive(req, res) {
 async function enrich(ownerId, snapshot, scope = 'active', includeNativeOnly = true) {
   const snapshots = await host.snapshots(ownerId);
   if (!snapshots.length) return snapshot;
+  const cleanedSourceWorkRefs = await nativeCoordinatorCleanedSourceWorkRefs({
+    ownerId,
+    tenantId: tenantId(),
+    snapshots,
+    scope,
+    readSource,
+    readMessages: (user, conversationId, messageIds) =>
+      Message.find({
+        user,
+        conversationId,
+        messageId: { $in: messageIds },
+        // Explicit retained-state read: ordinary message queries hide cleanup tombstones.
+        deletedAt: { $ne: null },
+        'cleanupTombstone.contractVersion': 1,
+      })
+        .select('user messageId conversationId deletedAt cleanupTombstone')
+        .lean(),
+  });
   const roster = mergeHostedAndNativeRoster({
     ownerId,
     tenantId: tenantId(),
@@ -149,6 +182,7 @@ async function enrich(ownerId, snapshot, scope = 'active', includeNativeOnly = t
     native: { snapshot: 'fresh', snapshots },
     scope,
     includeNativeOnly,
+    cleanedSourceWorkRefs,
   });
   return require('./NativeCoordinatorResultDeliveryService')({
     ownerId,

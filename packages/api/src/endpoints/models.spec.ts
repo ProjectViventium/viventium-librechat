@@ -699,21 +699,53 @@ describe('cached native history admission floor', () => {
     const routes = [{ provider: 'native', model: 'codex-cli:gpt-6.1-sol' },
       { provider: 'native', model: 'claude-code:claude-opus-5-5' }];
     expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints)).toBe(237500);
-    expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints,
-      { providerId: 'native', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 487824 })).toBe(487824);
-    expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints,
-      { providerId: 'native', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 131072 })).toBe(131072);
-    expect(await getNativeConversationReplayBudgetForRoutes(routes, endpoints,
-      { providerId: 'foreign', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 487824 })).toBe(237500);
-    expect(await getNativeConversationReplayBudgetForRoutes([
-      ...routes, { provider: 'native', model: 'operator-capped' },
-    ], endpoints, { providerId: 'native', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 487824 })).toBe(65536);
-    expect(await getNativeConversationReplayBudgetForRoutes([
-      ...routes, { provider: 'native', model: 'operator-capped' },
-    ], endpoints)).toBe(65536);
-    expect(await getNativeConversationReplayBudgetForRoutes([
-      ...routes, { provider: 'native', model: 'unknown' },
-    ], endpoints)).toBeNull();
+    expect(
+      await getNativeConversationReplayBudgetForRoutes(routes, endpoints, {
+        providerId: 'native',
+        modelId: 'codex-cli:gpt-6.1-sol',
+        budgetBytes: 487824,
+      }),
+    ).toBe(487824);
+    expect(
+      await getNativeConversationReplayBudgetForRoutes(routes, endpoints, {
+        providerId: 'native',
+        modelId: 'codex-cli:gpt-6.1-sol',
+        budgetBytes: 131072,
+      }),
+    ).toBe(131072);
+    expect(
+      await getNativeConversationReplayBudgetForRoutes(routes, endpoints, {
+        providerId: 'foreign',
+        modelId: 'codex-cli:gpt-6.1-sol',
+        budgetBytes: 487824,
+      }),
+    ).toBe(237500);
+    expect(
+      await getNativeConversationReplayBudgetForRoutes([routes[0]], endpoints, {
+        providerId: 'native',
+        modelId: 'codex-cli:gpt-6.1-sol',
+        budgetBytes: 1048576,
+      }),
+    ).toBe(1048576);
+    expect(
+      await getNativeConversationReplayBudgetForRoutes(
+        [...routes, { provider: 'native', model: 'operator-capped' }],
+        endpoints,
+        { providerId: 'native', modelId: 'codex-cli:gpt-6.1-sol', budgetBytes: 487824 },
+      ),
+    ).toBe(65536);
+    expect(
+      await getNativeConversationReplayBudgetForRoutes(
+        [...routes, { provider: 'native', model: 'operator-capped' }],
+        endpoints,
+      ),
+    ).toBe(65536);
+    expect(
+      await getNativeConversationReplayBudgetForRoutes(
+        [...routes, { provider: 'native', model: 'unknown' }],
+        endpoints,
+      ),
+    ).toBeNull();
     expect(mockedAxios.get).not.toHaveBeenCalled();
   });
   it.each([

@@ -454,6 +454,9 @@ function readinessIdentity(facts) {
     version: storage.version,
     thresholdPercent: storage.thresholdPercent,
     warningMarginPercent: storage.warningMarginPercent,
+    ...(facts.executionMode === 'host'
+      ? { executionMode: 'host', nativeRequiredBytes: facts.nativeStorage?.requiredBytes }
+      : {}),
   };
   const measurement = {
     version: storage.version,
@@ -461,6 +464,7 @@ function readinessIdentity(facts) {
     usedPercent: storage.usedPercent,
     availableBytes: storage.availableBytes,
     ...(Object.hasOwn(storage, 'reason') ? { reason: storage.reason } : {}),
+    ...(facts.executionMode === 'host' ? { nativeStorage: facts.nativeStorage } : {}),
   };
   return {
     factsSha256: sha256(canonicalReadinessJson(facts)),
@@ -921,6 +925,7 @@ describe('ViventiumOrchestrationMode', () => {
     process.env.VIVENTIUM_PARALLEL_WORK_RELEASE_GATE_FILE = releasePath;
     process.env.VIVENTIUM_RUNTIME_DIR = releaseDir;
     delete process.env.VIVENTIUM_PARALLEL_WORK_LOCAL_QA_OVERRIDE;
+    delete process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE;
     fs.chmodSync(releaseDir, 0o700);
     fs.rmSync(receiptAttestationKeyLinkPath, { force: true });
     fs.rmSync(receiptAttestationKeyPath, { force: true });
@@ -2526,6 +2531,68 @@ describe('ViventiumOrchestrationMode', () => {
       }
     },
   );
+
+  test('native byte release facts accept capacity despite critical percentage and preserve the configured zero floor', () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'host';
+    const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
+    for (const nativeStorage of [
+      { version: 1, healthy: true, availableBytes: 17 * 1024 ** 3, requiredBytes: 4 * 1024 ** 3 },
+      { version: 1, healthy: true, availableBytes: 0, requiredBytes: 0 },
+    ]) {
+      writeLocalQaSnapshot({
+        readiness_facts: {
+          ...validReadinessFacts(),
+          executionMode: 'host',
+          nativeStorage,
+          storagePressure: measuredStoragePressure('critical'),
+        },
+      });
+      expect(parallelWorkReleaseGateSnapshot()).toMatchObject({
+        available: true,
+        releaseReady: false,
+        label: 'PRE-GATE / NOT READY',
+      });
+    }
+  });
+
+  test('native byte release facts reject forged PASS labels for invalid capacity and keep Docker unchanged', () => {
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'host';
+    const { parallelWorkReleaseGateSnapshot } = require('../ViventiumOrchestrationMode');
+    for (const nativeStorage of [
+      undefined,
+      {
+        version: 1,
+        healthy: false,
+        availableBytes: null,
+        requiredBytes: 0,
+        errorCode: 'storage_probe_unavailable',
+      },
+      { version: 1, healthy: false, availableBytes: 3 * 1024 ** 3, requiredBytes: 4 * 1024 ** 3 },
+      { version: 1, healthy: true, availableBytes: 3 * 1024 ** 3, requiredBytes: 4 * 1024 ** 3 },
+    ]) {
+      writeLocalQaSnapshot({
+        readiness_facts: { ...validReadinessFacts(), executionMode: 'host', nativeStorage },
+      });
+      expect(parallelWorkReleaseGateSnapshot()).toMatchObject({ available: false });
+    }
+    process.env.VIVENTIUM_PARALLEL_WORK_EXECUTION_MODE = 'docker';
+    writeLocalQaSnapshot({
+      readiness_facts: {
+        ...validReadinessFacts(),
+        executionMode: 'docker',
+        nativeStorage: {
+          version: 1,
+          healthy: true,
+          availableBytes: 17 * 1024 ** 3,
+          requiredBytes: 4 * 1024 ** 3,
+        },
+        storagePressure: measuredStoragePressure('critical'),
+      },
+    });
+    expect(parallelWorkReleaseGateSnapshot()).toMatchObject({ available: false });
+    writeLocalQaSnapshot();
+    expect(parallelWorkReleaseGateSnapshot()).toMatchObject({ available: true });
+  });
 
   test('rejects malformed local QA facts instead of fabricating availability', () => {
     writeReleaseSnapshot({

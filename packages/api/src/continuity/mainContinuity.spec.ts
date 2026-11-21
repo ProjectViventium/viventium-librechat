@@ -28,6 +28,7 @@ import {
   canDeferAcceptedMainCompaction,
   renderMainBackgroundInputs,
   renderAcceptedMainContextForCarrier,
+  fitConversationContinuityForCarrier,
   MAIN_CONTINUITY_CONTEXT_BUDGET_HEADER,
 } from './mainContinuity';
 import type { AcceptedMainTurn, MainContinuityState } from './mainContinuity';
@@ -3057,7 +3058,7 @@ describe('current-carrier semantic output policy', () => {
       ).toBe(false);
     },
   );
-  test.each([131073.5, Number.MAX_SAFE_INTEGER + 1, 65536, NaN, Infinity])(
+  test.each([131073.5, Number.MAX_SAFE_INTEGER + 1, 0, -1, NaN, Infinity])(
     'rejects a carrier outside the existing bounded domain (%s)',
     (carrierMaxUtf8Bytes) => {
       expect(
@@ -3282,6 +3283,39 @@ describe('current-carrier semantic output policy', () => {
 
 /* === VIVENTIUM START === Responsive admission changes the view, never summary promotion. === */
 describe('responsive continuity view', () => {
+  test('shrinking native capacity discloses an older prefix gap without slicing its evidence', () => {
+    const original = '<reviewed-prefix>' + 'Older evidence. '.repeat(6500) + '</reviewed-prefix>';
+    const guidance = jest.fn(() => 'Disclose the temporary gap.');
+    const carrier = { carrierMaxUtf8Bytes: 40245, reservedContextUtf8Bytes: 30015 };
+    const capsule = fitConversationContinuityForCarrier(original, carrier, guidance);
+    expect(capsule).toContain('reason="context_budget"');
+    expect(capsule).toContain('original_sources="retained"');
+    expect(capsule).toContain('Disclose the temporary gap.');
+    expect(capsule).not.toContain('Older evidence.');
+    expect(Buffer.byteLength(capsule) + carrier.reservedContextUtf8Bytes).toBeLessThanOrEqual(
+      carrier.carrierMaxUtf8Bytes,
+    );
+    expect(original.endsWith('</reviewed-prefix>')).toBe(true);
+  });
+
+  test('keeps a fitting reviewed prefix byte exact and fails closed if even disclosure cannot fit', () => {
+    const guidance = jest.fn(() => 'Disclose the temporary gap.');
+    const carrier = { carrierMaxUtf8Bytes: 40245, reservedContextUtf8Bytes: 30015 };
+    expect(fitConversationContinuityForCarrier('Whole reviewed prefix.', carrier, guidance)).toBe(
+      'Whole reviewed prefix.',
+    );
+    expect(guidance).not.toHaveBeenCalled();
+    expect(() =>
+      fitConversationContinuityForCarrier(
+        'x'.repeat(1000),
+        {
+          carrierMaxUtf8Bytes: 100,
+          reservedContextUtf8Bytes: 99,
+        },
+        guidance,
+      ),
+    ).toThrow('Required continuity disclosure');
+  });
   const turn = (id: string, text: string): AcceptedMainTurn => ({
     logicalTurnId: id, revision: 1, conversationId: 'synthetic',
     userMessageId: `${id}-user`, assistantMessageId: `${id}-answer`, origin: 'interactive',

@@ -19,6 +19,8 @@ const {
   deliverCortexBatchToRunningMain,
   readRetainedNativeMainFinal,
   inspectRetainedMainFinalState,
+  resolveCurrentDurableWorkReceipt,
+  publicDurableWorkReceipt,
 } = require('@librechat/api');
 const {
   extractEnvVariable,
@@ -973,6 +975,15 @@ async function recoverNativeResponse(identity) {
     messageId: identity.source.messageId,
   });
   if (!requestMessage) return false;
+  // Native recovery owns the same exact committed-work receipt as the ordinary FINAL route.
+  // A failed reply cannot turn an already accepted operation into an unaccepted request.
+  const job = await GenerationJobManager.getJob(identity.streamId);
+  const { receipt: workReceipt } = resolveCurrentDurableWorkReceipt({
+    job,
+    responseMessageId: identity.responseMessageId,
+    sourceEventId: job?.metadata?.interactionContext?.source_event_id,
+    requireSuperseded: false,
+  });
   const finished = await GenerationJobManager.finishNativeResponse(
     identity,
     {
@@ -980,12 +991,12 @@ async function recoverNativeResponse(identity) {
       conversation: { conversationId: identity.conversationId },
       requestMessage: sanitizeMessageForTransmit(requestMessage),
       responseMessage: sanitizeMessageForTransmit(response),
+      ...(workReceipt ? { durableEffectReceipt: publicDurableWorkReceipt(workReceipt) } : {}),
     },
     terminal ? 'cancelled' : undefined,
   );
   if (!finished) return false;
   if (terminal) return markNativeResponseReplayStored(identity, 'cancelled');
-  const job = await GenerationJobManager.getJob(identity.streamId);
   if (job?.metadata?.deliveryPolicy?.commit_authority === 'server') {
     const accepted = await GenerationJobManager.acknowledgeStreamDelivery(identity.streamId, {
       state: 'committed',
@@ -1264,6 +1275,11 @@ async function offerMissionEvidenceToCurrentMain({
       return false;
     const store = GenerationJobManager.getJobStore();
     const current = async () => {
+      if (
+        insights?.some((insight) => insight.authority?.kind === 'native_coordinator_progress') &&
+        !(await require('./NativeCoordinatorProgressService').insightsCurrent(insights))
+      )
+        return false;
       const job = await store.getJob(identity.streamId);
       if (
         !nativeJobMatches(job, identity) ||
@@ -1295,9 +1311,11 @@ async function offerMissionEvidenceToCurrentMain({
         streamId: identity.streamId,
         insights,
         context: JSON.stringify(
-          insights?.some((insight) => insight.authority?.kind === 'durable_work_callback')
-            ? { accepted_work_evidence: insights }
-            : { terminal_evidence: insights },
+          insights?.every((insight) => insight.authority?.kind === 'native_coordinator_progress')
+            ? { progress_evidence: insights }
+            : insights?.some((insight) => insight.authority?.kind === 'durable_work_callback')
+              ? { accepted_work_evidence: insights }
+              : { terminal_evidence: insights },
         ),
       },
       current,

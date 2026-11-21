@@ -2,6 +2,8 @@ import type { IInteractionDurableEffect } from '@librechat/data-schemas';
 import type { SourceMutationPrepareInput, SourceMutationService } from './sourceMutation';
 import {
   executeSourceMutation,
+  SourceMutationPreDispatchFailure,
+  sourceEffectFacts,
   readSourceRecoverySnapshot,
   resolveManagedMutationSource,
 } from './sourceMutation';
@@ -220,5 +222,102 @@ test('a live reservation holds capture; expiry becomes unknown, never absent', a
   expect(expired.pending).toBe(false);
   expect(expired.facts.effects[0].status).toBe('provider_outcome_unknown');
   expect(expired.facts.work[0].launchState).toBe('dispatch_unknown');
+});
+
+test('trusted local preparation failure releases only the unstarted action claim', async () => {
+  const f = fixture();
+  const error = new SourceMutationPreDispatchFailure(
+    Object.assign(new Error('owner read rejected'), {
+      code: 'glasshive_owner_required',
+      status: 403,
+      retryable: false,
+      outcomeUnknown: true,
+    }),
+  );
+  expect(error).toMatchObject({ status: 403, retryable: false, outcomeUnknown: false });
+  f.dispatch.mockRejectedValueOnce(error);
+  await expect(executeSourceMutation({ ...f, input })).rejects.toBe(error);
+  expect(f.service.settleDurableEffectFailure).toHaveBeenCalledWith(
+    expect.objectContaining({
+      outcome: 'failed_without_effect',
+      failureCode: 'source_mutation_preparation_failed',
+    }),
+  );
+  expect(f.service.commitDurableEffect).not.toHaveBeenCalled();
+});
+
+test('remote no-effect flags cannot certify a failed local dispatch', async () => {
+  const f = fixture();
+  f.dispatch.mockRejectedValueOnce(
+    Object.assign(new Error('timeout'), {
+      code: 'glasshive_account_request_timeout',
+      noEffect: true,
+      outcomeUnknown: false,
+    }),
+  );
+  await expect(executeSourceMutation({ ...f, input })).rejects.toThrow('timeout');
+  expect(f.service.settleDurableEffectFailure).toHaveBeenCalledWith(
+    expect.objectContaining({ outcome: 'provider_outcome_unknown' }),
+  );
+});
+
+test('reconciliation reads and commits the original receipt without a new dispatch or author grant', async () => {
+  const f = fixture();
+  f.service.prepareDurableEffect.mockResolvedValueOnce({
+    decision: 'reconcile',
+    effectKey: 'effect',
+    claimToken: 'fresh-claim',
+  } as never);
+  const reconcile = jest.fn(async () => ({
+    receiptRef: 'original-receipt',
+    result: { status: 'accepted', workRef: 'original-work' },
+  }));
+  expect(await executeSourceMutation({ ...f, input, reconcile })).toEqual({
+    status: 'accepted',
+    workRef: 'original-work',
+  });
+  expect(f.dispatch).not.toHaveBeenCalled();
+  expect(f.assertAuthor).not.toHaveBeenCalled();
+  expect(reconcile).toHaveBeenCalledTimes(1);
+  expect(f.service.commitDurableEffect).toHaveBeenCalledWith(
+    expect.objectContaining({
+      claimToken: 'fresh-claim',
+      providerReceiptRef: 'original-receipt',
+    }),
+  );
+  expect(
+    sourceEffectFacts([
+      {
+        effectKey: 'effect',
+        status: 'committed',
+        effectKind: 'durable_work_action_accepted',
+        replayResult: { status: 'blocked', reason: 'native_action_failed' },
+      } as IInteractionDurableEffect,
+    ])[0],
+  ).toMatchObject({
+    status: 'committed',
+    resultStatus: 'blocked',
+    resultReason: 'native_action_failed',
+  });
+});
+
+test('an unresolved original receipt remains unknown even with a new local preparation failure', async () => {
+  const f = fixture();
+  f.service.prepareDurableEffect.mockResolvedValueOnce({
+    decision: 'reconcile',
+    effectKey: 'effect',
+    claimToken: 'fresh-claim',
+  } as never);
+  const reconcile = jest.fn(async () => {
+    throw new SourceMutationPreDispatchFailure(new Error('receipt unavailable'));
+  });
+  await expect(executeSourceMutation({ ...f, input, reconcile })).rejects.toThrow(
+    'receipt unavailable',
+  );
+  expect(f.dispatch).not.toHaveBeenCalled();
+  expect(f.service.settleDurableEffectFailure).toHaveBeenCalledWith(
+    expect.objectContaining({ outcome: 'provider_outcome_unknown' }),
+  );
+  expect(f.service.commitDurableEffect).not.toHaveBeenCalled();
 });
 /* === VIVENTIUM END === */
